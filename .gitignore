@@ -1,0 +1,33 @@
+build
+dist
+target/
+.env
+.DS_Store
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Auto Claude data directory
+.auto-claude/
+
+# CommandCode data directory
+.commandcode/
+
+# Auto Claude generated files
+.auto-claude-security.json
+.auto-claude-status
+.claude_settings.json
+.superpowers/
+.worktrees/
+.security-key
+logs/security/
+
+.remember/
+docs/plans/
+docs/roadmaps/
+docs/superpowers/
+
+# Agent orchestration / tooling artifacts
+.orchestrate/
+cli/

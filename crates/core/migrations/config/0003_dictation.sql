@@ -1,0 +1,4 @@
+-- Dictation settings live in the existing `settings` KV table (no new tables).
+-- Canonical keys:
+--   dictation.post_process  -> JSON boolean (default false): optional LLM audio_refinement
+--   dictation.active_model  -> JSON string (optional): Whisper model id when using local engine

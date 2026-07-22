@@ -1,0 +1,33 @@
+[package]
+name = "kea-platform"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+system-audio-sck = ["dep:screencapturekit"]
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+arboard.workspace = true
+enigo.workspace = true
+global-hotkey.workspace = true
+tracing.workspace = true
+cpal.workspace = true
+rodio.workspace = true
+screencapturekit = { version = "7", optional = true, features = ["macos_13_0", "async"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+core-graphics = "0.25"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+block2 = "0.6"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json.workspace = true

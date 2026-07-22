@@ -1,0 +1,22 @@
+[package]
+name = "kea-features"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kea-core = { path = "../core" }
+kea-engines = { path = "../engines" }
+kea-platform = { path = "../platform" }
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+keyring.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

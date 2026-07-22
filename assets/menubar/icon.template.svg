@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" width="22" height="22">
+  <!-- Stylized "V" for menu bar template icon -->
+  <g transform="translate(11, 11)">
+    <!-- Left stroke of V -->
+    <path d="M-7 -5 L-1.5 6" stroke="black" stroke-width="2.2" stroke-linecap="round" fill="none"/>
+    <!-- Right stroke of V -->
+    <path d="M7 -5 L1.5 6" stroke="black" stroke-width="2.2" stroke-linecap="round" fill="none"/>
+    <!-- Central accent dot -->
+    <circle cx="0" cy="-1" r="1.5" fill="black"/>
+  </g>
+</svg>

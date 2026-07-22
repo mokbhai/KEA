@@ -1,0 +1,47 @@
+name: CI
+# push is limited to main so PR branches get a single run (pull_request)
+# instead of the duplicate push+pull_request pair.
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux Tauri/webkit deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Build UI
+        run: cd ui && npm install && npm run build
+      - name: Rust tests
+        run: cargo test --workspace
+      - name: Build app crate
+        run: cargo build -p kea-app
+
+  smoke-launch:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Build UI
+        run: cd ui && npm install && npm run build
+      - name: Build app crate
+        run: cargo build -p kea-app
+      - name: Smoke launch
+        run: SMOKE_RESET_DATA=1 ./scripts/smoke_launch.sh

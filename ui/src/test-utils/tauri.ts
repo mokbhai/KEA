@@ -1,0 +1,60 @@
+import { vi } from "vitest";
+
+/**
+ * Shared Tauri mock for page/component tests. Wire it up per test file with:
+ *
+ *   vi.mock("@tauri-apps/api/core", async () => (await import("../test-utils/tauri")).coreModule);
+ *   vi.mock("@tauri-apps/api/event", async () => (await import("../test-utils/tauri")).eventModule);
+ *
+ * then route commands with `onInvoke({...})`, fire backend events with
+ * `emitTauriEvent(...)`, and call `resetTauriMocks()` in beforeEach.
+ */
+
+type InvokeArgs = Record<string, unknown> | undefined;
+type EventListener = (event: { payload: unknown }) => void;
+
+export const invokeMock = vi.fn<(cmd: string, args?: InvokeArgs) => unknown>();
+
+const listeners = new Map<string, Set<EventListener>>();
+
+export const coreModule = {
+  invoke: async (cmd: string, args?: InvokeArgs) => invokeMock(cmd, args),
+};
+
+export const eventModule = {
+  listen: (event: string, handler: EventListener) => {
+    let set = listeners.get(event);
+    if (!set) {
+      set = new Set();
+      listeners.set(event, set);
+    }
+    set.add(handler);
+    return Promise.resolve(() => {
+      set.delete(handler);
+    });
+  },
+};
+
+/** Fires every listener registered for a Tauri event. */
+export function emitTauriEvent(event: string, payload: unknown) {
+  listeners.get(event)?.forEach((handler) => handler({ payload }));
+}
+
+/** Routes invoke calls to per-command handlers; unmocked commands reject. */
+export function onInvoke(handlers: Record<string, (args?: InvokeArgs) => unknown>) {
+  invokeMock.mockImplementation((cmd, args) => {
+    const handler = handlers[cmd];
+    if (!handler) throw new Error(`unmocked invoke: ${cmd}`);
+    return handler(args);
+  });
+}
+
+export function resetTauriMocks() {
+  invokeMock.mockReset();
+  listeners.clear();
+}
+
+/** All calls to a given command, as their raw args objects. */
+export function invokeCalls(cmd: string): InvokeArgs[] {
+  return invokeMock.mock.calls.filter(([name]) => name === cmd).map(([, args]) => args);
+}

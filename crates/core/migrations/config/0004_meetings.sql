@@ -1,0 +1,4 @@
+-- Meeting settings live in the existing `settings` KV table (no new tables).
+-- Canonical keys:
+--   meetings.segment_duration_secs -> JSON number (default 30): STT chunk duration in seconds
+--   meetings.prefer_system_audio   -> JSON boolean (default true): prefer loopback/system capture when available

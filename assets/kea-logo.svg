@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2E5D50"/><stop offset="1" stop-color="#4E8A5B"/>
+    </linearGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9CC456"/><stop offset="1" stop-color="#6E9A3C"/>
+    </linearGradient>
+  </defs>
+  <rect x="48" y="48" width="928" height="928" rx="212" fill="url(#bg)"/>
+  <!-- Kea (NZ alpine parrot) head, profile facing left -->
+  <ellipse cx="600" cy="510" rx="235" ry="250" fill="url(#body)"/>
+  <!-- long dark hooked beak -->
+  <path fill="#2B3A34" d="
+    M480 456
+    C 372 430 258 456 214 512
+    C 268 512 322 524 360 552
+    C 322 560 292 586 296 622
+    C 330 604 378 600 418 612
+    C 462 566 486 508 490 470 Z"/>
+  <!-- orange cere (kea warmth) -->
+  <path fill="#E98A2B" d="M486 452 C 448 444 418 452 400 472 C 436 478 468 492 492 510 C 502 490 498 466 486 452 Z"/>
+  <!-- eye -->
+  <circle cx="612" cy="452" r="42" fill="#F4EFE2"/>
+  <circle cx="612" cy="452" r="21" fill="#22302B"/>
+</svg>

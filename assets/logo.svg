@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Clean rounded square background -->
+  <rect x="32" y="32" width="448" height="448" rx="96" ry="96" fill="#6366f1"/>
+
+  <!-- Bold stylized "V" - clean and minimal -->
+  <g transform="translate(256, 256)">
+    <!-- Main V shape -->
+    <path
+      d="M-90 -100 L0 100 L90 -100"
+      stroke="white"
+      stroke-width="36"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      fill="none"
+    />
+  </g>
+</svg>

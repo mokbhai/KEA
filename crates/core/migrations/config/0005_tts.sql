@@ -1,0 +1,5 @@
+-- TTS settings live in the existing `settings` KV table (no new tables).
+-- Canonical keys:
+--   tts.replace_mode  -> JSON string (default "clipboard"): "clipboard" | "accessibility"
+--   tts.active_voice  -> JSON string (optional): TTS voice id
+--   tts.active_model  -> JSON string (optional): TTS model id

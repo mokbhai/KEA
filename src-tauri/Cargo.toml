@@ -1,0 +1,34 @@
+[package]
+name = "kea-app"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+updater = ["tauri-plugin-updater"]
+whisper = ["kea-engines/whisper", "kea-infer/whisper"]
+parakeet = ["kea-engines/parakeet"]
+tts-local = ["kea-engines/tts-local"]
+sherpa = ["kea-infer/sherpa"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+kea-core = { path = "../crates/core" }
+kea-engines = { path = "../crates/engines" }
+kea-features = { path = "../crates/features" }
+kea-platform = { path = "../crates/platform" }
+kea-infer = { path = "../crates/infer" }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-updater = { version = "2", optional = true }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+sqlx.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
