@@ -81,6 +81,9 @@ export default function HotkeyRow({
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [regError, setRegError] = useState<string | null>(null);
+  // Bumped after every save so each one re-queries; a boolean would only ever
+  // flip false→true and so only cover the first.
+  const [saveCount, setSaveCount] = useState(0);
   const { capturing, pending, captureError, startCapture, clearPending } = useHotkeyRecorder();
 
   useEffect(() => {
@@ -97,7 +100,7 @@ export default function HotkeyRow({
         setRegError(match && !match.ok ? match.error : null);
       })
       .catch(() => {});
-  }, [feature, command, checkRegistration, saved]);
+  }, [feature, command, checkRegistration, saveCount]);
 
   // Save immediately once a combo is captured — same save-on-change rows as
   // the rest of the app.
@@ -110,6 +113,7 @@ export default function HotkeyRow({
         if (cancelled) return;
         setCurrent({ accelerator: pending, source: "custom" });
         setSaved(true);
+        setSaveCount((n) => n + 1);
         clearPending();
         onSaved?.(pending);
       })
@@ -126,9 +130,15 @@ export default function HotkeyRow({
   const registrationHint = regError
     ? `Shortcut registration failed at startup: ${regError}`
     : null;
+  // Anything but the static copy is a failure, and must not read as help text.
+  const problem = error ?? captureError ?? registrationHint;
 
   return (
-    <Row label={label} hint={error ?? captureError ?? registrationHint ?? hint}>
+    <Row
+      label={label}
+      hint={problem ?? hint}
+      tone={problem ? "danger" : "muted"}
+    >
       {capturing ? (
         <span className="kea-muted" aria-live="polite">
           Press keys… (Esc to cancel)
