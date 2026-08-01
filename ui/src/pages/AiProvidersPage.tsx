@@ -17,6 +17,7 @@ import DefaultsPicker, {
 import ProviderRow from "../components/ProviderRow";
 import { Row, RowGroup } from "../components/SettingsRow";
 import Spinner from "../components/Spinner";
+import { describeBinding } from "../lib/featureSlot";
 import { slugify } from "../lib/format";
 
 const CAPABILITIES: { capability: Capability; icon: string }[] = [
@@ -73,32 +74,8 @@ export default function AiProvidersPage() {
       .catch(() => {});
   }, [refreshProviders, refreshBindings]);
 
-  const providerName = (ref: string | null) =>
-    providers?.find((p) => p.provider_ref === ref)?.name ?? null;
-
-  const summary = (binding: Binding | null): string | null => {
-    if (!binding) return null;
-    switch (binding.engine_id) {
-      case "openai":
-      case "openai-stt":
-      case "openai-tts":
-        return `OpenAI${binding.model ? ` · ${binding.model}` : ""}`;
-      case "openai-compatible":
-        return `${providerName(binding.provider_ref) ?? "Custom server"}${
-          binding.model ? ` · ${binding.model}` : ""
-        }`;
-      case "whisper":
-      case "parakeet":
-      case "sherpa-tts": {
-        const name = binding.model
-          ? modelNames.get(binding.model) ?? binding.model
-          : binding.engine_id;
-        return `${name} — on this Mac`;
-      }
-      default:
-        return binding.model ?? binding.engine_id;
-    }
-  };
+  const summary = (binding: Binding | null): string | null =>
+    describeBinding(binding, { providers: providers ?? [], modelNames });
 
   const addProvider = async () => {
     const name = newName.trim();

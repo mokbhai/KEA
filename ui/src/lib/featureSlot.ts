@@ -154,11 +154,9 @@ function blockedReason(
   effective: Binding | null,
   env: Env,
 ): BlockedReason | null {
-  const what = spec.label.toLowerCase();
-
   if (!effective) {
     return {
-      message: `no ${what} is set up yet.`,
+      message: "Nothing is set up for this yet.",
       actionLabel: "Choose…",
       fix: "picker",
     };
@@ -166,7 +164,7 @@ function blockedReason(
 
   if (!env.engineIds[spec.capability].has(effective.engine_id)) {
     return {
-      message: `the chosen ${what} isn't available in this build.`,
+      message: "The saved choice isn't available in this version.",
       actionLabel: "Change…",
       fix: "picker",
     };
@@ -187,7 +185,7 @@ function blockedReason(
   if (ref && !env.keyByRef.get(ref)) {
     const name = env.providers.find((p) => p.provider_ref === ref)?.name ?? ref;
     return {
-      message: `${name} needs an API key before ${what} can run.`,
+      message: `${name} needs an API key.`,
       actionLabel: "Open AI Providers",
       fix: "ai-providers",
     };

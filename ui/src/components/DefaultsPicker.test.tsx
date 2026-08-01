@@ -104,4 +104,54 @@ describe("DefaultsPicker", () => {
     expect(onApplied).toHaveBeenCalled();
     expect(await screen.findByText("Saved ✓")).toBeTruthy();
   });
+
+  it("writes a feature-scoped override when given a feature and slot", async () => {
+    mockSttWorld({ installed: ["whisper-base"] });
+    render(
+      <DefaultsPicker
+        capability="stt"
+        feature="meetings"
+        slot="stt"
+        open
+        onClose={() => {}}
+        onApplied={() => {}}
+      />,
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: /Whisper Base/ }));
+
+    await waitFor(() => expect(invokeCalls("set_binding")).toHaveLength(1));
+    expect(invokeCalls("set_binding")[0]).toEqual({
+      feature: "meetings",
+      slot: "stt",
+      engine: "whisper",
+      model: "whisper-base",
+      providerRef: null,
+    });
+    // The global dictation model belongs to dictation, not to a meetings
+    // override — the override binding already carries the model.
+    expect(invokeCalls("set_dictation_settings")).toHaveLength(0);
+  });
+
+  it("keeps the dictation model in step with a dictation override", async () => {
+    mockSttWorld({ installed: ["whisper-base"] });
+    render(
+      <DefaultsPicker
+        capability="stt"
+        feature="dictation"
+        slot="stt"
+        open
+        onClose={() => {}}
+        onApplied={() => {}}
+      />,
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: /Whisper Base/ }));
+
+    await waitFor(() => expect(invokeCalls("set_dictation_settings")).toHaveLength(1));
+    expect(invokeCalls("set_binding")[0]).toMatchObject({
+      feature: "dictation",
+      slot: "stt",
+    });
+  });
 });
