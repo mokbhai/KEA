@@ -33,6 +33,16 @@ function renderPage() {
 describe("GeneralPage", () => {
   beforeEach(() => resetTauriMocks());
 
+  it("titles the page with the only h1", async () => {
+    mockGeneralWorld();
+    renderPage();
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "General" }),
+    ).toBeTruthy();
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+  });
+
   it("saves the appearance preference from the row", async () => {
     mockGeneralWorld();
     renderPage();

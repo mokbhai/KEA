@@ -37,7 +37,7 @@ export default function LogsPage() {
 
   return (
     <div>
-      <h2 style={{ marginTop: 0 }}>Logs</h2>
+      <h1 style={{ marginTop: 0 }}>Logs</h1>
       <p className="kea-muted" style={{ marginTop: 0 }}>
         Tail of the rolling KEA application log (last {Math.round(DEFAULT_MAX_BYTES / 1024)}{" "}
         KB).

@@ -21,6 +21,16 @@ function mockWorld(options: Parameters<typeof featureHandlers>[0] = {}) {
 describe("ReadAloudPage", () => {
   beforeEach(() => resetTauriMocks());
 
+  it("titles the page with the only h1", async () => {
+    mockWorld({ bindings: { "default/tts": openAiBinding("openai-tts") } });
+    render(<ReadAloudPage />);
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Read aloud" }),
+    ).toBeTruthy();
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+  });
+
   it("warns when nothing is set up", async () => {
     mockWorld({ bindings: {} });
     render(<ReadAloudPage />);

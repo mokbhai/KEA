@@ -50,7 +50,7 @@ export default function FeatureAiCard({ ai, title = "AI", featureLabel }: Props)
 
   return (
     <section style={{ marginBottom: 24 }}>
-      <h3 style={{ margin: "0 0 12px" }}>{title}</h3>
+      <h2 style={{ margin: "0 0 12px" }}>{title}</h2>
       {ai.statuses === null ? (
         <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 44 }}>
           <Spinner size={16} />

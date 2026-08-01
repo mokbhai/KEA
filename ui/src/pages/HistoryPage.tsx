@@ -182,7 +182,7 @@ export default function HistoryPage() {
 
   return (
     <div>
-      <h2 style={{ marginTop: 0 }}>History</h2>
+      <h1 style={{ marginTop: 0 }}>History</h1>
       <p className="kea-muted" style={{ marginTop: 0 }}>
         Browse recorded feature actions and rewrite conversations from data.db.
       </p>
@@ -354,7 +354,7 @@ export default function HistoryPage() {
             background: "var(--surface-2)",
           }}
         >
-          <h3 style={{ margin: "0 0 12px" }}>Detail</h3>
+          <h2 style={{ margin: "0 0 12px" }}>Detail</h2>
           {busy && !actionDetail ? (
             <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 60 }}>
               <Spinner size={16} />
@@ -412,7 +412,7 @@ export default function HistoryPage() {
               </dl>
               {linkedAction && (
                 <div style={{ marginTop: 16 }}>
-                  <h4 style={{ margin: "0 0 8px" }}>Linked action</h4>
+                  <h3 style={{ margin: "0 0 8px" }}>Linked action</h3>
                   <p className="kea-muted" style={{ margin: 0 }}>
                     {linkedAction.feature_id} / {linkedAction.command} —{" "}
                     <span style={{ color: statusColor(linkedAction.status) }}>
@@ -422,9 +422,9 @@ export default function HistoryPage() {
                 </div>
               )}
               <div style={{ marginTop: 16 }}>
-                <h4 style={{ margin: "0 0 8px" }}>
+                <h3 style={{ margin: "0 0 8px" }}>
                   Messages
-                </h4>
+                </h3>
                 {messagesLoading ? (
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <Spinner size={14} />

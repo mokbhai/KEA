@@ -23,7 +23,7 @@ export default function MeetingDetail({ detail, onDelete, busy = false }: Props)
   return (
     <div>
       <header style={{ marginBottom: 16 }}>
-        <h3 style={{ margin: "0 0 4px" }}>{meeting.title}</h3>
+        <h2 style={{ margin: "0 0 4px" }}>{meeting.title}</h2>
         <p className="kea-muted" style={{ margin: 0 }}>
           {meeting.started_at}
           {meeting.ended_at ? ` — ${meeting.ended_at}` : ""}
@@ -41,7 +41,7 @@ export default function MeetingDetail({ detail, onDelete, busy = false }: Props)
 
       {notes && (
         <section className="kea-card" style={{ marginBottom: 16 }}>
-          <h4 style={{ margin: "0 0 12px" }}>Notes</h4>
+          <h3 style={{ margin: "0 0 12px" }}>Notes</h3>
           <NotesSection label="Summary" content={notes.summary} />
           <NotesSection label="Decisions" content={notes.decisions} />
           <NotesSection label="Action items" content={notes.action_items} />
@@ -51,7 +51,7 @@ export default function MeetingDetail({ detail, onDelete, busy = false }: Props)
       )}
 
       <section style={{ marginBottom: 16 }}>
-        <h4 style={{ margin: "0 0 8px" }}>Transcript</h4>
+        <h3 style={{ margin: "0 0 8px" }}>Transcript</h3>
         <TranscriptPanel
           segments={segments}
           emptyMessage="No segments recorded for this meeting."

@@ -159,7 +159,7 @@ export default function ModelsPage() {
 
   return (
     <div>
-      <h2 style={{ marginTop: 0 }}>Models</h2>
+      <h1 style={{ marginTop: 0 }}>Models</h1>
       <p className="kea-muted" style={{ marginBottom: 24 }}>
         Download models to run speech features privately on this Mac.
       </p>
@@ -168,7 +168,7 @@ export default function ModelsPage() {
 
       {sections.map((section) => (
         <section key={section.kind} style={{ marginBottom: 28 }}>
-          <h3 style={{ margin: "0 0 12px" }}>{section.title}</h3>
+          <h2 style={{ margin: "0 0 12px" }}>{section.title}</h2>
           {section.models.length === 0 ? (
             <p className="kea-muted" style={{ margin: 0 }}>
               No models available.

@@ -90,7 +90,7 @@ export default function Onboarding({ onFinish }: Props) {
 
   return (
     <div style={{ maxWidth: 640, margin: "40px auto", padding: "0 16px" }}>
-      <h2 style={{ marginTop: 0, textAlign: "center", marginBottom: 24 }}>Welcome to KEA</h2>
+      <h1 style={{ marginTop: 0, textAlign: "center", marginBottom: 24 }}>Welcome to KEA</h1>
       <p className="kea-muted" style={{ textAlign: "center", marginBottom: 8 }}>
         Step {step + 1} of {total}: {STEPS[step]}
       </p>

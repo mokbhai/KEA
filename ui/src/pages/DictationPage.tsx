@@ -144,7 +144,7 @@ export default function DictationPage({ onNavigate }: Props) {
   return (
     <div>
       <header>
-        <h2 style={{ marginTop: 0 }}>Dictation</h2>
+        <h1 style={{ marginTop: 0 }}>Dictation</h1>
         <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
           Hold the shortcut anywhere on your Mac, talk, and KEA types what you said.
         </p>
@@ -153,7 +153,7 @@ export default function DictationPage({ onNavigate }: Props) {
       <FeatureBanner ai={ai} onNavigate={onNavigate} />
 
       <section style={{ marginBottom: 24 }}>
-        <h3 style={{ margin: "0 0 12px" }}>Behavior</h3>
+        <h2 style={{ margin: "0 0 12px" }}>Behavior</h2>
         {settingsLoading ? (
           <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 44 }}>
             <Spinner size={16} />
@@ -195,7 +195,7 @@ export default function DictationPage({ onNavigate }: Props) {
       <FeatureAiCard ai={ai} featureLabel="Dictation" />
 
       <section style={{ marginBottom: 24 }}>
-        <h3 style={{ margin: "0 0 12px" }}>Try it</h3>
+        <h2 style={{ margin: "0 0 12px" }}>Try it</h2>
         <div className="kea-card">
           <p style={{ marginTop: 0 }}>
             {accelerator ? (

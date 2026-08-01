@@ -38,6 +38,14 @@ describe("ModelsPage", () => {
   beforeEach(() => resetTauriMocks());
   afterEach(() => vi.restoreAllMocks());
 
+  it("titles the page with the only h1", async () => {
+    mockModelsWorld();
+    render(<ModelsPage />);
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Models" })).toBeTruthy();
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+  });
+
   it("confirms with the consequence before removing an active-default model", async () => {
     mockModelsWorld();
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);

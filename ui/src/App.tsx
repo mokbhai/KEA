@@ -213,7 +213,9 @@ function AppShell() {
           >
             ☰
           </button>
-          <h1 className="kea-topbar__title">KEA</h1>
+          {/* Brand label, not the document heading: every page now owns its
+              own h1, so a second one here would give the mobile outline two. */}
+          <span className="kea-topbar__title">KEA</span>
         </header>
       )}
 
