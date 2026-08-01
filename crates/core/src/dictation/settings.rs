@@ -28,7 +28,14 @@ impl DictationSettingsRepo {
                 .get(KEY_POST_PROCESS)
                 .await?
                 .unwrap_or(false),
-            active_model: self.settings.get(KEY_ACTIVE_MODEL).await?,
+            // Stored as an Option, so a cleared model is the JSON literal
+            // `null` rather than a missing row — read it back as one and
+            // flatten, or every later read of these settings would fail.
+            active_model: self
+                .settings
+                .get::<Option<String>>(KEY_ACTIVE_MODEL)
+                .await?
+                .flatten(),
         })
     }
 
@@ -59,5 +66,30 @@ mod tests {
         };
         repo.set(&cfg).await.unwrap();
         assert_eq!(repo.get().await.unwrap(), cfg);
+    }
+
+    #[tokio::test]
+    async fn clearing_the_active_model_survives_a_reread() {
+        // Clearing writes the JSON literal `null`; reading it back must yield
+        // None instead of failing to deserialize.
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let repo = DictationSettingsRepo::new(SettingsRepo::new(pool));
+        repo.set(&DictationSettings {
+            post_process: true,
+            active_model: Some("ggml-base.en".into()),
+        })
+        .await
+        .unwrap();
+        repo.set(&DictationSettings {
+            post_process: true,
+            active_model: None,
+        })
+        .await
+        .unwrap();
+
+        let got = repo.get().await.unwrap();
+        assert_eq!(got.active_model, None);
+        assert!(got.post_process);
     }
 }

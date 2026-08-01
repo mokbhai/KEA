@@ -188,6 +188,27 @@ function ownsSettings(capability: Capability, target: BindingTarget): boolean {
  * otherwise — and keeps the per-feature active_model / active_voice settings
  * consistent. The single write path shared by the DefaultsPicker (both the
  * defaults on AI Providers and the per-feature overrides) and the wizard.
+ *
+ * The settings-level model is the fallback for whichever engine a *model-less*
+ * binding later resolves to — it is not scoped to the engine picked here
+ * (crates/features/src/dictation.rs: `binding.model.or(settings.active_model)`).
+ * Only the local engine that owns it can load what it holds, so a pick either
+ * writes a model that engine could load or leaves the setting alone. Two
+ * things follow:
+ *
+ * - Never mirror a foreign id. A cloud id ("whisper-1") or a parakeet id
+ *   (separate ONNX storage) would fail as "model not installed" the next time
+ *   a model-less whisper binding resolved — and those are reachable, the local
+ *   onboarding path writes whisper/null.
+ * - Never clear it either. A retained whisper id is inert: every reachable
+ *   non-whisper binding carries its own model, so the fallback is read only
+ *   when a model-less whisper binding resolves, which is exactly the case it
+ *   exists for. Clearing would break that case (whisper hard-errors with
+ *   "whisper requires a model id"; sherpa falls back to the first catalog
+ *   voice, which may not be installed). So item #3's "stale id" is cosmetic:
+ *   an id that disagrees with the current binding is deliberately kept,
+ *   because nothing else ever reads it. A model whose *files* are gone is a
+ *   different matter, and the backend clears it on delete_model.
  */
 export async function applyDefaultChoice(
   capability: Capability,
@@ -198,15 +219,29 @@ export async function applyDefaultChoice(
   const to = target ?? defaultTarget(capability);
   await setBinding(to.feature, to.slot, choice.engine, choice.model, choice.providerRef);
   if (!ownsSettings(capability, to)) return;
-  if (capability === "stt" && choice.engine === "whisper" && choice.model !== null) {
+  if (capability === "stt") {
+    // Only a whisper pick with a model of its own has anything to say here.
+    if (choice.engine !== "whisper" || choice.model === null) return;
     const settings = await getDictationSettings();
-    await setDictationSettings({ ...settings, active_model: choice.model });
-  } else if (capability === "tts" && choice.engine === "sherpa-tts" && choice.model !== null) {
+    if (settings.active_model !== choice.model) {
+      await setDictationSettings({ ...settings, active_model: choice.model });
+    }
+  } else if (capability === "tts") {
+    // Same rule for the model; the voice is independent — it belongs to the
+    // cloud engine and is passed only by picks that carry one.
+    const keepsModel = choice.engine !== "sherpa-tts" || choice.model === null;
     const settings = await getTtsSettings();
-    await setTtsSettings({ ...settings, active_model: choice.model });
-  } else if (capability === "tts" && choice.engine === "openai-tts" && voice) {
-    const settings = await getTtsSettings();
-    await setTtsSettings({ ...settings, active_voice: voice });
+    const next = {
+      ...settings,
+      active_model: keepsModel ? settings.active_model : choice.model,
+      active_voice: voice ?? settings.active_voice,
+    };
+    if (
+      next.active_model !== settings.active_model ||
+      next.active_voice !== settings.active_voice
+    ) {
+      await setTtsSettings(next);
+    }
   }
 }
 

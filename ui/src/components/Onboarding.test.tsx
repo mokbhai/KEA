@@ -215,7 +215,9 @@ describe("Onboarding wizard", () => {
         providerRef: "openai",
       },
     ]);
-    // Alloy becomes the active voice, mirroring the defaults picker.
+    // Alloy becomes the active voice, mirroring the defaults picker. The
+    // fallback model stays empty: it is only ever a local sherpa id, and the
+    // cloud model lives on the binding that was just written.
     expect(invokeCalls("set_tts_settings")).toEqual([
       { settings: { active_voice: "alloy", active_model: null } },
     ]);

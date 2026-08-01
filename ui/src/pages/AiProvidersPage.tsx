@@ -17,6 +17,7 @@ import DefaultsPicker, {
 import ProviderRow from "../components/ProviderRow";
 import { Row, RowGroup } from "../components/SettingsRow";
 import Spinner from "../components/Spinner";
+import { usePendingActivation } from "../hooks/usePendingActivation";
 import { describeBinding } from "../lib/featureSlot";
 import { slugify } from "../lib/format";
 
@@ -57,6 +58,10 @@ export default function AiProvidersPage() {
     );
     setBindings({ llm, stt, tts });
   }, []);
+
+  // Owned by the page, not the popover: a model download outlives the picker,
+  // and the default still gets set if the user closes it mid-download.
+  const activation = usePendingActivation(() => void refreshBindings());
 
   useEffect(() => {
     void refreshProviders();
@@ -218,8 +223,14 @@ export default function AiProvidersPage() {
             capability={pickerFor}
             open
             onClose={() => setPickerFor(null)}
-            onApplied={() => void refreshBindings()}
+            activation={activation}
           />
+        )}
+        {!pickerFor && activation.pending && (
+          <p className="kea-muted" style={{ marginTop: 8 }}>
+            Downloading {activation.pending.option.label} — it becomes the default when the
+            download finishes.
+          </p>
         )}
       </section>
     </div>

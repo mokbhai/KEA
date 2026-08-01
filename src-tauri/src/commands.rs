@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use kea_core::dictation::{DictationSettings, DictationSettingsRepo};
 use kea_core::log::{current_log_path, tail_log_file};
 use kea_core::meetings::{MeetingSettings, MeetingSettingsRepo};
-use kea_core::resolve::{Resolution, DEFAULT_FEATURE_ID};
+use kea_core::resolve::Resolution;
 use kea_core::rewrite::{
     build_llm_request, PresetRepo, PromptOverrideRepo, ProviderConfig, ProviderConfigRepo,
     RewriteInput, RewriteMode, RewritePreset,
@@ -24,8 +24,8 @@ use kea_engines::{EngineRegistry, TtsOpts};
 use kea_features::demo::run_ping;
 use kea_features::{
     drain_and_stop_meeting, run_dictation_with_storage, run_meeting_poll_segment,
-    run_meeting_start, run_meeting_stop, run_tts_synthesize, ActiveMeeting, ContentStorageOpts,
-    MeetingRunContext,
+    run_meeting_start, run_meeting_stop, run_tts_synthesize, ActiveMeeting, CapKind,
+    ContentStorageOpts, MeetingRunContext,
 };
 use kea_features::run_rewrite_with_storage;
 use kea_core::resolve::SlotResolver;
@@ -350,17 +350,35 @@ pub fn provider_entries(custom: &[CustomProvider]) -> Vec<ProviderEntry> {
     entries
 }
 
-/// Validates a to-be-added custom provider (pure, unit-testable).
+/// Characters a provider ref may contain. The ref becomes part of settings
+/// keys (`provider.<ref>`) and of the keychain account name, so anything
+/// outside this set — whitespace, slashes, quotes, uppercase — is rejected
+/// rather than silently normalized.
+fn is_valid_provider_ref_char(c: char) -> bool {
+    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
+}
+
+/// Validates a to-be-added custom provider and returns the entry to store
+/// (pure, unit-testable). Both fields are trimmed *before* validation, so a
+/// ref like `" openai"` can't slip past the built-in / duplicate checks and
+/// then be stored — and displayed — as `openai`.
 pub fn validate_new_provider(
     provider_ref: &str,
     name: &str,
     existing: &[CustomProvider],
-) -> Result<(), String> {
-    if provider_ref.trim().is_empty() {
+) -> Result<CustomProvider, String> {
+    let provider_ref = provider_ref.trim();
+    let name = name.trim();
+    if provider_ref.is_empty() {
         return Err("Provider id can't be empty".into());
     }
-    if name.trim().is_empty() {
+    if name.is_empty() {
         return Err("Provider name can't be empty".into());
+    }
+    if !provider_ref.chars().all(is_valid_provider_ref_char) {
+        return Err(format!(
+            "Provider id \"{provider_ref}\" may only use lowercase letters, digits, dot, underscore and hyphen"
+        ));
     }
     if BUILT_IN_PROVIDERS.iter().any(|(r, _)| *r == provider_ref) {
         return Err(format!("\"{provider_ref}\" is a built-in provider"));
@@ -368,7 +386,10 @@ pub fn validate_new_provider(
     if existing.iter().any(|p| p.provider_ref == provider_ref) {
         return Err(format!("A provider \"{provider_ref}\" already exists"));
     }
-    Ok(())
+    Ok(CustomProvider {
+        provider_ref: provider_ref.into(),
+        name: name.into(),
+    })
 }
 
 async fn load_custom_providers(settings: &SettingsRepo) -> Result<Vec<CustomProvider>, String> {
@@ -419,6 +440,25 @@ pub fn provider_test_result_for_status(status: u16) -> ProviderTestResult {
     }
 }
 
+/// Courtesy warning appended to a test result when the saved key would travel
+/// over plain HTTP. Advisory only — it never changes the ok/failed verdict,
+/// because a local server on `http://` is a legitimate setup.
+pub const CLEARTEXT_KEY_WARNING: &str = "key sent over plain http";
+
+/// Whether testing this provider would put the bearer key on the wire in
+/// cleartext (pure, unit-testable).
+pub fn sends_key_in_cleartext(base_url: &str, has_key: bool) -> bool {
+    has_key && base_url.trim_start().to_ascii_lowercase().starts_with("http://")
+}
+
+/// Appends the cleartext warning to a result's message, keeping `ok` as-is.
+pub fn with_cleartext_warning(result: ProviderTestResult) -> ProviderTestResult {
+    ProviderTestResult {
+        message: format!("{} — {CLEARTEXT_KEY_WARNING}", result.message),
+        ..result
+    }
+}
+
 /// Existence-only credential probe: the secret never crosses this boundary.
 pub async fn credential_exists(
     store: &dyn kea_core::secrets::CredentialStore,
@@ -431,27 +471,104 @@ pub async fn credential_exists(
         .map_err(|e| e.to_string())
 }
 
-/// Drops the capability-default binding for `slot` when it references
-/// `model_id`. Returns whether a binding was deleted.
-pub async fn clear_default_binding_for_model(
+/// Drops every binding for `slot` that names `model_id` — the capability
+/// default *and* per-feature overrides (dictation/stt, meetings/stt, tts/tts).
+/// Returns the feature ids whose bindings were cleared. A row left pointing at
+/// deleted files would otherwise only surface as an inference failure later.
+pub async fn clear_bindings_for_model(
     bindings: &BindingRepo,
     slot: &str,
     model_id: &str,
-) -> Result<bool, String> {
-    if let Some(binding) = bindings
-        .get(DEFAULT_FEATURE_ID, slot)
+) -> Result<Vec<String>, String> {
+    bindings
+        .delete_by_model(slot, model_id)
         .await
-        .map_err(|e| e.to_string())?
-    {
-        if binding.model.as_deref() == Some(model_id) {
-            bindings
-                .delete(DEFAULT_FEATURE_ID, slot)
-                .await
-                .map_err(|e| e.to_string())?;
-            return Ok(true);
+        .map_err(|e| e.to_string())
+}
+
+/// Clears the settings-level fallback model (`dictation.active_model` /
+/// `tts.active_model`) when it names the removed model. Those settings are
+/// consulted when a binding carries no model of its own, so they dangle the
+/// same way a binding does. Returns whether a setting was cleared.
+pub async fn clear_active_model_for_deleted(
+    config_pool: &SqlitePool,
+    slot: &str,
+    model_id: &str,
+) -> Result<bool, String> {
+    match slot {
+        "stt" => {
+            let repo = DictationSettingsRepo::new(SettingsRepo::new(config_pool.clone()));
+            let current = repo.get().await.map_err(|e| e.to_string())?;
+            if current.active_model.as_deref() != Some(model_id) {
+                return Ok(false);
+            }
+            repo.set(&DictationSettings {
+                active_model: None,
+                ..current
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(true)
         }
+        "tts" => {
+            let repo = TtsSettingsRepo::new(SettingsRepo::new(config_pool.clone()));
+            let current = repo.get().await.map_err(|e| e.to_string())?;
+            if current.active_model.as_deref() != Some(model_id) {
+                return Ok(false);
+            }
+            repo.set(&TtsSettings {
+                active_model: None,
+                ..current
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+        _ => Ok(false),
     }
-    Ok(false)
+}
+
+/// The engine capability a slot name implies. Slot names are the capability
+/// names everywhere in this app (`llm` / `stt` / `tts`); anything else is a
+/// custom slot with no known capability.
+pub fn capability_for_slot(slot: &str) -> Option<CapKind> {
+    match slot {
+        "llm" => Some(CapKind::Llm),
+        "stt" => Some(CapKind::Stt),
+        "tts" => Some(CapKind::Tts),
+        _ => None,
+    }
+}
+
+/// Rejects an engine that can't serve `slot`: unknown ids always, and — for
+/// the three known slot kinds — engines registered under another capability.
+/// A `tts` engine bound to the `llm` slot would persist a default that every
+/// resolve silently skips, so the UI would show a default that isn't used.
+/// Unknown/custom slots keep the previous "registered anywhere" rule.
+pub fn validate_engine_for_slot(
+    engines: &EngineRegistry,
+    slot: &str,
+    engine: &str,
+) -> Result<(), String> {
+    let llm = engines.llm(engine).is_some();
+    let stt = engines.stt(engine).is_some();
+    let tts = engines.tts(engine).is_some();
+    if !(llm || stt || tts) {
+        return Err(format!("unknown engine id: {engine}"));
+    }
+    let (ok, label) = match capability_for_slot(slot) {
+        Some(CapKind::Llm) => (llm, "text"),
+        Some(CapKind::Stt) => (stt, "speech-to-text"),
+        Some(CapKind::Tts) => (tts, "text-to-speech"),
+        None => return Ok(()),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "engine '{engine}' is not a {label} engine (slot '{slot}')"
+        ))
+    }
 }
 
 pub fn default_rewrite_accelerator() -> &'static str {
@@ -1404,13 +1521,10 @@ pub async fn set_binding(
     model: Option<String>,
     provider_ref: Option<String>,
 ) -> Result<(), String> {
-    // Validate engine id exists in the registry before persisting.
-    let known = state.engines.llm(&engine).is_some()
-        || state.engines.stt(&engine).is_some()
-        || state.engines.tts(&engine).is_some();
-    if !known {
-        return Err(format!("unknown engine id: {engine}"));
-    }
+    // Validate the engine against the slot's capability before persisting: an
+    // engine of the wrong kind would be skipped by every resolve, leaving the
+    // UI showing a default that is never used.
+    validate_engine_for_slot(&state.engines, &slot, &engine)?;
     BindingRepo::new(state.config_pool.clone())
         .set(
             &feature,
@@ -1521,15 +1635,21 @@ pub async fn test_provider(
         .build()
         .map_err(|e| e.to_string())?;
     let mut request = client.get(&url);
+    let has_key = api_key.is_some();
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }
-    Ok(match request.send().await {
+    let result = match request.send().await {
         Ok(response) => provider_test_result_for_status(response.status().as_u16()),
         Err(_) => ProviderTestResult {
             ok: false,
             message: "Server unreachable".into(),
         },
+    };
+    Ok(if sends_key_in_cleartext(&base_url, has_key) {
+        with_cleartext_warning(result)
+    } else {
+        result
     })
 }
 
@@ -1550,8 +1670,8 @@ pub async fn add_custom_provider(
 ) -> Result<(), String> {
     let settings = SettingsRepo::new(state.config_pool.clone());
     let mut custom = load_custom_providers(&settings).await?;
-    validate_new_provider(&provider_ref, &name, &custom)?;
-    custom.push(CustomProvider { provider_ref, name });
+    // Store the normalized entry, not the raw input.
+    custom.push(validate_new_provider(&provider_ref, &name, &custom)?);
     save_custom_providers(&settings, &custom).await
 }
 
@@ -1561,7 +1681,8 @@ pub async fn update_custom_provider(
     provider_ref: String,
     name: String,
 ) -> Result<(), String> {
-    if name.trim().is_empty() {
+    let name = name.trim().to_string();
+    if name.is_empty() {
         return Err("Provider name can't be empty".into());
     }
     let settings = SettingsRepo::new(state.config_pool.clone());
@@ -2131,6 +2252,7 @@ pub async fn set_dictation_stt_binding(
     model: Option<String>,
     provider_ref: Option<String>,
 ) -> Result<(), String> {
+    validate_engine_for_slot(&state.engines, "stt", &engine)?;
     BindingRepo::new(state.config_pool.clone())
         .set(
             DICTATION_FEATURE_ID,
@@ -2437,6 +2559,7 @@ pub async fn set_tts_binding(
     model: Option<String>,
     provider_ref: Option<String>,
 ) -> Result<(), String> {
+    validate_engine_for_slot(&state.engines, "tts", &engine)?;
     BindingRepo::new(state.config_pool.clone())
         .set(
             TTS_FEATURE_ID,
@@ -2494,9 +2617,35 @@ pub async fn read_selection(
     trigger_tts_inner(&state, &app).await
 }
 
+/// Holds the "a preview is running" flag for as long as it lives, clearing it
+/// on every exit path (including `?` returns, cancellation and panics).
+pub struct PreviewGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> PreviewGuard<'a> {
+    /// Claims the preview slot, or `None` when one is already running.
+    pub fn try_acquire(flag: &'a AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self { flag })
+    }
+}
+
+impl Drop for PreviewGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
 /// Synthesizes a short fixed sentence with the named TTS engine and plays it.
 /// Bypasses selection capture and action history — this is a settings preview,
 /// not a read-aloud run.
+///
+/// One preview at a time: playback blocks a thread from the blocking pool and
+/// mixes with whatever is already playing, so rapid clicks would overlay
+/// voices and pile up threads. A second request is refused with a message
+/// rather than silently overlapping or cutting the first one off.
 #[tauri::command]
 pub async fn preview_voice(
     state: State<'_, Arc<AppState>>,
@@ -2505,6 +2654,8 @@ pub async fn preview_voice(
     voice: Option<String>,
 ) -> Result<(), String> {
     const PREVIEW_SENTENCE: &str = "Hi! This is how this voice sounds when reading aloud.";
+    let _guard = PreviewGuard::try_acquire(&state.preview_playing)
+        .ok_or_else(|| "A voice preview is already playing — wait for it to finish.".to_string())?;
     let tts = state
         .engines
         .tts(&engine)
@@ -2607,9 +2758,11 @@ pub fn validate_model_id_for_delete(kind: &str, model_id: &str) -> Result<(), St
     }
 }
 
-/// Removes an installed model's files (whisper .gguf file or onnx dir). When a
-/// capability default referenced the removed model, that binding is dropped
-/// too — the UI confirms with the user before calling this.
+/// Removes an installed model's files (whisper .gguf file or onnx dir). Every
+/// binding that referenced the removed model — the capability default and any
+/// per-feature override — is dropped too, along with the settings-level
+/// fallback model, so nothing keeps pointing at deleted files. The UI confirms
+/// with the user before calling this.
 #[tauri::command]
 pub async fn delete_model(
     state: State<'_, Arc<AppState>>,
@@ -2633,7 +2786,18 @@ pub async fn delete_model(
     .map_err(|e| format!("failed to remove model files: {e}"))?;
 
     let bindings = BindingRepo::new(state.config_pool.clone());
-    clear_default_binding_for_model(&bindings, default_slot, &model_id).await?;
+    let cleared = clear_bindings_for_model(&bindings, default_slot, &model_id).await?;
+    if !cleared.is_empty() {
+        tracing::info!(
+            model = %model_id,
+            slot = %default_slot,
+            features = %cleared.join(", "),
+            "cleared bindings referencing the deleted model"
+        );
+    }
+    if clear_active_model_for_deleted(&state.config_pool, default_slot, &model_id).await? {
+        tracing::info!(model = %model_id, slot = %default_slot, "cleared active_model setting");
+    }
     Ok(())
 }
 
@@ -2701,6 +2865,7 @@ pub fn check_update() -> Result<UpdateStatus, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kea_core::resolve::DEFAULT_FEATURE_ID;
     use kea_core::rewrite::CredentialSourceAdapter;
     use kea_core::secrets::{CredentialStore, InMemoryCredentialStore};
     use kea_core::store::db::{open_pool, run_config_migrations};
@@ -2867,6 +3032,69 @@ mod tests {
         assert!(validate_new_provider("mistral", "Mistral", &existing).is_ok());
     }
 
+    #[test]
+    fn validate_new_provider_trims_before_checking_and_storing() {
+        let existing = vec![CustomProvider {
+            provider_ref: "groq".into(),
+            name: "Groq".into(),
+        }];
+        // Padding must not smuggle a ref past the built-in / duplicate checks.
+        assert!(validate_new_provider(" openai", "Name", &existing).is_err());
+        assert!(validate_new_provider("groq ", "Name", &existing).is_err());
+
+        let stored = validate_new_provider("  mistral  ", "  Mistral  ", &existing).unwrap();
+        assert_eq!(stored.provider_ref, "mistral");
+        assert_eq!(stored.name, "Mistral");
+    }
+
+    #[test]
+    fn validate_new_provider_restricts_ref_charset() {
+        // The ref feeds settings keys and keychain account names.
+        for bad in [
+            "My Provider",
+            "OpenAI",
+            "prov/ider",
+            "prov:ider",
+            "../escape",
+            "prov\"ider",
+            "prövider",
+        ] {
+            assert!(
+                validate_new_provider(bad, "Name", &[]).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        for good in ["groq", "my-server", "my_server", "v1.2", "llama3"] {
+            assert!(
+                validate_new_provider(good, "Name", &[]).is_ok(),
+                "expected {good:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn cleartext_key_warning_only_for_http_with_a_key() {
+        assert!(sends_key_in_cleartext("http://localhost:1234/v1", true));
+        assert!(sends_key_in_cleartext("HTTP://Localhost/v1", true));
+        // No key on the wire, or TLS: nothing to warn about.
+        assert!(!sends_key_in_cleartext("http://localhost:1234/v1", false));
+        assert!(!sends_key_in_cleartext("https://api.openai.com/v1", true));
+        // "https" must not be matched by a sloppy prefix check.
+        assert!(!sends_key_in_cleartext("https://http.example.com/v1", true));
+    }
+
+    #[test]
+    fn cleartext_warning_keeps_the_ok_verdict() {
+        let warned = with_cleartext_warning(provider_test_result_for_status(200));
+        assert!(warned.ok, "a warning must not fail an otherwise good test");
+        assert!(warned.message.starts_with("Connected"));
+        assert!(warned.message.contains(CLEARTEXT_KEY_WARNING));
+
+        let failed = with_cleartext_warning(provider_test_result_for_status(401));
+        assert!(!failed.ok);
+        assert!(failed.message.contains("Invalid key"));
+    }
+
     #[tokio::test]
     async fn custom_providers_roundtrip_under_single_settings_key() {
         let pool = open_pool("sqlite::memory:").await.unwrap();
@@ -2882,7 +3110,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_default_binding_only_when_model_matches() {
+    async fn clear_bindings_only_when_model_matches() {
         let pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&pool).await.unwrap();
         let bindings = kea_core::store::bindings::BindingRepo::new(pool);
@@ -2901,19 +3129,189 @@ mod tests {
 
         // A different model leaves the default in place.
         assert!(
-            !clear_default_binding_for_model(&bindings, "tts", "vits-piper-en-us-amy-low")
+            clear_bindings_for_model(&bindings, "tts", "vits-piper-en-us-amy-low")
                 .await
                 .unwrap()
+                .is_empty()
         );
         assert!(bindings.get(DEFAULT_FEATURE_ID, "tts").await.unwrap().is_some());
 
         // The referenced model clears it.
+        assert_eq!(
+            clear_bindings_for_model(&bindings, "tts", "vits-piper-en-us-lessac-medium")
+                .await
+                .unwrap(),
+            vec![DEFAULT_FEATURE_ID.to_string()]
+        );
+        assert!(bindings.get(DEFAULT_FEATURE_ID, "tts").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_bindings_covers_feature_overrides_not_just_the_default() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let bindings = kea_core::store::bindings::BindingRepo::new(pool);
+        for feature in [DEFAULT_FEATURE_ID, DICTATION_FEATURE_ID, MEETINGS_FEATURE_ID] {
+            bindings
+                .set(
+                    feature,
+                    "stt",
+                    Binding {
+                        engine_id: "whisper".into(),
+                        model: Some("ggml-base.en".into()),
+                        provider_ref: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        // An override on a model that stays installed must survive.
+        bindings
+            .set(
+                TTS_FEATURE_ID,
+                "tts",
+                Binding {
+                    engine_id: "sherpa-tts".into(),
+                    model: Some("ggml-base.en".into()),
+                    provider_ref: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let cleared = clear_bindings_for_model(&bindings, "stt", "ggml-base.en")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cleared,
+            vec![
+                DEFAULT_FEATURE_ID.to_string(),
+                DICTATION_FEATURE_ID.to_string(),
+                MEETINGS_FEATURE_ID.to_string()
+            ]
+        );
+        for feature in [DEFAULT_FEATURE_ID, DICTATION_FEATURE_ID, MEETINGS_FEATURE_ID] {
+            assert!(
+                bindings.get(feature, "stt").await.unwrap().is_none(),
+                "{feature}/stt should have been cleared"
+            );
+        }
+        // Same model id, different capability slot: untouched.
+        assert!(bindings.get(TTS_FEATURE_ID, "tts").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn clear_active_model_drops_only_the_deleted_model() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let dictation = DictationSettingsRepo::new(SettingsRepo::new(pool.clone()));
+        dictation
+            .set(&DictationSettings {
+                post_process: true,
+                active_model: Some("ggml-base.en".into()),
+            })
+            .await
+            .unwrap();
+        let tts = TtsSettingsRepo::new(SettingsRepo::new(pool.clone()));
+        tts.set(&TtsSettings {
+            active_voice: Some("alloy".into()),
+            active_model: Some("vits-piper-en-us-amy-low".into()),
+        })
+        .await
+        .unwrap();
+
+        // A model that isn't the active one leaves the setting alone.
+        assert!(!clear_active_model_for_deleted(&pool, "stt", "ggml-small")
+            .await
+            .unwrap());
+        assert_eq!(
+            dictation.get().await.unwrap().active_model.as_deref(),
+            Some("ggml-base.en")
+        );
+
+        // The active one is cleared, and unrelated fields survive.
+        assert!(clear_active_model_for_deleted(&pool, "stt", "ggml-base.en")
+            .await
+            .unwrap());
+        let after = dictation.get().await.unwrap();
+        assert_eq!(after.active_model, None);
+        assert!(after.post_process, "post_process must not be disturbed");
+
         assert!(
-            clear_default_binding_for_model(&bindings, "tts", "vits-piper-en-us-lessac-medium")
+            clear_active_model_for_deleted(&pool, "tts", "vits-piper-en-us-amy-low")
                 .await
                 .unwrap()
         );
-        assert!(bindings.get(DEFAULT_FEATURE_ID, "tts").await.unwrap().is_none());
+        let after_tts = tts.get().await.unwrap();
+        assert_eq!(after_tts.active_model, None);
+        assert_eq!(after_tts.active_voice.as_deref(), Some("alloy"));
+
+        // Unknown slots are a no-op rather than an error.
+        assert!(!clear_active_model_for_deleted(&pool, "llm", "gpt-4o")
+            .await
+            .unwrap());
+    }
+
+    #[test]
+    fn preview_guard_admits_one_at_a_time_and_releases_on_drop() {
+        let flag = AtomicBool::new(false);
+        let first = PreviewGuard::try_acquire(&flag).expect("first preview should start");
+        assert!(
+            PreviewGuard::try_acquire(&flag).is_none(),
+            "a second preview must be refused while one is playing"
+        );
+        drop(first);
+        assert!(
+            PreviewGuard::try_acquire(&flag).is_some(),
+            "the slot must be free again once the preview finishes"
+        );
+    }
+
+    fn capability_registry() -> EngineRegistry {
+        let mut reg = EngineRegistry::default();
+        reg.register_llm(Arc::new(NoopLlmEngine));
+        reg.register_stt(Arc::new(kea_engines::noop::NoopSttEngine));
+        reg.register_tts(Arc::new(kea_engines::noop::NoopTtsEngine));
+        reg
+    }
+
+    #[test]
+    fn slot_capability_is_derived_from_the_slot_name() {
+        assert_eq!(capability_for_slot("llm"), Some(CapKind::Llm));
+        assert_eq!(capability_for_slot("stt"), Some(CapKind::Stt));
+        assert_eq!(capability_for_slot("tts"), Some(CapKind::Tts));
+        assert_eq!(capability_for_slot("summarize"), None);
+    }
+
+    #[test]
+    fn engine_validation_is_scoped_to_the_slot_capability() {
+        let reg = capability_registry();
+        assert!(validate_engine_for_slot(&reg, "llm", "noop").is_ok());
+        assert!(validate_engine_for_slot(&reg, "stt", "noop-stt").is_ok());
+        assert!(validate_engine_for_slot(&reg, "tts", "noop-tts").is_ok());
+
+        // A tts engine on the llm slot resolves to nothing: reject it.
+        let err = validate_engine_for_slot(&reg, "llm", "noop-tts").unwrap_err();
+        assert!(err.contains("noop-tts"), "got: {err}");
+        assert!(err.contains("text"), "got: {err}");
+        assert!(validate_engine_for_slot(&reg, "stt", "noop").is_err());
+        assert!(validate_engine_for_slot(&reg, "tts", "noop-stt").is_err());
+    }
+
+    #[test]
+    fn engine_validation_rejects_unknown_ids_and_keeps_custom_slots_working() {
+        let reg = capability_registry();
+        assert_eq!(
+            validate_engine_for_slot(&reg, "stt", "ghost").unwrap_err(),
+            "unknown engine id: ghost"
+        );
+        assert_eq!(
+            validate_engine_for_slot(&reg, "whatever", "ghost").unwrap_err(),
+            "unknown engine id: ghost"
+        );
+        // Unknown slots keep the old "registered anywhere" rule.
+        assert!(validate_engine_for_slot(&reg, "whatever", "noop-tts").is_ok());
     }
 
     #[test]

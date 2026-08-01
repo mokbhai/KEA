@@ -60,7 +60,8 @@ export default function ProviderRow({ provider, onRemoved }: Props) {
 
   const saveKey = async () => {
     const secret = keyDraft.trim();
-    if (!secret) return;
+    // Enter can fire while a save is in flight; the button is disabled then.
+    if (busy || !secret) return;
     setBusy(true);
     setError(null);
     try {
@@ -181,6 +182,15 @@ export default function ProviderRow({ provider, onRemoved }: Props) {
                   className="kea-input"
                   value={keyDraft}
                   onChange={(e) => setKeyDraft(e.target.value)}
+                  // Enter commits, like every other field on these pages.
+                  // The button stays: a password field gives no hint that
+                  // Enter would do anything, and it carries the disabled and
+                  // busy states.
+                  onKeyDown={(e) => {
+                    if (e.key !== "Enter") return;
+                    e.preventDefault();
+                    void saveKey();
+                  }}
                   placeholder={isLocal ? "Optional — only if your server needs one" : "Paste API key"}
                   aria-label={`${provider.name} API key`}
                   autoComplete="off"
