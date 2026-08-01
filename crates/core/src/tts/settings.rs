@@ -34,8 +34,19 @@ impl TtsSettingsRepo {
 
     pub async fn get(&self) -> Result<TtsSettings, KeaError> {
         Ok(TtsSettings {
-            active_voice: self.settings.get(KEY_ACTIVE_VOICE).await?,
-            active_model: self.settings.get(KEY_ACTIVE_MODEL).await?,
+            // Both are stored as Options, so a cleared value is the JSON
+            // literal `null` rather than a missing row — read it back as one
+            // and flatten, or every later read of these settings would fail.
+            active_voice: self
+                .settings
+                .get::<Option<String>>(KEY_ACTIVE_VOICE)
+                .await?
+                .flatten(),
+            active_model: self
+                .settings
+                .get::<Option<String>>(KEY_ACTIVE_MODEL)
+                .await?
+                .flatten(),
         })
     }
 
@@ -66,6 +77,24 @@ mod tests {
         };
         repo.set(&cfg).await.unwrap();
         assert_eq!(repo.get().await.unwrap(), cfg);
+    }
+
+    #[tokio::test]
+    async fn clearing_voice_and_model_survives_a_reread() {
+        // Clearing writes the JSON literal `null`; reading it back must yield
+        // None instead of failing to deserialize.
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let repo = TtsSettingsRepo::new(SettingsRepo::new(pool));
+        repo.set(&TtsSettings {
+            active_voice: Some("alloy".into()),
+            active_model: Some("tts-1".into()),
+        })
+        .await
+        .unwrap();
+        repo.set(&TtsSettings::default()).await.unwrap();
+
+        assert_eq!(repo.get().await.unwrap(), TtsSettings::default());
     }
 
     #[tokio::test]

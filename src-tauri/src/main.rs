@@ -70,6 +70,10 @@ pub struct AppState {
     /// The counter guards against stale emits: a newer run's id is larger.
     pub dictation_run_counter: AtomicU64,
     pub dictation_current_run: Mutex<Option<u64>>,
+    /// True while a voice preview is synthesizing or playing. Playback pins a
+    /// blocking-pool thread and mixes with anything already playing, so a
+    /// second preview is refused rather than overlaid.
+    pub preview_playing: AtomicBool,
     /// True while a meeting stop is in its post-capture processing window
     /// (STT + synthesis, after `active_meeting` was taken). Consulted so a
     /// hotkey press can't park on the audio lock and replay as a fresh start.
@@ -403,6 +407,7 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
         active_downloads: Mutex::new(HashSet::new()),
         dictation_run_counter: AtomicU64::new(0),
         dictation_current_run: Mutex::new(None),
+        preview_playing: AtomicBool::new(false),
         meeting_processing: AtomicBool::new(false),
     });
 
