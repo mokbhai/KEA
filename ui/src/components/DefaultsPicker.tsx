@@ -15,6 +15,7 @@ import {
   startOptionDownload,
   CAPABILITY_LABELS,
   OPENAI_TTS_VOICES,
+  type BindingTarget,
   type Capability,
   type CapabilityOption,
 } from "../lib/capabilityDefaults";
@@ -32,11 +33,12 @@ type Props = {
   onApplied: () => void;
   /**
    * Binding row the choice is written to. Defaults to the capability-wide
-   * ("default", capability) row; feature pages pass their own feature/slot to
-   * write an override that only affects that feature.
+   * ("default", capability) row; feature pages pass their own feature and slot
+   * to write an override that only affects that feature. Feature and slot
+   * travel together so a half-specified target can't silently fall back to
+   * overwriting the global default.
    */
-  feature?: string;
-  slot?: string;
+  target?: BindingTarget;
   /** Heading override, e.g. "Speech to text for Dictation". */
   title?: string;
 };
@@ -60,14 +62,12 @@ export default function DefaultsPicker({
   open,
   onClose,
   onApplied,
-  feature,
-  slot,
+  target,
   title,
 }: Props) {
-  const target =
-    feature && slot ? { feature, slot } : defaultTarget(capability);
-  const targetFeature = target.feature;
-  const targetSlot = target.slot;
+  const resolved = target ?? defaultTarget(capability);
+  const targetFeature = resolved.feature;
+  const targetSlot = resolved.slot;
   const [loading, setLoading] = useState(true);
   const [options, setOptions] = useState<PickerOption[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);

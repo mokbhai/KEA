@@ -110,8 +110,7 @@ describe("DefaultsPicker", () => {
     render(
       <DefaultsPicker
         capability="stt"
-        feature="meetings"
-        slot="stt"
+        target={{ feature: "meetings", slot: "stt" }}
         open
         onClose={() => {}}
         onApplied={() => {}}
@@ -138,8 +137,7 @@ describe("DefaultsPicker", () => {
     render(
       <DefaultsPicker
         capability="stt"
-        feature="dictation"
-        slot="stt"
+        target={{ feature: "dictation", slot: "stt" }}
         open
         onClose={() => {}}
         onApplied={() => {}}

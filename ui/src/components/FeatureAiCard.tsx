@@ -121,8 +121,7 @@ export default function FeatureAiCard({ ai, title = "AI", featureLabel }: Props)
       {ai.pickerSpec && (
         <DefaultsPicker
           capability={ai.pickerSpec.capability}
-          feature={ai.pickerSpec.feature}
-          slot={ai.pickerSpec.slot}
+          target={{ feature: ai.pickerSpec.feature, slot: ai.pickerSpec.slot }}
           title={`${ai.pickerSpec.label} for ${featureLabel}`}
           open
           onClose={ai.closePicker}
