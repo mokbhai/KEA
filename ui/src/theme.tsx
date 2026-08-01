@@ -70,9 +70,18 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
         const stored = await getSetting(SETTING_KEY);
         if (cancelled) return;
 
-        const resolved = isPreference(stored) ? stored : "system";
+        // Backend empty/invalid: keep an existing user's cached preference
+        // instead of clobbering it with "system".
+        const cached = readLocalCache();
+        const resolved = isPreference(stored) ? stored : cached ?? "system";
         setPreferenceState(resolved);
         writeLocalCache(resolved);
+        if (!isPreference(stored) && cached) {
+          // Push the cached preference to the backend to complete the migration.
+          void setSetting(SETTING_KEY, cached).catch(() => {
+            // invoke unavailable outside Tauri
+          });
+        }
       } catch {
         if (cancelled) return;
         setPreferenceState(readLocalCache() ?? "system");

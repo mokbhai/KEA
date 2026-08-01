@@ -372,11 +372,16 @@ pub fn validate_new_provider(
 }
 
 async fn load_custom_providers(settings: &SettingsRepo) -> Result<Vec<CustomProvider>, String> {
-    settings
-        .get(CUSTOM_PROVIDERS_KEY)
-        .await
-        .map(|list| list.unwrap_or_default())
-        .map_err(|e| e.to_string())
+    match settings.get(CUSTOM_PROVIDERS_KEY).await {
+        Ok(list) => Ok(list.unwrap_or_default()),
+        // A corrupt stored value must not hide the built-in providers; the
+        // next save overwrites it.
+        Err(kea_core::error::KeaError::Serde(e)) => {
+            tracing::warn!(%e, "corrupt providers.custom value ignored");
+            Ok(Vec::new())
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 async fn save_custom_providers(
@@ -1975,7 +1980,7 @@ pub async fn run_demo(state: State<'_, Arc<AppState>>, prompt: String) -> Result
         .await
         .map_err(|e| e.to_string())?
     {
-        Resolution::Bound(id) => id,
+        Resolution::Bound(b) => b.engine_id,
         other => return Err(resolution_error(other).unwrap_or_else(|| "resolution failed".into())),
     };
     run_ping(&state.engines, &engine_id, &prompt).await
@@ -2522,6 +2527,21 @@ pub async fn download_onnx_model(
     Ok(())
 }
 
+/// Validates an IPC-supplied model id against the kind's catalog before any
+/// filesystem call — the id becomes a path component, so an unknown id
+/// (including any traversal attempt) must be rejected (pure, unit-testable).
+pub fn validate_model_id_for_delete(kind: &str, model_id: &str) -> Result<(), String> {
+    let known = match kind {
+        "whisper" => ModelRegistry::find_whisper(model_id).is_some(),
+        _ => onnx_catalog_for_kind(kind)?.iter().any(|e| e.id == model_id),
+    };
+    if known {
+        Ok(())
+    } else {
+        Err(format!("unknown {kind} model: {model_id}"))
+    }
+}
+
 /// Removes an installed model's files (whisper .gguf file or onnx dir). When a
 /// capability default referenced the removed model, that binding is dropped
 /// too — the UI confirms with the user before calling this.
@@ -2540,6 +2560,7 @@ pub async fn delete_model(
             ))
         }
     };
+    validate_model_id_for_delete(&kind, &model_id)?;
     match kind.as_str() {
         "whisper" => state.model_storage.remove_model(&model_id),
         _ => onnx_storage_for(&state, &kind)?.remove_onnx(&model_id),
@@ -2669,7 +2690,12 @@ mod tests {
 
     #[test]
     fn resolution_error_maps_outcomes() {
-        assert!(resolution_error(Resolution::Bound("openai".into())).is_none());
+        assert!(resolution_error(Resolution::Bound(Binding {
+            engine_id: "openai".into(),
+            model: None,
+            provider_ref: None,
+        }))
+        .is_none());
         assert_eq!(
             resolution_error(Resolution::Unresolvable),
             Some("no llm engine available".into())
@@ -2679,6 +2705,39 @@ mod tests {
                 .unwrap()
                 .contains("a")
         );
+    }
+
+    #[test]
+    fn validate_model_id_for_delete_accepts_catalog_ids_only() {
+        let whisper_id = ModelRegistry::whisper_catalog()[0].id.clone();
+        assert!(validate_model_id_for_delete("whisper", &whisper_id).is_ok());
+        let tts_id = ModelRegistry::tts_catalog()[0].id.clone();
+        assert!(validate_model_id_for_delete("tts", &tts_id).is_ok());
+
+        // unknown ids are rejected before any filesystem call
+        assert!(validate_model_id_for_delete("whisper", "nonexistent").is_err());
+        assert!(validate_model_id_for_delete("parakeet", "nonexistent").is_err());
+
+        // traversal attempts are never catalog ids
+        assert!(validate_model_id_for_delete("whisper", "../../etc/passwd").is_err());
+        assert!(validate_model_id_for_delete("tts", "/etc/passwd").is_err());
+
+        // unknown kinds bubble the catalog error
+        assert!(validate_model_id_for_delete("bogus", "anything").is_err());
+    }
+
+    #[tokio::test]
+    async fn load_custom_providers_survives_corrupt_value() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let settings = SettingsRepo::new(pool);
+        settings
+            .set(CUSTOM_PROVIDERS_KEY, &"not a provider list")
+            .await
+            .unwrap();
+
+        let got = load_custom_providers(&settings).await.unwrap();
+        assert!(got.is_empty(), "corrupt value should yield no custom providers");
     }
 
     #[tokio::test]

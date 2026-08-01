@@ -186,7 +186,7 @@ export default function DefaultsPicker({ capability, open, onClose, onApplied }:
               id: `llm:${p.provider_ref}`,
               label: p.name,
               detail: isLocal ? "your server" : isOpenAi ? "cloud" : "custom server",
-              status: isLocal ? "no key needed" : cloudStatus(p.provider_ref),
+              status: isLocal ? "No key needed" : cloudStatus(p.provider_ref),
               ready: isLocal || (keyByRef.get(p.provider_ref) ?? false),
               engine: isOpenAi ? "openai" : "openai-compatible",
               model: null,
@@ -272,6 +272,9 @@ export default function DefaultsPicker({ capability, open, onClose, onApplied }:
     setError(null);
     setSavedId(null);
     if (option.downloadKind && option.model && !option.installed) {
+      // Sync the ref imperatively: the download-complete event can arrive
+      // before React re-renders and syncs pendingRef from state.
+      pendingRef.current = option;
       setPending(option);
       try {
         if (option.downloadKind === "whisper") {
@@ -280,6 +283,7 @@ export default function DefaultsPicker({ capability, open, onClose, onApplied }:
           await downloadOnnxModel(option.downloadKind, option.model);
         }
       } catch (e) {
+        pendingRef.current = null;
         setPending(null);
         setError(e instanceof Error ? e.message : String(e));
       }

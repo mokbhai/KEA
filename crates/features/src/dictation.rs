@@ -103,27 +103,23 @@ pub async fn run_dictation_with_storage(
     let pcm = audio.stop_mic().await.map_err(|e| e.to_string())?;
 
     let resolver = SlotResolver::new(engines, bindings);
-    let engine_id = match resolver.resolve_stt("dictation", "stt").await {
-        Ok(Resolution::Bound(id)) => id,
+    let binding = match resolver.resolve_stt("dictation", "stt").await {
+        Ok(Resolution::Bound(b)) => b,
         Ok(Resolution::NeedsChoice(_)) => {
             return Err("multiple stt engines available; bind the dictation stt slot".into());
         }
         Ok(Resolution::Unresolvable) => return Err("no stt engine available".into()),
         Err(e) => return Err(e.to_string()),
     };
-
-    let binding = bindings
-        .get("dictation", "stt")
-        .await
-        .map_err(|e| e.to_string())?;
+    let engine_id = binding.engine_id.clone();
 
     let action_id = actions
         .record(NewAction {
             feature_id: "dictation".into(),
             command: "push_to_talk".into(),
             engine_id: engine_id.clone(),
-            model: binding.as_ref().and_then(|b| b.model.clone()),
-            provider_ref: binding.as_ref().and_then(|b| b.provider_ref.clone()),
+            model: binding.model.clone(),
+            provider_ref: binding.provider_ref.clone(),
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -145,11 +141,11 @@ pub async fn run_dictation_with_storage(
 
     let stt_opts = SttOpts {
         model: binding
-            .as_ref()
-            .and_then(|b| b.model.clone())
+            .model
+            .clone()
             .or_else(|| settings.active_model.clone()),
         language: None,
-        provider_ref: binding.as_ref().and_then(|b| b.provider_ref.clone()),
+        provider_ref: binding.provider_ref.clone(),
     };
 
     let transcript = match engine.transcribe(pcm_to_audio(pcm), stt_opts).await {
@@ -173,8 +169,8 @@ pub async fn run_dictation_with_storage(
 
     if settings.post_process {
         let transcript_text = final_text.clone();
-        let llm_engine_id = match resolver.resolve_llm("rewrite", "llm").await {
-            Ok(Resolution::Bound(id)) => id,
+        let llm_binding = match resolver.resolve_llm("rewrite", "llm").await {
+            Ok(Resolution::Bound(b)) => b,
             Ok(Resolution::NeedsChoice(_)) => {
                 let msg = "multiple llm engines available; bind the rewrite llm slot";
                 if let Err(inner) = actions
@@ -215,11 +211,7 @@ pub async fn run_dictation_with_storage(
                 return Err(e.to_string());
             }
         };
-
-        let llm_binding = bindings
-            .get("rewrite", "llm")
-            .await
-            .map_err(|e| e.to_string())?;
+        let llm_engine_id = llm_binding.engine_id.clone();
 
         let mut llm_req = match build_llm_request(
             &RewriteInput {
@@ -246,7 +238,7 @@ pub async fn run_dictation_with_storage(
             }
         };
 
-        llm_req.model = llm_binding.as_ref().and_then(|b| b.model.clone());
+        llm_req.model = llm_binding.model.clone();
 
         let llm = match engines.llm(&llm_engine_id) {
             Some(eng) => eng,
@@ -270,8 +262,8 @@ pub async fn run_dictation_with_storage(
                     action_id,
                     "dictation",
                     &llm_engine_id,
-                    llm_binding.as_ref().and_then(|b| b.model.clone()),
-                    llm_binding.as_ref().and_then(|b| b.provider_ref.clone()),
+                    llm_binding.model.clone(),
+                    llm_binding.provider_ref.clone(),
                     &transcript_text,
                     &resp.text,
                 )

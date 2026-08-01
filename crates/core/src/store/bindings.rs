@@ -1,7 +1,7 @@
 use sqlx::SqlitePool;
 use crate::error::KeaError;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
     pub engine_id: String,
     pub model: Option<String>,

@@ -1,6 +1,6 @@
 use kea_engines::EngineRegistry;
 use crate::error::KeaError;
-use crate::store::bindings::BindingRepo;
+use crate::store::bindings::{Binding, BindingRepo};
 
 /// Reserved feature id for capability-wide default bindings: a row stored as
 /// `("default", "llm"|"stt"|"tts")` applies to every feature without an
@@ -9,9 +9,21 @@ pub const DEFAULT_FEATURE_ID: &str = "default";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Resolution {
-    Bound(String),            // engine_id chosen
+    /// The winning binding: the feature's own row, the capability default, or
+    /// an auto-bound engine (model/provider_ref None). Carrying the whole
+    /// binding lets consumers use a default's model/provider_ref without
+    /// re-reading the feature row (which would drop them).
+    Bound(Binding),
     NeedsChoice(Vec<String>), // candidate engine ids
     Unresolvable,             // bound to a missing engine, or no candidates
+}
+
+fn auto_binding(engine_id: String) -> Binding {
+    Binding {
+        engine_id,
+        model: None,
+        provider_ref: None,
+    }
 }
 
 pub struct SlotResolver<'a> {
@@ -27,7 +39,7 @@ impl<'a> SlotResolver<'a> {
     pub async fn resolve_llm(&self, feature_id: &str, slot: &str) -> Result<Resolution, KeaError> {
         if let Some(b) = self.bindings.get(feature_id, slot).await? {
             return Ok(if self.engines.llm(&b.engine_id).is_some() {
-                Resolution::Bound(b.engine_id)
+                Resolution::Bound(b)
             } else {
                 Resolution::Unresolvable
             });
@@ -36,13 +48,13 @@ impl<'a> SlotResolver<'a> {
         // missing engine falls through to the auto/unresolvable path.
         if let Some(b) = self.bindings.get(DEFAULT_FEATURE_ID, "llm").await? {
             if self.engines.llm(&b.engine_id).is_some() {
-                return Ok(Resolution::Bound(b.engine_id));
+                return Ok(Resolution::Bound(b));
             }
         }
         let candidates = self.engines.list_llm_ids();
         Ok(match candidates.len() {
             0 => Resolution::Unresolvable,
-            1 => Resolution::Bound(candidates.into_iter().next().unwrap()),
+            1 => Resolution::Bound(auto_binding(candidates.into_iter().next().unwrap())),
             _ => Resolution::NeedsChoice(candidates),
         })
     }
@@ -50,20 +62,20 @@ impl<'a> SlotResolver<'a> {
     pub async fn resolve_stt(&self, feature_id: &str, slot: &str) -> Result<Resolution, KeaError> {
         if let Some(b) = self.bindings.get(feature_id, slot).await? {
             return Ok(if self.engines.stt(&b.engine_id).is_some() {
-                Resolution::Bound(b.engine_id)
+                Resolution::Bound(b)
             } else {
                 Resolution::Unresolvable
             });
         }
         if let Some(b) = self.bindings.get(DEFAULT_FEATURE_ID, "stt").await? {
             if self.engines.stt(&b.engine_id).is_some() {
-                return Ok(Resolution::Bound(b.engine_id));
+                return Ok(Resolution::Bound(b));
             }
         }
         let candidates = self.engines.list_stt_ids();
         Ok(match candidates.len() {
             0 => Resolution::Unresolvable,
-            1 => Resolution::Bound(candidates.into_iter().next().unwrap()),
+            1 => Resolution::Bound(auto_binding(candidates.into_iter().next().unwrap())),
             _ => Resolution::NeedsChoice(candidates),
         })
     }
@@ -71,20 +83,20 @@ impl<'a> SlotResolver<'a> {
     pub async fn resolve_tts(&self, feature_id: &str, slot: &str) -> Result<Resolution, KeaError> {
         if let Some(b) = self.bindings.get(feature_id, slot).await? {
             return Ok(if self.engines.tts(&b.engine_id).is_some() {
-                Resolution::Bound(b.engine_id)
+                Resolution::Bound(b)
             } else {
                 Resolution::Unresolvable
             });
         }
         if let Some(b) = self.bindings.get(DEFAULT_FEATURE_ID, "tts").await? {
             if self.engines.tts(&b.engine_id).is_some() {
-                return Ok(Resolution::Bound(b.engine_id));
+                return Ok(Resolution::Bound(b));
             }
         }
         let candidates = self.engines.list_tts_ids();
         Ok(match candidates.len() {
             0 => Resolution::Unresolvable,
-            1 => Resolution::Bound(candidates.into_iter().next().unwrap()),
+            1 => Resolution::Bound(auto_binding(candidates.into_iter().next().unwrap())),
             _ => Resolution::NeedsChoice(candidates),
         })
     }
@@ -109,7 +121,7 @@ mod tests {
         let (bindings, mut reg) = setup().await;
         reg.register_llm(Arc::new(NoopLlmEngine));
         let r = SlotResolver::new(&reg, &bindings).resolve_llm("demo", "llm").await.unwrap();
-        assert!(matches!(r, Resolution::Bound(id) if id == "noop"));
+        assert!(matches!(r, Resolution::Bound(b) if b.engine_id == "noop"));
     }
 
     #[tokio::test]
@@ -138,7 +150,7 @@ mod tests {
             .resolve_stt("dictation", "stt")
             .await
             .unwrap();
-        assert!(matches!(r, Resolution::Bound(id) if id == "noop-stt"));
+        assert!(matches!(r, Resolution::Bound(b) if b.engine_id == "noop-stt"));
     }
 
     #[tokio::test]
@@ -183,7 +195,7 @@ mod tests {
             .resolve_tts("tts", "tts")
             .await
             .unwrap();
-        assert!(matches!(r, Resolution::Bound(id) if id == "noop-tts"));
+        assert!(matches!(r, Resolution::Bound(b) if b.engine_id == "noop-tts"));
     }
 
     #[tokio::test]
@@ -230,7 +242,7 @@ mod tests {
         bindings.set("demo", "llm", Binding {
             engine_id: "noop".into(), model: None, provider_ref: None }).await.unwrap();
         let r = SlotResolver::new(&reg, &bindings).resolve_llm("demo", "llm").await.unwrap();
-        assert!(matches!(r, Resolution::Bound(id) if id == "noop"));
+        assert!(matches!(r, Resolution::Bound(b) if b.engine_id == "noop"));
     }
 
     #[tokio::test]
@@ -241,7 +253,7 @@ mod tests {
         bindings.set(DEFAULT_FEATURE_ID, "llm", Binding {
             engine_id: "noop2".into(), model: None, provider_ref: None }).await.unwrap();
         let r = SlotResolver::new(&reg, &bindings).resolve_llm("demo", "llm").await.unwrap();
-        assert!(matches!(r, Resolution::Bound(id) if id == "noop2"));
+        assert!(matches!(r, Resolution::Bound(b) if b.engine_id == "noop2"));
     }
 
     #[tokio::test]
@@ -251,7 +263,7 @@ mod tests {
         bindings.set(DEFAULT_FEATURE_ID, "llm", Binding {
             engine_id: "ghost".into(), model: None, provider_ref: None }).await.unwrap();
         let r = SlotResolver::new(&reg, &bindings).resolve_llm("demo", "llm").await.unwrap();
-        assert!(matches!(r, Resolution::Bound(id) if id == "noop"));
+        assert!(matches!(r, Resolution::Bound(b) if b.engine_id == "noop"));
     }
 
     #[tokio::test]
@@ -274,7 +286,7 @@ mod tests {
             .resolve_stt("dictation", "stt")
             .await
             .unwrap();
-        assert!(matches!(r, Resolution::Bound(id) if id == "noop-stt2"));
+        assert!(matches!(r, Resolution::Bound(b) if b.engine_id == "noop-stt2"));
     }
 
     #[tokio::test]
@@ -288,7 +300,46 @@ mod tests {
             .resolve_tts("tts", "tts")
             .await
             .unwrap();
-        assert!(matches!(r, Resolution::Bound(id) if id == "noop-tts2"));
+        assert!(matches!(r, Resolution::Bound(b) if b.engine_id == "noop-tts2"));
+    }
+
+    #[tokio::test]
+    async fn capability_default_carries_model_and_provider_ref() {
+        let (bindings, mut reg) = setup().await;
+        reg.register_llm(Arc::new(NoopLlmEngine));
+        reg.register_llm(Arc::new(SecondNoop));
+        bindings.set(DEFAULT_FEATURE_ID, "llm", Binding {
+            engine_id: "noop2".into(),
+            model: Some("gpt-4o-mini".into()),
+            provider_ref: Some("openai".into()),
+        }).await.unwrap();
+        let r = SlotResolver::new(&reg, &bindings).resolve_llm("demo", "llm").await.unwrap();
+        let Resolution::Bound(b) = r else { panic!("expected Bound, got {r:?}") };
+        assert_eq!(b.engine_id, "noop2");
+        assert_eq!(b.model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(b.provider_ref.as_deref(), Some("openai"));
+    }
+
+    #[tokio::test]
+    async fn feature_override_model_wins_over_default_model() {
+        let (bindings, mut reg) = setup().await;
+        reg.register_llm(Arc::new(NoopLlmEngine));
+        reg.register_llm(Arc::new(SecondNoop));
+        bindings.set(DEFAULT_FEATURE_ID, "llm", Binding {
+            engine_id: "noop2".into(),
+            model: Some("default-model".into()),
+            provider_ref: Some("default-provider".into()),
+        }).await.unwrap();
+        bindings.set("demo", "llm", Binding {
+            engine_id: "noop".into(),
+            model: Some("override-model".into()),
+            provider_ref: None,
+        }).await.unwrap();
+        let r = SlotResolver::new(&reg, &bindings).resolve_llm("demo", "llm").await.unwrap();
+        let Resolution::Bound(b) = r else { panic!("expected Bound, got {r:?}") };
+        assert_eq!(b.engine_id, "noop");
+        assert_eq!(b.model.as_deref(), Some("override-model"));
+        assert_eq!(b.provider_ref, None);
     }
 
     // a second engine id for the multi-engine test

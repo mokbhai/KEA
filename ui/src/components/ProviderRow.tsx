@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   deleteCredential,
   getProviderConfig,
@@ -32,6 +32,7 @@ export default function ProviderRow({ provider, onRemoved }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedKey, flash] = useSavedFlash();
+  const lastSavedConfig = useRef<ProviderConfig>(emptyConfig());
 
   useEffect(() => {
     let cancelled = false;
@@ -42,7 +43,11 @@ export default function ProviderRow({ provider, onRemoved }: Props) {
       .catch(() => {});
     getProviderConfig(provider.provider_ref)
       .then((cfg) => {
-        if (!cancelled) setConfig(cfg ?? emptyConfig());
+        if (!cancelled) {
+          const next = cfg ?? emptyConfig();
+          setConfig(next);
+          lastSavedConfig.current = next;
+        }
       })
       .catch(() => {});
     return () => {
@@ -100,9 +105,16 @@ export default function ProviderRow({ provider, onRemoved }: Props) {
   };
 
   const saveConfig = async () => {
+    // Blur fires even without edits; skip the invoke (and the "Saved ✓"
+    // flash) when nothing changed since the last save.
+    const last = lastSavedConfig.current;
+    if (config.base_url === last.base_url && config.default_model === last.default_model) {
+      return;
+    }
     setError(null);
     try {
       await setProviderConfig(provider.provider_ref, config);
+      lastSavedConfig.current = config;
       flash("config");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
