@@ -17,19 +17,13 @@ import DefaultsPicker, {
 import ProviderRow from "../components/ProviderRow";
 import { Row, RowGroup } from "../components/SettingsRow";
 import Spinner from "../components/Spinner";
+import { slugify } from "../lib/format";
 
 const CAPABILITIES: { capability: Capability; icon: string }[] = [
   { capability: "llm", icon: "✍️" },
   { capability: "stt", icon: "🎙" },
   { capability: "tts", icon: "🔊" },
 ];
-
-function slugify(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
 
 export default function AiProvidersPage() {
   const [providers, setProviders] = useState<Provider[] | null>(null);
