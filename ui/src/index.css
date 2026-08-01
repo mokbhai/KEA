@@ -5,7 +5,24 @@
   --surface-2: #eef0f3;
   --text: #1a1d21;
   --text-muted: #5c6370;
+  /* 1.38:1 light / 1.29:1 dark against --surface. Decorative where it draws a
+     container edge (.kea-card, .kea-topbar, .kea-sidebar, .kea-panel), but NOT
+     decorative everywhere: it is also the sole boundary of .kea-icon-btn
+     (background: transparent — the outline is the entire affordance),
+     .kea-segment, .kea-choice and the unselected meeting button in
+     MeetingsPage, and --btn-border below carries the same value on .kea-btn,
+     whose --btn-bg is identical to --surface in light theme. Those are real
+     1.4.11 shortfalls; they predate this palette pass and are tracked in
+     issue #11. Do not read the floor in palette.contrast.test.ts as a claim
+     that this value is sufficient — it only stops it fading further. */
   --border: #d8dce2;
+  /* The .kea-table row rules only. Row grouping is conveyed by the table
+     markup and row state by a background fill, so this is not a 1.4.11 3:1
+     case — but at --border's 1.38:1 the rule did not read as a divider at all.
+     Split from --border so the separator can be lifted without hardening every
+     card edge in the app. Clears 2:1 against all three row fills (--surface,
+     --btn-hover-bg, --surface-2); see palette.contrast.test.ts. */
+  --border-strong: #a1a9b4;
   --accent: #2563eb;
   --accent-text: #ffffff;
   --btn-bg: #ffffff;
@@ -14,7 +31,10 @@
   --btn-hover-bg: #eef0f3;
   --input-bg: #ffffff;
   --input-text: #1a1d21;
-  --input-border: #c5cad2;
+  /* The 1px box is the *only* boundary of every .kea-input / .kea-select, so
+     it is a 1.4.11 non-text control boundary and must clear 3:1 against
+     --surface. The old #c5cad2 measured 1.65:1. */
+  --input-border: #888f99;
   --underline: #2563eb;
   --danger: #b91c1c;
   --ok: #15803d;
@@ -37,16 +57,33 @@
   --text: #e6e8eb;
   --text-muted: #9aa0ab;
   --border: #30343c;
-  --accent: #4c8dff;
-  --accent-text: #ffffff;
+  --border-strong: #5c6371;
+  /* Lifted from #4c8dff, which as a foreground on --surface-2 measured 4.49:1
+     — one hundredth short of 4.5 for the active nav item and the current
+     picker option. Contrast is luminance-only and --surface-2 cannot be
+     darkened without collapsing the elevation step above --surface, so accent
+     luminance is the only lever. It is bounded on both sides, and the value
+     has to sit inside the window rather than merely above the floor:
+       accent on --surface-2 >= 4.5  =>  L >= 0.2788
+       white thumb on accent >= 3.0  =>  L <= 0.3000   (checked .kea-toggle)
+     #4c8dff is L 0.2781 (the bug); #5090ff is L 0.2887, inside both bounds.
+     Overshooting the ceiling would trade this failure for a toggle failure. */
+  --accent: #5090ff;
+  /* A white label on this accent is 3.10:1 — it was already only 3.20:1 on the
+     old #4c8dff, and no accent in the window above can carry white at 4.5
+     (that would need L <= 0.1833, far below the 0.2788 floor). A light accent
+     in a dark theme takes dark ink, not white; this is the same near-black as
+     --bg, so it stays in palette, and measures 5.73:1. */
+  --accent-text: #16181d;
   --btn-bg: #262a33;
   --btn-text: #e6e8eb;
   --btn-border: #30343c;
   --btn-hover-bg: #30343c;
   --input-bg: #1e2128;
   --input-text: #e6e8eb;
-  --input-border: #404650;
-  --underline: #4c8dff;
+  /* See the light-theme note: 1.4.11 boundary, was #404650 at 1.70:1. */
+  --input-border: #6a717d;
+  --underline: #5090ff;
   --danger: #f87171;
   --ok: #4ade80;
   --ok-bg: rgba(74, 222, 128, 0.12);
@@ -58,6 +95,12 @@
      --surface, so both edges of the control stay visible. */
   --toggle-track: #868c96;
   --toggle-thumb: #ffffff;
+  /* Softens the thumb edge. It does NOT carry the thumb/track boundary and
+     must not be relied on for it: `background-clip` defaults to `border-box`,
+     so the thumb's own #ffffff fill paints under this border and the ring
+     composites over white, not over the track — rendering #8c8c8c, which is
+     1.08:1 against the checked track and 1.01:1 against the unchecked one.
+     The fills themselves carry 1.4.11 here: 3.10:1 checked, 3.38:1 unchecked. */
   --toggle-thumb-border: rgba(0, 0, 0, 0.45);
 }
 
@@ -803,8 +846,11 @@ a:hover {
   color: var(--text-muted);
 }
 
+/* --border-strong, not --border: this rule is the only thing dividing one data
+   row from the next, and --border reaches just 1.38:1 / 1.29:1 against
+   --surface. Card edges keep the quieter --border. */
 .kea-table tbody tr {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--border-strong);
   cursor: pointer;
 }
 
@@ -825,10 +871,34 @@ a:hover {
   background: none;
   border: none;
   cursor: pointer;
-  /* Underlined at rest, not just on hover: --accent only reaches 2.61:1
+  /* Underlined at rest, not just on hover: --accent only reaches 2.53:1
      against the --text in the cells around it in dark theme, so colour alone
      cannot be what marks this cell as actionable. */
   text-decoration: underline;
+}
+
+/* The label hands itself back to --text on a hovered row. --accent on
+   --btn-hover-bg is 4.03:1 in dark theme, and the fix cannot be to darken
+   --btn-hover-bg — not because no fill clears 4.5, but because the ones that
+   do are indistinguishable from the resting button:
+
+     --accent (#5090ff) is L 0.28872, so 4.5:1 needs a fill of L <= 0.02528
+     --btn-bg is L 0.02307, so the lightest legal hover is 1.03:1 against it
+     even at the accent ceiling the toggle imposes (L 0.30) it is only 1.06:1
+
+   That is an invisible hover on every .kea-btn and .kea-segment in the app, to
+   rescue one label. So the label yields instead: the underline, not the
+   colour, is what marks this control (see the note above), and --text on
+   --btn-hover-bg is 14.81:1 / 10.17:1.
+
+   Two things this rule is NOT. It is not that --accent fails on anything
+   lighter than --surface-2 — the true cutoff is L 0.02528 against
+   --surface-2's 0.02307, a sliver of headroom, just far too narrow a band to
+   give a hover fill any presence. And it is not forced in light theme, where
+   #2563eb on --btn-hover-bg is 4.53:1, a pass; the rule is left unscoped so
+   the control does not change which colour it uses per theme. */
+.kea-table tbody tr:hover .kea-table__select {
+  color: var(--text);
 }
 
 .kea-table__select:hover {
