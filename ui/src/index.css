@@ -99,6 +99,13 @@ h2 {
   font-weight: 600;
 }
 
+/* Without this, the UA default (1.17em bold) renders h3 heavier than the h2
+   above it. */
+h3 {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
 a {
   color: var(--accent);
   text-decoration: none;
@@ -121,6 +128,9 @@ a:hover {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+    /* Zeroing duration alone leaves delays intact — e.g. the drawer's
+       `visibility 0s linear 0.2s` would still wait 200ms. */
+    transition-delay: 0s !important;
   }
 }
 
@@ -699,8 +709,14 @@ a:hover {
   text-align: center;
 }
 
+.kea-status-pill--progress {
+  border-color: var(--accent);
+}
+
+/* The fill has to stay opaque — this pill is position:fixed over arbitrary
+   page content, and --danger-bg is a ~10% tint. */
 .kea-status-pill--error {
-  background: var(--danger-bg);
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface));
   border-color: var(--danger);
 }
 
@@ -796,7 +812,7 @@ a:hover {
   background: var(--btn-hover-bg);
 }
 
-.kea-table tbody tr[aria-selected="true"] {
+.kea-table tbody tr[aria-current="true"] {
   background: var(--surface-2);
 }
 
