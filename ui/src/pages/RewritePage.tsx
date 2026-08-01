@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import { previewRewrite } from "../api";
+import { previewRewrite, triggerRewrite } from "../api";
 import FeatureAiCard from "../components/FeatureAiCard";
 import FeatureBanner, { type FixNavigate } from "../components/FeatureBanner";
 import HotkeyRow from "../components/HotkeyRow";
@@ -47,6 +47,28 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
         settings.mode === "ask_kea" ? settings.custom_instruction || null : null,
       );
       setResult(text);
+    } catch (e) {
+      setRunStatus(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // The real shortcut path: rewrites whatever is selected in the app you were
+  // last in, and replaces it there.
+  const runSelection = async () => {
+    setBusy(true);
+    setRunStatus(null);
+    setResult(null);
+    try {
+      const text = await triggerRewrite(
+        settings.mode,
+        settings.preset_id,
+        settings.mode === "ask_kea" ? settings.custom_instruction || null : null,
+      );
+      setRunStatus(
+        text ? "Rewritten and replaced in the app you were last in." : "Rewrite completed.",
+      );
     } catch (e) {
       setRunStatus(e instanceof Error ? e.message : String(e));
     } finally {
@@ -106,23 +128,34 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
               style={{ width: "100%", maxWidth: 520, resize: "vertical" }}
             />
           </label>
-          <button
-            type="button"
-            className="kea-btn kea-btn--primary"
-            onClick={() => void runSample()}
-            disabled={busy || !sample.trim()}
-          >
-            {busy ? (
-              <>
-                <Spinner size={14} /> Rewriting…
-              </>
-            ) : (
-              "Rewrite this"
-            )}
-          </button>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button
+              type="button"
+              className="kea-btn kea-btn--primary"
+              onClick={() => void runSample()}
+              disabled={busy || !sample.trim()}
+            >
+              {busy ? (
+                <>
+                  <Spinner size={14} /> Rewriting…
+                </>
+              ) : (
+                "Rewrite this"
+              )}
+            </button>
+            <button
+              type="button"
+              className="kea-btn"
+              onClick={() => void runSelection()}
+              disabled={busy}
+            >
+              Rewrite my selection
+            </button>
+          </div>
           <p className="kea-muted" style={{ margin: "8px 0 0", fontSize: "0.8125rem" }}>
-            Runs the same rewrite your shortcut does, but only shows the result
-            here — nothing is pasted anywhere.
+            "Rewrite this" shows the result here and pastes nothing anywhere.
+            "Rewrite my selection" runs the real shortcut and replaces the text
+            you have selected in another app.
           </p>
           {result !== null && (
             <div style={{ marginTop: 12 }}>
@@ -142,7 +175,7 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
             </div>
           )}
           {runStatus && (
-            <p style={{ marginTop: 12, marginBottom: 0, fontSize: "0.8125rem", color: "var(--danger)" }}>
+            <p className="kea-muted" style={{ marginTop: 12, marginBottom: 0 }}>
               {runStatus}
             </p>
           )}
