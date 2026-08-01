@@ -372,11 +372,16 @@ pub fn validate_new_provider(
 }
 
 async fn load_custom_providers(settings: &SettingsRepo) -> Result<Vec<CustomProvider>, String> {
-    settings
-        .get(CUSTOM_PROVIDERS_KEY)
-        .await
-        .map(|list| list.unwrap_or_default())
-        .map_err(|e| e.to_string())
+    match settings.get(CUSTOM_PROVIDERS_KEY).await {
+        Ok(list) => Ok(list.unwrap_or_default()),
+        // A corrupt stored value must not hide the built-in providers; the
+        // next save overwrites it.
+        Err(kea_core::error::KeaError::Serde(e)) => {
+            tracing::warn!(%e, "corrupt providers.custom value ignored");
+            Ok(Vec::new())
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 async fn save_custom_providers(
@@ -2719,6 +2724,20 @@ mod tests {
 
         // unknown kinds bubble the catalog error
         assert!(validate_model_id_for_delete("bogus", "anything").is_err());
+    }
+
+    #[tokio::test]
+    async fn load_custom_providers_survives_corrupt_value() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let settings = SettingsRepo::new(pool);
+        settings
+            .set(CUSTOM_PROVIDERS_KEY, &"not a provider list")
+            .await
+            .unwrap();
+
+        let got = load_custom_providers(&settings).await.unwrap();
+        assert!(got.is_empty(), "corrupt value should yield no custom providers");
     }
 
     #[tokio::test]
