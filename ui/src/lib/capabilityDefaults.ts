@@ -1,0 +1,193 @@
+import {
+  downloadOnnxModel,
+  downloadWhisperModel,
+  getDictationSettings,
+  getTtsSettings,
+  hasCredential,
+  listInstalledOnnxModels,
+  listInstalledWhisperModels,
+  listOnnxModels,
+  listWhisperModels,
+  setBinding,
+  setDictationSettings,
+  setTtsSettings,
+  type OnnxModel,
+  type Provider,
+  type WhisperModel,
+} from "../api";
+import { formatBytes } from "./format";
+
+export type Capability = "llm" | "stt" | "tts";
+
+export const CAPABILITY_LABELS: Record<Capability, string> = {
+  llm: "Writing & rewriting",
+  stt: "Speech to text",
+  tts: "Text to speech",
+};
+
+export const OPENAI_TTS_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
+
+export type DownloadKind = "whisper" | "parakeet" | "tts";
+
+/** A concrete, pickable default for a capability (shared between the
+ * DefaultsPicker popover and the onboarding wizard). */
+export type CapabilityOption = {
+  id: string;
+  label: string;
+  detail: string;
+  status: string;
+  ready: boolean;
+  engine: string;
+  model: string | null;
+  providerRef: string | null;
+  installed?: boolean;
+  downloadKind?: DownloadKind;
+  cloudVoices?: boolean;
+};
+
+/** Which providers have a saved credential ("local-llm" never needs one). */
+export async function loadKeyStates(providers: Provider[]): Promise<Map<string, boolean>> {
+  const keyByRef = new Map<string, boolean>();
+  await Promise.all(
+    providers.map(async (p) => {
+      const saved =
+        p.provider_ref === "local-llm"
+          ? true
+          : await hasCredential(p.provider_ref).catch(() => false);
+      keyByRef.set(p.provider_ref, saved);
+    }),
+  );
+  return keyByRef;
+}
+
+function localOption(
+  m: WhisperModel | OnnxModel,
+  engine: string,
+  downloadKind: DownloadKind,
+  installed: Set<string>,
+): CapabilityOption {
+  return {
+    id: `${engine}:${m.id}`,
+    label: m.display_name,
+    detail: `on this Mac · ${m.language}`,
+    status: installed.has(m.id) ? "installed ✓" : `${formatBytes(m.size_bytes)} ⬇`,
+    ready: true,
+    engine,
+    model: m.id,
+    providerRef: null,
+    installed: installed.has(m.id),
+    downloadKind,
+  };
+}
+
+/** Builds the selectable options for one capability from the model catalogs
+ * and provider list — identical for the picker and the wizard. */
+export async function buildCapabilityOptions(
+  capability: Capability,
+  providers: Provider[],
+  keyByRef: Map<string, boolean>,
+): Promise<CapabilityOption[]> {
+  const cloudStatus = (ref: string) => (keyByRef.get(ref) ? "key ✓" : "Key missing");
+  const hasOpenAi = providers.some((p) => p.provider_ref === "openai");
+
+  const opts: CapabilityOption[] = [];
+  if (capability === "stt") {
+    const [whisper, whisperInstalled, parakeet, parakeetInstalled] = await Promise.all([
+      listWhisperModels(),
+      listInstalledWhisperModels(),
+      listOnnxModels("parakeet"),
+      listInstalledOnnxModels("parakeet"),
+    ]);
+    const wInstalled = new Set(whisperInstalled);
+    const pInstalled = new Set(parakeetInstalled);
+    whisper.forEach((m) => opts.push(localOption(m, "whisper", "whisper", wInstalled)));
+    parakeet.forEach((m) => opts.push(localOption(m, "parakeet", "parakeet", pInstalled)));
+    if (hasOpenAi) {
+      opts.push({
+        id: "openai-stt:whisper-1",
+        label: "OpenAI whisper-1",
+        detail: "cloud",
+        status: cloudStatus("openai"),
+        ready: keyByRef.get("openai") ?? false,
+        engine: "openai-stt",
+        model: "whisper-1",
+        providerRef: "openai",
+      });
+    }
+  } else if (capability === "tts") {
+    const [voices, voicesInstalled] = await Promise.all([
+      listOnnxModels("tts"),
+      listInstalledOnnxModels("tts"),
+    ]);
+    const vInstalled = new Set(voicesInstalled);
+    voices.forEach((m) => opts.push(localOption(m, "sherpa-tts", "tts", vInstalled)));
+    if (hasOpenAi) {
+      opts.push({
+        id: "openai-tts",
+        label: "OpenAI voices",
+        detail: "cloud",
+        status: cloudStatus("openai"),
+        ready: keyByRef.get("openai") ?? false,
+        engine: "openai-tts",
+        model: null,
+        providerRef: "openai",
+        cloudVoices: true,
+      });
+    }
+  } else {
+    providers.forEach((p) => {
+      const isOpenAi = p.provider_ref === "openai";
+      const isLocal = p.provider_ref === "local-llm";
+      opts.push({
+        id: `llm:${p.provider_ref}`,
+        label: p.name,
+        detail: isLocal ? "your server" : isOpenAi ? "cloud" : "custom server",
+        status: isLocal ? "No key needed" : cloudStatus(p.provider_ref),
+        ready: isLocal || (keyByRef.get(p.provider_ref) ?? false),
+        engine: isOpenAi ? "openai" : "openai-compatible",
+        model: null,
+        providerRef: p.provider_ref,
+      });
+    });
+  }
+  return opts;
+}
+
+export type DefaultChoice = {
+  engine: string;
+  model: string | null;
+  providerRef: string | null;
+};
+
+/**
+ * Writes a ("default", capability) binding and keeps the per-feature
+ * active_model / active_voice settings consistent — the single write path
+ * shared by the DefaultsPicker and the onboarding wizard.
+ */
+export async function applyDefaultChoice(
+  capability: Capability,
+  choice: DefaultChoice,
+  voice?: string | null,
+): Promise<void> {
+  await setBinding("default", capability, choice.engine, choice.model, choice.providerRef);
+  if (capability === "stt" && choice.engine === "whisper" && choice.model !== null) {
+    const settings = await getDictationSettings();
+    await setDictationSettings({ ...settings, active_model: choice.model });
+  } else if (capability === "tts" && choice.engine === "sherpa-tts" && choice.model !== null) {
+    const settings = await getTtsSettings();
+    await setTtsSettings({ ...settings, active_model: choice.model });
+  } else if (capability === "tts" && choice.engine === "openai-tts" && voice) {
+    const settings = await getTtsSettings();
+    await setTtsSettings({ ...settings, active_voice: voice });
+  }
+}
+
+/** Kicks off the download for a not-yet-installed local option. */
+export async function startOptionDownload(option: CapabilityOption): Promise<void> {
+  if (!option.downloadKind || !option.model) return;
+  if (option.downloadKind === "whisper") {
+    await downloadWhisperModel(option.model);
+  } else {
+    await downloadOnnxModel(option.downloadKind, option.model);
+  }
+}
