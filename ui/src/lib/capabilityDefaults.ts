@@ -192,12 +192,23 @@ function ownsSettings(capability: Capability, target: BindingTarget): boolean {
  * The settings-level model is the fallback for whichever engine a *model-less*
  * binding later resolves to — it is not scoped to the engine picked here
  * (crates/features/src/dictation.rs: `binding.model.or(settings.active_model)`).
- * So a pick either mirrors a model that engine could load, or clears the
- * setting; it must never substitute an id from a different model namespace.
- * `dictation.active_model` has only ever meant a whisper id, and whisper/null
- * bindings are reachable (the local onboarding path writes one), so a Parakeet
- * or cloud STT pick clears it rather than writing an id whisper can't load.
- * Either way no stale model survives a pick that disagrees with it.
+ * Only the local engine that owns it can load what it holds, so a pick either
+ * writes a model that engine could load or leaves the setting alone. Two
+ * things follow:
+ *
+ * - Never mirror a foreign id. A cloud id ("whisper-1") or a parakeet id
+ *   (separate ONNX storage) would fail as "model not installed" the next time
+ *   a model-less whisper binding resolved — and those are reachable, the local
+ *   onboarding path writes whisper/null.
+ * - Never clear it either. A retained whisper id is inert: every reachable
+ *   non-whisper binding carries its own model, so the fallback is read only
+ *   when a model-less whisper binding resolves, which is exactly the case it
+ *   exists for. Clearing would break that case (whisper hard-errors with
+ *   "whisper requires a model id"; sherpa falls back to the first catalog
+ *   voice, which may not be installed). So item #3's "stale id" is cosmetic:
+ *   an id that disagrees with the current binding is deliberately kept,
+ *   because nothing else ever reads it. A model whose *files* are gone is a
+ *   different matter, and the backend clears it on delete_model.
  */
 export async function applyDefaultChoice(
   capability: Capability,
@@ -209,24 +220,20 @@ export async function applyDefaultChoice(
   await setBinding(to.feature, to.slot, choice.engine, choice.model, choice.providerRef);
   if (!ownsSettings(capability, to)) return;
   if (capability === "stt") {
-    // Only whisper ids are loadable through this fallback; anything else
-    // (parakeet's separate ONNX namespace, a cloud id like "whisper-1")
-    // would fail as "model not installed" the next time a model-less local
-    // binding resolved.
-    const nextModel = choice.engine === "whisper" ? choice.model : null;
+    // Only a whisper pick with a model of its own has anything to say here.
+    if (choice.engine !== "whisper" || choice.model === null) return;
     const settings = await getDictationSettings();
-    if (settings.active_model !== nextModel) {
-      await setDictationSettings({ ...settings, active_model: nextModel });
+    if (settings.active_model !== choice.model) {
+      await setDictationSettings({ ...settings, active_model: choice.model });
     }
   } else if (capability === "tts") {
-    // Same rule as above: tts.active_model is the fallback for a model-less
-    // binding, and only sherpa's own ids are loadable through it. A cloud
-    // pick clears it — its binding carries the cloud model already.
-    const nextModel = choice.engine === "sherpa-tts" ? choice.model : null;
+    // Same rule for the model; the voice is independent — it belongs to the
+    // cloud engine and is passed only by picks that carry one.
+    const keepsModel = choice.engine !== "sherpa-tts" || choice.model === null;
     const settings = await getTtsSettings();
     const next = {
       ...settings,
-      active_model: nextModel,
+      active_model: keepsModel ? settings.active_model : choice.model,
       active_voice: voice ?? settings.active_voice,
     };
     if (

@@ -277,7 +277,7 @@ describe("DefaultsPicker", () => {
     });
   });
 
-  it("clears a stale dictation model when the pick is not a whisper one", async () => {
+  it("leaves the dictation fallback alone when the pick is not a whisper one", async () => {
     onInvoke({
       list_providers: () => [{ provider_ref: "openai", name: "OpenAI", built_in: true }],
       get_binding: () => null,
@@ -304,13 +304,12 @@ describe("DefaultsPicker", () => {
 
     await userEvent.click(await screen.findByRole("button", { name: /Parakeet v2/ }));
 
-    // Cleared, not replaced: dictation.active_model is the fallback for
-    // whichever engine a model-less binding resolves to, and parakeet ids
-    // live in a different namespace from whisper's.
-    await waitFor(() => expect(invokeCalls("set_dictation_settings")).toHaveLength(1));
-    expect(invokeCalls("set_dictation_settings")[0]).toEqual({
-      settings: { post_process: true, active_model: null },
-    });
+    await waitFor(() => expect(invokeCalls("set_binding")).toHaveLength(1));
+    // Untouched, neither mirrored nor cleared. Mirroring would hand a
+    // parakeet id (separate ONNX storage) to whisper; clearing would strip
+    // the fallback a model-less whisper binding needs. The parakeet binding
+    // carries its own model, so the retained whisper id is never read.
+    expect(invokeCalls("set_dictation_settings")).toHaveLength(0);
   });
 
   it("never leaves a dictation model that a local engine could not load", async () => {
@@ -318,8 +317,8 @@ describe("DefaultsPicker", () => {
     // whisper/null; the user sets a dictation override to OpenAI whisper-1;
     // "use default again" deletes the override; resolve falls back to
     // whisper/null, takes the model from active_model and whisper fails with
-    // "model not installed: whisper-1". So a cloud pick must clear the
-    // fallback rather than mirror its own model id into it.
+    // "model not installed: whisper-1". A cloud pick must not put its own
+    // model id there.
     mockSttWorld({ installed: ["whisper-base"] });
     onInvoke({
       list_providers: () => [{ provider_ref: "openai", name: "OpenAI", built_in: true }],
@@ -338,20 +337,55 @@ describe("DefaultsPicker", () => {
 
     await userEvent.click(await screen.findByRole("button", { name: /OpenAI whisper-1/ }));
 
-    await waitFor(() => expect(invokeCalls("set_dictation_settings")).toHaveLength(1));
-    const written = invokeCalls("set_dictation_settings")[0] as {
-      settings: { active_model: string | null };
-    };
-    expect(written.settings.active_model).toBeNull();
-    expect(written.settings.active_model).not.toBe("whisper-1");
-    // The binding itself still carries the cloud model.
+    await waitFor(() => expect(invokeCalls("set_binding")).toHaveLength(1));
+    // The binding carries the cloud model; the local fallback is not touched,
+    // so it keeps the installed whisper id it already held.
     expect(invokeCalls("set_binding")[0]).toMatchObject({
       engine: "openai-stt",
       model: "whisper-1",
     });
+    expect(invokeCalls("set_dictation_settings")).toHaveLength(0);
   });
 
-  it("clears the local voice model when picking cloud voices", async () => {
+  it("keeps a usable whisper fallback across a switch to another engine", async () => {
+    // Steps 1-4 of the reachable break: (1) local onboarding leaves
+    // default/stt = whisper/null; (2) a whisper pick on the dictation card
+    // records its model as the fallback; (3) the user switches that override
+    // to a cloud engine; (4) "use default again" drops the override and
+    // resolve lands back on whisper/null — which transcribes only because
+    // step 3 left the fallback in place.
+    let dictation = { post_process: false, active_model: null as string | null };
+    onInvoke({
+      list_providers: () => [{ provider_ref: "openai", name: "OpenAI", built_in: true }],
+      get_binding: () => null,
+      has_credential: () => true,
+      list_whisper_models: () => WHISPER_CATALOG,
+      list_installed_whisper_models: () => ["whisper-base"],
+      list_onnx_models: () => [],
+      list_installed_onnx_models: () => [],
+      set_binding: () => undefined,
+      get_dictation_settings: () => dictation,
+      set_dictation_settings: (args) => {
+        dictation = (args as { settings: typeof dictation }).settings;
+      },
+    });
+    render(<Harness capability="stt" target={{ feature: "dictation", slot: "stt" }} />);
+
+    // Step 2: the whisper pick populates the fallback.
+    await userEvent.click(await screen.findByRole("button", { name: /Whisper Base/ }));
+    await waitFor(() => expect(dictation.active_model).toBe("whisper-base"));
+
+    // Step 3: switching to the cloud engine must not disturb it.
+    await userEvent.click(screen.getByRole("button", { name: /OpenAI whisper-1/ }));
+    await waitFor(() => expect(invokeCalls("set_binding")).toHaveLength(2));
+    expect(invokeCalls("set_binding")[1]).toMatchObject({ engine: "openai-stt" });
+
+    // Step 4 works because this still names an installed whisper model.
+    expect(dictation.active_model).toBe("whisper-base");
+    expect(invokeCalls("set_dictation_settings")).toHaveLength(1);
+  });
+
+  it("sets the cloud voice without disturbing the local voice model", async () => {
     onInvoke({
       list_providers: () => [{ provider_ref: "openai", name: "OpenAI", built_in: true }],
       get_binding: () => null,
@@ -369,8 +403,11 @@ describe("DefaultsPicker", () => {
     await userEvent.click(await screen.findByRole("button", { name: /^OpenAI voices/ }));
 
     await waitFor(() => expect(invokeCalls("set_tts_settings")).toHaveLength(1));
+    // The voice is the cloud engine's; the model stays as the fallback for a
+    // model-less sherpa binding, which would otherwise fall back to the
+    // first catalog voice and may not have it installed.
     expect(invokeCalls("set_tts_settings")[0]).toEqual({
-      settings: { active_voice: "alloy", active_model: null },
+      settings: { active_voice: "alloy", active_model: "vits-piper-en-us-amy-low" },
     });
   });
 
