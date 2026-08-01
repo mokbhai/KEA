@@ -110,8 +110,16 @@ export default function AiProvidersPage() {
     const name = newName.trim();
     if (!name) return;
     setError(null);
+    const ref = slugify(name);
+    if (!ref) {
+      setError("Provider name needs at least one letter or number.");
+      return;
+    }
+    if (providers?.some((p) => p.provider_ref === ref)) {
+      setError(`A provider "${ref}" already exists.`);
+      return;
+    }
     try {
-      const ref = slugify(name);
       await addCustomProvider(ref, name);
       if (newUrl.trim()) {
         await setProviderConfig(ref, { base_url: newUrl.trim(), default_model: "" });
