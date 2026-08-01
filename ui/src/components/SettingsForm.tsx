@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   REWRITE_MODES,
   deletePreset,
@@ -11,6 +11,7 @@ import {
   type RewriteMode,
   type RewritePreset,
 } from "../api";
+import { Row, RowGroup } from "./SettingsRow";
 import Spinner from "./Spinner";
 
 export type RewriteSettings = {
@@ -21,11 +22,13 @@ export type RewriteSettings = {
 
 type Props = {
   onChange?: (settings: RewriteSettings) => void;
+  /** Rows rendered above the rewrite options in the same group (the hotkey). */
+  leadingRows?: ReactNode;
 };
 
 const defaultMode: RewriteMode = "improve";
 
-export default function SettingsForm({ onChange }: Props) {
+export default function SettingsForm({ onChange, leadingRows }: Props) {
   const [mode, setMode] = useState<RewriteMode>(defaultMode);
   const [presetId, setPresetId] = useState<string>("");
   const [customInstruction, setCustomInstruction] = useState("");
@@ -171,149 +174,163 @@ export default function SettingsForm({ onChange }: Props) {
   };
 
   return (
-    <section className="kea-card" style={{ marginBottom: 16 }}>
-      <h3 style={{ margin: "0 0 12px" }}>Rewrite settings</h3>
+    <>
       {loading ? (
-        <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 200 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 120 }}>
           <Spinner size={16} />
           <span className="kea-muted">Loading settings…</span>
         </div>
       ) : (
         <>
-      <label style={{ display: "block", marginBottom: 12 }}>
-        <span className="kea-label">Mode</span>
-        <select
-          className="kea-select"
-          value={mode}
-          onChange={(e) => {
-            const m = e.target.value as RewriteMode;
-            setMode(m);
-            persist(m, presetId, customInstruction);
-          }}
-          style={{ minWidth: 220 }}
-        >
-          {REWRITE_MODES.map((m) => (
-            <option key={m.value} value={m.value}>
-              {m.label}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label style={{ display: "block", marginBottom: 12 }}>
-        <span className="kea-label">Preset</span>
-        <select
-          className="kea-select"
-          value={presetId}
-          onChange={(e) => {
-            const pid = e.target.value;
-            setPresetId(pid);
-            persist(mode, pid, customInstruction);
-          }}
-          style={{ minWidth: 220 }}
-        >
-          <option value="">None (use mode template)</option>
-          {presets.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name}
-            </option>
-          ))}
-        </select>
-      </label>
-      {mode === "ask_kea" && (
-        <label style={{ display: "block", marginBottom: 12 }}>
-          <span className="kea-label">Custom instruction</span>
-          <textarea
-            className="kea-input"
-            value={customInstruction}
-            onChange={(e) => {
-              // Typing counts as interaction so a slow mount fetch can't
-              // clobber text entered before it resolves (persist is on blur).
-              userInteractedRef.current = true;
-              setCustomInstruction(e.target.value);
-            }}
-            onBlur={(e) => persist(mode, presetId, e.target.value)}
-            rows={3}
-            style={{ maxWidth: 480, resize: "vertical" }}
-            placeholder="Tell KEA what to do with the selection…"
-          />
-        </label>
-      )}
-      <label style={{ display: "block", marginBottom: 12 }}>
-        <span className="kea-label">Prompt override (optional)</span>
-        <textarea
-          className="kea-input"
-          value={promptOverride}
-          onChange={(e) => setPromptOverrideText(e.target.value)}
-          rows={3}
-          style={{ maxWidth: 480, resize: "vertical" }}
-          placeholder="Override the built-in prompt for the selected mode"
-        />
-      </label>
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
-        <button type="button" className="kea-btn" onClick={savePromptOverride} disabled={busy}>
-          Save prompt override
-        </button>
-      </div>
-      <fieldset
-        style={{
-          border: "1px solid var(--border)",
-          borderRadius: 6,
-          padding: 12,
-          margin: 0,
-        }}
-      >
-        <legend style={{ fontWeight: 600 }}>Manage presets</legend>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
-          <input
-            className="kea-input"
-            value={newPresetName}
-            onChange={(e) => setNewPresetName(e.target.value)}
-            placeholder="Preset name"
-            style={{ minWidth: 140, maxWidth: 200 }}
-          />
-          <input
-            className="kea-input"
-            value={newPresetInstruction}
-            onChange={(e) => setNewPresetInstruction(e.target.value)}
-            placeholder="Instruction"
-            style={{ flex: 1, minWidth: 200, maxWidth: "none" }}
-          />
-          <button
-            type="button"
-            className="kea-btn"
-            onClick={addPreset}
-            disabled={busy || !newPresetName.trim() || !newPresetInstruction.trim()}
-          >
-            Add preset
-          </button>
-        </div>
-        {presets.length > 0 && (
-          <ul style={{ margin: 0, paddingLeft: 20 }}>
-            {presets.map((p) => (
-              <li key={p.id} style={{ marginBottom: 4 }}>
-                <strong>{p.name}</strong> — {p.instruction.slice(0, 60)}
-                {p.instruction.length > 60 ? "…" : ""}{" "}
+          <RowGroup aria-label="Rewrite behavior">
+            {leadingRows}
+            <Row label="Style" hint="How KEA rewrites the text you select.">
+              <select
+                className="kea-select"
+                aria-label="Rewrite style"
+                value={mode}
+                onChange={(e) => {
+                  const m = e.target.value as RewriteMode;
+                  setMode(m);
+                  persist(m, presetId, customInstruction);
+                }}
+              >
+                {REWRITE_MODES.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </Row>
+            <Row label="Preset" hint="A saved instruction, used instead of the style.">
+              <select
+                className="kea-select"
+                aria-label="Rewrite preset"
+                value={presetId}
+                onChange={(e) => {
+                  const pid = e.target.value;
+                  setPresetId(pid);
+                  persist(mode, pid, customInstruction);
+                }}
+              >
+                <option value="">None (use style)</option>
+                {presets.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            </Row>
+            {mode === "ask_kea" && (
+              <Row label="Instruction" hint="What Ask KEA should do with the selection.">
+                <textarea
+                  className="kea-input"
+                  aria-label="Custom instruction"
+                  value={customInstruction}
+                  onChange={(e) => {
+                    // Typing counts as interaction so a slow mount fetch can't
+                    // clobber text entered before it resolves (persist is on blur).
+                    userInteractedRef.current = true;
+                    setCustomInstruction(e.target.value);
+                  }}
+                  onBlur={(e) => persist(mode, presetId, e.target.value)}
+                  rows={2}
+                  style={{ width: 280, resize: "vertical" }}
+                  placeholder="Tell KEA what to do with the selection…"
+                />
+              </Row>
+            )}
+          </RowGroup>
+
+          <details className="kea-advanced">
+            <summary>Advanced</summary>
+            <div className="kea-advanced__body">
+              <label>
+                <span className="kea-label">Prompt override (optional)</span>
+                <textarea
+                  className="kea-input"
+                  value={promptOverride}
+                  onChange={(e) => setPromptOverrideText(e.target.value)}
+                  rows={3}
+                  style={{ resize: "vertical" }}
+                  placeholder="Override the built-in prompt for the selected style"
+                />
+              </label>
+              <div>
                 <button
                   type="button"
                   className="kea-btn"
-                  onClick={() => removePreset(p.id)}
+                  onClick={savePromptOverride}
                   disabled={busy}
-                  style={{ marginLeft: 8 }}
                 >
-                  Delete
+                  Save prompt override
                 </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </fieldset>
-      {status && (
-        <p className="kea-muted" style={{ marginTop: 12 }}>
-          {status}
-        </p>
-      )}
+              </div>
+              <fieldset
+                style={{
+                  border: "1px solid var(--border)",
+                  borderRadius: 6,
+                  padding: 12,
+                  margin: 0,
+                }}
+              >
+                <legend style={{ fontWeight: 600 }}>Manage presets</legend>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+                  <input
+                    className="kea-input"
+                    value={newPresetName}
+                    onChange={(e) => setNewPresetName(e.target.value)}
+                    placeholder="Preset name"
+                    aria-label="Preset name"
+                    style={{ minWidth: 140, maxWidth: 200 }}
+                  />
+                  <input
+                    className="kea-input"
+                    value={newPresetInstruction}
+                    onChange={(e) => setNewPresetInstruction(e.target.value)}
+                    placeholder="Instruction"
+                    aria-label="Preset instruction"
+                    style={{ flex: 1, minWidth: 200, maxWidth: "none" }}
+                  />
+                  <button
+                    type="button"
+                    className="kea-btn"
+                    onClick={addPreset}
+                    disabled={busy || !newPresetName.trim() || !newPresetInstruction.trim()}
+                  >
+                    Add preset
+                  </button>
+                </div>
+                {presets.length > 0 && (
+                  <ul style={{ margin: 0, paddingLeft: 20 }}>
+                    {presets.map((p) => (
+                      <li key={p.id} style={{ marginBottom: 4 }}>
+                        <strong>{p.name}</strong> — {p.instruction.slice(0, 60)}
+                        {p.instruction.length > 60 ? "…" : ""}{" "}
+                        <button
+                          type="button"
+                          className="kea-btn"
+                          onClick={() => removePreset(p.id)}
+                          disabled={busy}
+                          style={{ marginLeft: 8 }}
+                        >
+                          Delete
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </fieldset>
+            </div>
+          </details>
+
+          {status && (
+            <p className="kea-muted" style={{ marginTop: 8, marginBottom: 0 }}>
+              {status}
+            </p>
+          )}
         </>
       )}
-    </section>
+    </>
   );
 }
