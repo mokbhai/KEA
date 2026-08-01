@@ -1,54 +1,28 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  downloadOnnxModel,
-  downloadWhisperModel,
   getBinding,
-  getDictationSettings,
-  getTtsSettings,
-  hasCredential,
-  listInstalledOnnxModels,
-  listInstalledWhisperModels,
-  listOnnxModels,
   listProviders,
-  listWhisperModels,
   previewVoice,
-  setBinding,
-  setDictationSettings,
-  setTtsSettings,
   type Binding,
-  type OnnxModel,
   type Provider,
-  type WhisperModel,
 } from "../api";
 import { useModelDownloads } from "../hooks/useModelDownloads";
-import { formatBytes } from "../lib/format";
+import {
+  buildCapabilityOptions,
+  loadKeyStates,
+  applyDefaultChoice,
+  startOptionDownload,
+  CAPABILITY_LABELS,
+  OPENAI_TTS_VOICES,
+  type Capability,
+  type CapabilityOption,
+} from "../lib/capabilityDefaults";
 import Spinner from "./Spinner";
 
-export type Capability = "llm" | "stt" | "tts";
+export { CAPABILITY_LABELS };
+export type { Capability };
 
-export const CAPABILITY_LABELS: Record<Capability, string> = {
-  llm: "Writing & rewriting",
-  stt: "Speech to text",
-  tts: "Text to speech",
-};
-
-const OPENAI_TTS_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
-
-type DownloadKind = "whisper" | "parakeet" | "tts";
-
-type PickerOption = {
-  id: string;
-  label: string;
-  detail: string;
-  status: string;
-  ready: boolean;
-  engine: string;
-  model: string | null;
-  providerRef: string | null;
-  installed?: boolean;
-  downloadKind?: DownloadKind;
-  cloudVoices?: boolean;
-};
+type PickerOption = CapabilityOption;
 
 type Props = {
   capability: Capability;
@@ -103,97 +77,8 @@ export default function DefaultsPicker({ capability, open, onClose, onApplied }:
           listProviders(),
           getBinding("default", capability).catch(() => null),
         ]);
-        const keyByRef = new Map<string, boolean>();
-        await Promise.all(
-          providerList.map(async (p) => {
-            const saved =
-              p.provider_ref === "local-llm"
-                ? true
-                : await hasCredential(p.provider_ref).catch(() => false);
-            keyByRef.set(p.provider_ref, saved);
-          }),
-        );
-
-        const localOption = (
-          m: WhisperModel | OnnxModel,
-          engine: string,
-          downloadKind: DownloadKind,
-          installed: Set<string>,
-        ): PickerOption => ({
-          id: `${engine}:${m.id}`,
-          label: m.display_name,
-          detail: `on this Mac · ${m.language}`,
-          status: installed.has(m.id) ? "installed ✓" : `${formatBytes(m.size_bytes)} ⬇`,
-          ready: true,
-          engine,
-          model: m.id,
-          providerRef: null,
-          installed: installed.has(m.id),
-          downloadKind,
-        });
-        const cloudStatus = (ref: string) => (keyByRef.get(ref) ? "key ✓" : "Key missing");
-        const hasOpenAi = providerList.some((p) => p.provider_ref === "openai");
-
-        const opts: PickerOption[] = [];
-        if (capability === "stt") {
-          const [whisper, whisperInstalled, parakeet, parakeetInstalled] = await Promise.all([
-            listWhisperModels(),
-            listInstalledWhisperModels(),
-            listOnnxModels("parakeet"),
-            listInstalledOnnxModels("parakeet"),
-          ]);
-          const wInstalled = new Set(whisperInstalled);
-          const pInstalled = new Set(parakeetInstalled);
-          whisper.forEach((m) => opts.push(localOption(m, "whisper", "whisper", wInstalled)));
-          parakeet.forEach((m) => opts.push(localOption(m, "parakeet", "parakeet", pInstalled)));
-          if (hasOpenAi) {
-            opts.push({
-              id: "openai-stt:whisper-1",
-              label: "OpenAI whisper-1",
-              detail: "cloud",
-              status: cloudStatus("openai"),
-              ready: keyByRef.get("openai") ?? false,
-              engine: "openai-stt",
-              model: "whisper-1",
-              providerRef: "openai",
-            });
-          }
-        } else if (capability === "tts") {
-          const [voices, voicesInstalled] = await Promise.all([
-            listOnnxModels("tts"),
-            listInstalledOnnxModels("tts"),
-          ]);
-          const vInstalled = new Set(voicesInstalled);
-          voices.forEach((m) => opts.push(localOption(m, "sherpa-tts", "tts", vInstalled)));
-          if (hasOpenAi) {
-            opts.push({
-              id: "openai-tts",
-              label: "OpenAI voices",
-              detail: "cloud",
-              status: cloudStatus("openai"),
-              ready: keyByRef.get("openai") ?? false,
-              engine: "openai-tts",
-              model: null,
-              providerRef: "openai",
-              cloudVoices: true,
-            });
-          }
-        } else {
-          providerList.forEach((p) => {
-            const isOpenAi = p.provider_ref === "openai";
-            const isLocal = p.provider_ref === "local-llm";
-            opts.push({
-              id: `llm:${p.provider_ref}`,
-              label: p.name,
-              detail: isLocal ? "your server" : isOpenAi ? "cloud" : "custom server",
-              status: isLocal ? "No key needed" : cloudStatus(p.provider_ref),
-              ready: isLocal || (keyByRef.get(p.provider_ref) ?? false),
-              engine: isOpenAi ? "openai" : "openai-compatible",
-              model: null,
-              providerRef: p.provider_ref,
-            });
-          });
-        }
+        const keyByRef = await loadKeyStates(providerList);
+        const opts = await buildCapabilityOptions(capability, providerList, keyByRef);
 
         if (!cancelled) {
           setProviders(providerList);
@@ -217,17 +102,11 @@ export default function DefaultsPicker({ capability, open, onClose, onApplied }:
     async (option: PickerOption) => {
       setError(null);
       try {
-        await setBinding("default", capability, option.engine, option.model, option.providerRef);
-        if (capability === "stt" && option.engine === "whisper") {
-          const settings = await getDictationSettings();
-          await setDictationSettings({ ...settings, active_model: option.model });
-        } else if (capability === "tts" && option.engine === "sherpa-tts") {
-          const settings = await getTtsSettings();
-          await setTtsSettings({ ...settings, active_model: option.model });
-        } else if (capability === "tts" && option.engine === "openai-tts") {
-          const settings = await getTtsSettings();
-          await setTtsSettings({ ...settings, active_voice: voiceRef.current });
-        }
+        await applyDefaultChoice(
+          capability,
+          option,
+          capability === "tts" ? voiceRef.current : null,
+        );
         setPending(null);
         setSavedId(option.id);
         setCurrentId(option.id);
@@ -277,11 +156,7 @@ export default function DefaultsPicker({ capability, open, onClose, onApplied }:
       pendingRef.current = option;
       setPending(option);
       try {
-        if (option.downloadKind === "whisper") {
-          await downloadWhisperModel(option.model);
-        } else {
-          await downloadOnnxModel(option.downloadKind, option.model);
-        }
+        await startOptionDownload(option);
       } catch (e) {
         pendingRef.current = null;
         setPending(null);
