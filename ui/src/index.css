@@ -877,16 +877,26 @@ a:hover {
   text-decoration: underline;
 }
 
-/* The label hands itself back to --text on a hovered row, because --accent
-   cannot clear 4.5:1 on any row fill lighter than --surface-2. That is not a
-   choice of value, it is the whole window: --accent is capped at L 0.30 by the
-   checked .kea-toggle, and even at that ceiling the lightest background it can
-   carry is L 0.0278 — below --btn-hover-bg's 0.0341. Pulling --btn-hover-bg
-   under the ceiling does not work either: it still measures 4.39:1 at L 0.0253
-   while leaving .kea-btn:hover at 1.06:1 against --btn-bg, i.e. no visible
-   hover anywhere in the app. Nothing is lost — the underline, not the colour,
-   is what marks this control (see the note above), and --text on
-   --btn-hover-bg is 14.81:1 / 10.17:1. */
+/* The label hands itself back to --text on a hovered row. --accent on
+   --btn-hover-bg is 4.03:1 in dark theme, and the fix cannot be to darken
+   --btn-hover-bg — not because no fill clears 4.5, but because the ones that
+   do are indistinguishable from the resting button:
+
+     --accent (#5090ff) is L 0.28872, so 4.5:1 needs a fill of L <= 0.02528
+     --btn-bg is L 0.02307, so the lightest legal hover is 1.03:1 against it
+     even at the accent ceiling the toggle imposes (L 0.30) it is only 1.06:1
+
+   That is an invisible hover on every .kea-btn and .kea-segment in the app, to
+   rescue one label. So the label yields instead: the underline, not the
+   colour, is what marks this control (see the note above), and --text on
+   --btn-hover-bg is 14.81:1 / 10.17:1.
+
+   Two things this rule is NOT. It is not that --accent fails on anything
+   lighter than --surface-2 — the true cutoff is L 0.02528 against
+   --surface-2's 0.02307, a sliver of headroom, just far too narrow a band to
+   give a hover fill any presence. And it is not forced in light theme, where
+   #2563eb on --btn-hover-bg is 4.53:1, a pass; the rule is left unscoped so
+   the control does not change which colour it uses per theme. */
 .kea-table tbody tr:hover .kea-table__select {
   color: var(--text);
 }

@@ -73,17 +73,27 @@ const PAIRS: Pair[] = [
   { fg: "--text", bg: "--surface-2", min: TEXT, why: "body copy on a raised or current row" },
   { fg: "--text", bg: "--bg", min: TEXT, why: "body copy on the app backdrop" },
   { fg: "--text", bg: "--btn-hover-bg", min: TEXT, why: ".kea-table__select on a hovered row" },
-  { fg: "--text", bg: "--ok-bg", bgOver: "--surface", min: TEXT, why: ".kea-banner--ok message" },
-  { fg: "--text", bg: "--warn-bg", bgOver: "--surface", min: TEXT, why: ".kea-banner--warn message" },
-  { fg: "--text", bg: "--danger-bg", bgOver: "--surface", min: TEXT, why: ".kea-banner--error message" },
-  { fg: "--text-muted", bg: "--surface", min: TEXT, why: ".kea-muted and table headers" },
+  // Over --bg, not --surface: .kea-main sets no background, and every <Banner>
+  // is a page- or section-level child — none sits inside a .kea-card. --bg is
+  // also the darker of the two in light theme, so it is the conservative
+  // backdrop as well as the correct one.
+  { fg: "--text", bg: "--ok-bg", bgOver: "--bg", min: TEXT, why: ".kea-banner--ok message" },
+  { fg: "--text", bg: "--warn-bg", bgOver: "--bg", min: TEXT, why: ".kea-banner--warn message" },
+  { fg: "--text", bg: "--danger-bg", bgOver: "--bg", min: TEXT, why: ".kea-banner--error message" },
+  { fg: "--text-muted", bg: "--surface", min: TEXT, why: ".kea-muted in a card, and table headers" },
+  { fg: "--text-muted", bg: "--bg", min: TEXT, why: ".kea-muted at page level, e.g. the ModelsPage intro" },
   { fg: "--text-muted", bg: "--surface-2", min: TEXT, why: ".kea-muted on a raised row" },
   { fg: "--btn-text", bg: "--btn-bg", min: TEXT, why: ".kea-btn label" },
   { fg: "--btn-text", bg: "--btn-hover-bg", min: TEXT, why: ".kea-btn label on hover" },
   { fg: "--input-text", bg: "--input-bg", min: TEXT, why: ".kea-input / .kea-select value" },
   { fg: "--accent-text", bg: "--accent", min: TEXT, why: ".kea-btn--primary label" },
   { fg: "--accent", bg: "--surface-2", min: TEXT, why: ".kea-nav-item--active, current picker option" },
-  { fg: "--accent", bg: "--surface", min: TEXT, why: ".kea-table__select at rest, and links" },
+  { fg: "--accent", bg: "--surface", min: TEXT, why: ".kea-table__select at rest, inside .kea-table-wrap" },
+  // Known gap, tracked in issue #11: .kea-status--* also render inside table
+  // cells (HistoryPanel.tsx:66) and so take the hovered and aria-current row
+  // fills, which are not measured here. Light --ok on either is 4.39:1 —
+  // below the floor. Pre-existing and identical on main, so adding the pair
+  // would fail the suite for a fault this branch did not introduce.
   { fg: "--ok", bg: "--surface", min: TEXT, why: ".kea-status--ok" },
   { fg: "--warn", bg: "--surface", min: TEXT, why: "warning status text" },
   { fg: "--danger", bg: "--surface", min: TEXT, why: ".kea-status--error" },
@@ -244,6 +254,10 @@ describe("contrast maths", () => {
 });
 
 describe("palette contrast (index.css tokens)", () => {
+  // Note the limit of this guard, so it is not mistaken for more than it is:
+  // token completeness is not pairing completeness. A token counts as covered
+  // once it is measured against ONE background, even where the UI puts it on
+  // three — see the .kea-status--* note in PAIRS. Tracked in issue #11.
   it("covers every token in :root", () => {
     const measured = new Set(PAIRS.flatMap((p) => [p.fg, p.bg, p.fgOver, p.bgOver]));
     const uncovered = Object.keys(LIGHT).filter((t) => !measured.has(t) && !(t in EXEMPT));
