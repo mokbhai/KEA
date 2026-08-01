@@ -26,10 +26,16 @@ export function useFeatureAi(specs: SlotSpec[]): FeatureAi {
   useEffect(() => {
     let cancelled = false;
     loadSlotStatuses(specs)
-      .then((next) => {
+      .then((report) => {
         if (cancelled) return;
-        setStatuses(next);
-        setError(null);
+        setStatuses(report.statuses);
+        // Say what actually happened rather than guessing at a cause: with a
+        // failed lookup the report carries no diagnoses at all.
+        setError(
+          report.error
+            ? `Couldn't check the AI setup for this feature: ${report.error}`
+            : null,
+        );
       })
       .catch((e) => {
         if (cancelled) return;
