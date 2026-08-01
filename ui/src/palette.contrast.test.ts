@@ -8,47 +8,74 @@
  *
  * The ratio maths is WCAG 2.1 verbatim (sRGB channel -> relative luminance ->
  * (L1 + 0.05) / (L2 + 0.05)) and is implemented locally on purpose — a contrast
- * checker is a dozen lines and not worth a dependency. `describes the maths`
- * below pins it against the two ratios everyone knows by heart.
+ * checker is a dozen lines and not worth a dependency. `contrast maths` below
+ * pins it against the two ratios everyone knows by heart.
  *
- * Adding a pair is one line in PAIRS.
+ * Adding a pair is one line in PAIRS. Adding a token without covering it is a
+ * failure: `covers every token` forces every entry in :root to be either
+ * measured or explicitly exempted with a reason.
+ *
+ * A translucent token must name the element it paints onto (`fgOver` /
+ * `bgOver`). There is deliberately no default: assuming the backdrop is the
+ * other half of the pair is how the first version of this file came to assert
+ * a ratio for a colour that renders nowhere on screen — a 1px border
+ * composites over its own element's background (background-clip is border-box
+ * by default), not over whatever sits behind that element.
  */
 import { describe, expect, it } from "vitest";
 import cssSource from "./index.css?raw";
 
-// ── WCAG 2.1 thresholds ──────────────────────────────────────────────
-/** 1.4.3 Contrast (Minimum) — body text and labels. */
+// ── Thresholds ───────────────────────────────────────────────────────
+/** WCAG 2.1 1.4.3 Contrast (Minimum) — body text and labels. */
 const TEXT = 4.5;
-/** 1.4.11 Non-text Contrast — control boundaries and state indicators. */
+/** WCAG 2.1 1.4.11 Non-text Contrast — control boundaries and state. */
 const NON_TEXT = 3.0;
 /**
- * Not a WCAG threshold. Floors for the two purely structural rules, recorded
- * so nobody quietly fades them back to invisibility. See the notes on each
- * pair for why 3:1 is not required of them.
+ * Not a WCAG threshold. The .kea-table row rule is structural: row grouping is
+ * conveyed by the table markup, row state by a background fill, and the
+ * actionable part of the row by the underlined .kea-table__select — so 3:1 is
+ * not required of it. It does have to read as a divider against every fill a
+ * row can take, which is what this floor pins.
  */
 const SEPARATOR_FLOOR = 2.0;
-const DECORATIVE_FLOOR = 1.25;
-
-type Theme = "light" | "dark";
+/**
+ * Not a WCAG threshold, and NOT a statement that these values pass.
+ *
+ * --border and --btn-border are known 1.4.11 shortfalls at 1.38:1 / 1.29:1 —
+ * decorative on card, topbar and sidebar edges, but also the sole boundary of
+ * .kea-icon-btn (transparent fill, so the outline is the entire affordance),
+ * .kea-segment, .kea-choice, the unselected meeting button in MeetingsPage,
+ * and every .kea-btn (whose --btn-bg equals --surface in light theme). They
+ * predate this palette pass and are tracked in issue #11. This floor exists
+ * only so the values cannot fade further while that issue is open; raising
+ * them to NON_TEXT is #11's job.
+ */
+const PENDING_FLOOR = 1.25;
 
 interface Pair {
-  /** Foreground token. If it is translucent it is composited over `bg`. */
+  /** Foreground token. */
   fg: string;
-  /** Background token. Must be opaque. */
+  /** Background token. */
   bg: string;
   /** Required ratio. */
   min: number;
   /** Where the pair shows up, and why it needs that threshold. */
   why: string;
-  /** Defaults to both themes. Set when the two themes solve it differently. */
-  themes?: Theme[];
+  /** Token `fg` paints onto. Required when `fg` is translucent. */
+  fgOver?: string;
+  /** Token `bg` paints onto. Required when `bg` is translucent. */
+  bgOver?: string;
 }
 
 const PAIRS: Pair[] = [
   // ── Text: 1.4.3 ────────────────────────────────────────────────────
   { fg: "--text", bg: "--surface", min: TEXT, why: "body copy on a card" },
-  { fg: "--text", bg: "--surface-2", min: TEXT, why: "body copy on a raised row" },
+  { fg: "--text", bg: "--surface-2", min: TEXT, why: "body copy on a raised or current row" },
   { fg: "--text", bg: "--bg", min: TEXT, why: "body copy on the app backdrop" },
+  { fg: "--text", bg: "--btn-hover-bg", min: TEXT, why: ".kea-table__select on a hovered row" },
+  { fg: "--text", bg: "--ok-bg", bgOver: "--surface", min: TEXT, why: ".kea-banner--ok message" },
+  { fg: "--text", bg: "--warn-bg", bgOver: "--surface", min: TEXT, why: ".kea-banner--warn message" },
+  { fg: "--text", bg: "--danger-bg", bgOver: "--surface", min: TEXT, why: ".kea-banner--error message" },
   { fg: "--text-muted", bg: "--surface", min: TEXT, why: ".kea-muted and table headers" },
   { fg: "--text-muted", bg: "--surface-2", min: TEXT, why: ".kea-muted on a raised row" },
   { fg: "--btn-text", bg: "--btn-bg", min: TEXT, why: ".kea-btn label" },
@@ -56,29 +83,39 @@ const PAIRS: Pair[] = [
   { fg: "--input-text", bg: "--input-bg", min: TEXT, why: ".kea-input / .kea-select value" },
   { fg: "--accent-text", bg: "--accent", min: TEXT, why: ".kea-btn--primary label" },
   { fg: "--accent", bg: "--surface-2", min: TEXT, why: ".kea-nav-item--active, current picker option" },
-  { fg: "--accent", bg: "--surface", min: TEXT, why: ".kea-table__select and links" },
+  { fg: "--accent", bg: "--surface", min: TEXT, why: ".kea-table__select at rest, and links" },
+  { fg: "--ok", bg: "--surface", min: TEXT, why: ".kea-status--ok" },
+  { fg: "--warn", bg: "--surface", min: TEXT, why: "warning status text" },
+  { fg: "--danger", bg: "--surface", min: TEXT, why: ".kea-status--error" },
 
   // ── Non-text: 1.4.11 ───────────────────────────────────────────────
   { fg: "--input-border", bg: "--surface", min: NON_TEXT, why: "the only boundary of .kea-input / .kea-select" },
   { fg: "--toggle-track", bg: "--surface", min: NON_TEXT, why: ".kea-toggle outer edge" },
   { fg: "--toggle-track", bg: "--toggle-thumb", min: NON_TEXT, why: ".kea-toggle unchecked thumb against its track" },
-  // Checked .kea-toggle: light theme separates thumb from track by fill, dark
-  // theme cannot (white on --accent is 2.87:1) and separates them with the
-  // 1px --toggle-thumb-border hairline instead.
-  { fg: "--accent", bg: "--toggle-thumb", min: NON_TEXT, why: ".kea-toggle checked thumb against its track", themes: ["light"] },
-  { fg: "--toggle-thumb-border", bg: "--accent", min: NON_TEXT, why: ".kea-toggle checked thumb hairline against its track", themes: ["dark"] },
+  { fg: "--accent", bg: "--toggle-thumb", min: NON_TEXT, why: ".kea-toggle checked thumb against its track" },
 
   // ── Structural, sub-3:1 by decision ────────────────────────────────
-  // .kea-table row rules. Not a 1.4.11 case: the row grouping is conveyed by
-  // the table markup, row state by a background fill, and the actionable part
-  // of the row by the underlined .kea-table__select — the rule identifies
-  // nothing on its own. It does still have to read as a divider, which
-  // --border (1.38 / 1.29) did not, hence the separate token.
-  { fg: "--border-strong", bg: "--surface", min: SEPARATOR_FLOOR, why: ".kea-table row separator" },
-  // Card / topbar / sidebar edges. Decorative; the surface fill already
-  // distinguishes the container from the backdrop.
-  { fg: "--border", bg: "--surface", min: DECORATIVE_FLOOR, why: "decorative container edge" },
+  // Measured against every fill a .kea-table row can take: resting, hovered
+  // and aria-current. A rule that only clears the floor against the resting
+  // fill is not enough — rows are scanned in exactly the other two states.
+  { fg: "--border-strong", bg: "--surface", min: SEPARATOR_FLOOR, why: ".kea-table separator, resting row" },
+  { fg: "--border-strong", bg: "--btn-hover-bg", min: SEPARATOR_FLOOR, why: ".kea-table separator, hovered row" },
+  { fg: "--border-strong", bg: "--surface-2", min: SEPARATOR_FLOOR, why: ".kea-table separator, aria-current row" },
+
+  // ── Known shortfalls, pinned not blessed (issue #11) ───────────────
+  { fg: "--border", bg: "--surface", min: PENDING_FLOOR, why: "card edges, but also the .kea-icon-btn / .kea-segment / .kea-choice boundary" },
+  { fg: "--btn-border", bg: "--surface", min: PENDING_FLOOR, why: "the only boundary of .kea-btn, whose fill matches --surface in light theme" },
 ];
+
+/**
+ * Tokens with no contrast pair, each with the reason it has none. Anything
+ * neither measured nor listed here fails `covers every token in :root`.
+ */
+const EXEMPT: Record<string, string> = {
+  "--underline": "declared but referenced by no rule; kept equal to --accent so it cannot drift",
+  "--toggle-thumb-border":
+    "softens the thumb edge rather than carrying it. background-clip defaults to border-box, so this ring composites over the thumb's own fill and never meets the track — the --toggle-thumb pairs above carry 1.4.11 for that control",
+};
 
 // ── WCAG 2.1 contrast maths ──────────────────────────────────────────
 interface Rgba {
@@ -107,11 +144,11 @@ function parseColor(value: string): Rgba {
 }
 
 /** Source-over composite of a translucent colour onto an opaque backdrop. */
-function composite(fg: Rgba, bg: Rgba): Rgba {
+function composite(fg: Rgba, backdrop: Rgba): Rgba {
   return {
-    r: fg.r * fg.a + bg.r * (1 - fg.a),
-    g: fg.g * fg.a + bg.g * (1 - fg.a),
-    b: fg.b * fg.a + bg.b * (1 - fg.a),
+    r: fg.r * fg.a + backdrop.r * (1 - fg.a),
+    g: fg.g * fg.a + backdrop.g * (1 - fg.a),
+    b: fg.b * fg.a + backdrop.b * (1 - fg.a),
     a: 1,
   };
 }
@@ -138,7 +175,7 @@ function contrastRatio(a: Rgba, b: Rgba): number {
 // ── Token extraction ─────────────────────────────────────────────────
 const WITHOUT_COMMENTS = cssSource.replace(/\/\*[\s\S]*?\*\//g, "");
 
-function readTokens(selector: string): Record<string, string> {
+function readBlock(selector: string): Record<string, string> {
   const start = WITHOUT_COMMENTS.indexOf(selector);
   if (start === -1) throw new Error(`palette contrast: no ${selector} block in index.css`);
   const open = WITHOUT_COMMENTS.indexOf("{", start);
@@ -151,42 +188,81 @@ function readTokens(selector: string): Record<string, string> {
   return tokens;
 }
 
-const THEMES: Record<Theme, Record<string, string>> = {
-  light: readTokens(":root {"),
-  dark: readTokens(':root[data-theme="dark"]'),
+const LIGHT = readBlock(":root {");
+/**
+ * Dark overrides :root rather than replacing it, exactly as the cascade does,
+ * so a token the dark block legitimately inherits reads as inherited rather
+ * than as missing.
+ */
+const THEMES = {
+  light: LIGHT,
+  dark: { ...LIGHT, ...readBlock(':root[data-theme="dark"]') },
 };
+type Theme = keyof typeof THEMES;
+
+/**
+ * Resolve a token to the opaque colour it actually renders as. A translucent
+ * token must name its backdrop; there is no implicit one.
+ */
+function resolve(
+  tokens: Record<string, string>,
+  name: string,
+  backdrop: string | undefined,
+  field: string,
+): Rgba {
+  const raw = tokens[name];
+  if (raw === undefined) throw new Error(`palette contrast: ${name} is not defined`);
+  const colour = parseColor(raw);
+  if (colour.a === 1) return colour;
+  if (backdrop === undefined) {
+    throw new Error(
+      `palette contrast: ${name} is translucent (${raw}); the pair must name what it paints onto via \`${field}\``,
+    );
+  }
+  return composite(colour, resolve(tokens, backdrop, undefined, field));
+}
 
 describe("contrast maths", () => {
   it("matches the two ratios WCAG spells out", () => {
-    const black = parseColor("#000000");
-    const white = parseColor("#ffffff");
-    expect(contrastRatio(black, white)).toBeCloseTo(21, 5);
-    expect(contrastRatio(white, white)).toBeCloseTo(1, 5);
+    expect(contrastRatio(parseColor("#000000"), parseColor("#ffffff"))).toBeCloseTo(21, 5);
+    expect(contrastRatio(parseColor("#ffffff"), parseColor("#ffffff"))).toBeCloseTo(1, 5);
   });
 
-  it("composites translucent foregrounds onto the backdrop", () => {
-    const half = parseColor("rgba(0, 0, 0, 0.5)");
-    expect(composite(half, parseColor("#ffffff"))).toEqual({ r: 127.5, g: 127.5, b: 127.5, a: 1 });
+  it("composites a translucent colour onto the backdrop it is given", () => {
+    const tokens = { "--ring": "rgba(0, 0, 0, 0.5)", "--thumb": "#ffffff", "--track": "#000000" };
+    // Same ring, two backdrops, two answers — which is exactly why the
+    // backdrop has to be stated rather than inferred from the pair.
+    expect(resolve(tokens, "--ring", "--thumb", "fgOver")).toEqual({ r: 127.5, g: 127.5, b: 127.5, a: 1 });
+    expect(resolve(tokens, "--ring", "--track", "fgOver")).toEqual({ r: 0, g: 0, b: 0, a: 1 });
+  });
+
+  it("refuses to guess a backdrop for a translucent token", () => {
+    expect(() => resolve({ "--ring": "rgba(0, 0, 0, 0.5)" }, "--ring", undefined, "fgOver")).toThrow(
+      /must name what it paints onto/,
+    );
   });
 });
 
 describe("palette contrast (index.css tokens)", () => {
+  it("covers every token in :root", () => {
+    const measured = new Set(PAIRS.flatMap((p) => [p.fg, p.bg, p.fgOver, p.bgOver]));
+    const uncovered = Object.keys(LIGHT).filter((t) => !measured.has(t) && !(t in EXEMPT));
+    expect(uncovered, `add to PAIRS, or to EXEMPT with a reason: ${uncovered.join(", ")}`).toEqual([]);
+  });
+
+  it("does not exempt a token that is in fact measured", () => {
+    const measured = new Set(PAIRS.flatMap((p) => [p.fg, p.bg]));
+    expect(Object.keys(EXEMPT).filter((t) => measured.has(t))).toEqual([]);
+  });
+
   for (const theme of Object.keys(THEMES) as Theme[]) {
     const tokens = THEMES[theme];
 
     describe(`${theme} theme`, () => {
-      it("defines every token the pairs reference", () => {
-        const missing = [...new Set(PAIRS.flatMap((p) => [p.fg, p.bg]))].filter((t) => !(t in tokens));
-        expect(missing).toEqual([]);
-      });
-
       for (const pair of PAIRS) {
-        if (pair.themes && !pair.themes.includes(theme)) continue;
-
         it(`${pair.fg} on ${pair.bg} clears ${pair.min}:1 — ${pair.why}`, () => {
-          const bg = parseColor(tokens[pair.bg]);
-          const rawFg = parseColor(tokens[pair.fg]);
-          const fg = rawFg.a < 1 ? composite(rawFg, bg) : rawFg;
+          const bg = resolve(tokens, pair.bg, pair.bgOver, "bgOver");
+          const fg = resolve(tokens, pair.fg, pair.fgOver, "fgOver");
           const ratio = contrastRatio(fg, bg);
 
           expect(
