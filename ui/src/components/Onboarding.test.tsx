@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -22,6 +22,18 @@ const WHISPER_CATALOG = [
     url: "",
     size_bytes: 148 * MB,
     sha256: "",
+  },
+];
+
+const PARAKEET_CATALOG = [
+  {
+    id: "parakeet-v3",
+    display_name: "Parakeet v3",
+    language: "English",
+    url: "",
+    size_bytes: 487 * MB,
+    sha256: "",
+    kind: "Parakeet",
   },
 ];
 
@@ -72,7 +84,7 @@ function mockWizardWorld({ hasKey = true, existingBindings = {} }: WorldOptions 
     list_tts_engines: () => [{ id: "sherpa-tts", models: [] }],
     list_whisper_models: () => WHISPER_CATALOG,
     list_installed_whisper_models: () => [],
-    list_onnx_models: (args) => (args?.kind === "tts" ? TTS_CATALOG : []),
+    list_onnx_models: (args) => (args?.kind === "tts" ? TTS_CATALOG : PARAKEET_CATALOG),
     list_installed_onnx_models: () => [],
     download_whisper_model: () => undefined,
     download_onnx_model: () => undefined,
@@ -226,6 +238,62 @@ describe("Onboarding wizard", () => {
     expect(slots).toEqual(["stt", "tts"]);
   });
 
+  it("writes no bindings when OpenAI is chosen without a key", async () => {
+    mockWizardWorld({ hasKey: false });
+    const user = userEvent.setup();
+    render(<Onboarding onFinish={() => {}} />);
+    await goToStep(2, user);
+
+    await user.click(continueBtn());
+    await screen.findByText(/Step 3 of 4/);
+
+    expect(invokeCalls("set_credential")).toHaveLength(0);
+    expect(invokeCalls("set_binding")).toHaveLength(0);
+  });
+
+  it("keeps previously configured voice defaults when re-running the wizard", async () => {
+    mockWizardWorld({
+      hasKey: true,
+      existingBindings: {
+        "default/stt": { engine_id: "parakeet", model: "parakeet-v3", provider_ref: null },
+        "default/tts": { engine_id: "sherpa-tts", model: "vits-piper-amy", provider_ref: null },
+      },
+    });
+    const user = userEvent.setup();
+    render(<Onboarding onFinish={() => {}} />);
+    await goToStep(3, user);
+
+    // Existing bindings win over the recommended/cloud preselection.
+    const local = (await screen.findByRole("radio", {
+      name: /Parakeet v3/,
+    })) as HTMLInputElement;
+    expect(local.checked).toBe(true);
+    const ttsLocal = screen.getByRole("radio", {
+      name: /A voice on this Mac/,
+    }) as HTMLInputElement;
+    expect(ttsLocal.checked).toBe(true);
+
+    await user.click(continueBtn());
+    await screen.findByText(/Step 4 of 4/);
+
+    expect(invokeCalls("set_binding")).toEqual([
+      {
+        feature: "default",
+        slot: "stt",
+        engine: "parakeet",
+        model: "parakeet-v3",
+        providerRef: null,
+      },
+      {
+        feature: "default",
+        slot: "tts",
+        engine: "sherpa-tts",
+        model: "vits-piper-amy",
+        providerRef: null,
+      },
+    ]);
+  });
+
   it("downloads the local speech model inline, then activates it on completion", async () => {
     mockWizardWorld({ hasKey: true });
     const user = userEvent.setup();
@@ -234,9 +302,10 @@ describe("Onboarding wizard", () => {
 
     // Key present and step 2 skipped → cloud is preselected; choose local.
     const local = await screen.findByRole("radio", { name: /Whisper Base/ });
-    expect((screen.getByRole("radio", { name: /OpenAI cloud/ }) as HTMLInputElement).checked).toBe(
-      true,
-    );
+    const sttGroup = screen.getByRole("radiogroup", { name: "Speech to text" });
+    expect(
+      (within(sttGroup).getByRole("radio", { name: /OpenAI cloud/ }) as HTMLInputElement).checked,
+    ).toBe(true);
     await user.click(local);
 
     await waitFor(() => expect(invokeCalls("download_whisper_model")).toHaveLength(1));
