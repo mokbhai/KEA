@@ -85,7 +85,7 @@ export default function PermissionPanel() {
           marginBottom: 12,
         }}
       >
-        <h3 style={{ margin: 0 }}>Permissions</h3>
+        <h2 style={{ margin: 0 }}>Permissions</h2>
         <button
           type="button"
           className="kea-btn"

@@ -126,13 +126,13 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
 
   return (
     <div>
-      <h2 style={{ marginTop: 0 }}>General</h2>
+      <h1 style={{ marginTop: 0 }}>General</h1>
       <p className="kea-muted" style={{ marginBottom: 24 }}>
         Appearance, startup, updates, notifications and permissions.
       </p>
 
       <section style={{ marginBottom: 24 }}>
-        <h3 style={{ margin: "0 0 12px" }}>Appearance</h3>
+        <h2 style={{ margin: "0 0 12px" }}>Appearance</h2>
         <RowGroup aria-label="Appearance">
           <Row label="Appearance" hint="Follow this Mac or pick a theme">
             {savedKey === "appearance" && <span className="kea-saved">Saved ✓</span>}
@@ -151,7 +151,7 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
       </section>
 
       <section style={{ marginBottom: 24 }}>
-        <h3 style={{ margin: "0 0 12px" }}>Startup & updates</h3>
+        <h2 style={{ margin: "0 0 12px" }}>Startup & updates</h2>
         <RowGroup aria-label="Startup and updates">
           <Row
             label="Launch at login"
@@ -188,7 +188,7 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
       </section>
 
       <section style={{ marginBottom: 24 }}>
-        <h3 style={{ margin: "0 0 12px" }}>Notifications</h3>
+        <h2 style={{ margin: "0 0 12px" }}>Notifications</h2>
         <RowGroup aria-label="Notifications">
           <Row label="Test notifications" hint={notifStatus ?? "Send a sample notification"}>
             <button
@@ -206,7 +206,7 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
       <PermissionPanel />
 
       <section style={{ marginBottom: 24 }}>
-        <h3 style={{ margin: "0 0 12px" }}>Setup assistant</h3>
+        <h2 style={{ margin: "0 0 12px" }}>Setup assistant</h2>
         <RowGroup aria-label="Setup assistant">
           <Row
             label="First-run setup"

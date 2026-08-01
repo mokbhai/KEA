@@ -108,7 +108,7 @@ export default function AiProvidersPage() {
 
   return (
     <div>
-      <h2 style={{ marginTop: 0 }}>AI Providers</h2>
+      <h1 style={{ marginTop: 0 }}>AI Providers</h1>
       <p className="kea-muted" style={{ marginBottom: 24 }}>
         Connect AI services once — every feature reuses them.
       </p>
@@ -116,7 +116,7 @@ export default function AiProvidersPage() {
       {error && <Banner variant="error">{error}</Banner>}
 
       <section style={{ marginBottom: 32 }}>
-        <h3 style={{ margin: "0 0 12px" }}>Providers</h3>
+        <h2 style={{ margin: "0 0 12px" }}>Providers</h2>
         {providers === null ? (
           <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 60 }}>
             <Spinner size={16} />
@@ -180,7 +180,7 @@ export default function AiProvidersPage() {
       </section>
 
       <section>
-        <h3 style={{ margin: "0 0 12px" }}>Defaults</h3>
+        <h2 style={{ margin: "0 0 12px" }}>Defaults</h2>
         {missing.length > 0 && (
           <Banner variant="warn">
             Not set: {missing.map(({ capability }) => CAPABILITY_LABELS[capability]).join(", ")}.

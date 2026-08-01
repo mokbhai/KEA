@@ -1,4 +1,14 @@
-import type { ReactNode } from "react";
+import {
+  Children,
+  cloneElement,
+  createContext,
+  Fragment,
+  isValidElement,
+  useContext,
+  useId,
+  type ReactElement,
+  type ReactNode,
+} from "react";
 
 type RowGroupProps = {
   children: ReactNode;
@@ -13,6 +23,56 @@ export function RowGroup({ children, ...aria }: RowGroupProps) {
   );
 }
 
+/**
+ * The id of the current row's hint, or undefined when the row has none.
+ * Components rendered as a row's control read this so the hint — which is
+ * visual-only otherwise — is announced with the control.
+ */
+const RowHintContext = createContext<string | undefined>(undefined);
+
+export function useRowHintId(): string | undefined {
+  return useContext(RowHintContext);
+}
+
+/**
+ * Native controls written inline as row children can't call the hook, so they
+ * get the association by cloning instead. Buttons are in here because they are
+ * the most common row control — a hotkey's "Re-record", a picker's "Change…" —
+ * and their hint is usually the row's whole state ("registration failed at
+ * startup: …"). Anything that already carries its own aria-describedby keeps it.
+ */
+const DESCRIBABLE = new Set(["input", "select", "textarea", "button", "a"]);
+
+function describeControls(children: ReactNode, hintId: string | undefined): ReactNode {
+  if (!hintId) return children;
+  return Children.map(children, (child) => {
+    if (!isValidElement(child)) return child;
+
+    // Components read the id from context instead; cloning would only set a
+    // prop they may not forward.
+    const isIntrinsic = typeof child.type === "string";
+    if (!isIntrinsic && child.type !== Fragment) return child;
+
+    // Fragments and plain wrappers are transparent: descend so a control
+    // nested in one is still reached.
+    if (child.type === Fragment || !DESCRIBABLE.has(child.type as string)) {
+      const props = child.props as { children?: ReactNode };
+      if (props.children === undefined) return child;
+      return cloneElement(
+        child as ReactElement<{ children?: ReactNode }>,
+        undefined,
+        describeControls(props.children, hintId),
+      );
+    }
+
+    const props = child.props as { "aria-describedby"?: string };
+    if (props["aria-describedby"]) return child;
+    return cloneElement(child as ReactElement<{ "aria-describedby"?: string }>, {
+      "aria-describedby": hintId,
+    });
+  });
+}
+
 type RowProps = {
   label: string;
   hint?: string;
@@ -22,12 +82,16 @@ type RowProps = {
 };
 
 export function Row({ label, hint, tone = "muted", children }: RowProps) {
+  const generatedId = useId();
+  const hintId = hint ? generatedId : undefined;
+
   return (
     <div className="kea-row">
       <span className="kea-row__label">
         {label}
         {hint && (
           <span
+            id={hintId}
             className={`kea-row__hint${
               tone === "danger" ? " kea-row__hint--danger" : ""
             }`}
@@ -36,7 +100,13 @@ export function Row({ label, hint, tone = "muted", children }: RowProps) {
           </span>
         )}
       </span>
-      {children && <span className="kea-row__control">{children}</span>}
+      {children && (
+        <span className="kea-row__control">
+          <RowHintContext.Provider value={hintId}>
+            {describeControls(children, hintId)}
+          </RowHintContext.Provider>
+        </span>
+      )}
     </div>
   );
 }

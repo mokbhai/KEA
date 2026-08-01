@@ -27,6 +27,16 @@ function mockWorld(options: Parameters<typeof featureHandlers>[0] = {}) {
 describe("DictationPage", () => {
   beforeEach(() => resetTauriMocks());
 
+  it("titles the page with the only h1", async () => {
+    mockWorld({ bindings: { "default/stt": whisperBinding } });
+    render(<DictationPage />);
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Dictation" }),
+    ).toBeTruthy();
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+  });
+
   it("warns when the speech model is not downloaded and links Models", async () => {
     mockWorld({
       bindings: { "default/stt": whisperBinding },

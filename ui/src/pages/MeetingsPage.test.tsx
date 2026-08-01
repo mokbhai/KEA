@@ -77,6 +77,16 @@ function mockWorld(options: Parameters<typeof featureHandlers>[0] = {}) {
 describe("MeetingsPage", () => {
   beforeEach(() => resetTauriMocks());
 
+  it("titles the page with the only h1", async () => {
+    mockWorld({ bindings: readyBindings });
+    render(<MeetingsPage />);
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Meetings" }),
+    ).toBeTruthy();
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+  });
+
   it("warns for each unconfigured slot", async () => {
     mockWorld({ bindings: {} });
     render(<MeetingsPage />);

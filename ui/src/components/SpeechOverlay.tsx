@@ -12,10 +12,10 @@ const stateLabels: Record<DictationState, string> = {
   processing: "Processing…",
 };
 
-const stateColors: Record<DictationState, { bg: string; fg: string }> = {
-  idle: { bg: "var(--surface-2)", fg: "var(--text-muted)" },
-  listening: { bg: "var(--surface-2)", fg: "var(--accent)" },
-  processing: { bg: "var(--surface-2)", fg: "var(--accent)" },
+const stateDots: Record<DictationState, string> = {
+  idle: "kea-dot--muted",
+  listening: "kea-dot--ok",
+  processing: "kea-dot--ok",
 };
 
 export default function SpeechOverlay() {
@@ -39,28 +39,11 @@ export default function SpeechOverlay() {
     }
   }, [state]);
 
-  const { bg, fg } = stateColors[state];
-
   return (
-    <div
-      style={{
-        position: "fixed",
-        top: 16,
-        right: 16,
-        display: "flex",
-        alignItems: "center",
-        gap: 10,
-        padding: "8px 14px",
-        borderRadius: 999,
-        background: bg,
-        color: fg,
-        fontSize: 13,
-        fontWeight: 500,
-        border: "1px solid var(--border)",
-        boxShadow: "0 2px 8px color-mix(in srgb, var(--text) 10%, transparent)",
-        zIndex: 1000,
-      }}
-    >
+    <div className={`kea-float kea-speech-overlay kea-speech-overlay--${state}`}>
+      {/* The state used to be carried by text colour alone; a dot carries it
+          for anyone who can't tell the two colours apart. */}
+      <span className={`kea-dot ${stateDots[state]}`} aria-hidden="true" />
       <span>{stateLabels[state]}</span>
       {state === "listening" && <LevelMeter level={level} />}
     </div>

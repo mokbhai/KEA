@@ -79,7 +79,7 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
   return (
     <div>
       <header>
-        <h2 style={{ marginTop: 0 }}>Rewrite</h2>
+        <h1 style={{ marginTop: 0 }}>Rewrite</h1>
         <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
           Select text anywhere on your Mac and press the shortcut to rewrite it in
           place.
@@ -97,7 +97,7 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
       )}
 
       <section style={{ marginBottom: 24 }}>
-        <h3 style={{ margin: "0 0 12px" }}>Behavior</h3>
+        <h2 style={{ margin: "0 0 12px" }}>Behavior</h2>
         <SettingsForm
           onChange={onSettingsChange}
           leadingRows={
@@ -115,7 +115,7 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
       <FeatureAiCard ai={ai} featureLabel="Rewrite" />
 
       <section style={{ marginBottom: 24 }}>
-        <h3 style={{ margin: "0 0 12px" }}>Try it</h3>
+        <h2 style={{ margin: "0 0 12px" }}>Try it</h2>
         <div className="kea-card">
           <label style={{ display: "block", marginBottom: 12 }}>
             <span className="kea-label">Sample text</span>

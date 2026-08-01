@@ -315,7 +315,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
   return (
     <div>
       <header>
-        <h2 style={{ marginTop: 0 }}>Meetings</h2>
+        <h1 style={{ marginTop: 0 }}>Meetings</h1>
         <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
           Record a meeting, watch the transcript appear live, and get notes when you
           stop.
@@ -344,7 +344,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
       )}
 
       <section style={{ marginBottom: 24 }}>
-        <h3 style={{ margin: "0 0 12px" }}>Behavior</h3>
+        <h2 style={{ margin: "0 0 12px" }}>Behavior</h2>
         <RowGroup aria-label="Meeting behavior">
           <HotkeyRow
             feature={MEETINGS_FEATURE}
@@ -413,7 +413,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
       <FeatureAiCard ai={ai} featureLabel="Meetings" />
 
       <section style={{ marginBottom: 24 }}>
-        <h3 style={{ margin: "0 0 12px" }}>Try it</h3>
+        <h2 style={{ margin: "0 0 12px" }}>Try it</h2>
         <div className="kea-card">
           <div
             style={{
@@ -471,7 +471,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
       </section>
 
       <section style={{ marginBottom: 24 }}>
-        <h3 style={{ margin: "0 0 12px" }}>Live transcript</h3>
+        <h2 style={{ margin: "0 0 12px" }}>Live transcript</h2>
         <div className="kea-card">
           <TranscriptPanel
             segments={segments}
@@ -501,7 +501,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
             overflowY: "auto",
           }}
         >
-          <h3 style={{ margin: "0 0 12px", fontSize: 15 }}>Past meetings</h3>
+          <h2 style={{ margin: "0 0 12px", fontSize: 15 }}>Past meetings</h2>
           {meetings.length === 0 ? (
             <p className="kea-muted" style={{ margin: 0 }}>
               No meetings yet.

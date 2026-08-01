@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { openLogFolder, tailLogs } from "../api";
+import Banner from "../components/Banner";
 import LogsViewer from "../components/LogsViewer";
 
 const DEFAULT_MAX_BYTES = 64 * 1024;
@@ -37,12 +38,17 @@ export default function LogsPage() {
 
   return (
     <div>
-      <h2 style={{ marginTop: 0 }}>Logs</h2>
-      <p className="kea-muted" style={{ marginTop: 0 }}>
-        Tail of the rolling KEA application log (last {Math.round(DEFAULT_MAX_BYTES / 1024)}{" "}
-        KB).
-      </p>
-      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+      <header>
+        <h1 style={{ marginTop: 0 }}>Logs</h1>
+        <p className="kea-muted" style={{ marginTop: 0, marginBottom: 16 }}>
+          Tail of the rolling KEA application log (last{" "}
+          {Math.round(DEFAULT_MAX_BYTES / 1024)} KB).
+        </p>
+      </header>
+
+      {status && <Banner variant="error">{status}</Banner>}
+
+      <div className="kea-toolbar">
         <button type="button" className="kea-btn" onClick={refresh} disabled={loading}>
           Refresh
         </button>
@@ -51,9 +57,6 @@ export default function LogsPage() {
         </button>
       </div>
       <LogsViewer content={content} loading={loading} />
-      {status && (
-        <p style={{ marginTop: 12, fontSize: 13, color: "var(--danger)" }}>{status}</p>
-      )}
     </div>
   );
 }

@@ -12,16 +12,13 @@ import {
   type ConversationSummary,
   type Message,
 } from "../api";
-import HistoryPanel from "../components/HistoryPanel";
+import Banner from "../components/Banner";
+import HistoryPanel, { statusClass } from "../components/HistoryPanel";
+import { Row, RowGroup } from "../components/SettingsRow";
 import Spinner from "../components/Spinner";
+import Toggle from "../components/Toggle";
 
 const PAGE_SIZE = 25;
-
-function statusColor(status: string): string {
-  if (status === "ok" || status === "success") return "var(--accent)";
-  if (status === "error" || status === "failed") return "var(--danger)";
-  return "var(--text-muted)";
-}
 
 export default function HistoryPage() {
   const [tab, setTab] = useState<"actions" | "conversations">("actions");
@@ -154,17 +151,6 @@ export default function HistoryPage() {
     setSelectedActionId(null);
   };
 
-  const tabStyle = (active: boolean): React.CSSProperties => ({
-    padding: "6px 12px",
-    border: "1px solid var(--border)",
-    borderRadius: 6,
-    background: active ? "var(--surface-2)" : "var(--surface)",
-    color: "var(--text)",
-    fontWeight: active ? 600 : 400,
-    cursor: "pointer",
-    fontFamily: "inherit",
-  });
-
   const selectedConversation = conversations.find((c) => c.id === selectedConversationId);
 
   const handleDeleteConversation = async (id: number) => {
@@ -182,33 +168,35 @@ export default function HistoryPage() {
 
   return (
     <div>
-      <h2 style={{ marginTop: 0 }}>History</h2>
-      <p className="kea-muted" style={{ marginTop: 0 }}>
-        Browse recorded feature actions and rewrite conversations from data.db.
-      </p>
+      <header>
+        <h1 style={{ marginTop: 0 }}>History</h1>
+        <p className="kea-muted" style={{ marginTop: 0, marginBottom: 16 }}>
+          Browse recorded feature actions and rewrite conversations from data.db.
+        </p>
+      </header>
 
-      <label
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          marginBottom: 16,
-          fontSize: 14,
-        }}
-      >
-        <input
-          type="checkbox"
-          checked={storeConversations}
-          disabled={storeBusy}
-          onChange={(e) => onStoreConversationsChange(e.target.checked)}
-        />
-        <span>Store conversation content</span>
-      </label>
+      {status && <Banner variant="error">{status}</Banner>}
 
-      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+      <RowGroup aria-label="History settings">
+        <Row
+          label="Store conversation content"
+          hint="Keeps transcripts and LLM exchanges in data.db so they can be reviewed here."
+        >
+          {storeBusy && <Spinner size={14} />}
+          <Toggle
+            label="Store conversation content"
+            checked={storeConversations}
+            disabled={storeBusy}
+            onChange={(next) => void onStoreConversationsChange(next)}
+          />
+        </Row>
+      </RowGroup>
+
+      <div className="kea-toolbar" style={{ marginTop: 16 }}>
         <button
           type="button"
-          style={tabStyle(tab === "actions")}
+          className="kea-segment"
+          aria-pressed={tab === "actions"}
           onClick={() => {
             // Clear the other tab's selection so its stale detail can't
             // shadow this tab's (the conversation detail branch is gated on
@@ -221,7 +209,8 @@ export default function HistoryPage() {
         </button>
         <button
           type="button"
-          style={tabStyle(tab === "conversations")}
+          className="kea-segment"
+          aria-pressed={tab === "conversations"}
           onClick={() => {
             setSelectedActionId(null);
             setTab("conversations");
@@ -233,13 +222,13 @@ export default function HistoryPage() {
 
       {tab === "actions" && (
         <>
-          <form onSubmit={onSearch} style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+          <form onSubmit={onSearch} className="kea-toolbar">
             <input
-              className="kea-input"
+              className="kea-input kea-toolbar__grow"
+              aria-label="Search actions"
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
               placeholder="Search feature, command, or engine…"
-              style={{ flex: 1, maxWidth: 400 }}
             />
             <button type="submit" className="kea-btn" disabled={busy}>
               Search
@@ -279,58 +268,72 @@ export default function HistoryPage() {
       {tab === "conversations" && (
         <>
           {conversations.length === 0 ? (
-            <p className="kea-muted">
-              No conversations stored yet. Enable "Store conversation content"
-              above, then run a rewrite or dictation with audio refinement to see
-              transcripts and LLM exchanges here.
-            </p>
+            <div className="kea-card">
+              <p className="kea-muted" style={{ margin: 0 }}>
+                No conversations stored yet. Enable "Store conversation content"
+                above, then run a rewrite or dictation with audio refinement to see
+                transcripts and LLM exchanges here.
+              </p>
+            </div>
           ) : (
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
-              <thead>
-                <tr style={{ borderBottom: "1px solid var(--border)", textAlign: "left" }}>
-                  <th style={{ padding: "8px 4px" }}>ID</th>
-                  <th style={{ padding: "8px 4px" }}>Feature</th>
-                  <th style={{ padding: "8px 4px" }}>Engine</th>
-                  <th style={{ padding: "8px 4px" }}>Model</th>
-                  <th style={{ padding: "8px 4px" }}>Created</th>
-                  <th style={{ padding: "8px 4px", width: 40 }} />
-                </tr>
-              </thead>
-              <tbody>
-                {conversations.map((conv) => (
-                  <tr
-                    key={conv.id}
-                    onClick={() => setSelectedConversationId(conv.id)}
-                    style={{
-                      borderBottom: "1px solid var(--border)",
-                      cursor: "pointer",
-                      background:
-                        selectedConversationId === conv.id ? "var(--surface-2)" : undefined,
-                    }}
-                  >
-                    <td style={{ padding: "10px 4px" }}>{conv.id}</td>
-                    <td style={{ padding: "10px 4px" }}>{conv.feature_id}</td>
-                    <td style={{ padding: "10px 4px" }}>{conv.engine_id}</td>
-                    <td style={{ padding: "10px 4px" }}>{conv.model ?? "—"}</td>
-                    <td style={{ padding: "10px 4px" }}>{conv.created_at}</td>
-                    <td style={{ padding: "10px 4px" }}>
-                      <button
-                        type="button"
-                        className="kea-btn"
-                        style={{ fontSize: 12, padding: "2px 8px" }}
-                        disabled={busy}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleDeleteConversation(conv.id);
-                        }}
-                      >
-                        Delete
-                      </button>
-                    </td>
+            <div className="kea-table-wrap">
+              <table className="kea-table">
+                <caption className="kea-visually-hidden">Stored conversations</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">ID</th>
+                    <th scope="col">Feature</th>
+                    <th scope="col">Engine</th>
+                    <th scope="col">Model</th>
+                    <th scope="col">Created</th>
+                    <th scope="col" className="kea-table__actions">
+                      <span className="kea-visually-hidden">Actions</span>
+                    </th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {conversations.map((conv) => (
+                    <tr
+                      key={conv.id}
+                      aria-current={selectedConversationId === conv.id ? "true" : undefined}
+                      onClick={() => setSelectedConversationId(conv.id)}
+                    >
+                      <td>
+                        <button
+                          type="button"
+                          className="kea-table__select"
+                          aria-label={`Show conversation ${conv.id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSelectedConversationId(conv.id);
+                          }}
+                        >
+                          {conv.id}
+                        </button>
+                      </td>
+                      <td>{conv.feature_id}</td>
+                      <td>{conv.engine_id}</td>
+                      <td>{conv.model ?? "—"}</td>
+                      <td>{conv.created_at}</td>
+                      <td className="kea-table__actions">
+                        <button
+                          type="button"
+                          className="kea-btn"
+                          aria-label={`Delete conversation ${conv.id}`}
+                          disabled={busy}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDeleteConversation(conv.id);
+                          }}
+                        >
+                          Delete
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
           {conversations.length >= limit && (
             <button
@@ -347,14 +350,8 @@ export default function HistoryPage() {
       )}
 
       {(actionDetail || selectedConversation || (busy && selectedActionId && tab === "actions")) && (
-        <aside
-          className="kea-card"
-          style={{
-            marginTop: 24,
-            background: "var(--surface-2)",
-          }}
-        >
-          <h3 style={{ margin: "0 0 12px" }}>Detail</h3>
+        <aside className="kea-card" style={{ marginTop: 24 }}>
+          <h2 style={{ margin: "0 0 12px" }}>Detail</h2>
           {busy && !actionDetail ? (
             <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 60 }}>
               <Spinner size={16} />
@@ -363,68 +360,62 @@ export default function HistoryPage() {
           ) : (
             <>
           {actionDetail && (
-            <dl style={{ margin: 0, display: "grid", gridTemplateColumns: "120px 1fr", gap: 8 }}>
-              <dt style={{ fontWeight: 600 }}>Feature</dt>
-              <dd style={{ margin: 0 }}>{actionDetail.feature_id}</dd>
-              <dt style={{ fontWeight: 600 }}>Command</dt>
-              <dd style={{ margin: 0 }}>{actionDetail.command}</dd>
-              <dt style={{ fontWeight: 600 }}>Engine</dt>
-              <dd style={{ margin: 0 }}>{actionDetail.engine_id}</dd>
-              <dt style={{ fontWeight: 600 }}>Model</dt>
-              <dd style={{ margin: 0 }}>{actionDetail.model ?? "—"}</dd>
-              <dt style={{ fontWeight: 600 }}>Provider</dt>
-              <dd style={{ margin: 0 }}>{actionDetail.provider_ref ?? "—"}</dd>
-              <dt style={{ fontWeight: 600 }}>Status</dt>
-              <dd style={{ margin: 0, color: statusColor(actionDetail.status) }}>
-                {actionDetail.status}
-              </dd>
-              <dt style={{ fontWeight: 600 }}>Started</dt>
-              <dd style={{ margin: 0 }}>{actionDetail.started_at}</dd>
-              <dt style={{ fontWeight: 600 }}>Finished</dt>
-              <dd style={{ margin: 0 }}>{actionDetail.finished_at ?? "—"}</dd>
+            <dl className="kea-detail-list">
+              <dt>Feature</dt>
+              <dd>{actionDetail.feature_id}</dd>
+              <dt>Command</dt>
+              <dd>{actionDetail.command}</dd>
+              <dt>Engine</dt>
+              <dd>{actionDetail.engine_id}</dd>
+              <dt>Model</dt>
+              <dd>{actionDetail.model ?? "—"}</dd>
+              <dt>Provider</dt>
+              <dd>{actionDetail.provider_ref ?? "—"}</dd>
+              <dt>Status</dt>
+              <dd className={statusClass(actionDetail.status)}>{actionDetail.status}</dd>
+              <dt>Started</dt>
+              <dd>{actionDetail.started_at}</dd>
+              <dt>Finished</dt>
+              <dd>{actionDetail.finished_at ?? "—"}</dd>
               {actionDetail.error && (
                 <>
-                  <dt style={{ fontWeight: 600 }}>Error</dt>
-                  <dd style={{ margin: 0, color: "var(--danger)" }}>{actionDetail.error}</dd>
+                  <dt>Error</dt>
+                  <dd className="kea-status--error">{actionDetail.error}</dd>
                 </>
               )}
             </dl>
           )}
           {selectedConversation && !actionDetail && (
             <>
-              <dl
-                style={{ margin: 0, display: "grid", gridTemplateColumns: "120px 1fr", gap: 8 }}
-              >
-                <dt style={{ fontWeight: 600 }}>Conversation</dt>
-                <dd style={{ margin: 0 }}>#{selectedConversation.id}</dd>
-                <dt style={{ fontWeight: 600 }}>Feature</dt>
-                <dd style={{ margin: 0 }}>{selectedConversation.feature_id}</dd>
-                <dt style={{ fontWeight: 600 }}>Engine</dt>
-                <dd style={{ margin: 0 }}>{selectedConversation.engine_id}</dd>
-                <dt style={{ fontWeight: 600 }}>Model</dt>
-                <dd style={{ margin: 0 }}>{selectedConversation.model ?? "—"}</dd>
-                <dt style={{ fontWeight: 600 }}>Created</dt>
-                <dd style={{ margin: 0 }}>{selectedConversation.created_at}</dd>
-                <dt style={{ fontWeight: 600 }}>Linked action</dt>
-                <dd style={{ margin: 0 }}>
-                  {selectedConversation.action_id ?? "—"}
-                </dd>
+              <dl className="kea-detail-list">
+                <dt>Conversation</dt>
+                <dd>#{selectedConversation.id}</dd>
+                <dt>Feature</dt>
+                <dd>{selectedConversation.feature_id}</dd>
+                <dt>Engine</dt>
+                <dd>{selectedConversation.engine_id}</dd>
+                <dt>Model</dt>
+                <dd>{selectedConversation.model ?? "—"}</dd>
+                <dt>Created</dt>
+                <dd>{selectedConversation.created_at}</dd>
+                <dt>Linked action</dt>
+                <dd>{selectedConversation.action_id ?? "—"}</dd>
               </dl>
               {linkedAction && (
                 <div style={{ marginTop: 16 }}>
-                  <h4 style={{ margin: "0 0 8px" }}>Linked action</h4>
+                  <h3 style={{ margin: "0 0 8px" }}>Linked action</h3>
                   <p className="kea-muted" style={{ margin: 0 }}>
                     {linkedAction.feature_id} / {linkedAction.command} —{" "}
-                    <span style={{ color: statusColor(linkedAction.status) }}>
+                    <span className={statusClass(linkedAction.status)}>
                       {linkedAction.status}
                     </span>
                   </p>
                 </div>
               )}
               <div style={{ marginTop: 16 }}>
-                <h4 style={{ margin: "0 0 8px" }}>
+                <h3 style={{ margin: "0 0 8px" }}>
                   Messages
-                </h4>
+                </h3>
                 {messagesLoading ? (
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <Spinner size={14} />
@@ -435,27 +426,14 @@ export default function HistoryPage() {
                     No messages in this conversation.
                   </p>
                 ) : (
-                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div className="kea-messages">
                     {messages.map((msg) => (
-                      <div
-                        key={msg.id}
-                        style={{
-                          padding: "8px 12px",
-                          borderRadius: 6,
-                          background: "var(--surface)",
-                          border: "1px solid var(--border)",
-                          fontSize: 13,
-                        }}
-                      >
-                        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                          <span style={{ fontWeight: 600, color: "var(--accent)" }}>
-                            {msg.role}
-                          </span>
+                      <div key={msg.id} className="kea-message">
+                        <div className="kea-message__meta">
+                          <span className="kea-message__role">{msg.role}</span>
                           <span className="kea-muted">{msg.created_at}</span>
                         </div>
-                        <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-                          {msg.content}
-                        </div>
+                        <div className="kea-message__body">{msg.content}</div>
                       </div>
                     ))}
                   </div>
@@ -476,10 +454,6 @@ export default function HistoryPage() {
           </>
         )}
         </aside>
-      )}
-
-      {status && (
-        <p style={{ marginTop: 12, fontSize: 13, color: "var(--danger)" }}>{status}</p>
       )}
     </div>
   );

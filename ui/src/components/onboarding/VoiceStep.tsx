@@ -267,7 +267,7 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
   return (
     <div>
       <section style={{ marginBottom: 24 }}>
-        <h3 style={{ margin: "0 0 4px" }}>Speech to text</h3>
+        <h2 style={{ margin: "0 0 4px" }}>Speech to text</h2>
         <p className="kea-muted" style={{ margin: "0 0 12px" }}>
           How KEA turns your voice into words for dictation and meetings.
         </p>
@@ -329,7 +329,7 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
       </section>
 
       <section>
-        <h3 style={{ margin: "0 0 4px" }}>Text to speech</h3>
+        <h2 style={{ margin: "0 0 4px" }}>Text to speech</h2>
         <p className="kea-muted" style={{ margin: "0 0 12px" }}>
           The voice KEA uses to read text aloud.
         </p>

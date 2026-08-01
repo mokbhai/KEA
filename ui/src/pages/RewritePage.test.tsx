@@ -27,6 +27,16 @@ function mockWorld(options: Parameters<typeof featureHandlers>[0] = {}) {
 describe("RewritePage", () => {
   beforeEach(() => resetTauriMocks());
 
+  it("titles the page with the only h1", async () => {
+    mockWorld();
+    render(<RewritePage />);
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Rewrite" }),
+    ).toBeTruthy();
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+  });
+
   it("warns when nothing is set up and offers a way to choose", async () => {
     // Two engines and no binding: the backend would ask for a choice.
     mockWorld({ engines: { llm: ["openai", "openai-compatible"] } });

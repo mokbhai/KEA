@@ -6,49 +6,71 @@ type Props = {
   onSelect: (id: number) => void;
 };
 
+/** Status text carries meaning, so it gets a token colour rather than --accent. */
+export function statusClass(status: string): string {
+  if (status === "ok" || status === "success") return "kea-status--ok";
+  if (status === "error" || status === "failed") return "kea-status--error";
+  return "kea-status--muted";
+}
+
 export default function HistoryPanel({ actions, selectedId, onSelect }: Props) {
   if (actions.length === 0) {
     return (
-      <p className="kea-muted" style={{ marginTop: 16 }}>
-        No actions recorded yet. Run rewrite, dictation, meetings, or read-aloud to
-        populate history.
-      </p>
+      <div className="kea-card">
+        <p className="kea-muted" style={{ margin: 0 }}>
+          No actions recorded yet. Run rewrite, dictation, meetings, or read-aloud to
+          populate history.
+        </p>
+      </div>
     );
   }
 
   return (
-    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
-      <thead>
-        <tr style={{ borderBottom: "1px solid var(--border)", textAlign: "left" }}>
-          <th style={{ padding: "8px 4px" }}>ID</th>
-          <th style={{ padding: "8px 4px" }}>Feature</th>
-          <th style={{ padding: "8px 4px" }}>Command</th>
-          <th style={{ padding: "8px 4px" }}>Engine</th>
-          <th style={{ padding: "8px 4px" }}>Status</th>
-        </tr>
-      </thead>
-      <tbody>
-        {actions.map((action) => {
-          const selected = selectedId === action.id;
-          return (
-            <tr
-              key={action.id}
-              onClick={() => onSelect(action.id)}
-              style={{
-                borderBottom: "1px solid var(--border)",
-                cursor: "pointer",
-                background: selected ? "var(--surface-2)" : undefined,
-              }}
-            >
-              <td style={{ padding: "10px 4px" }}>{action.id}</td>
-              <td style={{ padding: "10px 4px" }}>{action.feature_id}</td>
-              <td style={{ padding: "10px 4px" }}>{action.command}</td>
-              <td style={{ padding: "10px 4px" }}>{action.engine_id}</td>
-              <td style={{ padding: "10px 4px" }}>{action.status}</td>
-            </tr>
-          );
-        })}
-      </tbody>
-    </table>
+    <div className="kea-table-wrap">
+      <table className="kea-table">
+        <caption className="kea-visually-hidden">Recorded actions</caption>
+        <thead>
+          <tr>
+            <th scope="col">ID</th>
+            <th scope="col">Feature</th>
+            <th scope="col">Command</th>
+            <th scope="col">Engine</th>
+            <th scope="col">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {actions.map((action) => {
+            const selected = selectedId === action.id;
+            return (
+              <tr
+                key={action.id}
+                aria-current={selected ? "true" : undefined}
+                onClick={() => onSelect(action.id)}
+              >
+                <td>
+                  {/* The row stays clickable; this is the part that takes a tab
+                      stop, so the detail is reachable without a mouse. */}
+                  <button
+                    type="button"
+                    className="kea-table__select"
+                    aria-label={`Show action ${action.id}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSelect(action.id);
+                    }}
+                  >
+                    {action.id}
+                  </button>
+                </td>
+                <td>{action.feature_id}</td>
+                <td>{action.command}</td>
+                <td>{action.engine_id}</td>
+                <td className={statusClass(action.status)}>{action.status}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
   );
 }
