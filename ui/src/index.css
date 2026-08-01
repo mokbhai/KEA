@@ -825,10 +825,14 @@ a:hover {
   background: none;
   border: none;
   cursor: pointer;
+  /* Underlined at rest, not just on hover: --accent only reaches 2.61:1
+     against the --text in the cells around it in dark theme, so colour alone
+     cannot be what marks this cell as actionable. */
+  text-decoration: underline;
 }
 
 .kea-table__select:hover {
-  text-decoration: underline;
+  text-decoration-thickness: 2px;
 }
 
 .kea-table__actions {
