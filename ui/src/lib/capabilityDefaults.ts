@@ -189,11 +189,15 @@ function ownsSettings(capability: Capability, target: BindingTarget): boolean {
  * consistent. The single write path shared by the DefaultsPicker (both the
  * defaults on AI Providers and the per-feature overrides) and the wizard.
  *
- * The settings-level model is the *fallback* used when a binding carries no
- * model of its own, so it must mirror the choice for every engine — not only
- * the two local ones. A Parakeet or cloud pick that left a stale whisper id
- * behind would hand that id to the new engine the moment a binding without a
- * model resolved. Picks with no model of their own (OpenAI voices) clear it.
+ * The settings-level model is the fallback for whichever engine a *model-less*
+ * binding later resolves to — it is not scoped to the engine picked here
+ * (crates/features/src/dictation.rs: `binding.model.or(settings.active_model)`).
+ * So a pick either mirrors a model that engine could load, or clears the
+ * setting; it must never substitute an id from a different model namespace.
+ * `dictation.active_model` has only ever meant a whisper id, and whisper/null
+ * bindings are reachable (the local onboarding path writes one), so a Parakeet
+ * or cloud STT pick clears it rather than writing an id whisper can't load.
+ * Either way no stale model survives a pick that disagrees with it.
  */
 export async function applyDefaultChoice(
   capability: Capability,
@@ -205,15 +209,24 @@ export async function applyDefaultChoice(
   await setBinding(to.feature, to.slot, choice.engine, choice.model, choice.providerRef);
   if (!ownsSettings(capability, to)) return;
   if (capability === "stt") {
+    // Only whisper ids are loadable through this fallback; anything else
+    // (parakeet's separate ONNX namespace, a cloud id like "whisper-1")
+    // would fail as "model not installed" the next time a model-less local
+    // binding resolved.
+    const nextModel = choice.engine === "whisper" ? choice.model : null;
     const settings = await getDictationSettings();
-    if (settings.active_model !== choice.model) {
-      await setDictationSettings({ ...settings, active_model: choice.model });
+    if (settings.active_model !== nextModel) {
+      await setDictationSettings({ ...settings, active_model: nextModel });
     }
   } else if (capability === "tts") {
+    // Same rule as above: tts.active_model is the fallback for a model-less
+    // binding, and only sherpa's own ids are loadable through it. A cloud
+    // pick clears it — its binding carries the cloud model already.
+    const nextModel = choice.engine === "sherpa-tts" ? choice.model : null;
     const settings = await getTtsSettings();
     const next = {
       ...settings,
-      active_model: choice.model,
+      active_model: nextModel,
       active_voice: voice ?? settings.active_voice,
     };
     if (

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   getBinding,
   listProviders,
@@ -6,6 +6,7 @@ import {
   type Binding,
   type Provider,
 } from "../api";
+import { useModelDownloads } from "../hooks/useModelDownloads";
 import type { PendingActivation } from "../hooks/usePendingActivation";
 import {
   buildCapabilityOptions,
@@ -83,7 +84,7 @@ export default function DefaultsPicker({
   const voiceRef = useRef(voice);
   voiceRef.current = voice;
 
-  const { savedId, error, progressById, clearFeedback, setError } = activation;
+  const { savedId, error, clearFeedback, setError } = activation;
   // Only one activation at a time, wherever it was started from.
   const busy = activation.pending !== null;
   // A download started for another slot keeps running; only show it as
@@ -129,6 +130,25 @@ export default function DefaultsPicker({
     };
   }, [open, capability, targetFeature, targetSlot, clearFeedback, setError]);
 
+  const downloadableIds = useMemo(
+    () => new Set(options.flatMap((o) => (o.downloadKind && o.model ? [o.model] : []))),
+    [options],
+  );
+
+  // Display only — activating is the hoisted flow's job. Watching the whole
+  // catalog (not just the pending model) keeps a download started on the
+  // Models page visible here, and stops an already-installed row from still
+  // offering to download.
+  const { progressById } = useModelDownloads({
+    catalogIds: downloadableIds,
+    onComplete: (modelId) =>
+      setOptions((prev) =>
+        prev.map((o) =>
+          o.model === modelId ? { ...o, installed: true, status: "installed ✓" } : o,
+        ),
+      ),
+  });
+
   // Reflect a finished download in the list even when this picker was closed
   // while it ran.
   useEffect(() => {
@@ -143,7 +163,11 @@ export default function DefaultsPicker({
     activation.start({
       capability,
       option,
-      voice: capability === "tts" ? voiceRef.current : null,
+      // Only the options that expose the voice dropdown carry a voice; the
+      // dropdown always has a value, so sending it for a local pick would
+      // overwrite the user's saved cloud voice with "alloy". Same predicate
+      // the preview button uses below.
+      voice: option.cloudVoices ? voiceRef.current : null,
       target: { feature: targetFeature, slot: targetSlot },
     });
 

@@ -42,6 +42,12 @@ export type PendingActivation = {
  * set. Held by the page (or the card) instead, the choice is applied when the
  * download finishes whether or not the picker is still on screen, and
  * `onApplied` refreshes the surface behind it.
+ *
+ * Known residual: the state lives no higher than the page, so navigating away
+ * mid-download still drops the activation (the download itself continues, and
+ * the model shows up as installed). Lifting it to app level or to a module
+ * store would close that gap; issue #3 asked only that closing the popover
+ * stop losing the choice.
  */
 export function usePendingActivation(onApplied?: () => void): PendingActivation {
   const [pending, setPending] = useState<ActivationRequest | null>(null);

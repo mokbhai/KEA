@@ -304,9 +304,50 @@ describe("DefaultsPicker", () => {
 
     await userEvent.click(await screen.findByRole("button", { name: /Parakeet v2/ }));
 
+    // Cleared, not replaced: dictation.active_model is the fallback for
+    // whichever engine a model-less binding resolves to, and parakeet ids
+    // live in a different namespace from whisper's.
     await waitFor(() => expect(invokeCalls("set_dictation_settings")).toHaveLength(1));
     expect(invokeCalls("set_dictation_settings")[0]).toEqual({
-      settings: { post_process: true, active_model: "parakeet-v2" },
+      settings: { post_process: true, active_model: null },
+    });
+  });
+
+  it("never leaves a dictation model that a local engine could not load", async () => {
+    // The break this guards: local onboarding leaves default stt =
+    // whisper/null; the user sets a dictation override to OpenAI whisper-1;
+    // "use default again" deletes the override; resolve falls back to
+    // whisper/null, takes the model from active_model and whisper fails with
+    // "model not installed: whisper-1". So a cloud pick must clear the
+    // fallback rather than mirror its own model id into it.
+    mockSttWorld({ installed: ["whisper-base"] });
+    onInvoke({
+      list_providers: () => [{ provider_ref: "openai", name: "OpenAI", built_in: true }],
+      get_binding: () => null,
+      has_credential: () => true,
+      list_whisper_models: () => WHISPER_CATALOG,
+      list_installed_whisper_models: () => ["whisper-base"],
+      list_onnx_models: () => [],
+      list_installed_onnx_models: () => [],
+      set_binding: () => undefined,
+      // Left over from an earlier local pick.
+      get_dictation_settings: () => ({ post_process: false, active_model: "whisper-base" }),
+      set_dictation_settings: () => undefined,
+    });
+    render(<Harness capability="stt" target={{ feature: "dictation", slot: "stt" }} />);
+
+    await userEvent.click(await screen.findByRole("button", { name: /OpenAI whisper-1/ }));
+
+    await waitFor(() => expect(invokeCalls("set_dictation_settings")).toHaveLength(1));
+    const written = invokeCalls("set_dictation_settings")[0] as {
+      settings: { active_model: string | null };
+    };
+    expect(written.settings.active_model).toBeNull();
+    expect(written.settings.active_model).not.toBe("whisper-1");
+    // The binding itself still carries the cloud model.
+    expect(invokeCalls("set_binding")[0]).toMatchObject({
+      engine: "openai-stt",
+      model: "whisper-1",
     });
   });
 
@@ -330,6 +371,38 @@ describe("DefaultsPicker", () => {
     await waitFor(() => expect(invokeCalls("set_tts_settings")).toHaveLength(1));
     expect(invokeCalls("set_tts_settings")[0]).toEqual({
       settings: { active_voice: "alloy", active_model: null },
+    });
+  });
+
+  it("keeps the saved cloud voice when picking a local voice", async () => {
+    // The voice dropdown always has a value, so a local pick must not send
+    // it: that would silently reset a saved "nova" back to "alloy".
+    onInvoke({
+      list_providers: () => [{ provider_ref: "openai", name: "OpenAI", built_in: true }],
+      get_binding: () => null,
+      has_credential: () => true,
+      list_onnx_models: () => [
+        {
+          id: "vits-piper-en-us-amy-low",
+          display_name: "Amy",
+          language: "English",
+          url: "",
+          size_bytes: 20 * MB,
+          sha256: "",
+        },
+      ],
+      list_installed_onnx_models: () => ["vits-piper-en-us-amy-low"],
+      set_binding: () => undefined,
+      get_tts_settings: () => ({ active_voice: "nova", active_model: null }),
+      set_tts_settings: () => undefined,
+    });
+    render(<Harness capability="tts" />);
+
+    await userEvent.click(await screen.findByRole("button", { name: /^Amy/ }));
+
+    await waitFor(() => expect(invokeCalls("set_tts_settings")).toHaveLength(1));
+    expect(invokeCalls("set_tts_settings")[0]).toEqual({
+      settings: { active_voice: "nova", active_model: "vits-piper-en-us-amy-low" },
     });
   });
 });
