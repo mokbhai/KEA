@@ -2,7 +2,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { onInvoke, resetTauriMocks } from "./test-utils/tauri";
-import { featureHandlers } from "./test-utils/featureWorld";
+import { featureHandlers, openAiBinding } from "./test-utils/featureWorld";
 import App from "./App";
 
 vi.mock("@tauri-apps/api/core", async () => (await import("./test-utils/tauri")).coreModule);
@@ -73,20 +73,24 @@ describe("AppShell", () => {
     });
   });
 
-  it("keeps the theme toggle and version out of the navigation landmark", async () => {
+  it("puts the theme toggle and version in their own landmark, not the nav", async () => {
     await renderShell();
 
     const nav = screen.getByRole("navigation", { name: "Main navigation" });
     expect(
       within(nav).queryByRole("button", { name: /Switch to (light|dark) mode/ }),
     ).toBeNull();
-    expect(
-      screen.getByRole("button", { name: /Switch to (light|dark) mode/ }),
-    ).toBeTruthy();
-    await waitFor(() => expect(screen.getByText("v0.1.0")).toBeTruthy());
     expect(within(nav).queryByText("v0.1.0")).toBeNull();
+
+    // Not merely outside <nav> — inside a region of its own, so it is not
+    // orphaned outside every landmark.
+    const footer = screen.getByRole("region", { name: "Theme and version" });
+    expect(
+      within(footer).getByRole("button", { name: /Switch to (light|dark) mode/ }),
+    ).toBeTruthy();
+    await waitFor(() => expect(within(footer).getByText("v0.1.0")).toBeTruthy());
     // Still inside the same sidebar column, so nothing moved visually.
-    expect(drawer().contains(screen.getByText("v0.1.0"))).toBe(true);
+    expect(drawer().contains(footer)).toBe(true);
   });
 
   it("takes the mobile layout from matchMedia, not window.innerWidth", async () => {
@@ -157,6 +161,54 @@ describe("AppShell", () => {
 
     await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
     expect(document.activeElement).toBe(last);
+  });
+
+  it("shuts the page behind the open drawer out too", async () => {
+    narrow = true;
+    await renderShell();
+
+    const main = document.querySelector("main")!;
+    expect(main.hasAttribute("inert")).toBe(false);
+
+    await userEvent.click(screen.getByRole("button", { name: "Open menu" }));
+    // Tab is trapped, but a virtual cursor or a pointer would otherwise still
+    // reach the page underneath.
+    await waitFor(() => expect(main.hasAttribute("inert")).toBe(true));
+
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(main.hasAttribute("inert")).toBe(false));
+  });
+
+  it("leaves focus alone when navigating with the drawer closed", async () => {
+    // A feature banner's fix action calls the same navigate() the nav items
+    // do. On mobile that closes the (already closed) drawer, which must not
+    // drag focus up to the topbar.
+    onInvoke(
+      featureHandlers({
+        engines: { llm: ["openai"] },
+        hasKey: false,
+        bindings: { "default/llm": openAiBinding("openai", "gpt-4o-mini") },
+        extra: {
+          get_setting: (args) => (args?.key === "onboarding.completed" ? "true" : null),
+          set_setting: () => undefined,
+          list_presets: () => [],
+          get_prompt_override: () => null,
+          list_whisper_models: () => [],
+          list_installed_whisper_models: () => [],
+        },
+      }),
+    );
+    narrow = true;
+    await renderShell();
+
+    const menuButton = screen.getByRole("button", { name: "Open menu" });
+    const fix = await screen.findByRole("button", { name: "Open AI Providers" });
+    await userEvent.click(fix);
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "AI Providers" }),
+    ).toBeTruthy();
+    expect(document.activeElement).not.toBe(menuButton);
   });
 
   it("closes the drawer after navigating from it", async () => {

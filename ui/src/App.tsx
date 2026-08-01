@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type MutableRefObject,
+} from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { getBinding, getSetting, setSetting, onDictationError, onMeetingError, onRewriteError, onRewriteProgress, onTtsError, onTtsState } from "./api";
 import Onboarding from "./components/Onboarding";
@@ -62,6 +68,27 @@ function useIsMobile() {
   return isMobile;
 }
 
+/**
+ * Applies the `inert` attribute to a node. React 18 has no `inert` prop, and an
+ * effect would miss the first mount of anything that appears later than the
+ * shell — the drawer only mounts once the onboarding check resolves — so this
+ * runs as a callback ref instead.
+ */
+function useInertRef<T extends HTMLElement>(
+  inert: boolean,
+  store?: MutableRefObject<T | null>,
+) {
+  return useCallback(
+    (node: T | null) => {
+      if (store) store.current = node;
+      if (!node) return;
+      if (inert) node.setAttribute("inert", "");
+      else node.removeAttribute("inert");
+    },
+    [inert, store],
+  );
+}
+
 function AppShell() {
   const [page, setPage] = useState<Page>("rewrite");
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -72,12 +99,14 @@ function AppShell() {
   const drawerRef = useRef<HTMLDivElement | null>(null);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
 
-  // Only ever called while the drawer is open (its triggers all live inside it
-  // or on the backdrop), so focus goes back where it came from rather than
-  // being dropped on <body>.
   const closeDrawer = useCallback(() => {
+    // Reclaim focus only if the drawer actually held it. navigate() also
+    // closes the drawer, and on mobile it runs for in-page navigation too —
+    // a feature banner's "Open AI Providers", say, with the drawer never
+    // open. Focusing the hamburger there would yank the user to the topbar.
+    const hadFocus = drawerRef.current?.contains(document.activeElement) ?? false;
     setDrawerOpen(false);
-    menuButtonRef.current?.focus();
+    if (hadFocus) menuButtonRef.current?.focus();
   }, []);
 
   const [onboarding, setOnboarding] = useState<"loading" | "show" | "hide">("loading");
@@ -129,23 +158,13 @@ function AppShell() {
     if (!isMobile) setDrawerOpen(false);
   }, [isMobile]);
 
-  // A drawer that is off-screen must not be tabbable. `visibility: hidden`
-  // does that in CSS; `inert` states it for assistive tech too and is honoured
-  // by every engine KEA ships on (WebKit 15.5+, Chromium 102+, Gecko 112+).
-  // It goes through the DOM because React 18 has no `inert` prop, and through a
-  // callback ref rather than an effect so it also applies on the drawer's first
-  // mount — which happens later than the shell's, once the onboarding check
-  // resolves.
-  const drawerClosed = isMobile && !drawerOpen;
-  const attachDrawer = useCallback(
-    (node: HTMLDivElement | null) => {
-      drawerRef.current = node;
-      if (!node) return;
-      if (drawerClosed) node.setAttribute("inert", "");
-      else node.removeAttribute("inert");
-    },
-    [drawerClosed],
-  );
+  // A drawer that is off-screen must not be tabbable, and an open one must not
+  // leave the page behind it reachable — Tab is trapped, but a virtual cursor
+  // or a pointer would still get there. `visibility: hidden` covers the closed
+  // drawer in CSS; `inert` states both for assistive tech and is honoured by
+  // every engine KEA ships on (WebKit 15.5+, Chromium 102+, Gecko 112+).
+  const attachDrawer = useInertRef(isMobile && !drawerOpen, drawerRef);
+  const attachMain = useInertRef(isMobile && drawerOpen);
 
   // While the drawer is open it owns the keyboard: Escape closes it and Tab
   // cycles inside it instead of wandering into the page behind.
@@ -332,7 +351,9 @@ function AppShell() {
             {navItem("logs", "Logs", "🛠")}
           </nav>
 
-          <div className="kea-sidebar__footer">
+          {/* A labelled section, so the toggle and version sit in a landmark
+              of their own instead of being orphaned outside every one. */}
+          <section className="kea-sidebar__footer" aria-label="Theme and version">
             <button
               type="button"
               className="kea-icon-btn"
@@ -342,10 +363,12 @@ function AppShell() {
               {theme === "dark" ? "☀️" : "🌙"}
             </button>
             <span className="kea-muted">{version ? `v${version}` : ""}</span>
-          </div>
+          </section>
         </div>
 
-        <main className="kea-main">{renderPage()}</main>
+        <main className="kea-main" ref={attachMain}>
+          {renderPage()}
+        </main>
       </div>
 
       <SpeechOverlay />
