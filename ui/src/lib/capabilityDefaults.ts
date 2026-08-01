@@ -177,6 +177,9 @@ export const defaultTarget = (capability: Capability): BindingTarget => ({
  */
 function ownsSettings(capability: Capability, target: BindingTarget): boolean {
   if (target.feature === "default") return true;
+  // Only the STT and TTS settings have a per-feature owner; there is no
+  // equivalent for text, so an llm override never writes one.
+  if (capability === "llm") return false;
   return capability === "stt" ? target.feature === "dictation" : target.feature === "tts";
 }
 

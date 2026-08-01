@@ -1978,6 +1978,12 @@ pub async fn trigger_rewrite(
 /// pastes anything back — it exists for the "Try it" card on the Rewrite page,
 /// where the user types the sample text and expects to read the result in the
 /// window rather than have it inserted into whatever app is frontmost.
+///
+/// It also deliberately skips the `ActionRepo` record/finish pair and the
+/// conversation storage that [`execute_rewrite`] performs, so a try-it run
+/// leaves no trace in History or Logs. Experimenting in the settings window is
+/// not something the user did to their own text, and padding their history
+/// with it would bury the runs that were.
 #[tauri::command]
 pub async fn preview_rewrite(
     state: State<'_, Arc<AppState>>,
