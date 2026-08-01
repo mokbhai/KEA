@@ -5,7 +5,7 @@ use kea_core::meetings::{
 };
 use kea_core::resolve::{Resolution, SlotResolver};
 use kea_core::store::actions::{ActionRepo, NewAction};
-use kea_core::store::bindings::BindingRepo;
+use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_core::store::meetings::{Meeting, MeetingDetail, MeetingNotes, MeetingRepo, NewMeeting, NewSegment};
 use kea_engines::EngineRegistry;
 use kea_engines::traits::{AudioPcm, SttOpts, Transcript};
@@ -101,13 +101,13 @@ fn new_meeting_id() -> String {
     format!("meeting-{millis}")
 }
 
-async fn resolve_stt_engine_id(
+async fn resolve_stt_binding(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
-) -> Result<String, String> {
+) -> Result<Binding, String> {
     let resolver = SlotResolver::new(engines, bindings);
     match resolver.resolve_stt("meetings", "stt").await {
-        Ok(Resolution::Bound(id)) => Ok(id),
+        Ok(Resolution::Bound(b)) => Ok(b),
         Ok(Resolution::NeedsChoice(_)) => {
             Err("multiple stt engines available; bind the meetings stt slot".into())
         }
@@ -116,13 +116,13 @@ async fn resolve_stt_engine_id(
     }
 }
 
-async fn resolve_llm_engine_id(
+async fn resolve_llm_binding(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
-) -> Result<String, String> {
+) -> Result<Binding, String> {
     let resolver = SlotResolver::new(engines, bindings);
     match resolver.resolve_llm("meetings", "llm").await {
-        Ok(Resolution::Bound(id)) => Ok(id),
+        Ok(Resolution::Bound(b)) => Ok(b),
         Ok(Resolution::NeedsChoice(_)) => {
             Err("multiple llm engines available; bind the meetings llm slot".into())
         }
@@ -147,20 +147,17 @@ pub async fn transcribe_meeting_segment(
     bindings: &BindingRepo,
     audio: &PcmFrame,
 ) -> Result<String, String> {
-    let engine_id = resolve_stt_engine_id(engines, bindings).await?;
-    let binding = bindings
-        .get("meetings", "stt")
-        .await
-        .map_err(|e| e.to_string())?;
+    let binding = resolve_stt_binding(engines, bindings).await?;
+    let engine_id = &binding.engine_id;
 
     let engine = engines
-        .stt(&engine_id)
+        .stt(engine_id)
         .ok_or_else(|| format!("no stt engine '{engine_id}'"))?;
 
     let stt_opts = SttOpts {
-        model: binding.as_ref().and_then(|b| b.model.clone()),
+        model: binding.model.clone(),
         language: None,
-        provider_ref: binding.as_ref().and_then(|b| b.provider_ref.clone()),
+        provider_ref: binding.provider_ref.clone(),
     };
 
     let transcript = transcribe_pcm_segment(engine.as_ref(), audio, stt_opts)
@@ -176,19 +173,16 @@ pub async fn synthesize_meeting_notes(
     meeting: &Meeting,
     segments: &[kea_core::MeetingSegment],
 ) -> Result<MeetingNotes, String> {
-    let engine_id = resolve_llm_engine_id(engines, bindings).await?;
-    let binding = bindings
-        .get("meetings", "llm")
-        .await
-        .map_err(|e| e.to_string())?;
+    let binding = resolve_llm_binding(engines, bindings).await?;
+    let engine_id = &binding.engine_id;
 
     let engine = engines
-        .llm(&engine_id)
+        .llm(engine_id)
         .ok_or_else(|| format!("no llm engine '{engine_id}'"))?;
 
     let transcript = format_transcript_for_synthesis(segments);
     let mut req = build_meeting_notes_request(&meeting.title, &meeting.started_at, &transcript);
-    req.model = binding.as_ref().and_then(|b| b.model.clone());
+    req.model = binding.model.clone();
     let resp = engine.complete(req).await.map_err(|e| e.to_string())?;
     let parsed = parse_meeting_notes_json(&resp.text).map_err(|e| e.to_string())?;
 
@@ -200,8 +194,8 @@ pub async fn synthesize_meeting_notes(
         follow_ups: parsed.follow_ups,
         open_questions: parsed.open_questions,
         prompt_version: MEETING_NOTES_PROMPT_VERSION.to_string(),
-        engine_id: Some(engine_id),
-        model: binding.as_ref().and_then(|b| b.model.clone()),
+        engine_id: Some(binding.engine_id.clone()),
+        model: binding.model.clone(),
     })
 }
 
@@ -210,18 +204,15 @@ pub async fn synthesize_meeting_title(
     bindings: &BindingRepo,
     summary: &str,
 ) -> Result<String, String> {
-    let engine_id = resolve_llm_engine_id(engines, bindings).await?;
-    let binding = bindings
-        .get("meetings", "llm")
-        .await
-        .map_err(|e| e.to_string())?;
+    let binding = resolve_llm_binding(engines, bindings).await?;
+    let engine_id = &binding.engine_id;
 
     let engine = engines
-        .llm(&engine_id)
+        .llm(engine_id)
         .ok_or_else(|| format!("no llm engine '{engine_id}'"))?;
 
     let mut req = build_meeting_title_request(summary);
-    req.model = binding.as_ref().and_then(|b| b.model.clone());
+    req.model = binding.model.clone();
     let resp = engine.complete(req).await.map_err(|e| e.to_string())?;
     Ok(sanitize_meeting_title(&resp.text))
 }
@@ -286,17 +277,11 @@ async fn append_transcribed_segment(
 }
 
 pub async fn run_meeting_start(ctx: &mut MeetingRunContext<'_>) -> Result<ActiveMeeting, String> {
-    let stt_engine_id = resolve_stt_engine_id(ctx.engines, ctx.bindings).await?;
-    let llm_engine_id = resolve_llm_engine_id(ctx.engines, ctx.bindings).await?;
+    let stt_binding = resolve_stt_binding(ctx.engines, ctx.bindings).await?;
+    let llm_binding = resolve_llm_binding(ctx.engines, ctx.bindings).await?;
 
     let capture_mode = capture_mode(ctx.audio.system_audio_capability(), ctx.settings.prefer_system_audio);
     let meeting_id = new_meeting_id();
-
-    let binding = ctx
-        .bindings
-        .get("meetings", "stt")
-        .await
-        .map_err(|e| e.to_string())?;
 
     // Acquire the capture gate FIRST. The audio layer admits exactly one
     // recorder, so a losing concurrent start (button + hotkey, or a double
@@ -313,8 +298,8 @@ pub async fn run_meeting_start(ctx: &mut MeetingRunContext<'_>) -> Result<Active
             id: meeting_id.clone(),
             title: "Untitled Meeting".into(),
             capture_mode: capture_mode.into(),
-            stt_engine_id: Some(stt_engine_id.clone()),
-            llm_engine_id: Some(llm_engine_id),
+            stt_engine_id: Some(stt_binding.engine_id.clone()),
+            llm_engine_id: Some(llm_binding.engine_id),
         })
         .await
     {
@@ -327,9 +312,9 @@ pub async fn run_meeting_start(ctx: &mut MeetingRunContext<'_>) -> Result<Active
         .record(NewAction {
             feature_id: "meetings".into(),
             command: "toggle_meeting".into(),
-            engine_id: stt_engine_id,
-            model: binding.as_ref().and_then(|b| b.model.clone()),
-            provider_ref: binding.as_ref().and_then(|b| b.provider_ref.clone()),
+            engine_id: stt_binding.engine_id,
+            model: stt_binding.model,
+            provider_ref: stt_binding.provider_ref,
         })
         .await
     {

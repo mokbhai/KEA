@@ -60,19 +60,15 @@ pub async fn run_tts_synthesize(
     }
 
     let resolver = SlotResolver::new(engines, bindings);
-    let engine_id = match resolver.resolve_tts("tts", "tts").await {
-        Ok(Resolution::Bound(id)) => id,
+    let binding = match resolver.resolve_tts("tts", "tts").await {
+        Ok(Resolution::Bound(b)) => b,
         Ok(Resolution::NeedsChoice(_)) => {
             return Err("multiple tts engines available; bind the tts tts slot".into());
         }
         Ok(Resolution::Unresolvable) => return Err("no tts engine available".into()),
         Err(e) => return Err(e.to_string()),
     };
-
-    let binding = bindings
-        .get("tts", "tts")
-        .await
-        .map_err(|e| e.to_string())?;
+    let engine_id = binding.engine_id.clone();
 
     let action_id = actions
         .record(NewAction {
@@ -80,10 +76,10 @@ pub async fn run_tts_synthesize(
             command: "read_selection".into(),
             engine_id: engine_id.clone(),
             model: binding
-                .as_ref()
-                .and_then(|b| b.model.clone())
+                .model
+                .clone()
                 .or_else(|| settings.active_model.clone()),
-            provider_ref: binding.as_ref().and_then(|b| b.provider_ref.clone()),
+            provider_ref: binding.provider_ref.clone(),
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -105,12 +101,12 @@ pub async fn run_tts_synthesize(
 
     let tts_opts = TtsOpts {
         model: binding
-            .as_ref()
-            .and_then(|b| b.model.clone())
+            .model
+            .clone()
             .or_else(|| settings.active_model.clone()),
         voice: settings.active_voice.clone(),
         format: None,
-        provider_ref: binding.as_ref().and_then(|b| b.provider_ref.clone()),
+        provider_ref: binding.provider_ref.clone(),
     };
 
     let pcm = match engine.synthesize(&text, tts_opts).await {

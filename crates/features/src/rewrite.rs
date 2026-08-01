@@ -164,33 +164,29 @@ pub async fn run_rewrite_with_storage(
     }
 
     let resolver = SlotResolver::new(engines, bindings);
-    let engine_id = match resolver.resolve_llm("rewrite", "llm").await {
-        Ok(Resolution::Bound(id)) => id,
+    let binding = match resolver.resolve_llm("rewrite", "llm").await {
+        Ok(Resolution::Bound(b)) => b,
         Ok(Resolution::NeedsChoice(_)) => {
             return Err("multiple llm engines available; bind the rewrite llm slot".into());
         }
         Ok(Resolution::Unresolvable) => return Err("no llm engine available".into()),
         Err(e) => return Err(e.to_string()),
     };
-
-    let binding = bindings
-        .get("rewrite", "llm")
-        .await
-        .map_err(|e| e.to_string())?;
+    let engine_id = binding.engine_id.clone();
 
     let mut llm_req = build_llm_request(&input, presets, overrides)
         .await
         .map_err(|e| e.to_string())?;
 
-    llm_req.model = binding.as_ref().and_then(|b| b.model.clone());
+    llm_req.model = binding.model.clone();
 
     let action_id = actions
         .record(NewAction {
             feature_id: "rewrite".into(),
             command: "rewrite_selection".into(),
             engine_id: engine_id.clone(),
-            model: binding.as_ref().and_then(|b| b.model.clone()),
-            provider_ref: binding.as_ref().and_then(|b| b.provider_ref.clone()),
+            model: binding.model.clone(),
+            provider_ref: binding.provider_ref.clone(),
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -243,8 +239,8 @@ pub async fn run_rewrite_with_storage(
         action_id,
         "rewrite",
         &engine_id,
-        binding.as_ref().and_then(|b| b.model.clone()),
-        binding.as_ref().and_then(|b| b.provider_ref.clone()),
+        binding.model.clone(),
+        binding.provider_ref.clone(),
         &input.source_text,
         &response.text,
     )

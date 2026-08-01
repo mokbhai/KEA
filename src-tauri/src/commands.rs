@@ -1975,7 +1975,7 @@ pub async fn run_demo(state: State<'_, Arc<AppState>>, prompt: String) -> Result
         .await
         .map_err(|e| e.to_string())?
     {
-        Resolution::Bound(id) => id,
+        Resolution::Bound(b) => b.engine_id,
         other => return Err(resolution_error(other).unwrap_or_else(|| "resolution failed".into())),
     };
     run_ping(&state.engines, &engine_id, &prompt).await
@@ -2669,7 +2669,12 @@ mod tests {
 
     #[test]
     fn resolution_error_maps_outcomes() {
-        assert!(resolution_error(Resolution::Bound("openai".into())).is_none());
+        assert!(resolution_error(Resolution::Bound(Binding {
+            engine_id: "openai".into(),
+            model: None,
+            provider_ref: None,
+        }))
+        .is_none());
         assert_eq!(
             resolution_error(Resolution::Unresolvable),
             Some("no llm engine available".into())
