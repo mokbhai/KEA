@@ -5,7 +5,14 @@
   --surface-2: #eef0f3;
   --text: #1a1d21;
   --text-muted: #5c6370;
+  /* Decorative container edge (cards, topbar, sidebar). Deliberately below
+     3:1 — it identifies nothing on its own, so 1.4.11 does not apply. */
   --border: #d8dce2;
+  /* Separator that has to stay readable as a *separator* rather than as
+     decoration: the .kea-table row rules. Structure is still conveyed by the
+     table markup, so this is not a 1.4.11 3:1 case, but 1.38:1 was too faint
+     to actually divide adjacent rows. See palette.contrast.test.ts. */
+  --border-strong: #adb5c0;
   --accent: #2563eb;
   --accent-text: #ffffff;
   --btn-bg: #ffffff;
@@ -14,7 +21,10 @@
   --btn-hover-bg: #eef0f3;
   --input-bg: #ffffff;
   --input-text: #1a1d21;
-  --input-border: #c5cad2;
+  /* The 1px box is the *only* boundary of every .kea-input / .kea-select, so
+     it is a 1.4.11 non-text control boundary and must clear 3:1 against
+     --surface. The old #c5cad2 measured 1.65:1. */
+  --input-border: #888f99;
   --underline: #2563eb;
   --danger: #b91c1c;
   --ok: #15803d;
@@ -37,16 +47,26 @@
   --text: #e6e8eb;
   --text-muted: #9aa0ab;
   --border: #30343c;
-  --accent: #4c8dff;
-  --accent-text: #ffffff;
+  --border-strong: #505663;
+  /* Lifted from #4c8dff: as a foreground on --surface-2 it measured 4.49:1,
+     one hundredth short of 4.5 for the active nav item and the current picker
+     option. Raising luminance is the only lever — contrast is luminance-only,
+     and --surface-2 cannot be darkened without collapsing the elevation step
+     above --surface. */
+  --accent: #5a97ff;
+  /* White label on the lifted --accent would be 2.98:1, and was already only
+     3.20:1 on the old accent. A light accent in a dark theme takes dark ink,
+     not white — this is the same near-black as --bg, so it stays in palette. */
+  --accent-text: #16181d;
   --btn-bg: #262a33;
   --btn-text: #e6e8eb;
   --btn-border: #30343c;
   --btn-hover-bg: #30343c;
   --input-bg: #1e2128;
   --input-text: #e6e8eb;
-  --input-border: #404650;
-  --underline: #4c8dff;
+  /* See the light-theme note: 1.4.11 boundary, was #404650 at 1.70:1. */
+  --input-border: #6a717d;
+  --underline: #5a97ff;
   --danger: #f87171;
   --ok: #4ade80;
   --ok-bg: rgba(74, 222, 128, 0.12);
@@ -58,7 +78,12 @@
      --surface, so both edges of the control stay visible. */
   --toggle-track: #868c96;
   --toggle-thumb: #ffffff;
-  --toggle-thumb-border: rgba(0, 0, 0, 0.45);
+  /* The white thumb sits at 2.87:1 on the lifted --accent (the checked track),
+     so in dark theme the thumb/track boundary is carried by this hairline
+     rather than by the two fills. At 0.55 it composites to 3.37:1 against the
+     checked track and 3.12:1 against the unchecked one. Light theme keeps
+     0.35 — there the fills themselves are 5.17:1 / 6.05:1. */
+  --toggle-thumb-border: rgba(0, 0, 0, 0.55);
 }
 
 /* ── Base ──────────────────────────────────────────────────────────── */
@@ -803,8 +828,11 @@ a:hover {
   color: var(--text-muted);
 }
 
+/* --border-strong, not --border: this rule is the only thing dividing one data
+   row from the next, and --border reaches just 1.38:1 / 1.29:1 against
+   --surface. Card edges keep the quieter --border. */
 .kea-table tbody tr {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--border-strong);
   cursor: pointer;
 }
 
