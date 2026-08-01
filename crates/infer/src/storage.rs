@@ -1,5 +1,17 @@
 use std::path::{Path, PathBuf};
 
+/// Rejects ids that could escape the storage root: `root.join(id)` replaces
+/// the root entirely for absolute paths and `..`/separators walk out of it.
+fn validate_removable_id(model_id: &str) -> std::io::Result<()> {
+    if model_id.contains('/') || model_id.contains('\\') || model_id.contains("..") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid model id: {model_id}"),
+        ));
+    }
+    Ok(())
+}
+
 pub struct ModelStorage {
     pub root: PathBuf,
 }
@@ -63,6 +75,7 @@ impl ModelStorage {
     /// Remove an installed whisper model file. Removing a model that is not
     /// installed is a no-op.
     pub fn remove_model(&self, model_id: &str) -> std::io::Result<()> {
+        validate_removable_id(model_id)?;
         match std::fs::remove_file(self.path_for(model_id)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
@@ -72,6 +85,7 @@ impl ModelStorage {
     /// Remove an installed ONNX model directory. Removing a model that is not
     /// installed is a no-op.
     pub fn remove_onnx(&self, model_id: &str) -> std::io::Result<()> {
+        validate_removable_id(model_id)?;
         match std::fs::remove_dir_all(self.onnx_dir_for(model_id)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
@@ -149,6 +163,36 @@ mod tests {
         assert!(!model_dir.exists());
         // removing again is a no-op
         storage.remove_onnx("vits-piper-en-us-lessac-medium").unwrap();
+    }
+
+    #[test]
+    fn remove_model_rejects_traversal_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ModelStorage::new(dir.path().join("models"));
+        std::fs::create_dir_all(&storage.root).unwrap();
+        let outside = dir.path().join("outside.gguf");
+        std::fs::write(&outside, b"keep me").unwrap();
+
+        for id in ["../outside", "..", "a/b", "a\\b", "/etc/passwd"] {
+            let err = storage.remove_model(id).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "id: {id}");
+        }
+        assert!(outside.exists(), "file outside the root must survive");
+    }
+
+    #[test]
+    fn remove_onnx_rejects_traversal_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ModelStorage::new(dir.path().join("models"));
+        std::fs::create_dir_all(&storage.root).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        for id in ["../outside", "..", "a/b", "a\\b", "/tmp"] {
+            let err = storage.remove_onnx(id).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "id: {id}");
+        }
+        assert!(outside.exists(), "dir outside the root must survive");
     }
 
     #[test]

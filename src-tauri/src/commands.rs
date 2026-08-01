@@ -2522,6 +2522,21 @@ pub async fn download_onnx_model(
     Ok(())
 }
 
+/// Validates an IPC-supplied model id against the kind's catalog before any
+/// filesystem call — the id becomes a path component, so an unknown id
+/// (including any traversal attempt) must be rejected (pure, unit-testable).
+pub fn validate_model_id_for_delete(kind: &str, model_id: &str) -> Result<(), String> {
+    let known = match kind {
+        "whisper" => ModelRegistry::find_whisper(model_id).is_some(),
+        _ => onnx_catalog_for_kind(kind)?.iter().any(|e| e.id == model_id),
+    };
+    if known {
+        Ok(())
+    } else {
+        Err(format!("unknown {kind} model: {model_id}"))
+    }
+}
+
 /// Removes an installed model's files (whisper .gguf file or onnx dir). When a
 /// capability default referenced the removed model, that binding is dropped
 /// too — the UI confirms with the user before calling this.
@@ -2540,6 +2555,7 @@ pub async fn delete_model(
             ))
         }
     };
+    validate_model_id_for_delete(&kind, &model_id)?;
     match kind.as_str() {
         "whisper" => state.model_storage.remove_model(&model_id),
         _ => onnx_storage_for(&state, &kind)?.remove_onnx(&model_id),
@@ -2684,6 +2700,25 @@ mod tests {
                 .unwrap()
                 .contains("a")
         );
+    }
+
+    #[test]
+    fn validate_model_id_for_delete_accepts_catalog_ids_only() {
+        let whisper_id = ModelRegistry::whisper_catalog()[0].id.clone();
+        assert!(validate_model_id_for_delete("whisper", &whisper_id).is_ok());
+        let tts_id = ModelRegistry::tts_catalog()[0].id.clone();
+        assert!(validate_model_id_for_delete("tts", &tts_id).is_ok());
+
+        // unknown ids are rejected before any filesystem call
+        assert!(validate_model_id_for_delete("whisper", "nonexistent").is_err());
+        assert!(validate_model_id_for_delete("parakeet", "nonexistent").is_err());
+
+        // traversal attempts are never catalog ids
+        assert!(validate_model_id_for_delete("whisper", "../../etc/passwd").is_err());
+        assert!(validate_model_id_for_delete("tts", "/etc/passwd").is_err());
+
+        // unknown kinds bubble the catalog error
+        assert!(validate_model_id_for_delete("bogus", "anything").is_err());
     }
 
     #[tokio::test]
