@@ -159,17 +159,45 @@ export type DefaultChoice = {
   providerRef: string | null;
 };
 
+/** Which binding row a choice is written to. */
+export type BindingTarget = { feature: string; slot: string };
+
+/** The capability-wide default row for a capability. */
+export const defaultTarget = (capability: Capability): BindingTarget => ({
+  feature: "default",
+  slot: capability,
+});
+
 /**
- * Writes a ("default", capability) binding and keeps the per-feature
- * active_model / active_voice settings consistent — the single write path
- * shared by the DefaultsPicker and the onboarding wizard.
+ * Whether writing this target should also update the global dictation / TTS
+ * settings. Those settings are the *fallback* model & voice for their own
+ * feature, so a capability default and the feature that owns them stay in
+ * sync — but an override for another feature (e.g. meetings) must not move
+ * them, since its binding already carries the model.
+ */
+function ownsSettings(capability: Capability, target: BindingTarget): boolean {
+  if (target.feature === "default") return true;
+  // Only the STT and TTS settings have a per-feature owner; there is no
+  // equivalent for text, so an llm override never writes one.
+  if (capability === "llm") return false;
+  return capability === "stt" ? target.feature === "dictation" : target.feature === "tts";
+}
+
+/**
+ * Writes a binding — the ("default", capability) row unless `target` says
+ * otherwise — and keeps the per-feature active_model / active_voice settings
+ * consistent. The single write path shared by the DefaultsPicker (both the
+ * defaults on AI Providers and the per-feature overrides) and the wizard.
  */
 export async function applyDefaultChoice(
   capability: Capability,
   choice: DefaultChoice,
   voice?: string | null,
+  target?: BindingTarget,
 ): Promise<void> {
-  await setBinding("default", capability, choice.engine, choice.model, choice.providerRef);
+  const to = target ?? defaultTarget(capability);
+  await setBinding(to.feature, to.slot, choice.engine, choice.model, choice.providerRef);
+  if (!ownsSettings(capability, to)) return;
   if (capability === "stt" && choice.engine === "whisper" && choice.model !== null) {
     const settings = await getDictationSettings();
     await setDictationSettings({ ...settings, active_model: choice.model });

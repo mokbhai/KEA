@@ -390,6 +390,11 @@ a:hover {
   color: var(--text-muted);
 }
 
+/* A hint that reports a failure, not one that explains the row. */
+.kea-row__hint--danger {
+  color: var(--danger);
+}
+
 .kea-row__control {
   display: inline-flex;
   align-items: center;

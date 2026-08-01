@@ -9,11 +9,13 @@ import {
 import { useModelDownloads } from "../hooks/useModelDownloads";
 import {
   buildCapabilityOptions,
+  defaultTarget,
   loadKeyStates,
   applyDefaultChoice,
   startOptionDownload,
   CAPABILITY_LABELS,
   OPENAI_TTS_VOICES,
+  type BindingTarget,
   type Capability,
   type CapabilityOption,
 } from "../lib/capabilityDefaults";
@@ -29,6 +31,16 @@ type Props = {
   open: boolean;
   onClose: () => void;
   onApplied: () => void;
+  /**
+   * Binding row the choice is written to. Defaults to the capability-wide
+   * ("default", capability) row; feature pages pass their own feature and slot
+   * to write an override that only affects that feature. Feature and slot
+   * travel together so a half-specified target can't silently fall back to
+   * overwriting the global default.
+   */
+  target?: BindingTarget;
+  /** Heading override, e.g. "Speech to text for Dictation". */
+  title?: string;
 };
 
 function defaultEngineFor(capability: Capability, providerRef: string): string {
@@ -45,7 +57,17 @@ function findMatch(options: PickerOption[], binding: Binding): string | null {
   return match?.id ?? null;
 }
 
-export default function DefaultsPicker({ capability, open, onClose, onApplied }: Props) {
+export default function DefaultsPicker({
+  capability,
+  open,
+  onClose,
+  onApplied,
+  target,
+  title,
+}: Props) {
+  const resolved = target ?? defaultTarget(capability);
+  const targetFeature = resolved.feature;
+  const targetSlot = resolved.slot;
   const [loading, setLoading] = useState(true);
   const [options, setOptions] = useState<PickerOption[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
@@ -75,7 +97,7 @@ export default function DefaultsPicker({ capability, open, onClose, onApplied }:
       try {
         const [providerList, binding] = await Promise.all([
           listProviders(),
-          getBinding("default", capability).catch(() => null),
+          getBinding(targetFeature, targetSlot).catch(() => null),
         ]);
         const keyByRef = await loadKeyStates(providerList);
         const opts = await buildCapabilityOptions(capability, providerList, keyByRef);
@@ -96,7 +118,7 @@ export default function DefaultsPicker({ capability, open, onClose, onApplied }:
     return () => {
       cancelled = true;
     };
-  }, [open, capability]);
+  }, [open, capability, targetFeature, targetSlot]);
 
   const apply = useCallback(
     async (option: PickerOption) => {
@@ -106,6 +128,7 @@ export default function DefaultsPicker({ capability, open, onClose, onApplied }:
           capability,
           option,
           capability === "tts" ? voiceRef.current : null,
+          { feature: targetFeature, slot: targetSlot },
         );
         setPending(null);
         setSavedId(option.id);
@@ -116,7 +139,7 @@ export default function DefaultsPicker({ capability, open, onClose, onApplied }:
         setError(e instanceof Error ? e.message : String(e));
       }
     },
-    [capability, onApplied],
+    [capability, onApplied, targetFeature, targetSlot],
   );
 
   const catalogIds = useMemo(
@@ -193,9 +216,13 @@ export default function DefaultsPicker({ capability, open, onClose, onApplied }:
   if (!open) return null;
 
   return (
-    <div className="kea-picker" role="dialog" aria-label={`Choose ${CAPABILITY_LABELS[capability]}`}>
+    <div
+      className="kea-picker"
+      role="dialog"
+      aria-label={title ?? `Choose ${CAPABILITY_LABELS[capability]}`}
+    >
       <div className="kea-picker__header">
-        <strong>Choose {CAPABILITY_LABELS[capability].toLowerCase()}</strong>
+        <strong>{title ?? `Choose ${CAPABILITY_LABELS[capability].toLowerCase()}`}</strong>
         <button type="button" className="kea-icon-btn" aria-label="Close" onClick={onClose}>
           ✕
         </button>

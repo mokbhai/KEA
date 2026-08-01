@@ -154,6 +154,24 @@ export const triggerRewrite = (
     customInstruction: custom_instruction ?? null,
   });
 
+/**
+ * Rewrites `text` with the Rewrite feature's own AI binding and returns the
+ * result. Nothing is captured from, or pasted into, the frontmost app — this
+ * backs the "Try it" card, unlike {@link triggerRewrite}.
+ */
+export const previewRewrite = (
+  text: string,
+  mode: RewriteMode,
+  preset_id?: string | null,
+  custom_instruction?: string | null,
+) =>
+  invoke<string>("preview_rewrite", {
+    text,
+    mode,
+    presetId: preset_id ?? null,
+    customInstruction: custom_instruction ?? null,
+  });
+
 export const runDemo = (prompt: string) => invoke<string>("run_demo", { prompt });
 
 export const onRewriteProgress = (
@@ -205,17 +223,6 @@ export const getDictationSettings = () =>
 
 export const setDictationSettings = (settings: DictationSettings) =>
   invoke<void>("set_dictation_settings", { settings });
-
-export const setDictationSttBinding = (
-  engine: string,
-  model?: string | null,
-  provider_ref?: string | null,
-) =>
-  invoke<void>("set_dictation_stt_binding", {
-    engine,
-    model: model ?? null,
-    providerRef: provider_ref ?? null,
-  });
 
 export const startDictation = () => invoke<void>("start_dictation");
 
@@ -487,17 +494,6 @@ export type OnnxModel = {
 export type OnnxModelKindParam = "parakeet" | "tts";
 
 export const listTtsEngines = () => invoke<EngineInfo[]>("list_tts_engines");
-
-export const setTtsBinding = (
-  engine: string,
-  model?: string | null,
-  provider_ref?: string | null,
-) =>
-  invoke<void>("set_tts_binding", {
-    engine,
-    model: model ?? null,
-    providerRef: provider_ref ?? null,
-  });
 
 export const getTtsSettings = () => invoke<TtsSettings>("get_tts_settings");
 

@@ -158,13 +158,13 @@ function AppShell() {
   const renderPage = () => {
     switch (page) {
       case "rewrite":
-        return <RewritePage onRunSetup={runSetup} />;
+        return <RewritePage onRunSetup={runSetup} onNavigate={navigate} />;
       case "dictation":
-        return <DictationPage />;
+        return <DictationPage onNavigate={navigate} />;
       case "meetings":
-        return <MeetingsPage />;
+        return <MeetingsPage onNavigate={navigate} />;
       case "read-aloud":
-        return <ReadAloudPage />;
+        return <ReadAloudPage onNavigate={navigate} />;
       case "ai-providers":
         return <AiProvidersPage />;
       case "models":

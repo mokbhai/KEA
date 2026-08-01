@@ -5,6 +5,11 @@ afterEach(() => {
   cleanup();
 });
 
+// jsdom does not implement scrollIntoView; the live transcript auto-scrolls.
+if (typeof Element !== "undefined" && !Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = () => {};
+}
+
 // jsdom does not implement matchMedia; theme/system-preference code needs it.
 if (typeof window !== "undefined" && !window.matchMedia) {
   window.matchMedia = (query: string): MediaQueryList =>

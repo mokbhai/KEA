@@ -25,6 +25,8 @@ jobs:
         with: { node-version: 20 }
       - name: Build UI
         run: cd ui && npm install && npm run build
+      - name: UI tests
+        run: cd ui && npm test
       - name: Rust tests
         run: cargo test --workspace
       - name: Build app crate

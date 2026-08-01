@@ -23,16 +23,30 @@ import {
   type PermStatus,
   type SystemAudioCapability,
 } from "../api";
+import Banner from "../components/Banner";
+import FeatureAiCard from "../components/FeatureAiCard";
+import FeatureBanner, { type FixNavigate } from "../components/FeatureBanner";
+import HotkeyRow from "../components/HotkeyRow";
 import LevelMeter from "../components/LevelMeter";
 import MeetingDetailView from "../components/MeetingDetail";
-import HotkeyBinder from "../components/HotkeyBinder";
-import SlotBinder from "../components/SlotBinder";
+import { Row, RowGroup } from "../components/SettingsRow";
 import Spinner from "../components/Spinner";
+import Toggle from "../components/Toggle";
 import TranscriptPanel, { type TranscriptSegment } from "../components/TranscriptPanel";
+import { useFeatureAi } from "../hooks/useFeatureAi";
+import { useSavedFlash } from "../hooks/useSavedFlash";
+import type { SlotSpec } from "../lib/featureSlot";
 
 const MEETINGS_FEATURE = "meetings";
-const MEETINGS_STT_SLOT = "stt";
-const MEETINGS_LLM_SLOT = "llm";
+const MEETINGS_COMMAND = "toggle_meeting";
+
+/** How long the "Try it" capture runs before it stops itself. */
+const TEST_CAPTURE_MS = 10_000;
+
+const SLOTS: SlotSpec[] = [
+  { feature: "meetings", slot: "stt", capability: "stt", label: "Speech to text" },
+  { feature: "meetings", slot: "llm", capability: "llm", label: "Notes writing" },
+];
 
 const capabilityLabels: Record<SystemAudioCapability, string> = {
   unavailable: "Mic only (system audio unavailable)",
@@ -41,14 +55,12 @@ const capabilityLabels: Record<SystemAudioCapability, string> = {
   screen_capture_kit: "Mic + system (ScreenCaptureKit)",
 };
 
-const settingsSummaryStyle: React.CSSProperties = {
-  cursor: "pointer",
-  color: "var(--text)",
-  fontWeight: 600,
-  fontSize: "0.875rem",
+type Props = {
+  onNavigate?: FixNavigate;
 };
 
-export default function MeetingsPage() {
+export default function MeetingsPage({ onNavigate }: Props) {
+  const ai = useFeatureAi(SLOTS);
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
@@ -62,6 +74,8 @@ export default function MeetingsPage() {
   const [screenPerm, setScreenPerm] = useState<PermStatus>("Unknown");
   const [meetingStatus, setMeetingStatus] = useState<string | null>(null);
   const [meetingBusy, setMeetingBusy] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const testTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const [settings, setSettings] = useState<MeetingSettings>({
     segment_duration_secs: 30,
@@ -69,6 +83,7 @@ export default function MeetingsPage() {
   });
   const [settingsStatus, setSettingsStatus] = useState<string | null>(null);
   const [settingsBusy, setSettingsBusy] = useState(false);
+  const [savedKey, flash] = useSavedFlash();
   // Set once the user edits a setting, so the mount fetch can't clobber input
   // typed before it resolves.
   const settingsTouchedRef = useRef(false);
@@ -76,14 +91,19 @@ export default function MeetingsPage() {
   const recording = state === "recording";
   const processing = state === "processing";
 
-  const saveSettings = async (next: MeetingSettings) => {
+  // The test-capture timeout fires outside React's render cycle, so it needs
+  // the live state rather than the value captured when it was scheduled.
+  const stateRef = useRef<MeetingState>(state);
+  stateRef.current = state;
+
+  const saveSettings = async (next: MeetingSettings, key: string) => {
     settingsTouchedRef.current = true;
     setSettings(next);
     setSettingsBusy(true);
     setSettingsStatus(null);
     try {
       await setMeetingSettings(next);
-      setSettingsStatus("Meeting settings saved.");
+      flash(key);
     } catch (e) {
       setSettingsStatus(e instanceof Error ? e.message : String(e));
     } finally {
@@ -172,6 +192,10 @@ export default function MeetingsPage() {
       }),
       onMeetingLevel(setLevel),
       onMeetingError((message) => {
+        // Capture failed: cancel the pending test stop so its rejection can't
+        // overwrite the message that actually explains what went wrong.
+        clearTimeout(testTimer.current);
+        setTesting(false);
         setMeetingStatus(message);
       }),
     ]);
@@ -186,6 +210,8 @@ export default function MeetingsPage() {
       setLevel(0);
     }
   }, [state]);
+
+  useEffect(() => () => clearTimeout(testTimer.current), []);
 
   const onMeetingStopped = async (meetingId: string) => {
     await refreshList();
@@ -236,14 +262,17 @@ export default function MeetingsPage() {
     try {
       await startMeeting();
       setMeetingStatus("Recording — speak into the mic.");
+      return true;
     } catch (e) {
       setMeetingStatus(e instanceof Error ? e.message : String(e));
+      return false;
     } finally {
       setMeetingBusy(false);
     }
   };
 
   const onStop = async () => {
+    clearTimeout(testTimer.current);
     setMeetingBusy(true);
     setMeetingStatus(null);
     try {
@@ -254,7 +283,28 @@ export default function MeetingsPage() {
       setMeetingStatus(e instanceof Error ? e.message : String(e));
     } finally {
       setMeetingBusy(false);
+      setTesting(false);
     }
+  };
+
+  const runTestCapture = async () => {
+    setTesting(true);
+    const started = await onStart();
+    if (!started) {
+      setTesting(false);
+      return;
+    }
+    setMeetingStatus("Test capture running — it stops itself in 10 seconds.");
+    testTimer.current = setTimeout(() => {
+      // start_meeting resolved, but the capture may have failed since; stopping
+      // a meeting that is no longer recording would only replace the real
+      // error with "no meeting is recording".
+      if (stateRef.current !== "recording") {
+        setTesting(false);
+        return;
+      }
+      void onStop();
+    }, TEST_CAPTURE_MS);
   };
 
   const needsScreenRecording =
@@ -266,174 +316,173 @@ export default function MeetingsPage() {
     <div>
       <header>
         <h2 style={{ marginTop: 0 }}>Meetings</h2>
-        <p className="kea-muted" style={{ marginTop: 0 }}>
-          Capture meeting audio, stream live transcript segments, and synthesize
-          notes when you stop.
+        <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
+          Record a meeting, watch the transcript appear live, and get notes when you
+          stop.
         </p>
       </header>
 
-      <section style={{ marginBottom: 24 }}>
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 12,
-            flexWrap: "wrap",
-            marginBottom: 12,
-          }}
-        >
-          <span
-            style={{
-              fontSize: 12,
-              fontWeight: 600,
-              padding: "4px 10px",
-              borderRadius: 999,
-              background: "var(--surface-2)",
-              color: "var(--accent)",
-              border: "1px solid var(--border)",
-            }}
-          >
-            {capabilityLabels[capability]}
-          </span>
-          <span className="kea-muted" style={{ fontSize: 13 }}>
-            State:{" "}
-            <strong style={{ color: "var(--text)" }}>
-              {state === "idle"
-                ? "Idle"
-                : state === "recording"
-                  ? "Recording"
-                  : "Processing"}
-            </strong>
-          </span>
-          {recording && <LevelMeter level={level} />}
-        </div>
+      <FeatureBanner ai={ai} onNavigate={onNavigate} />
 
-        {needsScreenRecording && (
-          <div style={{ marginBottom: 12 }}>
-            <p className="kea-muted" style={{ margin: "0 0 8px" }}>
-              System audio capture requires Screen Recording permission on macOS.
-            </p>
+      {needsScreenRecording && (
+        <Banner
+          variant="warn"
+          action={
             <button
               type="button"
               className="kea-btn"
-              onClick={requestScreenRecording}
+              onClick={() => void requestScreenRecording()}
               disabled={actionBusy}
             >
-              Request Screen Recording permission
+              Grant permission
             </button>
-          </div>
-        )}
+          }
+        >
+          System audio — capturing the other side of a call needs Screen Recording
+          permission.
+        </Banner>
+      )}
 
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button
-            type="button"
-            className="kea-btn kea-btn--primary"
-            onClick={onStart}
-            disabled={actionBusy || recording || processing}
+      <section style={{ marginBottom: 24 }}>
+        <h3 style={{ margin: "0 0 12px" }}>Behavior</h3>
+        <RowGroup aria-label="Meeting behavior">
+          <HotkeyRow
+            feature={MEETINGS_FEATURE}
+            command={MEETINGS_COMMAND}
+            label="Shortcut"
+            hint="Starts or stops meeting notes."
+            checkRegistration
+          />
+          <Row
+            label="Record system audio too"
+            hint={`Right now: ${capabilityLabels[capability]}.`}
           >
-            Start meeting
-          </button>
-          <button
-            type="button"
-            className="kea-btn"
-            onClick={onStop}
-            disabled={actionBusy || !recording}
+            {savedKey === "prefer_system_audio" && <span className="kea-saved">Saved ✓</span>}
+            <Toggle
+              label="Record system audio too"
+              checked={settings.prefer_system_audio}
+              disabled={settingsBusy}
+              onChange={(next) =>
+                void saveSettings({ ...settings, prefer_system_audio: next }, "prefer_system_audio")
+              }
+            />
+          </Row>
+          <Row
+            label="Transcribe every"
+            hint="How often live transcript segments appear. Applies from the next meeting."
           >
-            Stop meeting
-          </button>
-        </div>
-        {meetingStatus && (
-          <p className="kea-muted" style={{ marginTop: 12, marginBottom: 0 }}>
-            {meetingStatus}
+            {savedKey === "segment_duration_secs" && <span className="kea-saved">Saved ✓</span>}
+            <input
+              className="kea-input"
+              type="number"
+              aria-label="Seconds per transcript segment"
+              min={5}
+              max={120}
+              step={5}
+              value={settings.segment_duration_secs}
+              disabled={settingsBusy}
+              onChange={(e) => {
+                settingsTouchedRef.current = true;
+                const v = parseInt(e.target.value, 10);
+                if (!isNaN(v)) setSettings({ ...settings, segment_duration_secs: v });
+              }}
+              onBlur={(e) => {
+                const v = parseInt(e.target.value, 10);
+                if (isNaN(v)) return;
+                // Clamp on persist: the backend takes any u32, so keep the
+                // value inside the advisory 5-120s range (negatives would
+                // fail u32 deserialization outright).
+                const clamped = Math.min(120, Math.max(5, v));
+                void saveSettings(
+                  { ...settings, segment_duration_secs: clamped },
+                  "segment_duration_secs",
+                );
+              }}
+              style={{ width: 88 }}
+            />
+            <span className="kea-muted">seconds</span>
+          </Row>
+        </RowGroup>
+        {settingsStatus && (
+          <p style={{ marginTop: 8, fontSize: "0.8125rem", color: "var(--danger)" }}>
+            {settingsStatus}
           </p>
         )}
       </section>
 
-      <details open className="kea-card" style={{ marginBottom: 16 }}>
-        <summary className="kea-label" style={settingsSummaryStyle}>
-          Settings
-        </summary>
-        <div style={{ marginTop: 16 }}>
-          <section className="kea-card" style={{ marginBottom: 16 }}>
-            <h3 style={{ margin: "0 0 12px" }}>Meeting options</h3>
-            <label style={{ display: "block", marginBottom: 12 }}>
-              <span className="kea-label">Segment duration (seconds)</span>
-              <input
-                className="kea-input"
-                type="number"
-                min={5}
-                max={120}
-                step={5}
-                value={settings.segment_duration_secs}
-                disabled={settingsBusy}
-                onChange={(e) => {
-                  settingsTouchedRef.current = true;
-                  const v = parseInt(e.target.value, 10);
-                  if (!isNaN(v)) setSettings({ ...settings, segment_duration_secs: v });
-                }}
-                onBlur={(e) => {
-                  const v = parseInt(e.target.value, 10);
-                  if (isNaN(v)) return;
-                  // Clamp on persist: the backend takes any u32, so keep the
-                  // value inside the advisory 5-120s range (negatives would
-                  // fail u32 deserialization outright).
-                  const clamped = Math.min(120, Math.max(5, v));
-                  saveSettings({ ...settings, segment_duration_secs: clamped });
-                }}
-                style={{ maxWidth: 120 }}
-              />
-              <span className="kea-muted" style={{ display: "block", marginTop: 4 }}>
-                Applies from the next meeting.
-              </span>
-            </label>
-            <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
-              <input
-                type="checkbox"
-                checked={settings.prefer_system_audio}
-                disabled={settingsBusy}
-                onChange={(e) =>
-                  saveSettings({ ...settings, prefer_system_audio: e.target.checked })
-                }
-              />
-              <span>Prefer system audio</span>
-            </label>
-            {settingsStatus && (
-              <p className="kea-muted" style={{ marginTop: 0, marginBottom: 0 }}>
-                {settingsStatus}
-              </p>
-            )}
-          </section>
-          <HotkeyBinder
-            feature={MEETINGS_FEATURE}
-            command="toggle_meeting"
-            label="Meeting hotkey"
-          />
-          <SlotBinder
-            feature={MEETINGS_FEATURE}
-            slot={MEETINGS_STT_SLOT}
-            slotKind="stt"
-            title="Meetings STT slot"
-          />
-          <SlotBinder
-            feature={MEETINGS_FEATURE}
-            slot={MEETINGS_LLM_SLOT}
-            slotKind="llm"
-            title="Meetings LLM slot"
+      <FeatureAiCard ai={ai} featureLabel="Meetings" />
+
+      <section style={{ marginBottom: 24 }}>
+        <h3 style={{ margin: "0 0 12px" }}>Try it</h3>
+        <div className="kea-card">
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 12,
+              flexWrap: "wrap",
+              marginBottom: 12,
+            }}
+          >
+            <span className="kea-muted" style={{ fontSize: 13 }}>
+              State:{" "}
+              <strong style={{ color: "var(--text)" }}>
+                {state === "idle" ? "Idle" : state === "recording" ? "Recording" : "Processing"}
+              </strong>
+            </span>
+            {recording && <LevelMeter level={level} />}
+          </div>
+
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button
+              type="button"
+              className="kea-btn kea-btn--primary"
+              onClick={() => void runTestCapture()}
+              disabled={actionBusy || recording || processing || testing}
+            >
+              Run a 10-second test
+            </button>
+            <button
+              type="button"
+              className="kea-btn"
+              onClick={() => void onStart()}
+              disabled={actionBusy || recording || processing || testing}
+            >
+              Start meeting
+            </button>
+            <button
+              type="button"
+              className="kea-btn"
+              onClick={() => void onStop()}
+              disabled={actionBusy || !recording}
+            >
+              Stop meeting
+            </button>
+          </div>
+          <p className="kea-muted" style={{ margin: "8px 0 0", fontSize: "0.8125rem" }}>
+            The test is a real capture — it is saved to your meetings like any other.
+          </p>
+          {meetingStatus && (
+            <p className="kea-muted" style={{ marginTop: 12, marginBottom: 0 }}>
+              {meetingStatus}
+            </p>
+          )}
+        </div>
+      </section>
+
+      <section style={{ marginBottom: 24 }}>
+        <h3 style={{ margin: "0 0 12px" }}>Live transcript</h3>
+        <div className="kea-card">
+          <TranscriptPanel
+            segments={segments}
+            live={recording}
+            emptyMessage={
+              recording
+                ? "Listening — segments appear every few seconds…"
+                : "Start a meeting to see live transcription."
+            }
           />
         </div>
-      </details>
-
-      <section className="kea-card" style={{ marginBottom: 24 }}>
-        <h3 style={{ margin: "0 0 8px" }}>Live transcript</h3>
-        <TranscriptPanel
-          segments={segments}
-          live={recording}
-          emptyMessage={
-            recording
-              ? "Listening — segments appear every few seconds…"
-              : "Start a meeting to see live transcription."
-          }
-        />
       </section>
 
       <div
