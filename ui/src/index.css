@@ -331,6 +331,11 @@ a:hover {
   padding: 12px 0;
 }
 
+.kea-drawer__nav {
+  display: flex;
+  flex-direction: column;
+}
+
 .kea-drawer__group-label {
   padding: 8px 16px 4px;
   font-size: 0.6875rem;
@@ -360,12 +365,18 @@ a:hover {
     bottom: 0;
     z-index: 200;
     transform: translateX(-100%);
-    transition: transform 0.2s ease;
+    /* Off-screen is not enough: a translated drawer still takes tab stops.
+       visibility:hidden removes it from the tab order, delayed so the slide-out
+       animation still plays. */
+    visibility: hidden;
+    transition: transform 0.2s ease, visibility 0s linear 0.2s;
     box-shadow: 2px 0 12px rgba(0, 0, 0, 0.15);
   }
 
   .kea-drawer--open {
     transform: translateX(0);
+    visibility: visible;
+    transition: transform 0.2s ease, visibility 0s;
   }
 }
 

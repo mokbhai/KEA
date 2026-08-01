@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { getBinding, getSetting, setSetting, onDictationError, onMeetingError, onRewriteError, onRewriteProgress, onTtsError, onTtsState } from "./api";
 import Onboarding from "./components/Onboarding";
@@ -29,17 +29,35 @@ type Page =
 
 const MOBILE_BREAKPOINT = 768;
 
+/**
+ * Everything focusable a drawer can hold. Enough to trap Tab without pulling
+ * in a focus-trap dependency.
+ */
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * One source of truth: the media query. Seeding from window.innerWidth as well
+ * meant the two could disagree (they round differently, and innerWidth counts
+ * the scrollbar) until the first change event arrived.
+ */
 function useIsMobile() {
-  const [isMobile, setIsMobile] = useState(
-    () => typeof window !== "undefined" && window.innerWidth <= MOBILE_BREAKPOINT,
+  const [mq] = useState<MediaQueryList | null>(() =>
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT}px)`)
+      : null,
   );
+  const [isMobile, setIsMobile] = useState(() => mq?.matches ?? false);
 
   useEffect(() => {
-    const mq = window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT}px)`);
+    if (!mq) return;
+    // Re-sync first: the viewport can change between the seeding render and
+    // this effect, and that change fires no event we are subscribed to yet.
+    setIsMobile(mq.matches);
     const onChange = () => setIsMobile(mq.matches);
     mq.addEventListener("change", onChange);
     return () => mq.removeEventListener("change", onChange);
-  }, []);
+  }, [mq]);
 
   return isMobile;
 }
@@ -51,6 +69,16 @@ function AppShell() {
   const [statusVariant, setStatusVariant] = useState<"progress" | "error" | null>(null);
   const { theme, toggle } = useTheme();
   const isMobile = useIsMobile();
+  const drawerRef = useRef<HTMLDivElement | null>(null);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+
+  // Only ever called while the drawer is open (its triggers all live inside it
+  // or on the backdrop), so focus goes back where it came from rather than
+  // being dropped on <body>.
+  const closeDrawer = useCallback(() => {
+    setDrawerOpen(false);
+    menuButtonRef.current?.focus();
+  }, []);
 
   const [onboarding, setOnboarding] = useState<"loading" | "show" | "hide">("loading");
 
@@ -101,9 +129,60 @@ function AppShell() {
     if (!isMobile) setDrawerOpen(false);
   }, [isMobile]);
 
+  // A drawer that is off-screen must not be tabbable. `visibility: hidden`
+  // does that in CSS; `inert` states it for assistive tech too and is honoured
+  // by every engine KEA ships on (WebKit 15.5+, Chromium 102+, Gecko 112+).
+  // It goes through the DOM because React 18 has no `inert` prop, and through a
+  // callback ref rather than an effect so it also applies on the drawer's first
+  // mount — which happens later than the shell's, once the onboarding check
+  // resolves.
+  const drawerClosed = isMobile && !drawerOpen;
+  const attachDrawer = useCallback(
+    (node: HTMLDivElement | null) => {
+      drawerRef.current = node;
+      if (!node) return;
+      if (drawerClosed) node.setAttribute("inert", "");
+      else node.removeAttribute("inert");
+    },
+    [drawerClosed],
+  );
+
+  // While the drawer is open it owns the keyboard: Escape closes it and Tab
+  // cycles inside it instead of wandering into the page behind.
+  useEffect(() => {
+    if (!isMobile || !drawerOpen) return;
+    const el = drawerRef.current;
+    el?.querySelector<HTMLElement>(FOCUSABLE)?.focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeDrawer();
+        return;
+      }
+      if (event.key !== "Tab" || !el) return;
+      const items = Array.from(el.querySelectorAll<HTMLElement>(FOCUSABLE));
+      if (items.length === 0) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      const outside = !el.contains(active);
+      if (event.shiftKey && (active === first || outside)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (active === last || outside)) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [isMobile, drawerOpen, closeDrawer]);
+
   const navigate = (next: Page) => {
     setPage(next);
-    if (isMobile) setDrawerOpen(false);
+    if (isMobile) closeDrawer();
   };
 
   const completeOnboarding = async () => {
@@ -204,12 +283,13 @@ function AppShell() {
       {isMobile && (
         <header className="kea-topbar">
           <button
+            ref={menuButtonRef}
             type="button"
             className="kea-icon-btn"
             aria-label="Open menu"
             aria-expanded={drawerOpen}
             aria-controls="kea-nav"
-            onClick={() => setDrawerOpen((o) => !o)}
+            onClick={() => (drawerOpen ? closeDrawer() : setDrawerOpen(true))}
           >
             ☰
           </button>
@@ -223,30 +303,34 @@ function AppShell() {
         {isMobile && (
           <div
             className={`kea-drawer-backdrop${drawerOpen ? " kea-drawer-backdrop--open" : ""}`}
-            onClick={() => setDrawerOpen(false)}
+            onClick={closeDrawer}
             aria-hidden="true"
           />
         )}
 
-        <nav
+        {/* The sidebar column, not the nav landmark: the theme toggle and the
+            version below are app chrome, so they sit outside <nav>. */}
+        <div
           id="kea-nav"
+          ref={attachDrawer}
           className={`kea-drawer${isMobile && drawerOpen ? " kea-drawer--open" : ""}`}
-          aria-label="Main navigation"
         >
-          <div className="kea-drawer__group-label">Features</div>
-          {navItem("rewrite", "Rewrite", "✏️")}
-          {navItem("dictation", "Dictation", "🎙")}
-          {navItem("meetings", "Meetings", "👥")}
-          {navItem("read-aloud", "Read-aloud", "🔊")}
+          <nav className="kea-drawer__nav" aria-label="Main navigation">
+            <div className="kea-drawer__group-label">Features</div>
+            {navItem("rewrite", "Rewrite", "✏️")}
+            {navItem("dictation", "Dictation", "🎙")}
+            {navItem("meetings", "Meetings", "👥")}
+            {navItem("read-aloud", "Read-aloud", "🔊")}
 
-          <div className="kea-drawer__group-label">Activity</div>
-          {navItem("history", "History", "🕘")}
+            <div className="kea-drawer__group-label">Activity</div>
+            {navItem("history", "History", "🕘")}
 
-          <div className="kea-drawer__group-label">Settings</div>
-          {navItem("ai-providers", "AI Providers", "🤖")}
-          {navItem("models", "Models", "📦")}
-          {navItem("general", "General", "⚙️")}
-          {navItem("logs", "Logs", "🛠")}
+            <div className="kea-drawer__group-label">Settings</div>
+            {navItem("ai-providers", "AI Providers", "🤖")}
+            {navItem("models", "Models", "📦")}
+            {navItem("general", "General", "⚙️")}
+            {navItem("logs", "Logs", "🛠")}
+          </nav>
 
           <div className="kea-sidebar__footer">
             <button
@@ -259,7 +343,7 @@ function AppShell() {
             </button>
             <span className="kea-muted">{version ? `v${version}` : ""}</span>
           </div>
-        </nav>
+        </div>
 
         <main className="kea-main">{renderPage()}</main>
       </div>
