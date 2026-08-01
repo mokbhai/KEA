@@ -91,6 +91,11 @@ export default function MeetingsPage({ onNavigate }: Props) {
   const recording = state === "recording";
   const processing = state === "processing";
 
+  // The test-capture timeout fires outside React's render cycle, so it needs
+  // the live state rather than the value captured when it was scheduled.
+  const stateRef = useRef<MeetingState>(state);
+  stateRef.current = state;
+
   const saveSettings = async (next: MeetingSettings, key: string) => {
     settingsTouchedRef.current = true;
     setSettings(next);
@@ -187,6 +192,10 @@ export default function MeetingsPage({ onNavigate }: Props) {
       }),
       onMeetingLevel(setLevel),
       onMeetingError((message) => {
+        // Capture failed: cancel the pending test stop so its rejection can't
+        // overwrite the message that actually explains what went wrong.
+        clearTimeout(testTimer.current);
+        setTesting(false);
         setMeetingStatus(message);
       }),
     ]);
@@ -286,7 +295,16 @@ export default function MeetingsPage({ onNavigate }: Props) {
       return;
     }
     setMeetingStatus("Test capture running — it stops itself in 10 seconds.");
-    testTimer.current = setTimeout(() => void onStop(), TEST_CAPTURE_MS);
+    testTimer.current = setTimeout(() => {
+      // start_meeting resolved, but the capture may have failed since; stopping
+      // a meeting that is no longer recording would only replace the real
+      // error with "no meeting is recording".
+      if (stateRef.current !== "recording") {
+        setTesting(false);
+        return;
+      }
+      void onStop();
+    }, TEST_CAPTURE_MS);
   };
 
   const needsScreenRecording =

@@ -1,7 +1,12 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { invokeCalls, onInvoke, resetTauriMocks } from "../test-utils/tauri";
+import {
+  emitTauriEvent,
+  invokeCalls,
+  onInvoke,
+  resetTauriMocks,
+} from "../test-utils/tauri";
 import { featureHandlers, openAiBinding } from "../test-utils/featureWorld";
 import MeetingsPage from "./MeetingsPage";
 
@@ -141,6 +146,28 @@ describe("MeetingsPage", () => {
     });
   });
 
+  it("does not judge meetings against dictation's fallback model", async () => {
+    // meeting.rs passes binding.model straight through — it never falls back
+    // to the dictation setting, so an undownloaded one must not block here.
+    mockWorld({
+      bindings: {
+        ...readyBindings,
+        "meetings/stt": { engine_id: "whisper", model: null, provider_ref: null },
+      },
+      installedWhisper: [],
+      extra: {
+        get_dictation_settings: () => ({
+          post_process: false,
+          active_model: "whisper-base",
+        }),
+      },
+    });
+    render(<MeetingsPage />);
+
+    expect(await screen.findByText(/This feature only —/)).toBeTruthy();
+    expect(screen.queryByText(/isn't downloaded yet/)).toBeNull();
+  });
+
   it("runs a labelled test capture that stops itself after ten seconds", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
@@ -158,11 +185,50 @@ describe("MeetingsPage", () => {
       ).toBeTruthy();
       expect(invokeCalls("stop_meeting")).toHaveLength(0);
 
+      // The backend confirms the capture is live, as it does on a real start.
+      await act(async () => {
+        emitTauriEvent("meeting:state", { state: "recording" });
+      });
+
       await act(async () => {
         vi.advanceTimersByTime(10_000);
       });
 
       await waitFor(() => expect(invokeCalls("stop_meeting")).toHaveLength(1));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the real error when a test capture fails after starting", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mockWorld({ bindings: readyBindings });
+      render(<MeetingsPage />);
+
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      await user.click(
+        await screen.findByRole("button", { name: "Run a 10-second test" }),
+      );
+      await waitFor(() => expect(invokeCalls("start_meeting")).toHaveLength(1));
+
+      // start_meeting resolved, then capture failed and the backend went idle.
+      await act(async () => {
+        emitTauriEvent("meeting:error", { message: "microphone is unavailable" });
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(10_000);
+      });
+
+      // Stopping a meeting that isn't recording would only replace the cause
+      // with "no meeting is recording".
+      expect(invokeCalls("stop_meeting")).toHaveLength(0);
+      expect(screen.getByText("microphone is unavailable")).toBeTruthy();
+      // The test button is usable again rather than latched off.
+      expect(
+        screen.getByRole("button", { name: "Run a 10-second test" }).hasAttribute("disabled"),
+      ).toBe(false);
     } finally {
       vi.useRealTimers();
     }
