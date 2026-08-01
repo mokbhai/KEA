@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { listProviders, previewVoice } from "../../api";
+import { getBinding, getTtsSettings, listProviders, previewVoice } from "../../api";
 import { useModelDownloads } from "../../hooks/useModelDownloads";
 import { useSavedFlash } from "../../hooks/useSavedFlash";
 import {
@@ -28,6 +28,7 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
   const [ttsMode, setTtsMode] = useState<"local" | "cloud">("local");
   const [cloudVoice, setCloudVoice] = useState(OPENAI_TTS_VOICES[0]);
   const [localVoiceId, setLocalVoiceId] = useState<string | null>(null);
+  const [sttSeededFromBinding, setSttSeededFromBinding] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedKey, flashSaved] = useSavedFlash();
 
@@ -42,13 +43,26 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
       try {
         const providers = await listProviders();
         const keyByRef = await loadKeyStates(providers);
-        const [sttOpts, ttsOpts] = await Promise.all([
+        const [sttOpts, ttsOpts, sttBinding, ttsBinding] = await Promise.all([
           buildCapabilityOptions("stt", providers, keyByRef),
           buildCapabilityOptions("tts", providers, keyByRef),
+          getBinding("default", "stt").catch(() => null),
+          getBinding("default", "tts").catch(() => null),
         ]);
         if (cancelled) return;
 
+        // An existing default wins over the recommended preselection, so
+        // re-running the wizard and pressing Continue keeps prior choices.
+        const boundLocalStt =
+          sttBinding && sttBinding.engine_id !== "openai-stt"
+            ? sttOpts.find(
+                (o) =>
+                  o.engine === sttBinding.engine_id &&
+                  (o.model ?? null) === (sttBinding.model ?? null),
+              ) ?? null
+            : null;
         const local =
+          boundLocalStt ??
           sttOpts.find((o) => o.engine === "whisper" && o.model === "whisper-base") ??
           sttOpts.find((o) => o.engine === "whisper") ??
           null;
@@ -62,9 +76,40 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
         setSttCloud(cloud);
         setTtsVoices(voices);
         setTtsCloudReady(Boolean(cloudTts?.ready));
-        setSttChoice(preferCloud && cloud?.ready ? "cloud" : "local");
-        setTtsMode(preferCloud && cloudTts?.ready ? "cloud" : "local");
-        setLocalVoiceId(voices[0]?.id ?? null);
+        setSttSeededFromBinding(Boolean(boundLocalStt));
+        setSttChoice(
+          sttBinding
+            ? sttBinding.engine_id === "openai-stt" && cloud?.ready
+              ? "cloud"
+              : "local"
+            : preferCloud && cloud?.ready
+              ? "cloud"
+              : "local",
+        );
+        setTtsMode(
+          ttsBinding
+            ? ttsBinding.engine_id === "openai-tts" && cloudTts?.ready
+              ? "cloud"
+              : "local"
+            : preferCloud && cloudTts?.ready
+              ? "cloud"
+              : "local",
+        );
+        const boundLocalVoice =
+          ttsBinding?.engine_id === "sherpa-tts"
+            ? voices.find((v) => (v.model ?? null) === (ttsBinding.model ?? null)) ?? null
+            : null;
+        setLocalVoiceId((boundLocalVoice ?? voices[0])?.id ?? null);
+        if (ttsBinding?.engine_id === "openai-tts") {
+          const settings = await getTtsSettings().catch(() => null);
+          if (
+            !cancelled &&
+            settings?.active_voice &&
+            OPENAI_TTS_VOICES.includes(settings.active_voice)
+          ) {
+            setCloudVoice(settings.active_voice);
+          }
+        }
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       } finally {
@@ -165,9 +210,10 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
       }
 
       if (ttsMode === "cloud" && ttsCloudReadyRef.current) {
+        // model null matches what the defaults picker writes for OpenAI voices.
         await applyDefaultChoice(
           "tts",
-          { engine: "openai-tts", model: "tts-1", providerRef: "openai" },
+          { engine: "openai-tts", model: null, providerRef: "openai" },
           cloudVoice,
         );
       } else {
@@ -241,7 +287,10 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
                 }}
               />
               <span className="kea-choice__body">
-                <span className="kea-choice__title">{sttLocal.label} — recommended</span>
+                <span className="kea-choice__title">
+                  {sttLocal.label}
+                  {sttSeededFromBinding ? "" : " — recommended"}
+                </span>
                 <span className="kea-choice__hint">
                   Runs on this Mac, works offline.{" "}
                   {sttLocal.installed
@@ -284,6 +333,44 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
         <p className="kea-muted" style={{ margin: "0 0 12px" }}>
           The voice KEA uses to read text aloud.
         </p>
+        <div
+          className="kea-choice-group"
+          role="radiogroup"
+          aria-label="Text to speech"
+          style={{ marginBottom: 12 }}
+        >
+          <label className={`kea-choice${ttsMode === "local" ? " kea-choice--selected" : ""}`}>
+            <input
+              type="radio"
+              name="tts-choice"
+              value="local"
+              checked={ttsMode === "local"}
+              onChange={() => setTtsMode("local")}
+            />
+            <span className="kea-choice__body">
+              <span className="kea-choice__title">A voice on this Mac</span>
+              <span className="kea-choice__hint">Private, works offline.</span>
+            </span>
+          </label>
+          <label className={`kea-choice${ttsMode === "cloud" ? " kea-choice--selected" : ""}`}>
+            <input
+              type="radio"
+              name="tts-choice"
+              value="cloud"
+              checked={ttsMode === "cloud"}
+              onChange={() => setTtsMode("cloud")}
+              disabled={!ttsCloudReady}
+            />
+            <span className="kea-choice__body">
+              <span className="kea-choice__title">OpenAI cloud voices</span>
+              <span className="kea-choice__hint">
+                {ttsCloudReady
+                  ? "Uses your OpenAI account. No download."
+                  : "Needs an OpenAI key (step 2)."}
+              </span>
+            </span>
+          </label>
+        </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           {ttsMode === "cloud" ? (
             <select
@@ -332,11 +419,6 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
           )}
           {savedKey === "tts" && <span className="kea-saved">Saved ✓</span>}
         </div>
-        {ttsMode === "cloud" && !ttsCloudReady && (
-          <p className="kea-muted" style={{ margin: "8px 0 0" }}>
-            Needs an OpenAI key (step 2).
-          </p>
-        )}
       </section>
 
       {error && (

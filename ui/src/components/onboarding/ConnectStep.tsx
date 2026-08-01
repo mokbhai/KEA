@@ -59,12 +59,12 @@ export default function ConnectStep({ setCommit, onCommitted }: Props) {
     };
   }, []);
 
-  const stateRef = useRef({ selected, keyDraft, customName, customUrl });
-  stateRef.current = { selected, keyDraft, customName, customUrl };
+  const stateRef = useRef({ selected, keyDraft, customName, customUrl, hasKey });
+  stateRef.current = { selected, keyDraft, customName, customUrl, hasKey };
 
   useEffect(() => {
     setCommit(async () => {
-      const { selected, keyDraft, customName, customUrl } = stateRef.current;
+      const { selected, keyDraft, customName, customUrl, hasKey } = stateRef.current;
 
       if (selected === "openai") {
         const draft = keyDraft.trim();
@@ -73,19 +73,23 @@ export default function ConnectStep({ setCommit, onCommitted }: Props) {
           setHasKey(true);
           setKeyDraft("");
         }
-        await setDefaultIfUnset(
-          "llm",
-          { engine: "openai", model: "gpt-4o-mini", providerRef: "openai" },
-        );
-        await setDefaultIfUnset(
-          "stt",
-          { engine: "openai-stt", model: "whisper-1", providerRef: "openai" },
-        );
-        await setDefaultIfUnset(
-          "tts",
-          { engine: "openai-tts", model: "tts-1", providerRef: "openai" },
-          "alloy",
-        );
+        // Without a key the cloud defaults could never work — leave them
+        // unset so amber status surfaces on the affected features instead.
+        if (hasKey || draft) {
+          await setDefaultIfUnset(
+            "llm",
+            { engine: "openai", model: "gpt-4o-mini", providerRef: "openai" },
+          );
+          await setDefaultIfUnset(
+            "stt",
+            { engine: "openai-stt", model: "whisper-1", providerRef: "openai" },
+          );
+          await setDefaultIfUnset(
+            "tts",
+            { engine: "openai-tts", model: "tts-1", providerRef: "openai" },
+            "alloy",
+          );
+        }
       } else if (selected === "local") {
         const [sttEngines, ttsEngines] = await Promise.all([
           listSttEngines().catch(() => []),
@@ -129,7 +133,12 @@ export default function ConnectStep({ setCommit, onCommitted }: Props) {
           await addCustomProvider(ref, name);
         }
         if (customUrl.trim()) {
-          await setProviderConfig(ref, { base_url: customUrl.trim(), default_model: "" });
+          // Preserve a previously configured default_model on re-run.
+          const existing = await getProviderConfig(ref).catch(() => null);
+          await setProviderConfig(ref, {
+            base_url: customUrl.trim(),
+            default_model: existing?.default_model ?? "",
+          });
         }
         await setDefaultIfUnset("llm", {
           engine: "openai-compatible",

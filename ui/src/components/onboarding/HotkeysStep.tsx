@@ -77,11 +77,13 @@ function HotkeyRow({
   command,
   label,
   hint,
+  onSaved,
 }: {
   feature: string;
   command: string;
   label: string;
   hint: string;
+  onSaved?: (accelerator: string) => void;
 }) {
   const [current, setCurrent] = useState<EffectiveHotkey | null>(null);
   const [saved, setSaved] = useState(false);
@@ -106,6 +108,7 @@ function HotkeyRow({
         setCurrent({ accelerator: pending, source: "custom" });
         setSaved(true);
         clearPending();
+        onSaved?.(pending);
       })
       .catch((e) => {
         if (cancelled) return;
@@ -115,7 +118,7 @@ function HotkeyRow({
     return () => {
       cancelled = true;
     };
-  }, [pending, feature, command, clearPending]);
+  }, [pending, feature, command, clearPending, onSaved]);
 
   return (
     <Row label={label} hint={error ?? captureError ?? hint}>
@@ -137,12 +140,14 @@ function HotkeyRow({
 }
 
 export default function HotkeysStep() {
-  const [rewriteKeys, setRewriteKeys] = useState<string | null>(null);
+  // The raw Rewrite accelerator; the row below updates it after re-recording
+  // so the "try it now" line never shows a stale combo.
+  const [rewriteAccel, setRewriteAccel] = useState<string | null>(null);
 
   useEffect(() => {
     getEffectiveHotkey("rewrite", "rewrite_selection")
-      .then((hk) => setRewriteKeys(hk ? formatAccelerator(hk.accelerator) : null))
-      .catch(() => setRewriteKeys(null));
+      .then((hk) => setRewriteAccel(hk ? hk.accelerator : null))
+      .catch(() => setRewriteAccel(null));
   }, []);
 
   return (
@@ -158,13 +163,15 @@ export default function HotkeysStep() {
             command={f.command}
             label={f.label}
             hint={f.hint}
+            onSaved={f.feature === "rewrite" ? setRewriteAccel : undefined}
           />
         ))}
       </RowGroup>
       <div style={{ marginTop: 16 }}>
         <Banner variant="ok">
           You're ready! Try it now: select some text in any app and press{" "}
-          <strong>{rewriteKeys ?? "the Rewrite shortcut"}</strong> to rewrite it.
+          <strong>{rewriteAccel ? formatAccelerator(rewriteAccel) : "the Rewrite shortcut"}</strong>{" "}
+          to rewrite it.
         </Banner>
       </div>
     </div>
