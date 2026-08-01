@@ -71,6 +71,50 @@ describe("RowGroup + Row", () => {
     }
   });
 
+  it("describes a button control with the row hint", () => {
+    render(
+      <RowGroup>
+        <Row
+          label="Shortcut"
+          tone="danger"
+          hint="Shortcut registration failed at startup: already in use"
+        >
+          <span className="kea-muted">Not set</span>
+          <button type="button">Re-record</button>
+        </Row>
+      </RowGroup>,
+    );
+    const button = screen.getByRole("button", { name: "Re-record" });
+    const hintId = button.getAttribute("aria-describedby");
+    expect(hintId).toBeTruthy();
+    expect(document.getElementById(hintId!)?.textContent).toBe(
+      "Shortcut registration failed at startup: already in use",
+    );
+  });
+
+  it("reaches a control nested in a fragment or a wrapper", () => {
+    render(
+      <RowGroup>
+        <Row label="Updates" hint="Last checked just now">
+          <>
+            <button type="button">Check now</button>
+          </>
+          <span>
+            <input aria-label="Channel" />
+          </span>
+        </Row>
+      </RowGroup>,
+    );
+    for (const control of [
+      screen.getByRole("button", { name: "Check now" }),
+      screen.getByRole("textbox", { name: "Channel" }),
+    ]) {
+      const hintId = control.getAttribute("aria-describedby");
+      expect(hintId).toBeTruthy();
+      expect(document.getElementById(hintId!)?.textContent).toBe("Last checked just now");
+    }
+  });
+
   it("leaves a control's own aria-describedby alone", () => {
     render(
       <>

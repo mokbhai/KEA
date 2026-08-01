@@ -2,6 +2,7 @@ import {
   Children,
   cloneElement,
   createContext,
+  Fragment,
   isValidElement,
   useContext,
   useId,
@@ -34,17 +35,36 @@ export function useRowHintId(): string | undefined {
 }
 
 /**
- * Native form controls written inline as row children can't call the hook, so
- * they get the association by cloning instead. Anything that already carries
- * its own aria-describedby keeps it.
+ * Native controls written inline as row children can't call the hook, so they
+ * get the association by cloning instead. Buttons are in here because they are
+ * the most common row control — a hotkey's "Re-record", a picker's "Change…" —
+ * and their hint is usually the row's whole state ("registration failed at
+ * startup: …"). Anything that already carries its own aria-describedby keeps it.
  */
-const DESCRIBABLE = new Set(["input", "select", "textarea"]);
+const DESCRIBABLE = new Set(["input", "select", "textarea", "button", "a"]);
 
 function describeControls(children: ReactNode, hintId: string | undefined): ReactNode {
   if (!hintId) return children;
   return Children.map(children, (child) => {
     if (!isValidElement(child)) return child;
-    if (typeof child.type !== "string" || !DESCRIBABLE.has(child.type)) return child;
+
+    // Components read the id from context instead; cloning would only set a
+    // prop they may not forward.
+    const isIntrinsic = typeof child.type === "string";
+    if (!isIntrinsic && child.type !== Fragment) return child;
+
+    // Fragments and plain wrappers are transparent: descend so a control
+    // nested in one is still reached.
+    if (child.type === Fragment || !DESCRIBABLE.has(child.type as string)) {
+      const props = child.props as { children?: ReactNode };
+      if (props.children === undefined) return child;
+      return cloneElement(
+        child as ReactElement<{ children?: ReactNode }>,
+        undefined,
+        describeControls(props.children, hintId),
+      );
+    }
+
     const props = child.props as { "aria-describedby"?: string };
     if (props["aria-describedby"]) return child;
     return cloneElement(child as ReactElement<{ "aria-describedby"?: string }>, {
