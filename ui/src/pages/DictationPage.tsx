@@ -24,8 +24,30 @@ import type { SlotSpec } from "../lib/featureSlot";
 const DICTATION_FEATURE = "dictation";
 const DICTATION_COMMAND = "push_to_talk";
 
-const SLOTS: SlotSpec[] = [
-  { feature: "dictation", slot: "stt", capability: "stt", label: "Speech to text" },
+const STT_SLOT: SlotSpec = {
+  feature: "dictation",
+  slot: "stt",
+  capability: "stt",
+  label: "Speech to text",
+};
+
+/**
+ * With clean-up on, dictation.rs resolves ("rewrite", "llm") and fails the
+ * *whole* run when it can't — the transcript is discarded, not merely left
+ * un-cleaned. So the clean-up AI is a real dependency exactly while the toggle
+ * is on, and the page must say so. Both arrays are module-level constants to
+ * keep useFeatureAi's stable-identity contract.
+ */
+const SLOTS_PLAIN: SlotSpec[] = [STT_SLOT];
+
+const SLOTS_WITH_CLEANUP: SlotSpec[] = [
+  STT_SLOT,
+  {
+    feature: "rewrite",
+    slot: "llm",
+    capability: "llm",
+    label: "Clean-up (uses the Rewrite AI)",
+  },
 ];
 
 type Props = {
@@ -33,8 +55,8 @@ type Props = {
 };
 
 export default function DictationPage({ onNavigate }: Props) {
-  const ai = useFeatureAi(SLOTS);
   const [postProcess, setPostProcess] = useState(false);
+  const ai = useFeatureAi(postProcess ? SLOTS_WITH_CLEANUP : SLOTS_PLAIN);
   const [settingsStatus, setSettingsStatus] = useState<string | null>(null);
   const [settingsLoading, setSettingsLoading] = useState(true);
   const [dictationStatus, setDictationStatus] = useState<string | null>(null);
@@ -150,7 +172,7 @@ export default function DictationPage({ onNavigate }: Props) {
               />
               <Row
                 label="Clean up text with AI"
-                hint="Removes filler words and fixes punctuation before typing."
+                hint="Removes filler words and fixes punctuation before typing. Needs the Rewrite AI — dictation fails outright without it."
               >
                 {savedKey === "post_process" && <span className="kea-saved">Saved ✓</span>}
                 <Toggle

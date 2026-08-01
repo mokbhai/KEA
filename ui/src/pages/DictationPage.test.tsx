@@ -97,6 +97,94 @@ describe("DictationPage", () => {
     });
   });
 
+  it("checks the saved fallback model when the binding carries none", async () => {
+    // dictation.rs uses settings.active_model when the binding has no model,
+    // so an undownloaded fallback blocks the feature just the same.
+    mockWorld({
+      bindings: { "default/stt": { engine_id: "whisper", model: null, provider_ref: null } },
+      installedWhisper: [],
+      extra: {
+        get_dictation_state: () => "idle",
+        get_dictation_settings: () => ({
+          post_process: false,
+          active_model: "whisper-base",
+        }),
+      },
+    });
+    render(<DictationPage />);
+
+    expect(await screen.findByText(/Whisper Base isn't downloaded yet/)).toBeTruthy();
+  });
+
+  it("warns about the clean-up AI only while clean-up is on", async () => {
+    // Clean-up on, speech to text fine, but no LLM default and two candidates:
+    // dictation.rs would fail the whole run and discard the transcript.
+    mockWorld({
+      bindings: { "default/stt": whisperBinding },
+      engines: { stt: ["whisper"], llm: ["openai", "openai-compatible"] },
+      extra: {
+        get_dictation_state: () => "idle",
+        get_dictation_settings: () => ({ post_process: true, active_model: null }),
+      },
+    });
+    render(<DictationPage />);
+
+    expect(
+      await screen.findByText(/Clean-up \(uses the Rewrite AI\) —/),
+    ).toBeTruthy();
+    expect(screen.getByText(/Nothing is set up for this yet/)).toBeTruthy();
+  });
+
+  it("does not mention the clean-up AI while clean-up is off", async () => {
+    mockWorld({
+      bindings: { "default/stt": whisperBinding },
+      engines: { stt: ["whisper"], llm: ["openai", "openai-compatible"] },
+    });
+    render(<DictationPage />);
+
+    expect(
+      await screen.findByText("Using default — Whisper Base — on this Mac"),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Clean-up \(uses the Rewrite AI\)/)).toBeNull();
+    expect(screen.queryByText(/Nothing is set up for this yet/)).toBeNull();
+  });
+
+  it("picks up the clean-up dependency when the toggle is switched on", async () => {
+    mockWorld({
+      bindings: { "default/stt": whisperBinding },
+      engines: { stt: ["whisper"], llm: ["openai", "openai-compatible"] },
+    });
+    render(<DictationPage />);
+
+    await userEvent.click(
+      await screen.findByRole("switch", { name: "Clean up text with AI" }),
+    );
+
+    expect(
+      await screen.findByText(/Clean-up \(uses the Rewrite AI\) —/),
+    ).toBeTruthy();
+  });
+
+  it("reports a lookup failure instead of inventing a cause", async () => {
+    mockWorld({
+      bindings: { "default/stt": whisperBinding },
+      extra: {
+        get_dictation_state: () => "idle",
+        list_stt_engines: () => {
+          throw new Error("ipc channel closed");
+        },
+      },
+    });
+    render(<DictationPage />);
+
+    expect(
+      await screen.findByText(/Couldn't check the AI setup for this feature/),
+    ).toBeTruthy();
+    // Without the engine list we cannot know the choice is unavailable.
+    expect(screen.queryByText(/isn't available in this version/)).toBeNull();
+    expect(screen.queryByText(/Nothing is set up for this yet/)).toBeNull();
+  });
+
   it("saves the AI clean-up toggle", async () => {
     mockWorld({ bindings: { "default/stt": whisperBinding } });
     render(<DictationPage />);
