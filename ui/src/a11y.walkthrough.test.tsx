@@ -24,6 +24,36 @@ const whisperBinding = {
   provider_ref: null,
 };
 
+const ACTION = {
+  id: 7,
+  feature_id: "rewrite",
+  command: "rewrite_selection",
+  engine_id: "openai",
+  status: "ok",
+};
+
+const CONVERSATION = {
+  id: 3,
+  action_id: 7,
+  feature_id: "rewrite",
+  engine_id: "openai",
+  model: "gpt-4o-mini",
+  provider_ref: "openai",
+  created_at: "2026-07-17T10:00:00Z",
+};
+
+const MEETING = {
+  id: "meeting-1",
+  title: "Test capture",
+  started_at: "2026-07-17T10:00:00Z",
+  ended_at: "2026-07-17T10:00:10Z",
+  status: "done",
+  capture_mode: "mic_only",
+  stt_engine_id: "whisper",
+  llm_engine_id: "openai",
+  error: null,
+};
+
 /** Every page's backend, resolved and healthy, so nothing is hidden behind an error. */
 function mockWholeApp() {
   onInvoke(
@@ -49,7 +79,10 @@ function mockWholeApp() {
         ],
         get_permission_status: () => "Granted",
         request_permission: () => "Granted",
-        list_meetings: () => [],
+        // Seeded, not empty: an empty table sweeps no rows, and the row
+        // controls are exactly what needs covering.
+        list_meetings: () => [MEETING],
+        get_meeting: () => ({ meeting: MEETING, segments: [], notes: null }),
         get_meeting_state: () => ({ state: "idle", active_meeting_id: null }),
         get_meeting_settings: () => ({
           segment_duration_secs: 30,
@@ -60,10 +93,17 @@ function mockWholeApp() {
         preview_voice: () => undefined,
         test_provider: () => "ok",
         delete_model: () => undefined,
-        list_actions: () => [],
-        list_conversations: () => [],
+        list_actions: () => [ACTION],
+        list_conversations: () => [CONVERSATION],
         list_messages: () => [],
-        get_action: () => null,
+        get_action: () => ({
+          ...ACTION,
+          model: "gpt-4o-mini",
+          provider_ref: "openai",
+          error: null,
+          started_at: "2026-07-17T10:00:00Z",
+          finished_at: "2026-07-17T10:00:01Z",
+        }),
         tail_logs: () => "INFO ready",
         open_log_folder: () => undefined,
       },
@@ -74,19 +114,34 @@ function mockWholeApp() {
 // <summary> is deliberately absent: browsers focus it, but user-event's tab()
 // does not include it in its focusable set, so it would report false failures.
 // The Advanced disclosures were checked by hand instead.
-const CONTROL_SELECTOR = "button, a[href], input, select, textarea, [tabindex]";
+const CONTROL_SELECTOR = "button, a[href], input, select, textarea";
 
-/** Anything a sighted mouse user can operate on the page right now. */
-function enabledControls(): HTMLElement[] {
+/**
+ * Everything a sighted mouse user can operate on the page right now.
+ *
+ * Deliberately NOT filtered by tabindex/aria-hidden/inert: those are exactly
+ * the ways a control gets hidden from the keyboard, so excluding them here
+ * would let a regression delete itself from the expectation instead of failing
+ * the test. They are asserted against separately below.
+ */
+function operableControls(): HTMLElement[] {
   return Array.from(document.body.querySelectorAll<HTMLElement>(CONTROL_SELECTOR)).filter(
-    (el) =>
-      !el.hasAttribute("disabled") &&
-      el.getAttribute("aria-hidden") !== "true" &&
-      el.getAttribute("tabindex") !== "-1" &&
-      !el.closest("[aria-hidden='true']") &&
-      !el.closest("[inert]"),
+    (el) => !el.hasAttribute("disabled"),
   );
 }
+
+/** Controls a mouse can reach but a keyboard cannot. */
+function hiddenFromKeyboard(): HTMLElement[] {
+  return operableControls().filter(
+    (el) =>
+      el.getAttribute("tabindex") === "-1" ||
+      el.closest("[aria-hidden='true']") !== null ||
+      el.closest("[inert]") !== null,
+  );
+}
+
+const describeControl = (el: HTMLElement) =>
+  `${el.tagName.toLowerCase()}: ${el.getAttribute("aria-label") ?? el.textContent?.trim()}`;
 
 /**
  * Tabs from the top of the document and reports which controls focus never
@@ -94,7 +149,7 @@ function enabledControls(): HTMLElement[] {
  * that never receives focus is either unreachable or sitting behind a trap.
  */
 async function tabSweep(): Promise<HTMLElement[]> {
-  const controls = enabledControls();
+  const controls = operableControls();
   const seen = new Set<Element>();
   const seenRadioGroups = new Set<string>();
   document.body.focus();
@@ -116,16 +171,17 @@ async function tabSweep(): Promise<HTMLElement[]> {
   });
 }
 
-const PAGES: [string, () => JSX.Element][] = [
-  ["Rewrite", () => <RewritePage />],
-  ["Dictation", () => <DictationPage />],
-  ["Meetings", () => <MeetingsPage />],
-  ["Read aloud", () => <ReadAloudPage />],
-  ["AI Providers", () => <AiProvidersPage />],
-  ["Models", () => <ModelsPage />],
-  ["General", () => <GeneralPage onRunSetup={() => {}} />],
-  ["History", () => <HistoryPage />],
-  ["Logs", () => <LogsPage />],
+/** Page title, how to render it, and row controls that must be in the sweep. */
+const PAGES: [string, () => JSX.Element, RegExp[]][] = [
+  ["Rewrite", () => <RewritePage />, []],
+  ["Dictation", () => <DictationPage />, []],
+  ["Meetings", () => <MeetingsPage />, [/Test capture/]],
+  ["Read aloud", () => <ReadAloudPage />, []],
+  ["AI Providers", () => <AiProvidersPage />, []],
+  ["Models", () => <ModelsPage />, []],
+  ["General", () => <GeneralPage onRunSetup={() => {}} />, []],
+  ["History", () => <HistoryPage />, [/^Show action 7$/]],
+  ["Logs", () => <LogsPage />, []],
 ];
 
 describe("keyboard-only walkthrough", () => {
@@ -134,17 +190,34 @@ describe("keyboard-only walkthrough", () => {
     mockWholeApp();
   });
 
-  it.each(PAGES)("reaches every control on %s with Tab alone", async (title, page) => {
-    render(<ThemeProvider>{page()}</ThemeProvider>);
-    await screen.findByRole("heading", { level: 1, name: title });
-    // Let the page settle so late-arriving controls are part of the sweep.
-    await waitFor(() => expect(invokeMock).toHaveBeenCalled());
+  it.each(PAGES)(
+    "reaches every control on %s with Tab alone",
+    async (title, page, required) => {
+      render(<ThemeProvider>{page()}</ThemeProvider>);
+      await screen.findByRole("heading", { level: 1, name: title });
+      // Let the page settle so late-arriving controls are part of the sweep.
+      await waitFor(() => expect(invokeMock).toHaveBeenCalled());
+      // Prove the seeded rows actually rendered, so the sweep is covering
+      // their controls rather than an empty table.
+      for (const name of required) {
+        expect(await screen.findByRole("button", { name })).toBeTruthy();
+      }
 
-    const unreachable = await tabSweep();
+      expect(hiddenFromKeyboard().map(describeControl)).toEqual([]);
+      expect((await tabSweep()).map(describeControl)).toEqual([]);
+    },
+  );
 
+  it("reaches every control on History's conversations tab", async () => {
+    render(<HistoryPage />);
+    await userEvent.click(await screen.findByRole("button", { name: "Conversations" }));
     expect(
-      unreachable.map((el) => `${el.tagName.toLowerCase()}: ${el.textContent?.trim()}`),
-    ).toEqual([]);
+      await screen.findByRole("button", { name: "Show conversation 3" }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Delete conversation 3" })).toBeTruthy();
+
+    expect(hiddenFromKeyboard().map(describeControl)).toEqual([]);
+    expect((await tabSweep()).map(describeControl)).toEqual([]);
   });
 
   it("runs the wizard end to end from the keyboard", async () => {
@@ -160,13 +233,8 @@ describe("keyboard-only walkthrough", () => {
     // Four steps, each advanced by focusing its primary action and pressing
     // Enter — no pointer events anywhere in this test.
     for (let step = 0; step < 4; step += 1) {
-      const unreachable = await tabSweep();
-      expect(
-        unreachable.map(
-          (el) =>
-            `${el.tagName.toLowerCase()}[${el.getAttribute("type") ?? ""}] ${el.getAttribute("aria-label") ?? el.textContent?.trim()}`,
-        ),
-      ).toEqual([]);
+      expect(hiddenFromKeyboard().map(describeControl)).toEqual([]);
+      expect((await tabSweep()).map(describeControl)).toEqual([]);
 
       const next = screen.getByRole("button", {
         name: step === 3 ? "Finish" : "Continue",
