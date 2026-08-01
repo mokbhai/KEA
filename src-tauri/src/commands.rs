@@ -10,8 +10,8 @@ use kea_core::log::{current_log_path, tail_log_file};
 use kea_core::meetings::{MeetingSettings, MeetingSettingsRepo};
 use kea_core::resolve::{Resolution, DEFAULT_FEATURE_ID};
 use kea_core::rewrite::{
-    PresetRepo, PromptOverrideRepo, ProviderConfig, ProviderConfigRepo, RewriteInput,
-    RewriteMode, RewritePreset,
+    build_llm_request, PresetRepo, PromptOverrideRepo, ProviderConfig, ProviderConfigRepo,
+    RewriteInput, RewriteMode, RewritePreset,
 };
 use kea_core::store::actions::{ActionDetail, ActionRepo, ActionRow};
 use kea_core::store::bindings::{Binding, BindingRepo};
@@ -1969,6 +1969,65 @@ pub async fn trigger_rewrite(
         },
     )
     .await
+}
+
+/// Runs the configured rewrite prompt over `text` with the Rewrite feature's
+/// own LLM binding and returns the result.
+///
+/// Unlike [`trigger_rewrite`] this never captures the selection and never
+/// pastes anything back — it exists for the "Try it" card on the Rewrite page,
+/// where the user types the sample text and expects to read the result in the
+/// window rather than have it inserted into whatever app is frontmost.
+#[tauri::command]
+pub async fn preview_rewrite(
+    state: State<'_, Arc<AppState>>,
+    text: String,
+    mode: RewriteMode,
+    preset_id: Option<String>,
+    custom_instruction: Option<String>,
+) -> Result<String, String> {
+    if text.trim().is_empty() {
+        return Err("type some text to rewrite first".into());
+    }
+
+    let bindings = BindingRepo::new(state.config_pool.clone());
+    let presets = PresetRepo::new(state.config_pool.clone());
+    let overrides = PromptOverrideRepo::new(state.config_pool.clone());
+
+    let resolver = SlotResolver::new(&state.engines, &bindings);
+    let binding = match resolver
+        .resolve_llm(REWRITE_FEATURE_ID, "llm")
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Resolution::Bound(b) => b,
+        other => return Err(resolution_error(other).unwrap_or_else(|| "resolution failed".into())),
+    };
+
+    let mut req = build_llm_request(
+        &RewriteInput {
+            source_text: text,
+            mode,
+            preset_id,
+            custom_instruction,
+        },
+        &presets,
+        &overrides,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    req.model = binding.model.clone();
+
+    let engine = state
+        .engines
+        .llm(&binding.engine_id)
+        .ok_or_else(|| format!("no llm engine '{}'", binding.engine_id))?;
+
+    engine
+        .complete(req)
+        .await
+        .map(|resp| resp.text)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

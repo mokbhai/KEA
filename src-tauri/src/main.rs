@@ -151,6 +151,7 @@ fn main() {
             commands::get_hotkey_registration_status,
             commands::set_hotkey,
             commands::trigger_rewrite,
+            commands::preview_rewrite,
             commands::run_demo,
             commands::list_whisper_models,
             commands::list_installed_whisper_models,

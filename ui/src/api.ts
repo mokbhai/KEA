@@ -154,6 +154,24 @@ export const triggerRewrite = (
     customInstruction: custom_instruction ?? null,
   });
 
+/**
+ * Rewrites `text` with the Rewrite feature's own AI binding and returns the
+ * result. Nothing is captured from, or pasted into, the frontmost app — this
+ * backs the "Try it" card, unlike {@link triggerRewrite}.
+ */
+export const previewRewrite = (
+  text: string,
+  mode: RewriteMode,
+  preset_id?: string | null,
+  custom_instruction?: string | null,
+) =>
+  invoke<string>("preview_rewrite", {
+    text,
+    mode,
+    presetId: preset_id ?? null,
+    customInstruction: custom_instruction ?? null,
+  });
+
 export const runDemo = (prompt: string) => invoke<string>("run_demo", { prompt });
 
 export const onRewriteProgress = (
