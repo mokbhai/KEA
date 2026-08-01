@@ -188,6 +188,12 @@ function ownsSettings(capability: Capability, target: BindingTarget): boolean {
  * otherwise — and keeps the per-feature active_model / active_voice settings
  * consistent. The single write path shared by the DefaultsPicker (both the
  * defaults on AI Providers and the per-feature overrides) and the wizard.
+ *
+ * The settings-level model is the *fallback* used when a binding carries no
+ * model of its own, so it must mirror the choice for every engine — not only
+ * the two local ones. A Parakeet or cloud pick that left a stale whisper id
+ * behind would hand that id to the new engine the moment a binding without a
+ * model resolved. Picks with no model of their own (OpenAI voices) clear it.
  */
 export async function applyDefaultChoice(
   capability: Capability,
@@ -198,15 +204,24 @@ export async function applyDefaultChoice(
   const to = target ?? defaultTarget(capability);
   await setBinding(to.feature, to.slot, choice.engine, choice.model, choice.providerRef);
   if (!ownsSettings(capability, to)) return;
-  if (capability === "stt" && choice.engine === "whisper" && choice.model !== null) {
+  if (capability === "stt") {
     const settings = await getDictationSettings();
-    await setDictationSettings({ ...settings, active_model: choice.model });
-  } else if (capability === "tts" && choice.engine === "sherpa-tts" && choice.model !== null) {
+    if (settings.active_model !== choice.model) {
+      await setDictationSettings({ ...settings, active_model: choice.model });
+    }
+  } else if (capability === "tts") {
     const settings = await getTtsSettings();
-    await setTtsSettings({ ...settings, active_model: choice.model });
-  } else if (capability === "tts" && choice.engine === "openai-tts" && voice) {
-    const settings = await getTtsSettings();
-    await setTtsSettings({ ...settings, active_voice: voice });
+    const next = {
+      ...settings,
+      active_model: choice.model,
+      active_voice: voice ?? settings.active_voice,
+    };
+    if (
+      next.active_model !== settings.active_model ||
+      next.active_voice !== settings.active_voice
+    ) {
+      await setTtsSettings(next);
+    }
   }
 }
 

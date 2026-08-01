@@ -215,9 +215,10 @@ describe("Onboarding wizard", () => {
         providerRef: "openai",
       },
     ]);
-    // Alloy becomes the active voice, mirroring the defaults picker.
+    // Alloy becomes the active voice, mirroring the defaults picker. The
+    // fallback model mirrors the binding's model so the two can't disagree.
     expect(invokeCalls("set_tts_settings")).toEqual([
-      { settings: { active_voice: "alloy", active_model: null } },
+      { settings: { active_voice: "alloy", active_model: "tts-1" } },
     ]);
   });
 

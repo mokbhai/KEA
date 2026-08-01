@@ -4,6 +4,7 @@ import DefaultsPicker from "./DefaultsPicker";
 import { Row, RowGroup } from "./SettingsRow";
 import Spinner from "./Spinner";
 import { useSavedFlash } from "../hooks/useSavedFlash";
+import { usePendingActivation } from "../hooks/usePendingActivation";
 import type { FeatureAi } from "../hooks/useFeatureAi";
 import type { SlotStatus } from "../lib/featureSlot";
 
@@ -32,6 +33,9 @@ export default function FeatureAiCard({ ai, title = "AI", featureLabel }: Props)
   const [savedKey, flash] = useSavedFlash();
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Held by the card, so closing the picker mid-download doesn't drop the
+  // choice: the binding is written when the download lands either way.
+  const activation = usePendingActivation(() => ai.reload());
 
   const useDefaultAgain = async (status: SlotStatus) => {
     const key = keyOf(status);
@@ -125,8 +129,14 @@ export default function FeatureAiCard({ ai, title = "AI", featureLabel }: Props)
           title={`${ai.pickerSpec.label} for ${featureLabel}`}
           open
           onClose={ai.closePicker}
-          onApplied={() => ai.reload()}
+          activation={activation}
         />
+      )}
+      {!ai.pickerSpec && activation.pending && (
+        <p className="kea-muted" style={{ marginTop: 8, fontSize: "0.8125rem" }}>
+          Downloading {activation.pending.option.label} — it will be used here when the download
+          finishes.
+        </p>
       )}
     </section>
   );

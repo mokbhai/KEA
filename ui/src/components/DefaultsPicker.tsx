@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   getBinding,
   listProviders,
@@ -6,13 +6,11 @@ import {
   type Binding,
   type Provider,
 } from "../api";
-import { useModelDownloads } from "../hooks/useModelDownloads";
+import type { PendingActivation } from "../hooks/usePendingActivation";
 import {
   buildCapabilityOptions,
   defaultTarget,
   loadKeyStates,
-  applyDefaultChoice,
-  startOptionDownload,
   CAPABILITY_LABELS,
   OPENAI_TTS_VOICES,
   type BindingTarget,
@@ -30,7 +28,12 @@ type Props = {
   capability: Capability;
   open: boolean;
   onClose: () => void;
-  onApplied: () => void;
+  /**
+   * The download-then-activate flow, owned by whoever renders this popover.
+   * It has to outlive the picker: closing mid-download must not drop the
+   * choice. `usePendingActivation(onApplied)` produces it.
+   */
+  activation: PendingActivation;
   /**
    * Binding row the choice is written to. Defaults to the capability-wide
    * ("default", capability) row; feature pages pass their own feature and slot
@@ -61,7 +64,7 @@ export default function DefaultsPicker({
   capability,
   open,
   onClose,
-  onApplied,
+  activation,
   target,
   title,
 }: Props) {
@@ -72,26 +75,32 @@ export default function DefaultsPicker({
   const [options, setOptions] = useState<PickerOption[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
-  const [savedId, setSavedId] = useState<string | null>(null);
-  const [pending, setPending] = useState<PickerOption | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [voice, setVoice] = useState(OPENAI_TTS_VOICES[0]);
   const [advProvider, setAdvProvider] = useState("openai");
   const [advModel, setAdvModel] = useState("");
   const [advEngine, setAdvEngine] = useState("");
 
-  const pendingRef = useRef<PickerOption | null>(null);
-  pendingRef.current = pending;
   const voiceRef = useRef(voice);
   voiceRef.current = voice;
+
+  const { savedId, error, progressById, clearFeedback, setError } = activation;
+  // Only one activation at a time, wherever it was started from.
+  const busy = activation.pending !== null;
+  // A download started for another slot keeps running; only show it as
+  // pending on the picker that started it.
+  const pending =
+    activation.pending &&
+    activation.pending.capability === capability &&
+    activation.pending.target.feature === targetFeature &&
+    activation.pending.target.slot === targetSlot
+      ? activation.pending.option
+      : null;
 
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
     setLoading(true);
-    setError(null);
-    setSavedId(null);
-    setPending(null);
+    clearFeedback();
 
     (async () => {
       try {
@@ -118,77 +127,25 @@ export default function DefaultsPicker({
     return () => {
       cancelled = true;
     };
-  }, [open, capability, targetFeature, targetSlot]);
+  }, [open, capability, targetFeature, targetSlot, clearFeedback, setError]);
 
-  const apply = useCallback(
-    async (option: PickerOption) => {
-      setError(null);
-      try {
-        await applyDefaultChoice(
-          capability,
-          option,
-          capability === "tts" ? voiceRef.current : null,
-          { feature: targetFeature, slot: targetSlot },
-        );
-        setPending(null);
-        setSavedId(option.id);
-        setCurrentId(option.id);
-        onApplied();
-      } catch (e) {
-        setPending(null);
-        setError(e instanceof Error ? e.message : String(e));
-      }
-    },
-    [capability, onApplied, targetFeature, targetSlot],
-  );
+  // Reflect a finished download in the list even when this picker was closed
+  // while it ran.
+  useEffect(() => {
+    if (!savedId) return;
+    setOptions((prev) =>
+      prev.map((o) => (o.id === savedId ? { ...o, installed: true, status: "installed ✓" } : o)),
+    );
+    setCurrentId(savedId);
+  }, [savedId]);
 
-  const catalogIds = useMemo(
-    () =>
-      new Set(
-        options.flatMap((o) => (o.downloadKind && o.model ? [o.model] : [])),
-      ),
-    [options],
-  );
-
-  const { progressById } = useModelDownloads({
-    catalogIds,
-    onComplete: (modelId) => {
-      setOptions((prev) =>
-        prev.map((o) =>
-          o.model === modelId ? { ...o, installed: true, status: "installed ✓" } : o,
-        ),
-      );
-      const picked = pendingRef.current;
-      if (picked?.model === modelId) {
-        void apply({ ...picked, installed: true });
-      }
-    },
-    onError: (modelId, message) => {
-      if (pendingRef.current?.model === modelId) setPending(null);
-      setError(`${modelId}: ${message}`);
-    },
-  });
-
-  const pick = async (option: PickerOption) => {
-    if (pending) return;
-    setError(null);
-    setSavedId(null);
-    if (option.downloadKind && option.model && !option.installed) {
-      // Sync the ref imperatively: the download-complete event can arrive
-      // before React re-renders and syncs pendingRef from state.
-      pendingRef.current = option;
-      setPending(option);
-      try {
-        await startOptionDownload(option);
-      } catch (e) {
-        pendingRef.current = null;
-        setPending(null);
-        setError(e instanceof Error ? e.message : String(e));
-      }
-      return;
-    }
-    await apply(option);
-  };
+  const pick = (option: PickerOption) =>
+    activation.start({
+      capability,
+      option,
+      voice: capability === "tts" ? voiceRef.current : null,
+      target: { feature: targetFeature, slot: targetSlot },
+    });
 
   const preview = async (option: PickerOption) => {
     setError(null);
@@ -201,7 +158,7 @@ export default function DefaultsPicker({
 
   const applyAdvanced = async () => {
     const engine = advEngine.trim() || defaultEngineFor(capability, advProvider);
-    await apply({
+    await pick({
       id: `advanced:${engine}:${advModel.trim()}`,
       label: advModel.trim() || engine,
       detail: "custom",
@@ -258,7 +215,7 @@ export default function DefaultsPicker({
                         currentId === option.id ? " kea-picker__option--current" : ""
                       }`}
                       onClick={() => void pick(option)}
-                      disabled={!option.ready || !!pending}
+                      disabled={!option.ready || busy}
                       aria-current={currentId === option.id ? "true" : undefined}
                     >
                       <span className="kea-picker__name">
@@ -337,6 +294,11 @@ export default function DefaultsPicker({
               </button>
             </div>
           </details>
+          {busy && !pending && (
+            <p className="kea-muted" style={{ marginTop: 8 }}>
+              Another download is still finishing — one at a time.
+            </p>
+          )}
           {error && (
             <p className="kea-muted" style={{ marginTop: 8 }}>
               {error}
