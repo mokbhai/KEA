@@ -2,6 +2,7 @@
 
 mod commands;
 mod events;
+mod overlay;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -714,6 +715,14 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
+    }
+
+    // Built up-front and left hidden: `emit_dictation_state` only shows and
+    // hides it, so the webview is already loaded and listening when the first
+    // state arrives. A failure here must not abort startup — dictation works
+    // without the HUD.
+    if let Err(e) = overlay::create(app.handle()) {
+        tracing::warn!(error = %e, "failed to create the dictation overlay window");
     }
 
     let open = MenuItem::with_id(app, "open", "Open KEA", true, None::<&str>)?;

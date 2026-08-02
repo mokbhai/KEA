@@ -8,7 +8,6 @@ import {
 import { getVersion } from "@tauri-apps/api/app";
 import { getBinding, getSetting, setSetting, onDictationError, onMeetingError, onRewriteError, onRewriteProgress, onTtsError, onTtsState } from "./api";
 import Onboarding from "./components/Onboarding";
-import SpeechOverlay from "./components/SpeechOverlay";
 import Spinner from "./components/Spinner";
 import StatusPill from "./components/StatusPill";
 import AiProvidersPage from "./pages/AiProvidersPage";
@@ -371,7 +370,6 @@ function AppShell() {
         </main>
       </div>
 
-      <SpeechOverlay />
       <StatusPill message={statusMessage} variant={statusVariant} />
         </>
       )}

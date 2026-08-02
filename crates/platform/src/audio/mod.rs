@@ -12,10 +12,12 @@ pub mod macos;
 pub mod macos_sck;
 #[cfg(not(target_os = "macos"))]
 pub mod stub;
+pub mod cues;
 pub mod playback;
 pub mod segment;
 pub mod util;
 
+pub use cues::{cue_pcm, Cue};
 pub use util::{accumulate_frames, chunk_pcm_by_duration, mix_frames, resample_linear, rms_level};
 
 /// Mono PCM samples at a specific sample rate (alias: capture buffer unit).
