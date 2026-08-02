@@ -29,7 +29,7 @@ use kea_features::{
 };
 use kea_features::run_rewrite_with_storage;
 use kea_core::resolve::SlotResolver;
-use kea_infer::{StreamedFile, DownloadTransport, InferError, ModelDownloader, ModelRegistry, ModelStorage, OnnxModelEntry};
+use kea_infer::{temp_file_for, StreamedFile, DownloadTransport, InferError, ModelDownloader, ModelRegistry, ModelStorage, OnnxModelEntry};
 use kea_platform::{
     new_text_io, parse_accelerator, AudioIo, AudioIoError, Cue, DictationState, HotkeyBinding,
     Hotkeys, MeetingState, PermKind, PermStatus, PcmFrame, SystemAudioCapability,
@@ -47,7 +47,7 @@ use crate::events::{
     emit_model_download_complete, emit_model_download_error, emit_model_download_progress,
     emit_tts_state, MeetingSegmentPayload,
 };
-use crate::AppState;
+use crate::{ActiveDownload, AppState};
 
 pub const REWRITE_ACTION_ID: &str = "rewrite:rewrite_selection";
 pub const REWRITE_FEATURE_ID: &str = "rewrite";
@@ -1037,7 +1037,35 @@ impl AudioIo for ReplayAudioIo {
     }
 }
 
-struct ReqwestDownloadTransport;
+/// How long to wait for the connection to come up before giving up.
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a transfer may go without delivering *any* bytes before it counts
+/// as dead. This is per-read, not per-transfer: a model is hundreds of
+/// megabytes and a slow link can legitimately take many minutes, so an overall
+/// deadline would cancel healthy downloads. What must never happen is the
+/// no-timeout case — a socket that stops delivering leaves the download task
+/// parked forever, so it emits neither completion nor error and the UI waits
+/// on a transfer that will never end.
+const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct ReqwestDownloadTransport {
+    connect_timeout: Duration,
+    stall_timeout: Duration,
+}
+
+impl ReqwestDownloadTransport {
+    fn new() -> Self {
+        Self::with_timeouts(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_STALL_TIMEOUT)
+    }
+
+    fn with_timeouts(connect_timeout: Duration, stall_timeout: Duration) -> Self {
+        Self {
+            connect_timeout,
+            stall_timeout,
+        }
+    }
+}
 
 #[async_trait]
 impl DownloadTransport for ReqwestDownloadTransport {
@@ -1051,7 +1079,11 @@ impl DownloadTransport for ReqwestDownloadTransport {
         use sha2::{Digest, Sha256};
         use std::io::Write;
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .read_timeout(self.stall_timeout)
+            .build()
+            .map_err(|e| InferError::Other(e.to_string()))?;
         let response = client
             .get(url)
             .send()
@@ -1090,7 +1122,50 @@ impl DownloadTransport for ReqwestDownloadTransport {
 }
 
 pub fn new_model_downloader(storage: ModelStorage) -> ModelDownloader {
-    ModelDownloader::new(Arc::new(ReqwestDownloadTransport), storage)
+    ModelDownloader::new(Arc::new(ReqwestDownloadTransport::new()), storage)
+}
+
+fn panic_reason(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Runs a download to completion and reduces every way it can end into one
+/// outcome the caller turns into exactly one event.
+///
+/// The panic arm is the point. A spawned task that unwinds is dropped
+/// silently: no completion, no error, nothing in the log — and the picker,
+/// which refuses to re-issue while a request is pending, sits on "starting
+/// download…" until the app is restarted. Catching the unwind here turns an
+/// invisible death into a message the UI can show and recover from.
+async fn run_download_task<F>(model_id: &str, download: F) -> Result<(), String>
+where
+    F: std::future::Future<Output = Result<(), InferError>>,
+{
+    use futures_util::FutureExt;
+
+    let outcome = std::panic::AssertUnwindSafe(download).catch_unwind().await;
+    match outcome {
+        Ok(Ok(())) => {
+            tracing::info!(model = %model_id, "model download finished");
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            let message = error.to_string();
+            tracing::warn!(model = %model_id, error = %message, "model download failed");
+            Err(message)
+        }
+        Err(payload) => {
+            let message = format!("download crashed: {}", panic_reason(payload.as_ref()));
+            tracing::error!(model = %model_id, error = %message, "model download panicked");
+            Err(message)
+        }
+    }
 }
 
 fn onnx_storage_for<'a>(state: &'a AppState, kind: &str) -> Result<&'a ModelStorage, String> {
@@ -2367,34 +2442,50 @@ pub async fn download_whisper_model(
     model_id: String,
     app: AppHandle,
 ) -> Result<(), String> {
-    let key = format!("whisper:{model_id}");
-    {
-        let mut guard = state.active_downloads.lock().map_err(|e| e.to_string())?;
-        if !guard.insert(key.clone()) {
-            return Err(format!("download of '{model_id}' already in progress"));
-        }
+    let key = download_key("whisper", &model_id);
+    let storage = ModelStorage::new(state.model_storage.root.clone());
+    let temp_path = temp_file_for(&storage.path_for(&model_id));
+
+    let mut guard = state.active_downloads.lock().map_err(|e| e.to_string())?;
+    if guard.contains_key(&key) {
+        return Err(format!("download of '{model_id}' already in progress"));
     }
-    let downloader = new_model_downloader(ModelStorage::new(state.model_storage.root.clone()));
+
+    let downloader = new_model_downloader(storage);
     let app_handle = app.clone();
     let state_for_cleanup = state.inner().clone();
     let mid = model_id.clone();
-    tauri::async_runtime::spawn(async move {
-        let result = downloader
-            .download_whisper(&model_id, |progress| {
-                emit_model_download_progress(&app_handle, &progress);
-            })
-            .await;
+    let cleanup_key = key.clone();
+    tracing::info!(model = %model_id, kind = "whisper", "model download started");
+    // The handle is registered while the lock is held, so a task that finishes
+    // instantly cannot have its entry removed before it was ever inserted.
+    let task = tauri::async_runtime::spawn(async move {
+        let outcome = run_download_task(&mid, async {
+            downloader
+                .download_whisper(&mid, |progress| {
+                    emit_model_download_progress(&app_handle, &progress);
+                })
+                .await
+                .map(|_| ())
+        })
+        .await;
         {
             let mut guard = state_for_cleanup.active_downloads.lock().unwrap();
-            guard.remove(&key);
+            guard.remove(&cleanup_key);
         }
-        match result {
-            Ok(_) => emit_model_download_complete(&app_handle, &mid),
-            Err(error) => {
-                emit_model_download_error(&app_handle, &mid, &error.to_string());
-            }
+        match outcome {
+            Ok(()) => emit_model_download_complete(&app_handle, &mid),
+            Err(message) => emit_model_download_error(&app_handle, &mid, &message),
         }
     });
+    guard.insert(
+        key,
+        ActiveDownload {
+            model_id,
+            temp_path,
+            task,
+        },
+    );
     Ok(())
 }
 
@@ -2886,34 +2977,104 @@ pub async fn download_onnx_model(
         .find(|e| e.id == model_id)
         .ok_or_else(|| format!("unknown {kind} model: {model_id}"))?;
 
-    let key = format!("onnx:{kind}:{model_id}");
-    {
-        let mut guard = state.active_downloads.lock().map_err(|e| e.to_string())?;
-        if !guard.insert(key.clone()) {
-            return Err(format!("download of '{model_id}' ({kind}) already in progress"));
-        }
+    let key = download_key(&kind, &model_id);
+    let temp_path = temp_file_for(&storage.onnx_dir_for(&model_id));
+
+    let mut guard = state.active_downloads.lock().map_err(|e| e.to_string())?;
+    if guard.contains_key(&key) {
+        return Err(format!("download of '{model_id}' ({kind}) already in progress"));
     }
+
     let downloader = new_model_downloader(storage);
     let app_handle = app.clone();
     let state_for_cleanup = state.inner().clone();
     let mid = model_id.clone();
-    tauri::async_runtime::spawn(async move {
-        let result = downloader
-            .download_onnx(&entry, |progress| {
-                emit_model_download_progress(&app_handle, &progress);
-            })
-            .await;
+    let cleanup_key = key.clone();
+    tracing::info!(
+        model = %model_id,
+        kind = %kind,
+        bytes = entry.size_bytes,
+        url = %entry.url,
+        "model download started"
+    );
+    // The handle is registered while the lock is held, so a task that finishes
+    // instantly cannot have its entry removed before it was ever inserted.
+    let task = tauri::async_runtime::spawn(async move {
+        let outcome = run_download_task(&mid, async {
+            downloader
+                .download_onnx(&entry, |progress| {
+                    emit_model_download_progress(&app_handle, &progress);
+                })
+                .await
+        })
+        .await;
         {
             let mut guard = state_for_cleanup.active_downloads.lock().unwrap();
-            guard.remove(&key);
+            guard.remove(&cleanup_key);
         }
-        match result {
-            Ok(_) => emit_model_download_complete(&app_handle, &mid),
-            Err(error) => {
-                emit_model_download_error(&app_handle, &mid, &error.to_string());
-            }
+        match outcome {
+            Ok(()) => emit_model_download_complete(&app_handle, &mid),
+            Err(message) => emit_model_download_error(&app_handle, &mid, &message),
         }
     });
+    guard.insert(
+        key,
+        ActiveDownload {
+            model_id,
+            temp_path,
+            task,
+        },
+    );
+    Ok(())
+}
+
+/// Identifies a download in `active_downloads`. Start and cancel must derive
+/// the same key from the same (kind, model) pair or a cancel silently misses.
+pub fn download_key(kind: &str, model_id: &str) -> String {
+    match kind {
+        "whisper" => format!("whisper:{model_id}"),
+        _ => format!("onnx:{kind}:{model_id}"),
+    }
+}
+
+/// Stops an in-flight download and clears the partial file.
+///
+/// This is the user's way out of a transfer they no longer want — a slow one,
+/// or one the UI is still showing as pending. It is deliberately forgiving:
+/// cancelling something that is already gone still emits the terminal event,
+/// because a UI stuck on a download the backend has forgotten is exactly the
+/// state that needs unsticking.
+#[tauri::command]
+pub async fn cancel_model_download(
+    state: State<'_, Arc<AppState>>,
+    kind: String,
+    model_id: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let key = download_key(&kind, &model_id);
+    let active = {
+        let mut guard = state.active_downloads.lock().map_err(|e| e.to_string())?;
+        guard.remove(&key)
+    };
+
+    match active {
+        Some(active) => {
+            active.task.abort();
+            // The aborted task is dropped mid-write, so nothing else will
+            // remove what it had already streamed.
+            let _ = std::fs::remove_file(&active.temp_path);
+            tracing::info!(model = %active.model_id, kind = %kind, "model download cancelled");
+        }
+        None => {
+            tracing::info!(
+                model = %model_id,
+                kind = %kind,
+                "cancel for a download that was no longer running"
+            );
+        }
+    }
+
+    emit_model_download_error(&app, &model_id, "download cancelled");
     Ok(())
 }
 
@@ -4281,6 +4442,57 @@ mod tests {
     fn a_run_that_produced_nothing_earns_the_neutral_cue() {
         assert_eq!(cue_for_dictation_outcome(&Ok(String::new())), Cue::Cancel);
         assert_eq!(cue_for_dictation_outcome(&Ok("  \n ".into())), Cue::Cancel);
+    }
+
+    #[test]
+    fn cancel_and_start_agree_on_the_download_key() {
+        // A cancel that derives a different key than the start silently misses:
+        // the task keeps running and the UI never escapes its pending state.
+        assert_eq!(download_key("whisper", "ggml-base.en"), "whisper:ggml-base.en");
+        assert_eq!(
+            download_key("parakeet", "parakeet-tdt-0.6b-v3"),
+            "onnx:parakeet:parakeet-tdt-0.6b-v3"
+        );
+        assert_eq!(download_key("tts", "vits-piper"), "onnx:tts:vits-piper");
+        // Same id under two kinds must not collide.
+        assert_ne!(download_key("parakeet", "shared-id"), download_key("tts", "shared-id"));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_download_still_reports_a_terminal_outcome() {
+        // A download task that ends without reporting is what stranded the
+        // picker on "starting download…": the UI got no completion and no
+        // error, and it refuses to re-issue while a request is pending. Every
+        // exit from the task has to map to an event the UI can act on.
+        let outcome = run_download_task("parakeet-tdt-0.6b-v3", async {
+            panic!("boom in the unpack");
+        })
+        .await;
+
+        let message = outcome.expect_err("a panicking download must report an error");
+        assert!(
+            message.contains("boom in the unpack"),
+            "the panic reason should survive into the message: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_download_reports_the_reason() {
+        let outcome = run_download_task("parakeet-tdt-0.6b-v3", async {
+            Err(InferError::Other("connection reset".into()))
+        })
+        .await;
+
+        assert!(
+            outcome.unwrap_err().contains("connection reset"),
+            "the failure reason has to reach the UI verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_download_reports_success() {
+        let outcome = run_download_task("parakeet-tdt-0.6b-v3", async { Ok(()) }).await;
+        assert!(outcome.is_ok(), "got {outcome:?}");
     }
 
     /// Serves one request: real 200 headers, a few body bytes, then silence

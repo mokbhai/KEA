@@ -515,6 +515,14 @@ export const downloadOnnxModel = (kind: OnnxModelKindParam, model_id: string) =>
 
 export type ModelKindParam = "whisper" | OnnxModelKindParam;
 
+/**
+ * Stops an in-flight download and discards its partial file. Safe to call for
+ * a download the backend has already forgotten — it still reports the terminal
+ * event, which is how a UI stuck on a dead transfer gets unstuck.
+ */
+export const cancelModelDownload = (kind: ModelKindParam, model_id: string) =>
+  invoke<void>("cancel_model_download", { kind, modelId: model_id });
+
 export const deleteModel = (kind: ModelKindParam, model_id: string) =>
   invoke<void>("delete_model", { kind, modelId: model_id });
 

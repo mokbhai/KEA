@@ -1,4 +1,5 @@
 import {
+  cancelModelDownload,
   downloadOnnxModel,
   downloadWhisperModel,
   getDictationSettings,
@@ -272,4 +273,10 @@ export async function startOptionDownload(option: CapabilityOption): Promise<voi
   } else {
     await downloadOnnxModel(option.downloadKind, option.model);
   }
+}
+
+/** Stops an option's download and discards whatever it had transferred. */
+export async function cancelOptionDownload(option: CapabilityOption): Promise<void> {
+  if (!option.downloadKind || !option.model) return;
+  await cancelModelDownload(option.downloadKind, option.model);
 }

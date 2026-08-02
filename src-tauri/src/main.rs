@@ -5,7 +5,6 @@ mod events;
 mod overlay;
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,6 +43,15 @@ use crate::commands::{
 };
 use crate::events::{emit_dictation_error, emit_meeting_error, emit_rewrite_error, emit_rewrite_progress, emit_tts_error};
 
+/// A download in flight: what the UI is waiting on, plus everything needed to
+/// stop it. Aborting drops the transfer mid-write, so the partial file has to
+/// be removed by whoever cancels — nothing else will.
+pub struct ActiveDownload {
+    pub model_id: String,
+    pub temp_path: PathBuf,
+    pub task: tauri::async_runtime::JoinHandle<()>,
+}
+
 pub struct AppState {
     pub engines: EngineRegistry,
     pub features: FeatureRegistry,
@@ -65,8 +73,10 @@ pub struct AppState {
     /// Per-feature hotkey registration outcomes recorded at startup; updated
     /// on re-registration via `set_hotkey`.
     pub hotkey_reg_status: Mutex<HashMap<String, HotkeyRegStatus>>,
-    /// Guards against concurrent downloads of the same model.
-    pub active_downloads: Mutex<HashSet<String>>,
+    /// Downloads in flight, keyed by [`crate::commands::download_key`]. Guards
+    /// against starting the same model twice, and holds what `cancel_model_download`
+    /// needs to stop one.
+    pub active_downloads: Mutex<HashMap<String, ActiveDownload>>,
     /// Dictation in-flight run tracking: (generation counter, current run id).
     /// The counter guards against stale emits: a newer run's id is larger.
     pub dictation_run_counter: AtomicU64,
@@ -197,6 +207,7 @@ fn main() {
             commands::list_onnx_models,
             commands::list_installed_onnx_models,
             commands::download_onnx_model,
+            commands::cancel_model_download,
             commands::delete_model,
             commands::preview_voice,
             commands::set_autostart,
@@ -405,7 +416,7 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
         level_poll_cancel: Mutex::new(None),
         segment_poll_cancel: Mutex::new(None),
         hotkey_reg_status: Mutex::new(HashMap::new()),
-        active_downloads: Mutex::new(HashSet::new()),
+        active_downloads: Mutex::new(HashMap::new()),
         dictation_run_counter: AtomicU64::new(0),
         dictation_current_run: Mutex::new(None),
         preview_playing: AtomicBool::new(false),

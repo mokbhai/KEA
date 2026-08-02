@@ -214,7 +214,10 @@ fn install_onnx_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), Infe
     Ok(())
 }
 
-fn temp_file_for(final_path: &Path) -> PathBuf {
+/// Where a transfer stages bytes before they are verified and moved into
+/// place. Public because a cancelled download is aborted mid-write from
+/// outside the downloader, and whoever cancels has to clear the partial file.
+pub fn temp_file_for(final_path: &Path) -> PathBuf {
     let mut name = final_path
         .file_name()
         .unwrap_or_default()
