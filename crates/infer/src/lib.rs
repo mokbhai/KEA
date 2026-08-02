@@ -6,7 +6,7 @@ pub mod sherpa_tts;
 pub mod storage;
 pub mod whisper;
 
-pub use download::{DownloadProgress, DownloadTransport, ModelDownloader};
+pub use download::{DownloadProgress, DownloadTransport, ModelDownloader, StreamedFile};
 pub use error::InferError;
 pub use registry::{ModelRegistry, OnnxModelEntry, OnnxModelKind, WhisperModelEntry};
 pub use sherpa_stt::SherpaSttInference;

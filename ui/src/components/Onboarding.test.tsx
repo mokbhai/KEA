@@ -80,8 +80,15 @@ function mockWizardWorld({ hasKey = true, existingBindings = {} }: WorldOptions 
         provider_ref: args?.providerRef ?? null,
       });
     },
-    list_stt_engines: () => [{ id: "whisper", models: [] }],
-    list_tts_engines: () => [{ id: "sherpa-tts", models: [] }],
+    list_stt_engines: () => [
+      { id: "whisper", models: [] },
+      { id: "parakeet", models: [] },
+      { id: "openai-stt", models: [] },
+    ],
+    list_tts_engines: () => [
+      { id: "sherpa-tts", models: [] },
+      { id: "openai-tts", models: [] },
+    ],
     list_whisper_models: () => WHISPER_CATALOG,
     list_installed_whisper_models: () => [],
     list_onnx_models: (args) => (args?.kind === "tts" ? TTS_CATALOG : PARAKEET_CATALOG),

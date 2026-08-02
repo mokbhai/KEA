@@ -29,7 +29,7 @@ use kea_features::{
 };
 use kea_features::run_rewrite_with_storage;
 use kea_core::resolve::SlotResolver;
-use kea_infer::{DownloadTransport, InferError, ModelDownloader, ModelRegistry, ModelStorage, OnnxModelEntry};
+use kea_infer::{StreamedFile, DownloadTransport, InferError, ModelDownloader, ModelRegistry, ModelStorage, OnnxModelEntry};
 use kea_platform::{
     new_text_io, parse_accelerator, AudioIo, AudioIoError, DictationState, HotkeyBinding,
     Hotkeys, MeetingState, PermKind, PermStatus, PcmFrame, SystemAudioCapability,
@@ -990,7 +990,16 @@ struct ReqwestDownloadTransport;
 
 #[async_trait]
 impl DownloadTransport for ReqwestDownloadTransport {
-    async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, InferError> {
+    async fn fetch_to_file(
+        &self,
+        url: &str,
+        dest: &std::path::Path,
+        on_chunk: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> Result<StreamedFile, InferError> {
+        use futures_util::StreamExt;
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+
         let client = reqwest::Client::new();
         let response = client
             .get(url)
@@ -1003,11 +1012,29 @@ impl DownloadTransport for ReqwestDownloadTransport {
                 response.status()
             )));
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| InferError::Other(e.to_string()))?;
-        Ok(bytes.to_vec())
+        let total = response.content_length().unwrap_or(0);
+
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::io::BufWriter::new(std::fs::File::create(dest)?);
+        let mut hasher = Sha256::new();
+        let mut received: u64 = 0;
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| InferError::Other(e.to_string()))?;
+            hasher.update(&chunk);
+            file.write_all(&chunk)?;
+            received += chunk.len() as u64;
+            on_chunk(received, total);
+        }
+        file.flush()?;
+
+        Ok(StreamedFile {
+            bytes: received,
+            sha256: format!("{:x}", hasher.finalize()),
+        })
     }
 }
 

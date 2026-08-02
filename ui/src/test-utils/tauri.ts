@@ -40,10 +40,37 @@ export function emitTauriEvent(event: string, payload: unknown) {
   listeners.get(event)?.forEach((handler) => handler({ payload }));
 }
 
+/**
+ * Engine registries a normal build has. Options are filtered against these,
+ * so a test that omitted them would see an empty picker for the wrong reason.
+ * Override per test to model a build without the local engines.
+ */
+export const DEFAULT_ENGINES: Record<string, { id: string; models: string[] }[]> = {
+  list_llm_engines: [
+    { id: "openai", models: [] },
+    { id: "openai-compatible", models: [] },
+  ],
+  list_stt_engines: [
+    { id: "whisper", models: [] },
+    { id: "parakeet", models: [] },
+    { id: "openai-stt", models: [] },
+  ],
+  list_tts_engines: [
+    { id: "sherpa-tts", models: [] },
+    { id: "openai-tts", models: [] },
+  ],
+};
+
 /** Routes invoke calls to per-command handlers; unmocked commands reject. */
 export function onInvoke(handlers: Record<string, (args?: InvokeArgs) => unknown>) {
+  const withEngines: Record<string, (args?: InvokeArgs) => unknown> = {
+    ...Object.fromEntries(
+      Object.entries(DEFAULT_ENGINES).map(([cmd, list]) => [cmd, () => list]),
+    ),
+    ...handlers,
+  };
   invokeMock.mockImplementation((cmd, args) => {
-    const handler = handlers[cmd];
+    const handler = withEngines[cmd];
     if (!handler) throw new Error(`unmocked invoke: ${cmd}`);
     return handler(args);
   });

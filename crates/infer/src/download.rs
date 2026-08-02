@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
+
 
 use crate::error::InferError;
 use crate::registry::{ModelRegistry, OnnxModelEntry};
@@ -51,15 +51,32 @@ pub struct DownloadProgress {
     pub bytes_total: u64,
 }
 
-#[async_trait]
-pub trait DownloadTransport: Send + Sync {
-    async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, InferError>;
+/// What a completed transfer wrote. The digest is computed while streaming so
+/// the file never has to be re-read (or held in memory) to be verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamedFile {
+    pub bytes: u64,
+    pub sha256: String,
 }
 
-fn verify_sha256(model_id: &str, expected: &str, data: &[u8]) -> Result<(), InferError> {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let actual = format!("{:x}", hasher.finalize());
+#[async_trait]
+pub trait DownloadTransport: Send + Sync {
+    /// Streams `url` into `dest`, calling `on_chunk(received, total)` as bytes
+    /// land. `total` is 0 when the server sends no length.
+    ///
+    /// Streaming is the contract, not an implementation detail: a model is
+    /// hundreds of megabytes, so buffering the whole body would both hold it
+    /// in memory twice and leave the UI with nothing to report until the very
+    /// end.
+    async fn fetch_to_file(
+        &self,
+        url: &str,
+        dest: &Path,
+        on_chunk: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> Result<StreamedFile, InferError>;
+}
+
+fn verify_digest(model_id: &str, expected: &str, actual: &str) -> Result<(), InferError> {
     if actual != expected {
         return Err(InferError::HashMismatch {
             model_id: model_id.to_string(),
@@ -101,12 +118,14 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), InferError> {
     Ok(())
 }
 
-fn install_onnx_archive(archive_bytes: &[u8], dest_dir: &Path) -> Result<(), InferError> {
+fn install_onnx_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), InferError> {
     use bzip2::read::BzDecoder;
     use tar::{Archive, EntryType};
 
     let temp = tempfile::tempdir()?;
-    let decoder = BzDecoder::new(archive_bytes);
+    // Decode straight off the file: the archive is streamed to disk, so
+    // holding it in memory again only to unpack it would undo that.
+    let decoder = BzDecoder::new(std::fs::File::open(archive_path)?);
     let mut archive = Archive::new(decoder);
 
     // Extract entry-by-entry with path-traversal hardening. tar's unpack()
@@ -230,29 +249,55 @@ impl ModelDownloader {
 
         check_disk_space(&self.storage.root, model_id, entry.size_bytes)?;
 
-        let data = self.transport.get_bytes(&entry.url).await?;
-        let bytes_total = data.len() as u64;
-
-        on_progress(DownloadProgress {
-            model_id: model_id.to_string(),
-            bytes_received: 0,
-            bytes_total,
-        });
-
-        verify_sha256(model_id, &entry.sha256, &data)?;
-
         let path = self.storage.path_for(model_id);
         let temp = temp_file_for(&path);
-        std::fs::write(&temp, &data)?;
+
+        let streamed = self
+            .stream_to_temp(&entry.url, &temp, model_id, entry.size_bytes, &on_progress)
+            .await?;
+        if let Err(e) = verify_digest(model_id, &entry.sha256, &streamed.sha256) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(e);
+        }
         std::fs::rename(&temp, &path)?;
 
         on_progress(DownloadProgress {
             model_id: model_id.to_string(),
-            bytes_received: bytes_total,
-            bytes_total,
+            bytes_received: streamed.bytes,
+            bytes_total: streamed.bytes,
         });
 
         Ok(path)
+    }
+
+    /// Streams a URL to `temp`, forwarding byte counts as they arrive so the
+    /// caller can report real progress. Falls back to the catalog size when
+    /// the server sends no `Content-Length`, so a percentage is still shown.
+    async fn stream_to_temp(
+        &self,
+        url: &str,
+        temp: &Path,
+        model_id: &str,
+        catalog_size: u64,
+        on_progress: &(impl Fn(DownloadProgress) + Send + Sync),
+    ) -> Result<StreamedFile, InferError> {
+        on_progress(DownloadProgress {
+            model_id: model_id.to_string(),
+            bytes_received: 0,
+            bytes_total: catalog_size,
+        });
+        let report = |received: u64, total: u64| {
+            on_progress(DownloadProgress {
+                model_id: model_id.to_string(),
+                bytes_received: received,
+                bytes_total: if total > 0 { total } else { catalog_size },
+            });
+        };
+        let streamed = self.transport.fetch_to_file(url, temp, &report).await;
+        if streamed.is_err() {
+            let _ = std::fs::remove_file(temp);
+        }
+        streamed
     }
 
     pub async fn download_onnx(
@@ -264,24 +309,25 @@ impl ModelDownloader {
 
         check_disk_space(&self.storage.root, &entry.id, entry.size_bytes.saturating_mul(2))?;
 
-        let data = self.transport.get_bytes(&entry.url).await?;
-        let bytes_total = data.len() as u64;
-
-        on_progress(DownloadProgress {
-            model_id: entry.id.clone(),
-            bytes_received: 0,
-            bytes_total,
-        });
-
-        verify_sha256(&entry.id, &entry.sha256, &data)?;
-
         let dest = self.storage.onnx_dir_for(&entry.id);
-        install_onnx_archive(&data, &dest)?;
+        let temp = temp_file_for(&dest);
+
+        let streamed = self
+            .stream_to_temp(&entry.url, &temp, &entry.id, entry.size_bytes, &on_progress)
+            .await?;
+        if let Err(e) = verify_digest(&entry.id, &entry.sha256, &streamed.sha256) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(e);
+        }
+
+        let installed = install_onnx_archive(&temp, &dest);
+        let _ = std::fs::remove_file(&temp);
+        installed?;
 
         on_progress(DownloadProgress {
             model_id: entry.id.clone(),
-            bytes_received: bytes_total,
-            bytes_total,
+            bytes_received: streamed.bytes,
+            bytes_total: streamed.bytes,
         });
 
         Ok(())
@@ -293,21 +339,101 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// Writes the payload in several chunks so tests see the same
+    /// mid-transfer progress a real socket produces. A fake that delivered
+    /// everything at once is what let a no-progress downloader look correct.
     struct FakeTransport {
         data: Vec<u8>,
+        chunks: usize,
+    }
+
+    impl FakeTransport {
+        fn new(data: Vec<u8>) -> Self {
+            Self { data, chunks: 4 }
+        }
     }
 
     #[async_trait]
     impl DownloadTransport for FakeTransport {
-        async fn get_bytes(&self, _url: &str) -> Result<Vec<u8>, InferError> {
-            Ok(self.data.clone())
+        async fn fetch_to_file(
+            &self,
+            _url: &str,
+            dest: &Path,
+            on_chunk: &(dyn Fn(u64, u64) + Send + Sync),
+        ) -> Result<StreamedFile, InferError> {
+            use sha2::{Digest, Sha256};
+            use std::io::Write;
+
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let total = self.data.len() as u64;
+            let size = self.data.len().div_ceil(self.chunks.max(1));
+            let mut file = std::fs::File::create(dest)?;
+            let mut hasher = Sha256::new();
+            let mut received = 0u64;
+            for chunk in self.data.chunks(size.max(1)) {
+                hasher.update(chunk);
+                file.write_all(chunk)?;
+                received += chunk.len() as u64;
+                on_chunk(received, total);
+            }
+            file.flush()?;
+            Ok(StreamedFile {
+                bytes: received,
+                sha256: format!("{:x}", hasher.finalize()),
+            })
         }
     }
 
     fn sha256_hex(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(data);
         format!("{:x}", h.finalize())
+    }
+
+    #[tokio::test]
+    async fn progress_arrives_during_the_transfer_not_only_at_the_end() {
+        // The regression this guards: the downloader used to buffer the whole
+        // body before emitting anything, so the UI showed "starting download…"
+        // for the entire transfer and could never render a percentage.
+        let payload = vec![7u8; 8192];
+        let hash = sha256_hex(&payload);
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ModelStorage::new(dir.path().to_path_buf());
+
+        let entry = OnnxModelEntry {
+            id: "streamed".into(),
+            display_name: "Streamed".into(),
+            language: "en-US".into(),
+            url: "https://example.com/m.tar.bz2".into(),
+            size_bytes: payload.len() as u64,
+            sha256: hash,
+            kind: crate::registry::OnnxModelKind::Parakeet,
+        };
+
+        let dl = ModelDownloader::new(Arc::new(FakeTransport::new(payload.clone())), storage);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        // Unpacking fails (not a real archive); progress is what's under test.
+        let _ = dl
+            .download_onnx(&entry, move |p| sink.lock().unwrap().push(p))
+            .await;
+
+        let events = seen.lock().unwrap();
+        let partial: Vec<_> = events
+            .iter()
+            .filter(|p| p.bytes_received > 0 && p.bytes_received < p.bytes_total)
+            .collect();
+        assert!(
+            !partial.is_empty(),
+            "expected progress while bytes were still arriving, got {events:?}"
+        );
+        assert!(
+            events.iter().all(|p| p.bytes_total > 0),
+            "every event must carry a total so a percentage can be shown: {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -329,9 +455,7 @@ mod tests {
         };
 
         let dl = ModelDownloader::new(
-            Arc::new(FakeTransport {
-                data: payload.clone(),
-            }),
+            Arc::new(FakeTransport::new(payload.clone())),
             storage,
         );
 
@@ -361,7 +485,7 @@ mod tests {
     async fn downloader_errors_on_unknown_model() {
         let dir = tempfile::tempdir().unwrap();
         let storage = ModelStorage::new(dir.path().to_path_buf());
-        let dl = ModelDownloader::new(Arc::new(FakeTransport { data: vec![] }), storage);
+        let dl = ModelDownloader::new(Arc::new(FakeTransport::new(vec![])), storage);
         let err = dl
             .download_whisper("unknown-model", |_| {})
             .await
@@ -375,9 +499,7 @@ mod tests {
         let storage = ModelStorage::new(dir.path().to_path_buf());
         let payload = b"tampered content".to_vec();
         let dl = ModelDownloader::new(
-            Arc::new(FakeTransport {
-                data: payload,
-            }),
+            Arc::new(FakeTransport::new(payload)),
             storage,
         );
 
@@ -409,9 +531,7 @@ mod tests {
         };
 
         let dl = ModelDownloader::new(
-            Arc::new(FakeTransport {
-                data: payload.clone(),
-            }),
+            Arc::new(FakeTransport::new(payload.clone())),
             storage,
         );
 
@@ -453,9 +573,7 @@ mod tests {
         };
 
         let dl = ModelDownloader::new(
-            Arc::new(FakeTransport {
-                data: b"not the expected content".to_vec(),
-            }),
+            Arc::new(FakeTransport::new(b"not the expected content".to_vec())),
             storage,
         );
 
@@ -476,9 +594,7 @@ mod tests {
         std::fs::write(&target, b"previous install").unwrap();
 
         let dl = ModelDownloader::new(
-            Arc::new(FakeTransport {
-                data: b"bad data".to_vec(),
-            }),
+            Arc::new(FakeTransport::new(b"bad data".to_vec())),
             storage,
         );
 
@@ -515,9 +631,7 @@ mod tests {
         };
 
         let dl = ModelDownloader::new(
-            Arc::new(FakeTransport {
-                data: payload.clone(),
-            }),
+            Arc::new(FakeTransport::new(payload.clone())),
             storage,
         );
 
@@ -553,9 +667,7 @@ mod tests {
         };
 
         let dl = ModelDownloader::new(
-            Arc::new(FakeTransport {
-                data: vec![0u8; 8],
-            }),
+            Arc::new(FakeTransport::new(vec![0u8; 8])),
             storage,
         );
 
@@ -592,9 +704,7 @@ mod tests {
         };
 
         let dl = ModelDownloader::new(
-            Arc::new(FakeTransport {
-                data: payload.clone(),
-            }),
+            Arc::new(FakeTransport::new(payload.clone())),
             storage,
         );
 

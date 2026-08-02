@@ -6,7 +6,10 @@ import {
   hasCredential,
   listInstalledOnnxModels,
   listInstalledWhisperModels,
+  listLlmEngines,
   listOnnxModels,
+  listSttEngines,
+  listTtsEngines,
   listWhisperModels,
   setBinding,
   setDictationSettings,
@@ -90,6 +93,14 @@ export async function buildCapabilityOptions(
   const cloudStatus = (ref: string) => (keyByRef.get(ref) ? "key ✓" : "Key missing");
   const hasOpenAi = providers.some((p) => p.provider_ref === "openai");
 
+  // Only offer engines this build actually registered. Local engines are
+  // behind cargo features, so a build without them would otherwise list
+  // Whisper, download a gigabyte for it, and only fail on save with
+  // "unknown engine id".
+  const lister =
+    capability === "stt" ? listSttEngines : capability === "tts" ? listTtsEngines : listLlmEngines;
+  const available = new Set((await lister()).map((e) => e.id));
+
   const opts: CapabilityOption[] = [];
   if (capability === "stt") {
     const [whisper, whisperInstalled, parakeet, parakeetInstalled] = await Promise.all([
@@ -100,9 +111,13 @@ export async function buildCapabilityOptions(
     ]);
     const wInstalled = new Set(whisperInstalled);
     const pInstalled = new Set(parakeetInstalled);
-    whisper.forEach((m) => opts.push(localOption(m, "whisper", "whisper", wInstalled)));
-    parakeet.forEach((m) => opts.push(localOption(m, "parakeet", "parakeet", pInstalled)));
-    if (hasOpenAi) {
+    if (available.has("whisper")) {
+      whisper.forEach((m) => opts.push(localOption(m, "whisper", "whisper", wInstalled)));
+    }
+    if (available.has("parakeet")) {
+      parakeet.forEach((m) => opts.push(localOption(m, "parakeet", "parakeet", pInstalled)));
+    }
+    if (hasOpenAi && available.has("openai-stt")) {
       opts.push({
         id: "openai-stt:whisper-1",
         label: "OpenAI whisper-1",
@@ -120,8 +135,10 @@ export async function buildCapabilityOptions(
       listInstalledOnnxModels("tts"),
     ]);
     const vInstalled = new Set(voicesInstalled);
-    voices.forEach((m) => opts.push(localOption(m, "sherpa-tts", "tts", vInstalled)));
-    if (hasOpenAi) {
+    if (available.has("sherpa-tts")) {
+      voices.forEach((m) => opts.push(localOption(m, "sherpa-tts", "tts", vInstalled)));
+    }
+    if (hasOpenAi && available.has("openai-tts")) {
       opts.push({
         id: "openai-tts",
         label: "OpenAI voices",
@@ -138,13 +155,15 @@ export async function buildCapabilityOptions(
     providers.forEach((p) => {
       const isOpenAi = p.provider_ref === "openai";
       const isLocal = p.provider_ref === "local-llm";
+      const engine = isOpenAi ? "openai" : "openai-compatible";
+      if (!available.has(engine)) return;
       opts.push({
         id: `llm:${p.provider_ref}`,
         label: p.name,
         detail: isLocal ? "your server" : isOpenAi ? "cloud" : "custom server",
         status: isLocal ? "No key needed" : cloudStatus(p.provider_ref),
         ready: isLocal || (keyByRef.get(p.provider_ref) ?? false),
-        engine: isOpenAi ? "openai" : "openai-compatible",
+        engine,
         model: null,
         providerRef: p.provider_ref,
       });
