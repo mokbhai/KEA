@@ -421,21 +421,71 @@ pub struct ProviderTestResult {
     pub message: String,
 }
 
-/// Maps a `GET {base_url}/models` HTTP status to a human-readable test
-/// outcome (pure, unit-testable).
-pub fn provider_test_result_for_status(status: u16) -> ProviderTestResult {
+/// Trims a server error body down to something worth showing in a row. Servers
+/// answer with anything from a bare string to a large HTML page, so cap it and
+/// unwrap the common `{"detail": "..."}` / `{"error": {"message": "..."}}`
+/// shapes rather than pasting raw JSON at the user.
+pub fn server_detail(body: &str) -> Option<String> {
+    let body = body.trim();
+    if body.is_empty() || body.starts_with('<') {
+        return None;
+    }
+    let text = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("detail")
+                .or_else(|| v.pointer("/error/message"))
+                .or_else(|| v.get("message"))
+                .and_then(|d| d.as_str().map(str::to_string))
+        })
+        .unwrap_or_else(|| body.to_string());
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.chars().take(160).collect())
+}
+
+/// Maps a `GET {base_url}/models` outcome to a human-readable test result.
+///
+/// `has_key` matters: a 401 with no key sent means nothing was saved for this
+/// provider, which is a different problem from a key the server rejected —
+/// reporting both as "Invalid key" sends people hunting for a bad key when
+/// none was ever read. The server's own explanation is appended when it gives
+/// one, because the status alone can't distinguish "this endpoint doesn't
+/// accept API keys" from "this key is wrong".
+pub fn provider_test_result_for_response(
+    status: u16,
+    has_key: bool,
+    body: &str,
+) -> ProviderTestResult {
+    let detail = server_detail(body);
+    let with_detail = |base: String| match &detail {
+        Some(d) => format!("{base} — {d}"),
+        None => base,
+    };
     match status {
         200..=299 => ProviderTestResult {
             ok: true,
             message: "Connected".into(),
         },
+        401 | 403 if !has_key => ProviderTestResult {
+            ok: false,
+            message: with_detail("No API key saved for this provider".into()),
+        },
         401 | 403 => ProviderTestResult {
             ok: false,
-            message: "Invalid key".into(),
+            message: with_detail("Server rejected the key".into()),
+        },
+        404 => ProviderTestResult {
+            ok: false,
+            message: with_detail(format!(
+                "No model list at this address (status {status}) — the base URL may be wrong"
+            )),
         },
         s => ProviderTestResult {
             ok: false,
-            message: format!("Server responded with status {s}"),
+            message: with_detail(format!("Server responded with status {s}")),
         },
     }
 }
@@ -1640,10 +1690,20 @@ pub async fn test_provider(
         request = request.bearer_auth(key);
     }
     let result = match request.send().await {
-        Ok(response) => provider_test_result_for_status(response.status().as_u16()),
-        Err(_) => ProviderTestResult {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            // Read the body before mapping: the status alone can't tell a
+            // rejected key from an endpoint that doesn't honour API keys.
+            let body = response.text().await.unwrap_or_default();
+            provider_test_result_for_response(status, has_key, &body)
+        }
+        Err(e) => ProviderTestResult {
             ok: false,
-            message: "Server unreachable".into(),
+            message: if e.is_timeout() {
+                "Server did not respond within 10 seconds".into()
+            } else {
+                "Server unreachable".into()
+            },
         },
     };
     Ok(if sends_key_in_cleartext(&base_url, has_key) {
@@ -2983,16 +3043,62 @@ mod tests {
 
     #[test]
     fn provider_test_status_maps_to_human_messages() {
-        let ok = provider_test_result_for_status(200);
+        let ok = provider_test_result_for_response(200, true, "");
         assert!(ok.ok);
         assert_eq!(ok.message, "Connected");
-        let auth = provider_test_result_for_status(401);
-        assert!(!auth.ok);
-        assert_eq!(auth.message, "Invalid key");
-        assert_eq!(provider_test_result_for_status(403).message, "Invalid key");
-        let other = provider_test_result_for_status(500);
+
+        // A 401 with no key read is a missing key, not a bad one — the two
+        // send the user looking in completely different places.
+        let missing = provider_test_result_for_response(401, false, "");
+        assert!(!missing.ok);
+        assert!(missing.message.contains("No API key saved"));
+
+        let rejected = provider_test_result_for_response(403, true, "");
+        assert!(!rejected.ok);
+        assert!(rejected.message.contains("Server rejected the key"));
+
+        let other = provider_test_result_for_response(500, true, "");
         assert!(!other.ok);
         assert!(other.message.contains("500"));
+    }
+
+    #[test]
+    fn provider_test_surfaces_the_server_explanation() {
+        // Real OpenWebUI bodies: the status is identical, the cause is not.
+        let no_token = provider_test_result_for_response(
+            401,
+            false,
+            r#"{"detail":"Not authenticated"}"#,
+        );
+        assert!(no_token.message.contains("Not authenticated"));
+
+        let bad_token = provider_test_result_for_response(
+            401,
+            true,
+            r#"{"detail":"Your session has expired or the token is invalid."}"#,
+        );
+        assert!(bad_token.message.contains("token is invalid"));
+
+        // OpenAI-shaped errors unwrap too.
+        let openai = provider_test_result_for_response(
+            401,
+            true,
+            r#"{"error":{"message":"Incorrect API key provided"}}"#,
+        );
+        assert!(openai.message.contains("Incorrect API key provided"));
+
+        // A wrong base URL usually means a 404, and should say so.
+        let missing_route = provider_test_result_for_response(404, true, "");
+        assert!(missing_route.message.contains("base URL"));
+    }
+
+    #[test]
+    fn server_detail_ignores_html_and_caps_length() {
+        assert_eq!(server_detail("<!DOCTYPE html><html>…"), None);
+        assert_eq!(server_detail("   "), None);
+        assert_eq!(server_detail("plain text reason").as_deref(), Some("plain text reason"));
+        let long = "x".repeat(500);
+        assert_eq!(server_detail(&long).unwrap().chars().count(), 160);
     }
 
     #[test]
@@ -3085,14 +3191,14 @@ mod tests {
 
     #[test]
     fn cleartext_warning_keeps_the_ok_verdict() {
-        let warned = with_cleartext_warning(provider_test_result_for_status(200));
+        let warned = with_cleartext_warning(provider_test_result_for_response(200, true, ""));
         assert!(warned.ok, "a warning must not fail an otherwise good test");
         assert!(warned.message.starts_with("Connected"));
         assert!(warned.message.contains(CLEARTEXT_KEY_WARNING));
 
-        let failed = with_cleartext_warning(provider_test_result_for_status(401));
+        let failed = with_cleartext_warning(provider_test_result_for_response(401, true, ""));
         assert!(!failed.ok);
-        assert!(failed.message.contains("Invalid key"));
+        assert!(failed.message.contains("Server rejected the key"));
     }
 
     #[tokio::test]
