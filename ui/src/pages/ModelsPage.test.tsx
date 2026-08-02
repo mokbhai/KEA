@@ -1,7 +1,7 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { invokeCalls, onInvoke, resetTauriMocks } from "../test-utils/tauri";
+import { emitTauriEvent, invokeCalls, onInvoke, resetTauriMocks } from "../test-utils/tauri";
 import ModelsPage from "./ModelsPage";
 
 vi.mock("@tauri-apps/api/core", async () => (await import("../test-utils/tauri")).coreModule);
@@ -71,5 +71,41 @@ describe("ModelsPage", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Remove" }));
 
     expect(invokeCalls("delete_model")).toHaveLength(0);
+  });
+
+  it("lets the user stop a download that has stopped moving", async () => {
+    // A transfer that stalls holds the row at its last percentage with no way
+    // out: clicking Download again is refused as "already in progress", so
+    // without a cancel the only escape is restarting the app.
+    onInvoke({
+      list_whisper_models: () => WHISPER_CATALOG,
+      list_installed_whisper_models: () => [],
+      list_onnx_models: () => [],
+      list_installed_onnx_models: () => [],
+      get_binding: () => null,
+      download_whisper_model: () => undefined,
+      cancel_model_download: () => undefined,
+    });
+    render(<ModelsPage />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Download" }));
+    await waitFor(() => expect(invokeCalls("download_whisper_model")).toHaveLength(1));
+
+    act(() => {
+      emitTauriEvent("model:download:progress", {
+        model_id: "whisper-base",
+        bytes_received: 3 * MB,
+        bytes_total: 148 * MB,
+      });
+    });
+    expect(await screen.findByText("2%")).toBeTruthy();
+
+    await userEvent.click(screen.getByRole("button", { name: /Cancel download/i }));
+
+    await waitFor(() => expect(invokeCalls("cancel_model_download")).toHaveLength(1));
+    expect(invokeCalls("cancel_model_download")[0]).toEqual({
+      kind: "whisper",
+      modelId: "whisper-base",
+    });
   });
 });

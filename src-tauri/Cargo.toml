@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = []
+# The local engines ship by default: the picker offers Whisper/Parakeet/local
+# voices and downloads their models, so a build without them registered lets a
+# user fetch a gigabyte and then hit "unknown engine id" when it is selected.
+default = ["whisper", "parakeet", "tts-local"]
 updater = ["tauri-plugin-updater"]
 whisper = ["kea-engines/whisper", "kea-infer/whisper"]
 parakeet = ["kea-engines/parakeet"]
@@ -20,7 +23,10 @@ kea-engines = { path = "../crates/engines" }
 kea-features = { path = "../crates/features" }
 kea-platform = { path = "../crates/platform" }
 kea-infer = { path = "../crates/infer" }
-tauri = { version = "2", features = ["tray-icon"] }
+# `macos-private-api` is what makes the transparent overlay window legal on
+# macOS; without it `WebviewWindowBuilder::transparent` is not even compiled.
+# Mirrored by `app.macOSPrivateApi` in tauri.conf.json.
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-updater = { version = "2", optional = true }
@@ -32,3 +38,5 @@ sqlx.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
+futures-util.workspace = true
+sha2.workspace = true

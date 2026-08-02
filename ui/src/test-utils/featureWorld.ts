@@ -42,7 +42,11 @@ export function featureHandlers({
   installedOnnx = [],
   extra = {},
 }: WorldOptions = {}): Handlers {
-  const infos = (ids: string[] = []) => ids.map((id) => ({ id, models: [] }));
+  // Default to a full registry: options are filtered against the engines a
+  // build registered, so an unset list would silently empty the picker. Tests
+  // modelling a build *without* a local engine pass the shorter list.
+  const infos = (ids: string[] | undefined, fallback: string[]) =>
+    (ids ?? fallback).map((id) => ({ id, models: [] }));
 
   return {
     list_providers: () => [
@@ -50,9 +54,9 @@ export function featureHandlers({
       { provider_ref: "local-llm", name: "Local server", built_in: true },
     ],
     has_credential: () => hasKey,
-    list_llm_engines: () => infos(engines.llm),
-    list_stt_engines: () => infos(engines.stt),
-    list_tts_engines: () => infos(engines.tts),
+    list_llm_engines: () => infos(engines.llm, ["openai", "openai-compatible"]),
+    list_stt_engines: () => infos(engines.stt, ["whisper", "parakeet", "openai-stt"]),
+    list_tts_engines: () => infos(engines.tts, ["sherpa-tts", "openai-tts"]),
     list_whisper_models: () => WHISPER_CATALOG,
     list_installed_whisper_models: () => installedWhisper,
     list_onnx_models: () => [],

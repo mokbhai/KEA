@@ -75,4 +75,43 @@ describe("GeneralPage", () => {
     expect(toggle.getAttribute("aria-checked")).toBe("true");
     expect(screen.getByText("Saved ✓")).toBeTruthy();
   });
+
+  it("defaults dictation sounds on and persists turning them off", async () => {
+    mockGeneralWorld();
+    renderPage();
+
+    const toggle = await screen.findByRole("switch", { name: "Play dictation sounds" });
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    await userEvent.click(toggle);
+
+    await waitFor(() =>
+      expect(
+        invokeCalls("set_setting").some(
+          (args) => args?.key === "sound.cues_enabled" && args?.value === "false",
+        ),
+      ).toBe(true),
+    );
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("reflects sounds already turned off", async () => {
+    const settings = new Map<string, string>([["sound.cues_enabled", "false"]]);
+    onInvoke({
+      get_setting: (args) => settings.get(args?.key as string) ?? null,
+      set_setting: () => undefined,
+      get_autostart: () => false,
+      set_autostart: () => undefined,
+      get_all_permission_statuses: () => [],
+    });
+    renderPage();
+
+    await waitFor(() =>
+      expect(
+        screen
+          .getByRole("switch", { name: "Play dictation sounds" })
+          .getAttribute("aria-checked"),
+      ).toBe("false"),
+    );
+  });
 });

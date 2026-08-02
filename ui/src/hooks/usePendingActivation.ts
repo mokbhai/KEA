@@ -2,6 +2,7 @@ import { useCallback, useRef, useState } from "react";
 import type { ModelDownloadProgress } from "../api";
 import {
   applyDefaultChoice,
+  cancelOptionDownload,
   startOptionDownload,
   type BindingTarget,
   type Capability,
@@ -28,6 +29,8 @@ export type PendingActivation = {
   progressById: Map<string, ModelDownloadProgress>;
   /** Downloads first when needed, then writes the binding. */
   start: (request: ActivationRequest) => Promise<void>;
+  /** Abandons the pending download and frees the picker for another pick. */
+  cancel: () => Promise<void>;
   /** Drops the saved/error feedback, keeping any pending download. */
   clearFeedback: () => void;
   setError: (message: string | null) => void;
@@ -128,10 +131,31 @@ export function usePendingActivation(onApplied?: () => void): PendingActivation 
     [apply, forget],
   );
 
+  /**
+   * Gives up on the pending download.
+   *
+   * The local state is dropped whether or not the backend acknowledges: the
+   * case this exists for is a download that stopped reporting altogether, and
+   * refusing to clear until the backend answers would leave the user in the
+   * very state they are trying to escape — `start` ignores every click while a
+   * request is pending, so a stuck request means no pick can be made at all.
+   */
+  const cancel = useCallback(async () => {
+    const request = pendingRef.current;
+    if (!request) return;
+    forget();
+    setError(null);
+    try {
+      await cancelOptionDownload(request.option);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [forget]);
+
   const clearFeedback = useCallback(() => {
     setSavedId(null);
     setError(null);
   }, []);
 
-  return { pending, savedId, error, progressById, start, clearFeedback, setError };
+  return { pending, savedId, error, progressById, start, cancel, clearFeedback, setError };
 }

@@ -12,9 +12,12 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-keyring = "3"
+# keyring 3 ships no credential store by default — without a platform feature
+# every write silently lands in a throwaway mock and nothing is ever persisted.
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 tempfile = "3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sha2 = "0.10"
 wiremock = "0.6"
 arboard = "3"

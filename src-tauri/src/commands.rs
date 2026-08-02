@@ -29,9 +29,9 @@ use kea_features::{
 };
 use kea_features::run_rewrite_with_storage;
 use kea_core::resolve::SlotResolver;
-use kea_infer::{DownloadTransport, InferError, ModelDownloader, ModelRegistry, ModelStorage, OnnxModelEntry};
+use kea_infer::{temp_file_for, StreamedFile, DownloadTransport, InferError, ModelDownloader, ModelRegistry, ModelStorage, OnnxModelEntry};
 use kea_platform::{
-    new_text_io, parse_accelerator, AudioIo, AudioIoError, DictationState, HotkeyBinding,
+    new_text_io, parse_accelerator, AudioIo, AudioIoError, Cue, DictationState, HotkeyBinding,
     Hotkeys, MeetingState, PermKind, PermStatus, PcmFrame, SystemAudioCapability,
 };
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,7 @@ use crate::events::{
     emit_model_download_complete, emit_model_download_error, emit_model_download_progress,
     emit_tts_state, MeetingSegmentPayload,
 };
-use crate::AppState;
+use crate::{ActiveDownload, AppState};
 
 pub const REWRITE_ACTION_ID: &str = "rewrite:rewrite_selection";
 pub const REWRITE_FEATURE_ID: &str = "rewrite";
@@ -421,21 +421,71 @@ pub struct ProviderTestResult {
     pub message: String,
 }
 
-/// Maps a `GET {base_url}/models` HTTP status to a human-readable test
-/// outcome (pure, unit-testable).
-pub fn provider_test_result_for_status(status: u16) -> ProviderTestResult {
+/// Trims a server error body down to something worth showing in a row. Servers
+/// answer with anything from a bare string to a large HTML page, so cap it and
+/// unwrap the common `{"detail": "..."}` / `{"error": {"message": "..."}}`
+/// shapes rather than pasting raw JSON at the user.
+pub fn server_detail(body: &str) -> Option<String> {
+    let body = body.trim();
+    if body.is_empty() || body.starts_with('<') {
+        return None;
+    }
+    let text = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("detail")
+                .or_else(|| v.pointer("/error/message"))
+                .or_else(|| v.get("message"))
+                .and_then(|d| d.as_str().map(str::to_string))
+        })
+        .unwrap_or_else(|| body.to_string());
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.chars().take(160).collect())
+}
+
+/// Maps a `GET {base_url}/models` outcome to a human-readable test result.
+///
+/// `has_key` matters: a 401 with no key sent means nothing was saved for this
+/// provider, which is a different problem from a key the server rejected —
+/// reporting both as "Invalid key" sends people hunting for a bad key when
+/// none was ever read. The server's own explanation is appended when it gives
+/// one, because the status alone can't distinguish "this endpoint doesn't
+/// accept API keys" from "this key is wrong".
+pub fn provider_test_result_for_response(
+    status: u16,
+    has_key: bool,
+    body: &str,
+) -> ProviderTestResult {
+    let detail = server_detail(body);
+    let with_detail = |base: String| match &detail {
+        Some(d) => format!("{base} — {d}"),
+        None => base,
+    };
     match status {
         200..=299 => ProviderTestResult {
             ok: true,
             message: "Connected".into(),
         },
+        401 | 403 if !has_key => ProviderTestResult {
+            ok: false,
+            message: with_detail("No API key saved for this provider".into()),
+        },
         401 | 403 => ProviderTestResult {
             ok: false,
-            message: "Invalid key".into(),
+            message: with_detail("Server rejected the key".into()),
+        },
+        404 => ProviderTestResult {
+            ok: false,
+            message: with_detail(format!(
+                "No model list at this address (status {status}) — the base URL may be wrong"
+            )),
         },
         s => ProviderTestResult {
             ok: false,
-            message: format!("Server responded with status {s}"),
+            message: with_detail(format!("Server responded with status {s}")),
         },
     }
 }
@@ -646,6 +696,57 @@ async fn store_conversations_enabled(config_pool: &SqlitePool) -> bool {
             true
         }
     }
+}
+
+/// Settings key for the dictation cue sounds toggle.
+pub const SOUND_CUES_SETTING: &str = "sound.cues_enabled";
+
+/// Reads the cue-sounds flag, defaulting ON.
+///
+/// Same both-shapes tolerance as `store_conversations_enabled`: the generic
+/// `set_setting` command writes a JSON string, other callers a JSON bool.
+pub fn cues_enabled_from_setting(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Bool(v)) => *v,
+        Some(serde_json::Value::String(s)) => s != "false",
+        Some(_) | None => true,
+    }
+}
+
+async fn sound_cues_enabled(config_pool: &SqlitePool) -> bool {
+    match SettingsRepo::new(config_pool.clone())
+        .get::<serde_json::Value>(SOUND_CUES_SETTING)
+        .await
+    {
+        Ok(value) => cues_enabled_from_setting(value.as_ref()),
+        Err(e) => {
+            tracing::warn!(%e, "failed to read {SOUND_CUES_SETTING}, defaulting to on");
+            true
+        }
+    }
+}
+
+/// Plays a dictation outcome cue, unless the user turned sounds off.
+///
+/// Fire-and-forget: playback pins a blocking-pool thread for the length of the
+/// cue, and the caller is on the path that returns the transcript.
+pub fn spawn_dictation_cue(state: &Arc<AppState>, cue: Cue) {
+    let config_pool = state.config_pool.clone();
+    tauri::async_runtime::spawn(async move {
+        if !sound_cues_enabled(&config_pool).await {
+            return;
+        }
+        let frame = kea_platform::cue_pcm(cue);
+        let played = tokio::task::spawn_blocking(move || {
+            kea_platform::audio::playback::play_pcm_blocking(&frame)
+        })
+        .await;
+        match played {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, ?cue, "failed to play dictation cue"),
+            Err(e) => tracing::warn!(error = %e, ?cue, "dictation cue playback task failed"),
+        }
+    });
 }
 
 pub async fn execute_rewrite(state: &AppState, input: RewriteInput) -> Result<String, String> {
@@ -936,12 +1037,53 @@ impl AudioIo for ReplayAudioIo {
     }
 }
 
-struct ReqwestDownloadTransport;
+/// How long to wait for the connection to come up before giving up.
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a transfer may go without delivering *any* bytes before it counts
+/// as dead. This is per-read, not per-transfer: a model is hundreds of
+/// megabytes and a slow link can legitimately take many minutes, so an overall
+/// deadline would cancel healthy downloads. What must never happen is the
+/// no-timeout case — a socket that stops delivering leaves the download task
+/// parked forever, so it emits neither completion nor error and the UI waits
+/// on a transfer that will never end.
+const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct ReqwestDownloadTransport {
+    connect_timeout: Duration,
+    stall_timeout: Duration,
+}
+
+impl ReqwestDownloadTransport {
+    fn new() -> Self {
+        Self::with_timeouts(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_STALL_TIMEOUT)
+    }
+
+    fn with_timeouts(connect_timeout: Duration, stall_timeout: Duration) -> Self {
+        Self {
+            connect_timeout,
+            stall_timeout,
+        }
+    }
+}
 
 #[async_trait]
 impl DownloadTransport for ReqwestDownloadTransport {
-    async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, InferError> {
-        let client = reqwest::Client::new();
+    async fn fetch_to_file(
+        &self,
+        url: &str,
+        dest: &std::path::Path,
+        on_chunk: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> Result<StreamedFile, InferError> {
+        use futures_util::StreamExt;
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .read_timeout(self.stall_timeout)
+            .build()
+            .map_err(|e| InferError::Other(e.to_string()))?;
         let response = client
             .get(url)
             .send()
@@ -953,16 +1095,77 @@ impl DownloadTransport for ReqwestDownloadTransport {
                 response.status()
             )));
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| InferError::Other(e.to_string()))?;
-        Ok(bytes.to_vec())
+        let total = response.content_length().unwrap_or(0);
+
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::io::BufWriter::new(std::fs::File::create(dest)?);
+        let mut hasher = Sha256::new();
+        let mut received: u64 = 0;
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| InferError::Other(e.to_string()))?;
+            hasher.update(&chunk);
+            file.write_all(&chunk)?;
+            received += chunk.len() as u64;
+            on_chunk(received, total);
+        }
+        file.flush()?;
+
+        Ok(StreamedFile {
+            bytes: received,
+            sha256: format!("{:x}", hasher.finalize()),
+        })
     }
 }
 
 pub fn new_model_downloader(storage: ModelStorage) -> ModelDownloader {
-    ModelDownloader::new(Arc::new(ReqwestDownloadTransport), storage)
+    ModelDownloader::new(Arc::new(ReqwestDownloadTransport::new()), storage)
+}
+
+fn panic_reason(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Runs a download to completion and reduces every way it can end into one
+/// outcome the caller turns into exactly one event.
+///
+/// The panic arm is the point. A spawned task that unwinds is dropped
+/// silently: no completion, no error, nothing in the log — and the picker,
+/// which refuses to re-issue while a request is pending, sits on "starting
+/// download…" until the app is restarted. Catching the unwind here turns an
+/// invisible death into a message the UI can show and recover from.
+async fn run_download_task<F>(model_id: &str, download: F) -> Result<(), String>
+where
+    F: std::future::Future<Output = Result<(), InferError>>,
+{
+    use futures_util::FutureExt;
+
+    let outcome = std::panic::AssertUnwindSafe(download).catch_unwind().await;
+    match outcome {
+        Ok(Ok(())) => {
+            tracing::info!(model = %model_id, "model download finished");
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            let message = error.to_string();
+            tracing::warn!(model = %model_id, error = %message, "model download failed");
+            Err(message)
+        }
+        Err(payload) => {
+            let message = format!("download crashed: {}", panic_reason(payload.as_ref()));
+            tracing::error!(model = %model_id, error = %message, "model download panicked");
+            Err(message)
+        }
+    }
 }
 
 fn onnx_storage_for<'a>(state: &'a AppState, kind: &str) -> Result<&'a ModelStorage, String> {
@@ -1081,6 +1284,12 @@ fn spawn_meeting_level_poll(state: &Arc<AppState>, app: &AppHandle) {
     });
 }
 
+/// How often the loop asks whether the buffer has reached a cut point. The
+/// segment *length* is no longer set by this interval — the cut is decided
+/// from the audio (a pause, or the configured maximum), so this only bounds
+/// how promptly a pause is noticed.
+const SEGMENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 fn spawn_segment_poll(state: &Arc<AppState>, app: &AppHandle, interval_secs: u32) {
     stop_segment_poll(state);
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
@@ -1090,7 +1299,10 @@ fn spawn_segment_poll(state: &Arc<AppState>, app: &AppHandle, interval_secs: u32
 
     let state = state.clone();
     let app = app.clone();
-    let poll_interval = Duration::from_secs(interval_secs.max(1) as u64);
+    // The configured length is passed to the cut logic as the hard cap, not
+    // used as the tick rate.
+    let _ = interval_secs;
+    let poll_interval = SEGMENT_POLL_INTERVAL;
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
         loop {
@@ -1315,6 +1527,14 @@ pub async fn stop_meeting_inner(
 }
 
 pub async fn start_dictation_inner(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
+    let result = start_dictation_run(state, app).await;
+    if result.is_err() {
+        spawn_dictation_cue(state, Cue::Error);
+    }
+    result
+}
+
+async fn start_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
     // Reject before touching the audio lock so a press during meeting
     // synthesis can't park on the lock and start once it's released.
     if state.meeting_processing.load(Ordering::SeqCst) {
@@ -1352,6 +1572,25 @@ pub async fn start_dictation_inner(state: &Arc<AppState>, app: &AppHandle) -> Re
 }
 
 pub async fn stop_dictation_inner(state: &Arc<AppState>, app: &AppHandle) -> Result<String, String> {
+    let result = stop_dictation_run(state, app).await;
+    spawn_dictation_cue(state, cue_for_dictation_outcome(&result));
+    result
+}
+
+/// Which cue a finished dictation run earns.
+///
+/// There is no abort/cancel path in dictation — a hotkey press either starts,
+/// stops, or is ignored — so the neutral blip goes to the closest thing there
+/// is: a run that completed but produced nothing to insert.
+pub fn cue_for_dictation_outcome(result: &Result<String, String>) -> Cue {
+    match result {
+        Ok(text) if text.trim().is_empty() => Cue::Cancel,
+        Ok(_) => Cue::Success,
+        Err(_) => Cue::Error,
+    }
+}
+
+async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<String, String> {
     stop_level_poll(state);
 
     let pcm = {
@@ -1640,10 +1879,20 @@ pub async fn test_provider(
         request = request.bearer_auth(key);
     }
     let result = match request.send().await {
-        Ok(response) => provider_test_result_for_status(response.status().as_u16()),
-        Err(_) => ProviderTestResult {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            // Read the body before mapping: the status alone can't tell a
+            // rejected key from an endpoint that doesn't honour API keys.
+            let body = response.text().await.unwrap_or_default();
+            provider_test_result_for_response(status, has_key, &body)
+        }
+        Err(e) => ProviderTestResult {
             ok: false,
-            message: "Server unreachable".into(),
+            message: if e.is_timeout() {
+                "Server did not respond within 10 seconds".into()
+            } else {
+                "Server unreachable".into()
+            },
         },
     };
     Ok(if sends_key_in_cleartext(&base_url, has_key) {
@@ -2193,34 +2442,50 @@ pub async fn download_whisper_model(
     model_id: String,
     app: AppHandle,
 ) -> Result<(), String> {
-    let key = format!("whisper:{model_id}");
-    {
-        let mut guard = state.active_downloads.lock().map_err(|e| e.to_string())?;
-        if !guard.insert(key.clone()) {
-            return Err(format!("download of '{model_id}' already in progress"));
-        }
+    let key = download_key("whisper", &model_id);
+    let storage = ModelStorage::new(state.model_storage.root.clone());
+    let temp_path = temp_file_for(&storage.path_for(&model_id));
+
+    let mut guard = state.active_downloads.lock().map_err(|e| e.to_string())?;
+    if guard.contains_key(&key) {
+        return Err(format!("download of '{model_id}' already in progress"));
     }
-    let downloader = new_model_downloader(ModelStorage::new(state.model_storage.root.clone()));
+
+    let downloader = new_model_downloader(storage);
     let app_handle = app.clone();
     let state_for_cleanup = state.inner().clone();
     let mid = model_id.clone();
-    tauri::async_runtime::spawn(async move {
-        let result = downloader
-            .download_whisper(&model_id, |progress| {
-                emit_model_download_progress(&app_handle, &progress);
-            })
-            .await;
+    let cleanup_key = key.clone();
+    tracing::info!(model = %model_id, kind = "whisper", "model download started");
+    // The handle is registered while the lock is held, so a task that finishes
+    // instantly cannot have its entry removed before it was ever inserted.
+    let task = tauri::async_runtime::spawn(async move {
+        let outcome = run_download_task(&mid, async {
+            downloader
+                .download_whisper(&mid, |progress| {
+                    emit_model_download_progress(&app_handle, &progress);
+                })
+                .await
+                .map(|_| ())
+        })
+        .await;
         {
             let mut guard = state_for_cleanup.active_downloads.lock().unwrap();
-            guard.remove(&key);
+            guard.remove(&cleanup_key);
         }
-        match result {
-            Ok(_) => emit_model_download_complete(&app_handle, &mid),
-            Err(error) => {
-                emit_model_download_error(&app_handle, &mid, &error.to_string());
-            }
+        match outcome {
+            Ok(()) => emit_model_download_complete(&app_handle, &mid),
+            Err(message) => emit_model_download_error(&app_handle, &mid, &message),
         }
     });
+    guard.insert(
+        key,
+        ActiveDownload {
+            model_id,
+            temp_path,
+            task,
+        },
+    );
     Ok(())
 }
 
@@ -2712,34 +2977,104 @@ pub async fn download_onnx_model(
         .find(|e| e.id == model_id)
         .ok_or_else(|| format!("unknown {kind} model: {model_id}"))?;
 
-    let key = format!("onnx:{kind}:{model_id}");
-    {
-        let mut guard = state.active_downloads.lock().map_err(|e| e.to_string())?;
-        if !guard.insert(key.clone()) {
-            return Err(format!("download of '{model_id}' ({kind}) already in progress"));
-        }
+    let key = download_key(&kind, &model_id);
+    let temp_path = temp_file_for(&storage.onnx_dir_for(&model_id));
+
+    let mut guard = state.active_downloads.lock().map_err(|e| e.to_string())?;
+    if guard.contains_key(&key) {
+        return Err(format!("download of '{model_id}' ({kind}) already in progress"));
     }
+
     let downloader = new_model_downloader(storage);
     let app_handle = app.clone();
     let state_for_cleanup = state.inner().clone();
     let mid = model_id.clone();
-    tauri::async_runtime::spawn(async move {
-        let result = downloader
-            .download_onnx(&entry, |progress| {
-                emit_model_download_progress(&app_handle, &progress);
-            })
-            .await;
+    let cleanup_key = key.clone();
+    tracing::info!(
+        model = %model_id,
+        kind = %kind,
+        bytes = entry.size_bytes,
+        url = %entry.url,
+        "model download started"
+    );
+    // The handle is registered while the lock is held, so a task that finishes
+    // instantly cannot have its entry removed before it was ever inserted.
+    let task = tauri::async_runtime::spawn(async move {
+        let outcome = run_download_task(&mid, async {
+            downloader
+                .download_onnx(&entry, |progress| {
+                    emit_model_download_progress(&app_handle, &progress);
+                })
+                .await
+        })
+        .await;
         {
             let mut guard = state_for_cleanup.active_downloads.lock().unwrap();
-            guard.remove(&key);
+            guard.remove(&cleanup_key);
         }
-        match result {
-            Ok(_) => emit_model_download_complete(&app_handle, &mid),
-            Err(error) => {
-                emit_model_download_error(&app_handle, &mid, &error.to_string());
-            }
+        match outcome {
+            Ok(()) => emit_model_download_complete(&app_handle, &mid),
+            Err(message) => emit_model_download_error(&app_handle, &mid, &message),
         }
     });
+    guard.insert(
+        key,
+        ActiveDownload {
+            model_id,
+            temp_path,
+            task,
+        },
+    );
+    Ok(())
+}
+
+/// Identifies a download in `active_downloads`. Start and cancel must derive
+/// the same key from the same (kind, model) pair or a cancel silently misses.
+pub fn download_key(kind: &str, model_id: &str) -> String {
+    match kind {
+        "whisper" => format!("whisper:{model_id}"),
+        _ => format!("onnx:{kind}:{model_id}"),
+    }
+}
+
+/// Stops an in-flight download and clears the partial file.
+///
+/// This is the user's way out of a transfer they no longer want — a slow one,
+/// or one the UI is still showing as pending. It is deliberately forgiving:
+/// cancelling something that is already gone still emits the terminal event,
+/// because a UI stuck on a download the backend has forgotten is exactly the
+/// state that needs unsticking.
+#[tauri::command]
+pub async fn cancel_model_download(
+    state: State<'_, Arc<AppState>>,
+    kind: String,
+    model_id: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let key = download_key(&kind, &model_id);
+    let active = {
+        let mut guard = state.active_downloads.lock().map_err(|e| e.to_string())?;
+        guard.remove(&key)
+    };
+
+    match active {
+        Some(active) => {
+            active.task.abort();
+            // The aborted task is dropped mid-write, so nothing else will
+            // remove what it had already streamed.
+            let _ = std::fs::remove_file(&active.temp_path);
+            tracing::info!(model = %active.model_id, kind = %kind, "model download cancelled");
+        }
+        None => {
+            tracing::info!(
+                model = %model_id,
+                kind = %kind,
+                "cancel for a download that was no longer running"
+            );
+        }
+    }
+
+    emit_model_download_error(&app, &model_id, "download cancelled");
     Ok(())
 }
 
@@ -2983,16 +3318,62 @@ mod tests {
 
     #[test]
     fn provider_test_status_maps_to_human_messages() {
-        let ok = provider_test_result_for_status(200);
+        let ok = provider_test_result_for_response(200, true, "");
         assert!(ok.ok);
         assert_eq!(ok.message, "Connected");
-        let auth = provider_test_result_for_status(401);
-        assert!(!auth.ok);
-        assert_eq!(auth.message, "Invalid key");
-        assert_eq!(provider_test_result_for_status(403).message, "Invalid key");
-        let other = provider_test_result_for_status(500);
+
+        // A 401 with no key read is a missing key, not a bad one — the two
+        // send the user looking in completely different places.
+        let missing = provider_test_result_for_response(401, false, "");
+        assert!(!missing.ok);
+        assert!(missing.message.contains("No API key saved"));
+
+        let rejected = provider_test_result_for_response(403, true, "");
+        assert!(!rejected.ok);
+        assert!(rejected.message.contains("Server rejected the key"));
+
+        let other = provider_test_result_for_response(500, true, "");
         assert!(!other.ok);
         assert!(other.message.contains("500"));
+    }
+
+    #[test]
+    fn provider_test_surfaces_the_server_explanation() {
+        // Real OpenWebUI bodies: the status is identical, the cause is not.
+        let no_token = provider_test_result_for_response(
+            401,
+            false,
+            r#"{"detail":"Not authenticated"}"#,
+        );
+        assert!(no_token.message.contains("Not authenticated"));
+
+        let bad_token = provider_test_result_for_response(
+            401,
+            true,
+            r#"{"detail":"Your session has expired or the token is invalid."}"#,
+        );
+        assert!(bad_token.message.contains("token is invalid"));
+
+        // OpenAI-shaped errors unwrap too.
+        let openai = provider_test_result_for_response(
+            401,
+            true,
+            r#"{"error":{"message":"Incorrect API key provided"}}"#,
+        );
+        assert!(openai.message.contains("Incorrect API key provided"));
+
+        // A wrong base URL usually means a 404, and should say so.
+        let missing_route = provider_test_result_for_response(404, true, "");
+        assert!(missing_route.message.contains("base URL"));
+    }
+
+    #[test]
+    fn server_detail_ignores_html_and_caps_length() {
+        assert_eq!(server_detail("<!DOCTYPE html><html>…"), None);
+        assert_eq!(server_detail("   "), None);
+        assert_eq!(server_detail("plain text reason").as_deref(), Some("plain text reason"));
+        let long = "x".repeat(500);
+        assert_eq!(server_detail(&long).unwrap().chars().count(), 160);
     }
 
     #[test]
@@ -3085,14 +3466,14 @@ mod tests {
 
     #[test]
     fn cleartext_warning_keeps_the_ok_verdict() {
-        let warned = with_cleartext_warning(provider_test_result_for_status(200));
+        let warned = with_cleartext_warning(provider_test_result_for_response(200, true, ""));
         assert!(warned.ok, "a warning must not fail an otherwise good test");
         assert!(warned.message.starts_with("Connected"));
         assert!(warned.message.contains(CLEARTEXT_KEY_WARNING));
 
-        let failed = with_cleartext_warning(provider_test_result_for_status(401));
+        let failed = with_cleartext_warning(provider_test_result_for_response(401, true, ""));
         assert!(!failed.ok);
-        assert!(failed.message.contains("Invalid key"));
+        assert!(failed.message.contains("Server rejected the key"));
     }
 
     #[tokio::test]
@@ -4020,5 +4401,172 @@ mod tests {
         }
         let g2 = try_acquire_busy(&flag);
         assert!(g2.is_some());
+    }
+
+    #[test]
+    fn cues_are_enabled_by_default() {
+        assert!(cues_enabled_from_setting(None));
+    }
+
+    #[test]
+    fn cues_read_both_the_string_and_the_bool_shape() {
+        assert!(!cues_enabled_from_setting(Some(&serde_json::json!("false"))));
+        assert!(!cues_enabled_from_setting(Some(&serde_json::json!(false))));
+        assert!(cues_enabled_from_setting(Some(&serde_json::json!("true"))));
+        assert!(cues_enabled_from_setting(Some(&serde_json::json!(true))));
+    }
+
+    #[test]
+    fn an_unexpected_cue_setting_value_leaves_cues_on() {
+        assert!(cues_enabled_from_setting(Some(&serde_json::json!(7))));
+        assert!(cues_enabled_from_setting(Some(&serde_json::Value::Null)));
+    }
+
+    #[test]
+    fn a_completed_dictation_run_earns_the_success_cue() {
+        assert_eq!(
+            cue_for_dictation_outcome(&Ok("hello there".into())),
+            Cue::Success
+        );
+    }
+
+    #[test]
+    fn a_failed_dictation_run_earns_the_error_cue() {
+        assert_eq!(
+            cue_for_dictation_outcome(&Err("no stt engine".into())),
+            Cue::Error
+        );
+    }
+
+    #[test]
+    fn a_run_that_produced_nothing_earns_the_neutral_cue() {
+        assert_eq!(cue_for_dictation_outcome(&Ok(String::new())), Cue::Cancel);
+        assert_eq!(cue_for_dictation_outcome(&Ok("  \n ".into())), Cue::Cancel);
+    }
+
+    #[test]
+    fn cancel_and_start_agree_on_the_download_key() {
+        // A cancel that derives a different key than the start silently misses:
+        // the task keeps running and the UI never escapes its pending state.
+        assert_eq!(download_key("whisper", "ggml-base.en"), "whisper:ggml-base.en");
+        assert_eq!(
+            download_key("parakeet", "parakeet-tdt-0.6b-v3"),
+            "onnx:parakeet:parakeet-tdt-0.6b-v3"
+        );
+        assert_eq!(download_key("tts", "vits-piper"), "onnx:tts:vits-piper");
+        // Same id under two kinds must not collide.
+        assert_ne!(download_key("parakeet", "shared-id"), download_key("tts", "shared-id"));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_download_still_reports_a_terminal_outcome() {
+        // A download task that ends without reporting is what stranded the
+        // picker on "starting download…": the UI got no completion and no
+        // error, and it refuses to re-issue while a request is pending. Every
+        // exit from the task has to map to an event the UI can act on.
+        let outcome = run_download_task("parakeet-tdt-0.6b-v3", async {
+            panic!("boom in the unpack");
+        })
+        .await;
+
+        let message = outcome.expect_err("a panicking download must report an error");
+        assert!(
+            message.contains("boom in the unpack"),
+            "the panic reason should survive into the message: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_download_reports_the_reason() {
+        let outcome = run_download_task("parakeet-tdt-0.6b-v3", async {
+            Err(InferError::Other("connection reset".into()))
+        })
+        .await;
+
+        assert!(
+            outcome.unwrap_err().contains("connection reset"),
+            "the failure reason has to reach the UI verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_download_reports_success() {
+        let outcome = run_download_task("parakeet-tdt-0.6b-v3", async { Ok(()) }).await;
+        assert!(outcome.is_ok(), "got {outcome:?}");
+    }
+
+    /// Serves one request: real 200 headers, a few body bytes, then silence
+    /// with the socket held open — the shape of a transfer that dies without
+    /// the peer ever closing the connection.
+    async fn stalling_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npartial")
+                .await
+                .unwrap();
+            // Hold the connection open forever without sending the rest.
+            std::future::pending::<()>().await;
+        });
+        format!("http://{addr}/model.tar.bz2")
+    }
+
+    #[tokio::test]
+    async fn a_stalled_transfer_fails_instead_of_hanging_forever() {
+        // The bug this guards: with no read timeout a transfer that stops
+        // mid-body never ends, so the download task never emits a terminal
+        // event and the picker sits on "starting download…" until the app is
+        // restarted. A stall has to become an error the UI can act on.
+        let url = stalling_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let transport = ReqwestDownloadTransport::with_timeouts(
+            Duration::from_millis(500),
+            Duration::from_millis(200),
+        );
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport.fetch_to_file(&url, &dir.path().join("model.tmp"), &|_, _| {}),
+        )
+        .await;
+
+        let result = outcome.expect("fetch_to_file hung past its read timeout");
+        assert!(
+            result.is_err(),
+            "a stalled transfer must surface as an error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_host_fails_instead_of_hanging_forever() {
+        // Same contract on the other end of the transfer: a connect that
+        // never completes must give up rather than pin the download task.
+        let dir = tempfile::tempdir().unwrap();
+        let transport = ReqwestDownloadTransport::with_timeouts(
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        );
+
+        // 203.0.113.0/24 is TEST-NET-3: reserved for documentation, so
+        // nothing answers and the SYN goes unacknowledged.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport.fetch_to_file(
+                "http://203.0.113.1/model.tar.bz2",
+                &dir.path().join("model.tmp"),
+                &|_, _| {},
+            ),
+        )
+        .await;
+
+        assert!(
+            outcome.expect("fetch_to_file hung past its connect timeout").is_err(),
+            "an unreachable host must surface as an error"
+        );
     }
 }

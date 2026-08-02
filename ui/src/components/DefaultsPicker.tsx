@@ -248,6 +248,16 @@ export default function DefaultsPicker({
                       </span>
                       <span className="kea-picker__status">{statusText}</span>
                     </button>
+                    {isPending && (
+                      <button
+                        type="button"
+                        className="kea-btn"
+                        aria-label={`Cancel download of ${option.label}`}
+                        onClick={() => void activation.cancel()}
+                      >
+                        Cancel
+                      </button>
+                    )}
                     {capability === "tts" && option.cloudVoices && (
                       <select
                         className="kea-select"

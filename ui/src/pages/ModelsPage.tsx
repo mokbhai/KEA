@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  cancelModelDownload,
   deleteModel,
   downloadOnnxModel,
   downloadWhisperModel,
@@ -122,6 +123,17 @@ export default function ModelsPage() {
     }
   };
 
+  // The row clears itself off the back of the error event the backend emits
+  // for a cancel, so there is nothing local to unwind here.
+  const cancel = async (kind: CatalogKind, modelId: string) => {
+    setError(null);
+    try {
+      await cancelModelDownload(kind, modelId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const remove = async (section: Section, model: WhisperModel | OnnxModel) => {
     const binding = bindings[section.capability];
     const isActiveDefault = binding?.model === model.id;
@@ -189,9 +201,19 @@ export default function ModelsPage() {
                     hint={`${model.language} · ${formatBytes(model.size_bytes)}`}
                   >
                     {progress ? (
-                      <span className="kea-muted">
-                        {percent !== null ? `${percent}%` : "Downloading…"}
-                      </span>
+                      <>
+                        <span className="kea-muted">
+                          {percent !== null ? `${percent}%` : "Downloading…"}
+                        </span>
+                        <button
+                          type="button"
+                          className="kea-btn"
+                          aria-label={`Cancel download of ${model.display_name}`}
+                          onClick={() => void cancel(section.kind, model.id)}
+                        >
+                          Cancel
+                        </button>
+                      </>
                     ) : installed ? (
                       <>
                         {section.kind === "tts" && (

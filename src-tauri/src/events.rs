@@ -43,6 +43,9 @@ pub struct ModelDownloadProgressPayload {
 }
 
 pub fn emit_dictation_state(app: &AppHandle, state: &str) {
+    // Driven from the emit site rather than the frontend so the floating HUD
+    // tracks dictation whether or not the main window is open.
+    crate::overlay::sync_visibility(app, state);
     let _ = app.emit(
         "dictation:state",
         DictationStatePayload {

@@ -63,7 +63,9 @@ describe("RewritePage", () => {
 
   it("shows no banner once a default resolves", async () => {
     mockWorld({
-      engines: { llm: ["openai"] },
+      // Both engines registered: the override picks the local server, whose
+      // engine is "openai-compatible".
+      engines: { llm: ["openai", "openai-compatible"] },
       bindings: { "default/llm": openAiBinding("openai", "gpt-4o-mini") },
     });
     render(<RewritePage />);
@@ -77,7 +79,9 @@ describe("RewritePage", () => {
 
   it("writes a rewrite-scoped override from the AI card", async () => {
     mockWorld({
-      engines: { llm: ["openai"] },
+      // Both engines registered: the override picks the local server, whose
+      // engine is "openai-compatible".
+      engines: { llm: ["openai", "openai-compatible"] },
       bindings: { "default/llm": openAiBinding("openai", "gpt-4o-mini") },
     });
     render(<RewritePage />);

@@ -8,8 +8,9 @@ pub mod permissions;
 pub mod textio;
 
 pub use audio::{
-    accumulate_frames, chunk_pcm_by_duration, mix_frames, resample_linear, rms_level, AudioIo,
-    AudioIoError, DictationState, MeetingState, PcmBuffer, PcmFrame, SystemAudioCapability,
+    accumulate_frames, chunk_pcm_by_duration, cue_pcm, mix_frames, resample_linear, rms_level,
+    AudioIo, AudioIoError, Cue, DictationState, MeetingState, PcmBuffer, PcmFrame,
+    SystemAudioCapability,
 };
 pub use hotkeys::{parse_accelerator, ActionId, HotkeyBinding, HotkeyError, Hotkeys};
 pub use permissions::{new_permissions, PermError, PermKind, PermStatus, Permissions};

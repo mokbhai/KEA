@@ -11,7 +11,8 @@
   },
   "app": {
     "windows": [{ "title": "KEA", "width": 900, "height": 640, "visible": true }],
-    "trayIcon": { "id": "main", "iconPath": "icons/128x128.png" }
+    "trayIcon": { "id": "main", "iconPath": "icons/128x128.png" },
+    "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,

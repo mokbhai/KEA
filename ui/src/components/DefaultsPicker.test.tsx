@@ -72,6 +72,7 @@ function mockSttWorld({ installed = [] as string[], hasKey = true } = {}) {
     list_onnx_models: () => [],
     list_installed_onnx_models: () => [],
     download_whisper_model: () => undefined,
+    cancel_model_download: () => undefined,
     set_binding: () => undefined,
     get_dictation_settings: () => ({ post_process: false, active_model: null }),
     set_dictation_settings: () => undefined,
@@ -187,6 +188,42 @@ describe("DefaultsPicker", () => {
         screen.getByRole("button", { name: /Whisper Base/ }).hasAttribute("disabled"),
       ).toBe(false),
     );
+  });
+
+  it("cancels a download the backend never reports on, and takes a new pick after", async () => {
+    // The wedge this guards: a download task that dies without emitting
+    // completion or error leaves the row on "starting download…" forever, and
+    // `start` refuses to re-issue while a request is pending — so every later
+    // click is swallowed and only restarting the app clears it. Cancel is the
+    // way out, and it has to leave the picker usable.
+    mockSttWorld({ installed: [] });
+    render(<Harness capability="stt" />);
+
+    await userEvent.click(await screen.findByRole("button", { name: /Whisper Base/ }));
+    await waitFor(() => expect(invokeCalls("download_whisper_model")).toHaveLength(1));
+    expect(await screen.findByText("starting download…")).toBeTruthy();
+
+    // No progress, completion or error event ever arrives.
+    await userEvent.click(await screen.findByRole("button", { name: /Cancel download/i }));
+
+    await waitFor(() => expect(invokeCalls("cancel_model_download")).toHaveLength(1));
+    expect(invokeCalls("cancel_model_download")[0]).toEqual({
+      kind: "whisper",
+      modelId: "whisper-base",
+    });
+    await waitFor(() => expect(screen.queryByText("starting download…")).toBeNull());
+
+    // The picker is live again: a second pick reaches the backend.
+    await userEvent.click(await screen.findByRole("button", { name: /Whisper Base/ }));
+    await waitFor(() => expect(invokeCalls("download_whisper_model")).toHaveLength(2));
+  });
+
+  it("offers no cancel on a row that is not downloading", async () => {
+    mockSttWorld({ installed: [] });
+    render(<Harness capability="stt" />);
+
+    await screen.findByRole("button", { name: /Whisper Base/ });
+    expect(screen.queryByRole("button", { name: /Cancel download/i })).toBeNull();
   });
 
   it("surfaces a failed download start without leaving the picker stuck", async () => {

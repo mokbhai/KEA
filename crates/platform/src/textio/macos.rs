@@ -32,7 +32,25 @@ impl MacTextIo {
 // Keycodes are physical scan codes, stable across all keyboard layouts:
 // kVK_ANSI_C = 8, kVK_ANSI_V = 9
 
+/// Releases modifiers the user is probably still holding.
+///
+/// These run straight off a hotkey, so the physical keys are usually still
+/// down — with Cmd+Shift+R that makes the synthetic Cmd+C arrive as
+/// Cmd+Shift+C, firing whatever owns *that* shortcut (a clipboard manager,
+/// say) instead of copying. Cmd+Shift+V is worse: it is "paste and match
+/// style" in many apps. A synthetic release is harmless if the key is already
+/// up, and the later physical release just repeats it.
+fn release_conflicting_modifiers(enigo: &mut Enigo) {
+    for key in [Key::Shift, Key::Control, Key::Alt] {
+        // Best effort: a modifier we cannot release must not abort the copy.
+        let _ = enigo.key(key, Direction::Release);
+    }
+    // Let the window server settle the flag change before the chord lands.
+    thread::sleep(Duration::from_millis(20));
+}
+
 fn synthesize_copy(enigo: &mut Enigo) -> Result<(), TextIoError> {
+    release_conflicting_modifiers(enigo);
     enigo
         .key(Key::Meta, Direction::Press)
         .map_err(|e| TextIoError::Other(e.to_string()))?;
@@ -46,6 +64,7 @@ fn synthesize_copy(enigo: &mut Enigo) -> Result<(), TextIoError> {
 }
 
 fn synthesize_paste(enigo: &mut Enigo) -> Result<(), TextIoError> {
+    release_conflicting_modifiers(enigo);
     enigo
         .key(Key::Meta, Direction::Press)
         .map_err(|e| TextIoError::Other(e.to_string()))?;
