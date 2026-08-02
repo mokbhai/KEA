@@ -1158,6 +1158,12 @@ fn spawn_meeting_level_poll(state: &Arc<AppState>, app: &AppHandle) {
     });
 }
 
+/// How often the loop asks whether the buffer has reached a cut point. The
+/// segment *length* is no longer set by this interval — the cut is decided
+/// from the audio (a pause, or the configured maximum), so this only bounds
+/// how promptly a pause is noticed.
+const SEGMENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 fn spawn_segment_poll(state: &Arc<AppState>, app: &AppHandle, interval_secs: u32) {
     stop_segment_poll(state);
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
@@ -1167,7 +1173,10 @@ fn spawn_segment_poll(state: &Arc<AppState>, app: &AppHandle, interval_secs: u32
 
     let state = state.clone();
     let app = app.clone();
-    let poll_interval = Duration::from_secs(interval_secs.max(1) as u64);
+    // The configured length is passed to the cut logic as the hard cap, not
+    // used as the tick rate.
+    let _ = interval_secs;
+    let poll_interval = SEGMENT_POLL_INTERVAL;
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
         loop {

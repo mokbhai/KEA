@@ -345,11 +345,28 @@ pub async fn run_meeting_poll_segment(
     sequence: &mut i32,
     elapsed_ms: &mut i64,
 ) -> Result<Option<MeetingSegmentEvent>, String> {
-    let pcm = ctx
+    // Ends the segment at a pause in speech when there is one, and at the
+    // user's configured length when the speaker never pauses — a boundary on
+    // the clock alone lands mid-word.
+    let cut_cfg = kea_platform::audio::segment::SegmentCutConfig {
+        max_secs: ctx.settings.segment_duration_secs as f32,
+        ..Default::default()
+    };
+    let Some(segment) = ctx
         .audio
-        .drain_meeting_buffer()
+        .try_drain_meeting_segment(cut_cfg)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+
+    // Silence is dropped rather than transcribed: a model handed a silent
+    // clip tends to emit plausible-looking text that was never spoken.
+    if !segment.has_speech {
+        return Ok(None);
+    }
+    let pcm = segment.pcm;
 
     if !has_min_audio(&pcm) {
         return Ok(None);
@@ -786,6 +803,22 @@ mod tests {
                     samples: vec![],
                     sample_rate_hz: 16_000,
                 }))
+        }
+
+        /// Each queued drain stands for one segment the cut logic released.
+        /// Where the boundary falls is covered by the cut tests in
+        /// kea-platform; these tests are about what the meeting does with a
+        /// segment once it has one.
+        async fn try_drain_meeting_segment(
+            &mut self,
+            _cfg: kea_platform::audio::segment::SegmentCutConfig,
+        ) -> Result<Option<kea_platform::audio::SpeechSegment>, AudioIoError> {
+            Ok(self.pending_drains.lock().unwrap().pop().map(|pcm| {
+                kea_platform::audio::SpeechSegment {
+                    pcm,
+                    has_speech: true,
+                }
+            }))
         }
     }
 

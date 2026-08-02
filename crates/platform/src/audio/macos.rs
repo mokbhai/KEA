@@ -607,6 +607,45 @@ impl AudioIo for MacAudioIo {
         Ok(accumulate_frames(&frames))
     }
 
+    async fn try_drain_meeting_segment(
+        &mut self,
+        cfg: crate::audio::segment::SegmentCutConfig,
+    ) -> Result<Option<crate::audio::SpeechSegment>, AudioIoError> {
+        let mut guard = self
+            .meeting_drain_frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let pending = accumulate_frames(&guard);
+        let Some(cut) = crate::audio::segment::find_segment_cut(
+            &pending.samples,
+            pending.sample_rate_hz,
+            cfg,
+        ) else {
+            // Not at a cut point yet — leave everything buffered.
+            return Ok(None);
+        };
+
+        // Keep whatever follows the cut as the start of the next segment, so
+        // audio spoken after the pause is not discarded.
+        let remainder = pending.samples[cut.take..].to_vec();
+        *guard = if remainder.is_empty() {
+            Vec::new()
+        } else {
+            vec![PcmFrame {
+                samples: remainder,
+                sample_rate_hz: pending.sample_rate_hz,
+            }]
+        };
+
+        Ok(Some(crate::audio::SpeechSegment {
+            pcm: PcmFrame {
+                samples: pending.samples[..cut.take].to_vec(),
+                sample_rate_hz: pending.sample_rate_hz,
+            },
+            has_speech: cut.has_speech,
+        }))
+    }
+
     async fn play(&self, pcm: PcmFrame) -> Result<(), AudioIoError> {
         tokio::task::spawn_blocking(move || crate::audio::playback::play_pcm_blocking(&pcm))
             .await

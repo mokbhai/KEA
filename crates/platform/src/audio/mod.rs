@@ -13,6 +13,7 @@ pub mod macos_sck;
 #[cfg(not(target_os = "macos"))]
 pub mod stub;
 pub mod playback;
+pub mod segment;
 pub mod util;
 
 pub use util::{accumulate_frames, chunk_pcm_by_duration, mix_frames, resample_linear, rms_level};
@@ -26,6 +27,15 @@ pub struct PcmFrame {
 
 /// Alias for [`PcmFrame`] used in dictation pipelines.
 pub type PcmBuffer = PcmFrame;
+
+/// A meeting segment taken at a cut point, with whether anyone actually spoke
+/// in it. A speechless segment is dropped rather than transcribed: models
+/// asked to transcribe silence tend to invent text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpeechSegment {
+    pub pcm: PcmFrame,
+    pub has_speech: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DictationState {
@@ -102,6 +112,20 @@ pub trait AudioIo: Send + Sync {
             samples: vec![],
             sample_rate_hz: 16_000,
         })
+    }
+
+    /// Takes the next segment *if* the buffer has reached a good cut point —
+    /// a pause in speech, or the configured maximum length. Returns `None`
+    /// while the speaker is still mid-flow, leaving the audio buffered.
+    ///
+    /// This is what keeps a boundary from landing mid-word; callers poll it
+    /// frequently rather than draining on a timer.
+    async fn try_drain_meeting_segment(
+        &mut self,
+        cfg: segment::SegmentCutConfig,
+    ) -> Result<Option<SpeechSegment>, AudioIoError> {
+        let _ = cfg;
+        Ok(None)
     }
 
     /// Play mono PCM to the default output device. Default impl is a no-op so fakes and stubs compile.
