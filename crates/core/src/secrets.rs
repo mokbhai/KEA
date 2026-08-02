@@ -74,10 +74,32 @@ mod tests {
 mod keyring_backing_tests {
     use super::*;
 
+    /// Whether this machine offers a credential store at all.
+    ///
+    /// Reading a key that was never written answers it: a working store says
+    /// `NoEntry`, while a headless box with no secret-service daemon (a CI
+    /// runner, a container) fails at the platform layer. That distinction is
+    /// what keeps the skip below narrow — the no-op backend this test exists
+    /// to catch reports `NoEntry` like any healthy store, so it is still held
+    /// to the roundtrip.
+    fn platform_store_available() -> bool {
+        match keyring::Entry::new("ai.kea.desktop.selftest", "availability-probe") {
+            Ok(entry) => !matches!(
+                entry.get_password(),
+                Err(keyring::Error::PlatformFailure(_)) | Err(keyring::Error::NoStorageAccess(_))
+            ),
+            Err(_) => false,
+        }
+    }
+
     /// The real store must actually persist. Without a platform feature the
     /// keyring crate falls back to a no-op backend where writes vanish.
     #[tokio::test]
     async fn keyring_store_roundtrips() {
+        if !platform_store_available() {
+            eprintln!("no platform credential store on this machine — skipping");
+            return;
+        }
         let store = KeyringCredentialStore::new("ai.kea.desktop.selftest");
         let _ = store.delete("probe").await;
         store.set("probe", "sk-roundtrip").await.unwrap();

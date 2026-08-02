@@ -1,0 +1,30 @@
+# Windows: put every object on the same MSVC runtime.
+#
+# The two vendored speech stacks disagree by default. sherpa-onnx publishes
+# only `win-x64-static-MT` prebuilts, while whisper.cpp builds against the
+# dynamic runtime — so once `src-tauri` began enabling both engines by
+# default, linking them into one binary failed with
+#   LNK2038: mismatch detected for 'RuntimeLibrary':
+#   'MT_StaticRelease' doesn't match 'MD_DynamicRelease'
+# sherpa ships no MD build, so the static runtime is the only side that can
+# move, and it has to move everywhere at once.
+#
+# `+crt-static` covers Rust std and every `cc`-built dependency. It does not
+# reach whisper.cpp: that is a CMake project, and the `cmake` crate has no
+# runtime-library handling. whisper.cpp also pins
+# `cmake_minimum_required(VERSION 3.5)`, which leaves policy CMP0091 at OLD —
+# and while that policy is OLD, CMAKE_MSVC_RUNTIME_LIBRARY is ignored
+# outright. Forcing the policy NEW is what makes the variable take effect.
+# whisper-rs-sys forwards any `CMAKE_*` env var as a `-D` define, which is how
+# both of these reach the build.
+#
+# The two CMake variables are set unconditionally because cargo's `[env]` has
+# no per-target form. They are inert off Windows: CMake reports them as unused
+# and carries on.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+CMAKE_POLICY_DEFAULT_CMP0091 = "NEW"
+CMAKE_MSVC_RUNTIME_LIBRARY = "MultiThreaded"
