@@ -69,3 +69,20 @@ mod tests {
         assert_eq!(store.get("openai").await.unwrap(), None);
     }
 }
+
+#[cfg(test)]
+mod keyring_backing_tests {
+    use super::*;
+
+    /// The real store must actually persist. Without a platform feature the
+    /// keyring crate falls back to a no-op backend where writes vanish.
+    #[tokio::test]
+    async fn keyring_store_roundtrips() {
+        let store = KeyringCredentialStore::new("ai.kea.desktop.selftest");
+        let _ = store.delete("probe").await;
+        store.set("probe", "sk-roundtrip").await.unwrap();
+        let got = store.get("probe").await.unwrap();
+        let _ = store.delete("probe").await;
+        assert_eq!(got, Some("sk-roundtrip".into()), "keyring did not persist the secret");
+    }
+}
