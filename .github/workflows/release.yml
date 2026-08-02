@@ -11,13 +11,19 @@ permissions:
 jobs:
   build-and-publish:
     runs-on: macos-15
-    timeout-minutes: 60
+    # A cold Tauri release build of this workspace (whisper, parakeet, cpal,
+    # rodio) plus the tests does not fit in 60 minutes on a macOS runner.
+    timeout-minutes: 120
 
-    # Promote the signing key to a job-level env var so the conditional step
-    # below can gate on it: the `secrets` context is NOT allowed in step-level
-    # `if:` expressions (it fails workflow validation), but `env` is.
     env:
+      # Promoted to job-level env so later steps can gate on presence: the
+      # `secrets` context is NOT allowed in step-level `if:` expressions (it
+      # fails workflow validation), but `env` is. This is also what makes the
+      # bundler emit the signed *.app.tar.gz + .sig instead of refusing to build.
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+      # Keeps the updater manifest URLs pointed at whatever repo built them.
+      KEA_REPO_SLUG: ${{ github.repository }}
 
     steps:
       - name: Check out repository
@@ -26,7 +32,21 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      # `cargo install tauri-cli` compiles the CLI from source and costs several
+      # minutes on every run; cache the resulting binary keyed on the pinned
+      # major so it is built once per runner image.
+      - name: Cache Tauri CLI
+        id: cache-tauri-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-tauri
+          key: ${{ runner.os }}-cargo-tauri-v2
+
       - name: Install Tauri CLI
+        if: steps.cache-tauri-cli.outputs.cache-hit != 'true'
         run: cargo install tauri-cli --version "^2" --locked
 
       - name: Install Node
@@ -37,7 +57,7 @@ jobs:
           cache-dependency-path: ui/package-lock.json
 
       - name: Install UI dependencies
-        run: npm --prefix ui install
+        run: npm --prefix ui ci
 
       - name: Verify tag matches package version
         run: |
@@ -48,88 +68,66 @@ jobs:
             exit 1
           fi
 
-      - name: Run checks
-        run: make release-check
+      - name: Verify release notes exist for this tag
+        run: ./scripts/extract_release_notes.sh "${GITHUB_REF_NAME#v}" > release-notes.md
 
-      - name: Build release artifacts
-        run: ./scripts/package_release.sh
+      # Lint and test only. The bundle build deliberately does NOT run here:
+      # `make release-check` would build the app once, and package_release.sh
+      # then ran `make clean` + a second full build, discarding the first. The
+      # single signed build below replaces both.
+      - name: Lint
+        run: make lint
 
-      # Updater artifacts are produced by the Tauri bundler itself (correct
-      # ed25519 .sig), NOT hand-rolled — the previous openssl SHA256 signing
-      # produced signatures the client always rejected. Runs only when a
-      # signing key is present; the maintainer must also set a non-empty
-      # bundle.updater.pubkey in tauri.conf.json (see docs/RELEASE.md), which
-      # is what makes the bundler emit the signed *.app.tar.gz + .sig.
-      - name: Build signed updater artifacts (conditional on signing key)
-        if: ${{ env.TAURI_SIGNING_PRIVATE_KEY != '' }}
-        env:
-          # TAURI_SIGNING_PRIVATE_KEY is inherited from the job-level env above.
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+      - name: Test
+        run: make test
+
+      - name: Build and package release artifacts
+        run: ./scripts/package_release.sh --features updater
+
+      - name: Verify updater artifacts were signed
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-
-          # The bundler emits the updater archive + ed25519 signature only when
-          # built with the updater feature and bundle.createUpdaterArtifacts
-          # enabled in tauri.conf.json (see docs/RELEASE.md).
-          cargo tauri build --features updater
-
-          # `|| true`: find exits non-zero when the src-tauri/target path is
-          # absent (workspace builds only populate target/), which would abort
-          # the step under `set -euo pipefail` before the guard below runs.
-          TAR_GZ="$(find target/release/bundle/macos src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app.tar.gz' 2>/dev/null | head -n 1 || true)"
-          SIG_FILE="$(find target/release/bundle/macos src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app.tar.gz.sig' 2>/dev/null | head -n 1 || true)"
-          if [[ -z "$TAR_GZ" || -z "$SIG_FILE" ]]; then
-            echo "Bundler did not produce updater artifacts. Ensure bundle.updater.pubkey is set in tauri.conf.json." >&2
+          if [[ ! -f "dist/latest.json" ]]; then
+            echo "dist/latest.json missing - the bundler produced no signed updater artifacts." >&2
+            echo "Check that TAURI_SIGNING_PRIVATE_KEY is set and bundle.createUpdaterArtifacts is true." >&2
             exit 1
           fi
-
-          # The client verifies against the CONTENTS of the .sig file (base64
-          # ed25519), not an openssl digest.
-          SIG="$(cat "$SIG_FILE")"
-          OUT_TAR="KEA_${VERSION}_aarch64.app.tar.gz"
-          cp "$TAR_GZ" "$OUT_TAR"
-
-          cat > latest.json << JSONEOF
-          {
-            "version": "v${VERSION}",
-            "notes": "KEA ${VERSION}",
-            "pub_date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-            "platforms": {
-              "darwin-aarch64": {
-                "signature": "${SIG}",
-                "url": "https://github.com/mokbhai/vox/releases/download/v${VERSION}/${OUT_TAR}"
-              }
+          node -e '
+            const fs = require("fs");
+            const m = JSON.parse(fs.readFileSync("dist/latest.json", "utf8"));
+            const expected = "v" + process.argv[1];
+            if (m.version !== expected) {
+              throw new Error(`latest.json version ${m.version} != ${expected}`);
             }
-          }
-          JSONEOF
-
-          mkdir -p dist
-          mv "$OUT_TAR" latest.json dist/
-          echo "Signed updater artifacts ready: dist/${OUT_TAR}, dist/latest.json"
-
-      - name: Extract release notes
-        run: |
-          ./scripts/extract_release_notes.sh "${GITHUB_REF_NAME#v}" > release-notes.md
+            const p = m.platforms["darwin-aarch64"];
+            if (!p || !p.signature || !p.url) {
+              throw new Error("latest.json is missing a darwin-aarch64 signature/url");
+            }
+          ' "$VERSION"
+          echo "Updater manifest verified:"
+          cat dist/latest.json
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v6
         with:
           name: KEA-${{ github.ref_name }}
+          if-no-files-found: error
           path: |
             dist/KEA-*.zip
-            dist/KEA-*.dmg
             dist/KEA_*.dmg
             dist/KEA_*.app.tar.gz
+            dist/KEA_*.app.tar.gz.sig
             dist/latest.json
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           body_path: release-notes.md
+          fail_on_unmatched_files: true
           files: |
             dist/KEA-*.zip
-            dist/KEA-*.dmg
             dist/KEA_*.dmg
             dist/KEA_*.app.tar.gz
+            dist/KEA_*.app.tar.gz.sig
             dist/latest.json

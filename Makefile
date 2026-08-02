@@ -7,6 +7,9 @@ BUNDLE_ID = ai.kea.desktop
 DIST_DIR = dist
 TAURI_CLI = cargo tauri
 APP_INSTALL_PATH = /Applications/$(APP_NAME).app
+# Extra flags forwarded to `cargo tauri build` (release packaging passes
+# --features updater through here so the signing logic below still applies).
+TAURI_BUILD_FLAGS ?=
 
 all: build
 
@@ -19,8 +22,24 @@ check-tauri:
 
 build: tauri-build
 
+# tauri.conf.json carries an updater pubkey, and the bundler REFUSES to build
+# when it finds one without a matching private key ("A public key has been
+# found, but no private key"). Local and CI bundle builds must not depend on the
+# release signing key, so fall back to --no-sign when it is absent. The release
+# workflow exports TAURI_SIGNING_PRIVATE_KEY and therefore takes the signed path,
+# which is what emits the *.app.tar.gz.sig the updater manifest needs.
+#
+# Only TAURI_SIGNING_PRIVATE_KEY is checked: the bundler's own guard names that
+# variable specifically, and setting TAURI_SIGNING_PRIVATE_KEY_PATH instead is
+# NOT enough to get past it. Its value may be either the key contents or a path.
 tauri-build: check-tauri
-	$(TAURI_CLI) build
+	@if [ -n "$$TAURI_SIGNING_PRIVATE_KEY" ]; then \
+		echo "Signing key present - building signed updater artifacts."; \
+		$(TAURI_CLI) build $(TAURI_BUILD_FLAGS); \
+	else \
+		echo "No TAURI_SIGNING_PRIVATE_KEY - building with --no-sign (no updater signature)."; \
+		$(TAURI_CLI) build --no-sign $(TAURI_BUILD_FLAGS); \
+	fi
 
 dev: tauri-dev
 

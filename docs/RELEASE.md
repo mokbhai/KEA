@@ -17,36 +17,63 @@ Use the helper script to update both together:
 
 ## Release Checklist
 
-1. Add the dated changelog entry in `CHANGELOG.md`.
+1. Add the dated changelog entry in `CHANGELOG.md`. The heading must be exactly
+   `## [<version>] - <YYYY-MM-DD>` with today's date — `scripts/release.sh`
+   refuses to run without it, and the workflow extracts the release body from it.
 2. Update the app version with `./scripts/set_version.sh <version>`.
-3. Run the verification gate:
+3. Run the lint and test gate:
 
 ```bash
-make release-check
+make lint
+make test
 ```
 
-This runs TypeScript checks, rustfmt, Rust compile checks, Rust tests, UI build, and a Tauri bundle build.
+This runs TypeScript checks, Rust compile checks, doc hygiene, the UI build, and
+the Rust workspace tests.
 
-4. Build release artifacts:
+4. Build and package release artifacts (this performs the bundle build):
 
 ```bash
 ./scripts/package_release.sh
 ```
 
-5. Create the release commit and annotated tag:
+5. Create the release commit and annotated tag, then push:
 
 ```bash
-./scripts/release.sh 0.1.0
+./scripts/release.sh <version>
+git push origin main
+git push origin v<version>
 ```
+
+Pushing the tag is what triggers `.github/workflows/release.yml`, which rebuilds,
+signs, and publishes the GitHub release.
 
 ## Release Artifacts
 
-`scripts/package_release.sh` produces artifacts under `dist/`, including:
+`scripts/package_release.sh` produces artifacts under `dist/`:
 
 - `dist/KEA-<version>.zip`
 - Tauri-generated DMG files such as `dist/KEA_<version>_<arch>.dmg`
+- When a signing key is present: `dist/KEA_<version>_<arch>.app.tar.gz`,
+  its `.sig`, and `dist/latest.json`
 
 Artifacts are copied from the Tauri bundle output under `target/release/bundle/` or `src-tauri/target/release/bundle/`.
+
+### Build once, package once
+
+`package_release.sh` builds the app itself. Do **not** run a separate bundle
+build before it: an earlier version of the release workflow ran `make
+release-check` (which bundles) and then `package_release.sh`, which began with
+`make clean` and rebuilt from scratch — two full Tauri builds per release, which
+is what exhausted the job timeout.
+
+Pass `--no-build` when a build has already happened in the same job, and
+`--features <list>` to forward cargo features to that build:
+
+```bash
+./scripts/package_release.sh --features updater   # build, then package
+./scripts/package_release.sh --no-build           # package an existing bundle
+```
 
 ## Auto-Update
 
