@@ -31,7 +31,7 @@ use kea_features::run_rewrite_with_storage;
 use kea_core::resolve::SlotResolver;
 use kea_infer::{StreamedFile, DownloadTransport, InferError, ModelDownloader, ModelRegistry, ModelStorage, OnnxModelEntry};
 use kea_platform::{
-    new_text_io, parse_accelerator, AudioIo, AudioIoError, DictationState, HotkeyBinding,
+    new_text_io, parse_accelerator, AudioIo, AudioIoError, Cue, DictationState, HotkeyBinding,
     Hotkeys, MeetingState, PermKind, PermStatus, PcmFrame, SystemAudioCapability,
 };
 use serde::{Deserialize, Serialize};
@@ -696,6 +696,57 @@ async fn store_conversations_enabled(config_pool: &SqlitePool) -> bool {
             true
         }
     }
+}
+
+/// Settings key for the dictation cue sounds toggle.
+pub const SOUND_CUES_SETTING: &str = "sound.cues_enabled";
+
+/// Reads the cue-sounds flag, defaulting ON.
+///
+/// Same both-shapes tolerance as `store_conversations_enabled`: the generic
+/// `set_setting` command writes a JSON string, other callers a JSON bool.
+pub fn cues_enabled_from_setting(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Bool(v)) => *v,
+        Some(serde_json::Value::String(s)) => s != "false",
+        Some(_) | None => true,
+    }
+}
+
+async fn sound_cues_enabled(config_pool: &SqlitePool) -> bool {
+    match SettingsRepo::new(config_pool.clone())
+        .get::<serde_json::Value>(SOUND_CUES_SETTING)
+        .await
+    {
+        Ok(value) => cues_enabled_from_setting(value.as_ref()),
+        Err(e) => {
+            tracing::warn!(%e, "failed to read {SOUND_CUES_SETTING}, defaulting to on");
+            true
+        }
+    }
+}
+
+/// Plays a dictation outcome cue, unless the user turned sounds off.
+///
+/// Fire-and-forget: playback pins a blocking-pool thread for the length of the
+/// cue, and the caller is on the path that returns the transcript.
+pub fn spawn_dictation_cue(state: &Arc<AppState>, cue: Cue) {
+    let config_pool = state.config_pool.clone();
+    tauri::async_runtime::spawn(async move {
+        if !sound_cues_enabled(&config_pool).await {
+            return;
+        }
+        let frame = kea_platform::cue_pcm(cue);
+        let played = tokio::task::spawn_blocking(move || {
+            kea_platform::audio::playback::play_pcm_blocking(&frame)
+        })
+        .await;
+        match played {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, ?cue, "failed to play dictation cue"),
+            Err(e) => tracing::warn!(error = %e, ?cue, "dictation cue playback task failed"),
+        }
+    });
 }
 
 pub async fn execute_rewrite(state: &AppState, input: RewriteInput) -> Result<String, String> {
@@ -1401,6 +1452,14 @@ pub async fn stop_meeting_inner(
 }
 
 pub async fn start_dictation_inner(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
+    let result = start_dictation_run(state, app).await;
+    if result.is_err() {
+        spawn_dictation_cue(state, Cue::Error);
+    }
+    result
+}
+
+async fn start_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
     // Reject before touching the audio lock so a press during meeting
     // synthesis can't park on the lock and start once it's released.
     if state.meeting_processing.load(Ordering::SeqCst) {
@@ -1438,6 +1497,25 @@ pub async fn start_dictation_inner(state: &Arc<AppState>, app: &AppHandle) -> Re
 }
 
 pub async fn stop_dictation_inner(state: &Arc<AppState>, app: &AppHandle) -> Result<String, String> {
+    let result = stop_dictation_run(state, app).await;
+    spawn_dictation_cue(state, cue_for_dictation_outcome(&result));
+    result
+}
+
+/// Which cue a finished dictation run earns.
+///
+/// There is no abort/cancel path in dictation — a hotkey press either starts,
+/// stops, or is ignored — so the neutral blip goes to the closest thing there
+/// is: a run that completed but produced nothing to insert.
+pub fn cue_for_dictation_outcome(result: &Result<String, String>) -> Cue {
+    match result {
+        Ok(text) if text.trim().is_empty() => Cue::Cancel,
+        Ok(_) => Cue::Success,
+        Err(_) => Cue::Error,
+    }
+}
+
+async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<String, String> {
     stop_level_poll(state);
 
     let pcm = {
@@ -4162,5 +4240,121 @@ mod tests {
         }
         let g2 = try_acquire_busy(&flag);
         assert!(g2.is_some());
+    }
+
+    #[test]
+    fn cues_are_enabled_by_default() {
+        assert!(cues_enabled_from_setting(None));
+    }
+
+    #[test]
+    fn cues_read_both_the_string_and_the_bool_shape() {
+        assert!(!cues_enabled_from_setting(Some(&serde_json::json!("false"))));
+        assert!(!cues_enabled_from_setting(Some(&serde_json::json!(false))));
+        assert!(cues_enabled_from_setting(Some(&serde_json::json!("true"))));
+        assert!(cues_enabled_from_setting(Some(&serde_json::json!(true))));
+    }
+
+    #[test]
+    fn an_unexpected_cue_setting_value_leaves_cues_on() {
+        assert!(cues_enabled_from_setting(Some(&serde_json::json!(7))));
+        assert!(cues_enabled_from_setting(Some(&serde_json::Value::Null)));
+    }
+
+    #[test]
+    fn a_completed_dictation_run_earns_the_success_cue() {
+        assert_eq!(
+            cue_for_dictation_outcome(&Ok("hello there".into())),
+            Cue::Success
+        );
+    }
+
+    #[test]
+    fn a_failed_dictation_run_earns_the_error_cue() {
+        assert_eq!(
+            cue_for_dictation_outcome(&Err("no stt engine".into())),
+            Cue::Error
+        );
+    }
+
+    #[test]
+    fn a_run_that_produced_nothing_earns_the_neutral_cue() {
+        assert_eq!(cue_for_dictation_outcome(&Ok(String::new())), Cue::Cancel);
+        assert_eq!(cue_for_dictation_outcome(&Ok("  \n ".into())), Cue::Cancel);
+    }
+
+    /// Serves one request: real 200 headers, a few body bytes, then silence
+    /// with the socket held open — the shape of a transfer that dies without
+    /// the peer ever closing the connection.
+    async fn stalling_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npartial")
+                .await
+                .unwrap();
+            // Hold the connection open forever without sending the rest.
+            std::future::pending::<()>().await;
+        });
+        format!("http://{addr}/model.tar.bz2")
+    }
+
+    #[tokio::test]
+    async fn a_stalled_transfer_fails_instead_of_hanging_forever() {
+        // The bug this guards: with no read timeout a transfer that stops
+        // mid-body never ends, so the download task never emits a terminal
+        // event and the picker sits on "starting download…" until the app is
+        // restarted. A stall has to become an error the UI can act on.
+        let url = stalling_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let transport = ReqwestDownloadTransport::with_timeouts(
+            Duration::from_millis(500),
+            Duration::from_millis(200),
+        );
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport.fetch_to_file(&url, &dir.path().join("model.tmp"), &|_, _| {}),
+        )
+        .await;
+
+        let result = outcome.expect("fetch_to_file hung past its read timeout");
+        assert!(
+            result.is_err(),
+            "a stalled transfer must surface as an error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_host_fails_instead_of_hanging_forever() {
+        // Same contract on the other end of the transfer: a connect that
+        // never completes must give up rather than pin the download task.
+        let dir = tempfile::tempdir().unwrap();
+        let transport = ReqwestDownloadTransport::with_timeouts(
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        );
+
+        // 203.0.113.0/24 is TEST-NET-3: reserved for documentation, so
+        // nothing answers and the SYN goes unacknowledged.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport.fetch_to_file(
+                "http://203.0.113.1/model.tar.bz2",
+                &dir.path().join("model.tmp"),
+                &|_, _| {},
+            ),
+        )
+        .await;
+
+        assert!(
+            outcome.expect("fetch_to_file hung past its connect timeout").is_err(),
+            "an unreachable host must surface as an error"
+        );
     }
 }

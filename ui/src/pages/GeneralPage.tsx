@@ -30,6 +30,9 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
   const [notifBusy, setNotifBusy] = useState(false);
   const [notifStatus, setNotifStatus] = useState<string | null>(null);
 
+  const [soundCues, setSoundCues] = useState(true);
+  const [soundCuesBusy, setSoundCuesBusy] = useState(false);
+
   const [setupBusy, setSetupBusy] = useState(false);
   const [setupError, setSetupError] = useState<string | null>(null);
 
@@ -40,6 +43,11 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
     getSetting("updates.auto_check")
       .then((v) => {
         if (v === "false") setAutoCheck(false);
+      })
+      .catch(() => {});
+    getSetting("sound.cues_enabled")
+      .then((v) => {
+        if (v === "false") setSoundCues(false);
       })
       .catch(() => {});
   }, []);
@@ -76,6 +84,20 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
       setAutoCheck(previous);
     } finally {
       setAutoCheckBusy(false);
+    }
+  };
+
+  const onSoundCuesChange = async (enabled: boolean) => {
+    const previous = soundCues;
+    setSoundCues(enabled);
+    setSoundCuesBusy(true);
+    try {
+      await setSetting("sound.cues_enabled", enabled ? "true" : "false");
+      flash("sound-cues");
+    } catch {
+      setSoundCues(previous);
+    } finally {
+      setSoundCuesBusy(false);
     }
   };
 
@@ -128,7 +150,7 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
     <div>
       <h1 style={{ marginTop: 0 }}>General</h1>
       <p className="kea-muted" style={{ marginBottom: 24 }}>
-        Appearance, startup, updates, notifications and permissions.
+        Appearance, startup, updates, sounds, notifications and permissions.
       </p>
 
       <section style={{ marginBottom: 24 }}>
@@ -188,8 +210,20 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
       </section>
 
       <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Notifications</h2>
-        <RowGroup aria-label="Notifications">
+        <h2 style={{ margin: "0 0 12px" }}>Sounds & notifications</h2>
+        <RowGroup aria-label="Sounds and notifications">
+          <Row
+            label="Dictation sounds"
+            hint="Play a short tone when dictation finishes or fails"
+          >
+            {savedKey === "sound-cues" && <span className="kea-saved">Saved ✓</span>}
+            <Toggle
+              checked={soundCues}
+              onChange={(next) => void onSoundCuesChange(next)}
+              label="Play dictation sounds"
+              disabled={soundCuesBusy}
+            />
+          </Row>
           <Row label="Test notifications" hint={notifStatus ?? "Send a sample notification"}>
             <button
               type="button"
