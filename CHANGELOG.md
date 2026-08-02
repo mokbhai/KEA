@@ -6,6 +6,39 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-03
+
+### Added
+
+- Floating dictation HUD overlay with a live waveform.
+- Synthesized dictation cue sounds with an on/off setting.
+- Rebuilt onboarding as a four-step setup wizard.
+- Shared feature-page template across dictation, rewrite, meetings, and text-to-speech.
+- Cancel control for in-flight model downloads, on both the engine picker and the Models page.
+- Signed auto-update artifacts: releases now publish `latest.json` and a signed `.app.tar.gz` for `tauri-plugin-updater`.
+
+### Changed
+
+- Restyled the remaining application surfaces and completed an accessibility audit.
+- Meeting transcription ends segments at a natural pause instead of on a fixed clock.
+- Model downloads stream to disk instead of buffering, and the picker only offers engines the build actually ships.
+- Release packaging builds the app once instead of building, cleaning, and rebuilding it.
+
+### Fixed
+
+- Added the missing Tauri v2 capability file. Without it the app resolved an empty ACL and rejected `plugin:event|listen`, so no `dictation:*`, `meeting:*`, or `model:download:*` event ever reached the frontend — which is what made a stalled model download unrecoverable.
+- Model downloads recover from a dead connection: connect and per-read stall timeouts, a panic-catching wrapper so a task always emits a terminal event, and tracing at both boundaries.
+- Calibrated palette tokens that failed WCAG 2.1 contrast in one or both themes, plus a regression test that reads the tokens straight out of `index.css`.
+- Held modifier keys are released before the synthetic copy/paste during text injection.
+- API keys are now actually persisted to the platform keychain.
+- Provider connection tests report the underlying failure instead of a generic error.
+- Capability defaults propagate resolver bindings correctly, and `delete_model` is hardened against unexpected input.
+- Cross-platform CI: the Ubuntu keyring test skips where no credential store exists, and Windows pins the target to the static MSVC runtime (sherpa-onnx ships MT-only prebuilts, and whisper.cpp needs CMP0091 forced NEW before it honours the runtime variable).
+
+### Security
+
+- Updater artifacts are signed with an ed25519 key and verified by the client against the public key embedded in the app.
+
 ## [0.1.0] - 2026-07-17
 
 ### Added

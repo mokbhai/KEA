@@ -45,7 +45,13 @@ if ! grep -q "^## \[$VERSION\] - $DATE$" CHANGELOG.md; then
 fi
 
 ./scripts/set_version.sh "$VERSION"
-make release-check
+
+# `make lint test` rather than `make release-check`: release-check ends in a
+# bundle build, and package_release.sh then runs `make clean` and rebuilds from
+# scratch, so the first bundle is always thrown away. package_release.sh owns
+# the one build that matters.
+make lint
+make test
 ./scripts/package_release.sh
 
 git add CHANGELOG.md src-tauri/tauri.conf.json src-tauri/Cargo.toml Cargo.lock
