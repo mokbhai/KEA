@@ -14,6 +14,16 @@ parakeet = ["kea-engines/parakeet"]
 tts-local = ["kea-engines/tts-local"]
 sherpa = ["kea-infer/sherpa"]
 
+# macOS only, and only for the dictation overlay: tao exposes
+# `visible_on_all_workspaces`, which sets NSWindowCollectionBehaviorCanJoinAllSpaces
+# and nothing else. Floating over ANOTHER app's full-screen space additionally
+# needs NSWindowCollectionBehaviorFullScreenAuxiliary, which Tauri does not
+# surface, so the NSWindow has to be addressed directly. objc2 is already in the
+# tree via kea-platform; objc2-app-kit is deliberately not pulled in for two
+# selectors.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
