@@ -123,6 +123,16 @@ fn install_onnx_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), Infe
     use tar::{Archive, EntryType};
 
     let temp = tempfile::tempdir()?;
+    // Resolve the staging root ONCE, and compare every entry against the
+    // resolved form. tempfile hands back the path as TMPDIR spells it, and on
+    // macOS TMPDIR lives under /var, which is itself a symlink to /private/var.
+    // The containment check below canonicalizes what it is checking, so
+    // comparing it against the unresolved root meant asking whether
+    // "/private/var/folders/.../T/xxx" starts with "/var/folders/.../T/xxx".
+    // It never does. Every ONNX archive therefore failed on its own first
+    // entry — the top-level directory — with "archive path escapes staging",
+    // which is the traversal guard firing on a perfectly ordinary bundle.
+    let temp_root = temp.path().canonicalize()?;
     // Decode straight off the file: the archive is streamed to disk, so
     // holding it in memory again only to unpack it would undo that.
     let decoder = BzDecoder::new(std::fs::File::open(archive_path)?);
@@ -153,16 +163,22 @@ fn install_onnx_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), Infe
                 entry_path.display()
             )));
         }
-        let target = temp.path().join(&entry_path);
-        // Canonicalize the parent to catch symlink-based escapes.
-        if let Some(parent) = target.parent() {
-            let resolved = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
-            if !resolved.starts_with(temp.path()) {
-                return Err(InferError::Other(format!(
-                    "archive path escapes staging: {}",
-                    entry_path.display()
-                )));
-            }
+        let target = temp_root.join(&entry_path);
+        // Resolve the parent to catch symlink-based escapes. It has to exist
+        // before it can be resolved, and an entry's parent is either the root
+        // or a directory an earlier entry created, so creating it here is not
+        // a new side effect — only an earlier one. The previous version fell
+        // back to the raw path when canonicalize failed, which turned the
+        // check into a no-op for exactly the entries it most needed to cover:
+        // the ones whose parent did not exist yet.
+        let parent = target.parent().unwrap_or(temp_root.as_path()).to_path_buf();
+        std::fs::create_dir_all(&parent)?;
+        let resolved_parent = parent.canonicalize()?;
+        if !resolved_parent.starts_with(&temp_root) {
+            return Err(InferError::Other(format!(
+                "archive path escapes staging: {}",
+                entry_path.display()
+            )));
         }
 
         match header.entry_type() {
@@ -177,9 +193,6 @@ fn install_onnx_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), Infe
                 ));
             }
             _ => {
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
                 entry
                     .unpack(&target)
                     .map_err(|e| InferError::Other(format!("failed to unpack entry: {e}")))?;
@@ -187,7 +200,7 @@ fn install_onnx_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), Infe
         }
     }
 
-    let bundle_root = find_onnx_bundle_root(temp.path())
+    let bundle_root = find_onnx_bundle_root(&temp_root)
         .ok_or_else(|| InferError::Other("onnx archive missing tokens.txt bundle".to_string()))?;
 
     if let Some(parent) = dest_dir.parent() {
@@ -387,6 +400,129 @@ mod tests {
                 sha256: format!("{:x}", hasher.finalize()),
             })
         }
+    }
+
+    /// Builds a real .tar.bz2 in memory. The archives these tests need are a
+    /// few hundred bytes, so round-tripping the actual codec is cheaper than
+    /// checking in a fixture and leaves nothing to drift.
+    fn build_archive(entries: &[(tar::EntryType, &str, &[u8], Option<&str>)]) -> Vec<u8> {
+        use bzip2::write::BzEncoder;
+        use bzip2::Compression;
+
+        let encoder = BzEncoder::new(Vec::new(), Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        for (kind, path, data, link) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(*kind);
+            header.set_mode(if *kind == tar::EntryType::Directory { 0o755 } else { 0o644 });
+            header.set_size(data.len() as u64);
+            if let Some(target) = link {
+                header.set_link_name(target).unwrap();
+                header.set_size(0);
+            }
+            // The name is written straight into the header field rather than
+            // through set_path, which refuses `..` outright. That refusal is
+            // the tar crate normalising on the WRITE side; the guard under
+            // test is on the read side, and the whole point is that a hostile
+            // archive is not built with this crate's cooperation. Every path
+            // here is well under the 100-byte field, so no GNU long-name
+            // record is needed.
+            let name_field = &mut header.as_old_mut().name;
+            name_field.fill(0);
+            name_field[..path.len()].copy_from_slice(path.as_bytes());
+            header.set_cksum();
+            builder.append(&header, *data).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn write_archive(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.tar.bz2");
+        std::fs::write(&path, bytes).unwrap();
+        (dir, path)
+    }
+
+    /// The bug behind "archive path escapes staging: vits-piper-en_US-lessac-medium/".
+    ///
+    /// Every sherpa bundle opens with its own top-level directory entry, and
+    /// that entry was rejected by the traversal guard on macOS, where TMPDIR
+    /// resolves through /var -> /private/var. No test ever unpacked a VALID
+    /// archive — the only coverage fed the installer garbage and asserted it
+    /// failed — so a guard that rejected everything looked exactly like a
+    /// guard that worked.
+    #[test]
+    fn installs_a_bundle_whose_entries_sit_under_a_top_level_directory() {
+        let archive = build_archive(&[
+            (tar::EntryType::Directory, "vits-piper-en_US-lessac-medium/", &[], None),
+            (
+                tar::EntryType::Regular,
+                "vits-piper-en_US-lessac-medium/tokens.txt",
+                b"a 1\nb 2\n",
+                None,
+            ),
+            (
+                tar::EntryType::Regular,
+                "vits-piper-en_US-lessac-medium/model.onnx",
+                b"onnx-bytes",
+                None,
+            ),
+        ]);
+        let (_archive_dir, archive_path) = write_archive(&archive);
+        let dest_parent = tempfile::tempdir().unwrap();
+        let dest = dest_parent.path().join("vits-piper-en-us-lessac-medium");
+
+        install_onnx_archive(&archive_path, &dest).expect("a valid bundle must install");
+
+        // The bundle root is unwrapped, not the directory that contained it:
+        // callers look for tokens.txt directly under the model dir.
+        assert_eq!(std::fs::read(dest.join("tokens.txt")).unwrap(), b"a 1\nb 2\n");
+        assert_eq!(std::fs::read(dest.join("model.onnx")).unwrap(), b"onnx-bytes");
+    }
+
+    /// The guard has to keep failing closed. Fixing the false positive above by
+    /// loosening containment would be worse than the bug it fixed.
+    #[test]
+    fn rejects_an_entry_that_climbs_out_of_staging() {
+        let archive = build_archive(&[(
+            tar::EntryType::Regular,
+            "../escaped.txt",
+            b"pwned",
+            None,
+        )]);
+        let (_archive_dir, archive_path) = write_archive(&archive);
+        let dest_parent = tempfile::tempdir().unwrap();
+        let dest = dest_parent.path().join("model");
+
+        let err = install_onnx_archive(&archive_path, &dest).unwrap_err();
+        assert!(
+            err.to_string().contains("archive path escapes staging"),
+            "expected a traversal rejection, got: {err}"
+        );
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn rejects_a_symlink_entry() {
+        let archive = build_archive(&[
+            (tar::EntryType::Directory, "bundle/", &[], None),
+            (
+                tar::EntryType::Regular,
+                "bundle/tokens.txt",
+                b"a 1\n",
+                None,
+            ),
+            (tar::EntryType::Symlink, "bundle/link", &[], Some("/etc/passwd")),
+        ]);
+        let (_archive_dir, archive_path) = write_archive(&archive);
+        let dest_parent = tempfile::tempdir().unwrap();
+        let dest = dest_parent.path().join("model");
+
+        let err = install_onnx_archive(&archive_path, &dest).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported symlink"),
+            "expected a symlink rejection, got: {err}"
+        );
     }
 
     fn sha256_hex(data: &[u8]) -> String {

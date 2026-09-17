@@ -8,6 +8,7 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ### Fixed
 
+- Local model bundles install again on macOS. The archive extractor resolved each entry's parent directory but compared it against the staging path as `TMPDIR` spells it — and on macOS that path runs through `/var`, a symlink to `/private/var`, so the two never shared a prefix. Every ONNX bundle was rejected on its own first entry with `archive path escapes staging: <model>/`, which is the path-traversal guard firing on an ordinary top-level directory. This affected every Parakeet model and every local TTS voice; Whisper models download as plain files and were unaffected. The traversal and symlink rejections are unchanged and now have tests, as does the valid-archive path that never had any.
 - A user-added AI provider is now actually used by the features that resolve it. The LLM request carried no provider, so the one registered OpenAI-compatible engine always read the built-in `local-llm` key — a custom provider failed every rewrite with "missing api key" even though its key was saved and its connection test passed. Rewrite, dictation refinement, meeting notes/titles, the rewrite preview and the voice preview all pass the bound provider through now. No stored keys need moving: they were always written and read under the provider id.
 
 ## [0.2.0] - 2026-08-03
