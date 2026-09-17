@@ -20,9 +20,14 @@ use core_foundation::base::TCFType;
 type AxInsertFn = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 static TEST_AX_INSERT: OnceLock<Mutex<Option<AxInsertFn>>> = OnceLock::new();
+static TEST_AX_TRUSTED: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
 
 fn test_ax_slot() -> &'static Mutex<Option<AxInsertFn>> {
     TEST_AX_INSERT.get_or_init(|| Mutex::new(None))
+}
+
+fn test_trust_slot() -> &'static Mutex<Option<bool>> {
+    TEST_AX_TRUSTED.get_or_init(|| Mutex::new(None))
 }
 
 /// Test seam: inject a fake AX inserter (or `None` to use the real AX APIs).
@@ -31,8 +36,51 @@ pub fn set_ax_insert_fn_for_test(insert: Option<AxInsertFn>) {
     *test_ax_slot().lock().unwrap() = insert;
 }
 
+#[cfg(test)]
+static AX_TRUST_TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+/// Test seam: forces the answer of [`is_ax_trusted`] while it is alive.
+///
+/// Trust is a property of the *process*, so without a seam no test can reach
+/// the untrusted branch — and the untrusted branch is the one that used to
+/// swallow dictated text. The override is process-global and `cargo test` runs
+/// tests in parallel in one process, so the guard also serialises its users:
+/// otherwise a test forcing "untrusted" could flip the answer underneath a
+/// neighbour mid-assertion.
+#[cfg(test)]
+pub struct AxTrustOverride {
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl AxTrustOverride {
+    pub fn force(trusted: bool) -> Self {
+        // A poisoned lock here means some other test panicked; that is no
+        // reason to fail this one on top of it.
+        let serial = AX_TRUST_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *test_trust_slot().lock().unwrap_or_else(|p| p.into_inner()) = Some(trusted);
+        Self { _serial: serial }
+    }
+}
+
+#[cfg(test)]
+impl Drop for AxTrustOverride {
+    fn drop(&mut self) {
+        *test_trust_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
 /// Whether this process is trusted for Accessibility APIs.
+///
+/// This gates far more than the AX insertion path: macOS also refuses to
+/// deliver `CGEventPost`ed keystrokes from an untrusted process, so it decides
+/// whether the clipboard+Cmd+V path in [`super::macos`] can work at all.
 pub fn is_ax_trusted() -> bool {
+    if let Some(forced) = *test_trust_slot().lock().unwrap_or_else(|p| p.into_inner()) {
+        return forced;
+    }
     unsafe { AXIsProcessTrusted() }
 }
 
