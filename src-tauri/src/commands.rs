@@ -2393,6 +2393,9 @@ pub async fn preview_rewrite(
     .await
     .map_err(|e| e.to_string())?;
     req.model = binding.model.clone();
+    // Try-it must hit the same provider the real rewrite would, or it would
+    // report a key problem the user does not have (or hide one they do).
+    req.provider_ref = binding.provider_ref.clone();
 
     let engine = state
         .engines
@@ -2410,15 +2413,21 @@ pub async fn preview_rewrite(
 pub async fn run_demo(state: State<'_, Arc<AppState>>, prompt: String) -> Result<String, String> {
     let bindings = BindingRepo::new(state.config_pool.clone());
     let resolver = SlotResolver::new(&state.engines, &bindings);
-    let engine_id = match resolver
+    let binding = match resolver
         .resolve_llm("demo", "llm")
         .await
         .map_err(|e| e.to_string())?
     {
-        Resolution::Bound(b) => b.engine_id,
+        Resolution::Bound(b) => b,
         other => return Err(resolution_error(other).unwrap_or_else(|| "resolution failed".into())),
     };
-    run_ping(&state.engines, &engine_id, &prompt).await
+    run_ping(
+        &state.engines,
+        &binding.engine_id,
+        binding.provider_ref.clone(),
+        &prompt,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2917,6 +2926,7 @@ pub async fn preview_voice(
     engine: String,
     model: Option<String>,
     voice: Option<String>,
+    provider_ref: Option<String>,
 ) -> Result<(), String> {
     const PREVIEW_SENTENCE: &str = "Hi! This is how this voice sounds when reading aloud.";
     let _guard = PreviewGuard::try_acquire(&state.preview_playing)
@@ -2932,7 +2942,12 @@ pub async fn preview_voice(
                 model,
                 voice,
                 format: None,
-                provider_ref: None,
+                // Carry the caller's provider through: the cloud TTS engine is
+                // registered once against the built-in "openai" ref, so a
+                // preview of a voice bound to a user-added provider would
+                // otherwise read the wrong key and fail as "missing api key"
+                // while the real read-aloud run succeeded.
+                provider_ref,
             },
         )
         .await

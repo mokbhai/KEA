@@ -239,6 +239,9 @@ pub async fn run_dictation_with_storage(
         };
 
         llm_req.model = llm_binding.model.clone();
+        // Same reason as run_rewrite: the provider lives on the binding, not on
+        // the shared engine instance.
+        llm_req.provider_ref = llm_binding.provider_ref.clone();
 
         let llm = match engines.llm(&llm_engine_id) {
             Some(eng) => eng,

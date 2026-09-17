@@ -104,6 +104,9 @@ describe("ReadAloudPage", () => {
       engine: "openai-tts",
       model: null,
       voice: null,
+      // The sample must go to the provider the binding names, or it would
+      // read a different key than the real read-aloud run does.
+      providerRef: "openai",
     });
   });
 });

@@ -38,7 +38,13 @@ pub async fn build_llm_request(
             override_prompt.as_deref(),
         )?
     };
-    Ok(LlmRequest { prompt, model: None })
+    // model and provider_ref are the resolved binding's to fill in — the
+    // prompt builder has no view of which engine or provider will run it.
+    Ok(LlmRequest {
+        prompt,
+        model: None,
+        provider_ref: None,
+    })
 }
 
 #[cfg(test)]

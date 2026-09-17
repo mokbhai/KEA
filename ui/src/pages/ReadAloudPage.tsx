@@ -74,6 +74,7 @@ export default function ReadAloudPage({ onNavigate }: Props) {
         effective.engine_id,
         effective.model ?? settings.active_model,
         settings.active_voice,
+        effective.provider_ref,
       );
       setRunStatus("Playing a sample sentence…");
     } catch (e) {

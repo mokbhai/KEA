@@ -183,6 +183,7 @@ pub async fn synthesize_meeting_notes(
     let transcript = format_transcript_for_synthesis(segments);
     let mut req = build_meeting_notes_request(&meeting.title, &meeting.started_at, &transcript);
     req.model = binding.model.clone();
+    req.provider_ref = binding.provider_ref.clone();
     let resp = engine.complete(req).await.map_err(|e| e.to_string())?;
     let parsed = parse_meeting_notes_json(&resp.text).map_err(|e| e.to_string())?;
 
@@ -213,6 +214,7 @@ pub async fn synthesize_meeting_title(
 
     let mut req = build_meeting_title_request(summary);
     req.model = binding.model.clone();
+    req.provider_ref = binding.provider_ref.clone();
     let resp = engine.complete(req).await.map_err(|e| e.to_string())?;
     Ok(sanitize_meeting_title(&resp.text))
 }

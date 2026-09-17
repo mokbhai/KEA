@@ -179,6 +179,10 @@ pub async fn run_rewrite_with_storage(
         .map_err(|e| e.to_string())?;
 
     llm_req.model = binding.model.clone();
+    // The binding names the provider; without forwarding it the engine falls
+    // back to whatever ref it was registered with, so a user-added provider's
+    // key is never read and the call fails as "missing api key".
+    llm_req.provider_ref = binding.provider_ref.clone();
 
     let action_id = actions
         .record(NewAction {
@@ -511,5 +515,191 @@ mod tests {
             "error message should mention the table issue, got: {:?}",
             detail.error
         );
+    }
+}
+
+/// End-to-end cover for the bug where a user-added OpenAI-compatible provider
+/// ("omni": custom base URL + its own key, selected as the capability default)
+/// failed every rewrite with "missing api key".
+///
+/// The whole chain matters here, which is why this is not an engine unit test:
+/// the registry is keyed by *engine* id, so `register_phase1_engines` puts a
+/// single compatible engine in it under the built-in `local-llm` provider ref.
+/// The only thing that says "omni" is the resolved binding. If `run_rewrite`
+/// does not forward `binding.provider_ref` into the request, the engine reads
+/// local-llm's (non-existent) credential and the user is told a key they just
+/// saved — and that "Test connection" just accepted — is missing.
+#[cfg(test)]
+mod custom_provider_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use kea_core::rewrite::{RewriteInput, RewriteMode};
+    use kea_core::store::bindings::Binding;
+    use kea_core::store::db::{open_pool, run_config_migrations, run_data_migrations};
+    use kea_engines::http::{HttpClient, MultipartPart};
+    use kea_engines::provider::{CredentialSource, ProviderConfig, ProviderConfigSource};
+    use kea_engines::traits::EngineError;
+    use kea_engines::OpenAiCompatibleLlmEngine;
+    use kea_platform::{TextIo, TextIoError};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    struct FakeTextIo {
+        selection: String,
+        replaced: Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl TextIo for FakeTextIo {
+        async fn capture_selection(&self) -> Result<String, TextIoError> {
+            Ok(self.selection.clone())
+        }
+
+        async fn replace(&self, text: &str) -> Result<(), TextIoError> {
+            *self.replaced.lock().unwrap() = Some(text.to_string());
+            Ok(())
+        }
+    }
+
+    /// Records what the engine actually put on the wire, so the test can
+    /// assert *which* provider's URL and key were used rather than merely
+    /// that some call succeeded.
+    #[derive(Default)]
+    struct RecordingHttp {
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl HttpClient for RecordingHttp {
+        async fn post_json(
+            &self,
+            url: &str,
+            bearer: &str,
+            _body: serde_json::Value,
+        ) -> Result<(u16, String), EngineError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((url.to_string(), bearer.to_string()));
+            Ok((
+                200,
+                r#"{"choices":[{"message":{"content":"polished"}}]}"#.to_string(),
+            ))
+        }
+
+        async fn post_multipart(
+            &self,
+            _url: &str,
+            _bearer: &str,
+            _parts: Vec<MultipartPart>,
+        ) -> Result<(u16, String), EngineError> {
+            unreachable!("rewrite never uploads multipart")
+        }
+
+        async fn post_binary(
+            &self,
+            _url: &str,
+            _bearer: &str,
+            _body: serde_json::Value,
+        ) -> Result<(u16, Vec<u8>), EngineError> {
+            unreachable!("rewrite never asks for binary")
+        }
+    }
+
+    struct MapCredentials(HashMap<String, String>);
+
+    #[async_trait]
+    impl CredentialSource for MapCredentials {
+        async fn api_key(&self, provider_ref: &str) -> Result<Option<String>, String> {
+            Ok(self.0.get(provider_ref).cloned())
+        }
+    }
+
+    struct MapConfigs(HashMap<String, ProviderConfig>);
+
+    #[async_trait]
+    impl ProviderConfigSource for MapConfigs {
+        async fn config(&self, provider_ref: &str) -> Option<ProviderConfig> {
+            self.0.get(provider_ref).cloned()
+        }
+    }
+
+    #[tokio::test]
+    async fn rewrite_uses_the_custom_providers_key_and_base_url() {
+        // State after the user adds "omni", saves its base URL + key, and
+        // picks it as the default writer. Nothing is stored for local-llm —
+        // that is the point: the engine must not fall back to it.
+        let http = Arc::new(RecordingHttp::default());
+        let creds = Arc::new(MapCredentials(HashMap::from([(
+            "omni".to_string(),
+            "omni-secret".to_string(),
+        )])));
+        let configs = Arc::new(MapConfigs(HashMap::from([(
+            "omni".to_string(),
+            ProviderConfig {
+                base_url: "https://omni.example/v1".into(),
+                default_model: "omni-large".into(),
+            },
+        )])));
+
+        let mut reg = EngineRegistry::default();
+        // Registered exactly as register_phase1_engines does it: one instance,
+        // defaulting to the built-in local-llm ref.
+        reg.register_llm(Arc::new(OpenAiCompatibleLlmEngine {
+            http: http.clone(),
+            credentials: creds,
+            configs,
+            provider_ref: "local-llm".into(),
+        }));
+
+        let config_pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&config_pool).await.unwrap();
+        let data_pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&data_pool).await.unwrap();
+
+        let bindings = BindingRepo::new(config_pool.clone());
+        bindings
+            .set(
+                kea_core::resolve::DEFAULT_FEATURE_ID,
+                "llm",
+                Binding {
+                    engine_id: "openai-compatible".into(),
+                    model: None,
+                    provider_ref: Some("omni".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let actions = ActionRepo::new(data_pool);
+        let presets = PresetRepo::new(config_pool.clone());
+        let overrides = PromptOverrideRepo::new(config_pool);
+        let textio = Arc::new(FakeTextIo {
+            selection: "bad text".into(),
+            replaced: Mutex::new(None),
+        });
+
+        let out = run_rewrite(
+            &reg,
+            &bindings,
+            &actions,
+            &presets,
+            &overrides,
+            textio.as_ref(),
+            RewriteInput {
+                source_text: String::new(),
+                mode: RewriteMode::Improve,
+                preset_id: None,
+                custom_instruction: None,
+            },
+        )
+        .await
+        .expect("rewrite should reach the custom provider");
+
+        assert_eq!(out, "polished");
+        let calls = http.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "https://omni.example/v1/chat/completions");
+        assert_eq!(calls[0].1, "omni-secret");
     }
 }

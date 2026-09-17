@@ -6,6 +6,10 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+### Fixed
+
+- A user-added AI provider is now actually used by the features that resolve it. The LLM request carried no provider, so the one registered OpenAI-compatible engine always read the built-in `local-llm` key — a custom provider failed every rewrite with "missing api key" even though its key was saved and its connection test passed. Rewrite, dictation refinement, meeting notes/titles, the rewrite preview and the voice preview all pass the bound provider through now. No stored keys need moving: they were always written and read under the provider id.
+
 ## [0.2.0] - 2026-08-03
 
 ### Added

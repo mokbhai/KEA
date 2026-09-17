@@ -27,21 +27,23 @@ impl LlmEngine for OpenAiCompatibleLlmEngine {
     }
 
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, EngineError> {
+        // One registered instance serves every OpenAI-compatible provider the
+        // user added, so the request's provider_ref (from the resolved
+        // binding) decides whose key and base URL to use. `self.provider_ref`
+        // is only the fallback for a binding that names no provider.
+        let provider_ref = req.provider_ref.as_deref().unwrap_or(&self.provider_ref);
         let api_key = self
             .credentials
-            .api_key(&self.provider_ref)
+            .api_key(provider_ref)
             .await
             .map_err(|e| EngineError::Auth(format!("keychain access failed: {e}")))?
             .ok_or_else(|| EngineError::Auth("missing api key".into()))?;
         let cfg = self
             .configs
-            .config(&self.provider_ref)
+            .config(provider_ref)
             .await
             .ok_or_else(|| {
-                EngineError::Config(format!(
-                    "missing provider config for {}",
-                    self.provider_ref
-                ))
+                EngineError::Config(format!("missing provider config for {provider_ref}"))
             })?;
         let model = req.model.as_deref().unwrap_or(&cfg.default_model);
         post_chat_completion(
@@ -138,6 +140,7 @@ mod tests {
             .complete(LlmRequest {
                 prompt: "rewrite me".into(),
                 model: None,
+                provider_ref: None,
             })
             .await
             .unwrap();
@@ -161,9 +164,59 @@ mod tests {
             .complete(LlmRequest {
                 prompt: "rewrite me".into(),
                 model: None,
+                provider_ref: None,
             })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("missing provider config"));
+    }
+
+    /// The regression this file exists to prevent: a user-added provider.
+    ///
+    /// `register_phase1_engines` registers exactly one compatible engine, with
+    /// `provider_ref: "local-llm"`, because the registry is keyed by engine
+    /// id. Every custom provider the user adds ("omni" here) therefore shares
+    /// it and can only be identified by the provider_ref the resolved binding
+    /// carries. When that was dropped the engine read local-llm's credential —
+    /// which does not exist — and the user saw "missing api key" for a key
+    /// they had just saved and successfully tested.
+    #[tokio::test]
+    async fn request_provider_ref_beats_the_registered_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"choices":[{"message":{"content":"omni"}}]}"#),
+            )
+            .mount(&server)
+            .await;
+
+        // Only "omni" is configured and keyed — exactly the state after the
+        // user adds a custom provider and saves its base URL and key.
+        let configs = FakeConfigs::with_config(
+            "omni",
+            ProviderConfig {
+                base_url: format!("{}/v1", server.uri()),
+                default_model: "omni-large".into(),
+            },
+        );
+        let creds = FakeCredentials::with_key("omni", "omni-key");
+
+        let engine = OpenAiCompatibleLlmEngine {
+            http: Arc::new(ReqwestHttpClient::new()),
+            credentials: creds,
+            configs,
+            provider_ref: "local-llm".into(),
+        };
+        let out = engine
+            .complete(LlmRequest {
+                prompt: "rewrite me".into(),
+                model: None,
+                provider_ref: Some("omni".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.text, "omni");
     }
 }

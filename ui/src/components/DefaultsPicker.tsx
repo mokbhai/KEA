@@ -174,7 +174,12 @@ export default function DefaultsPicker({
   const preview = async (option: PickerOption) => {
     setError(null);
     try {
-      await previewVoice(option.engine, option.model, option.cloudVoices ? voiceRef.current : null);
+      await previewVoice(
+        option.engine,
+        option.model,
+        option.cloudVoices ? voiceRef.current : null,
+        option.providerRef,
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }

@@ -526,15 +526,23 @@ export const cancelModelDownload = (kind: ModelKindParam, model_id: string) =>
 export const deleteModel = (kind: ModelKindParam, model_id: string) =>
   invoke<void>("delete_model", { kind, modelId: model_id });
 
+/**
+ * `providerRef` names whose key and base URL the preview should use. The cloud
+ * TTS engine is registered once against the built-in "openai" ref, so a
+ * preview of a voice bound to a user-added provider that omitted this would
+ * read the wrong key and fail while the real read-aloud run worked.
+ */
 export const previewVoice = (
   engine: string,
   model?: string | null,
   voice?: string | null,
+  providerRef?: string | null,
 ) =>
   invoke<void>("preview_voice", {
     engine,
     model: model ?? null,
     voice: voice ?? null,
+    providerRef: providerRef ?? null,
   });
 
 export const onTtsState = (handler: (state: TtsState) => void): Promise<UnlistenFn> =>

@@ -363,6 +363,9 @@ describe("Onboarding wizard", () => {
       engine: "openai-tts",
       model: null,
       voice: "nova",
+      // Onboarding only ever offers OpenAI, so it names no provider and the
+      // backend falls back to the engine's built-in "openai" ref.
+      providerRef: null,
     });
   });
 });

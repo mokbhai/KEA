@@ -30,15 +30,19 @@ impl LlmEngine for OpenAiLlmEngine {
     }
 
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, EngineError> {
+        // Same seam as the compatible engine: the resolved binding names the
+        // provider, `self.provider_ref` is only the fallback for a binding
+        // that carries none (an auto-resolved slot).
+        let provider_ref = req.provider_ref.as_deref().unwrap_or(&self.provider_ref);
         let api_key = self
             .credentials
-            .api_key(&self.provider_ref)
+            .api_key(provider_ref)
             .await
             .map_err(|e| EngineError::Auth(format!("keychain access failed: {e}")))?
             .ok_or_else(|| EngineError::Auth("missing api key".into()))?;
         let cfg = self
             .configs
-            .config(&self.provider_ref)
+            .config(provider_ref)
             .await
             .unwrap_or(ProviderConfig {
                 base_url: DEFAULT_BASE_URL.into(),
@@ -138,6 +142,7 @@ mod tests {
             .complete(LlmRequest {
                 prompt: "fix this".into(),
                 model: None,
+                provider_ref: None,
             })
             .await
             .unwrap();
@@ -172,6 +177,7 @@ mod tests {
             .complete(LlmRequest {
                 prompt: "fix this".into(),
                 model: None,
+                provider_ref: None,
             })
             .await
             .unwrap_err();
@@ -206,6 +212,7 @@ mod tests {
             .complete(LlmRequest {
                 prompt: "test".into(),
                 model: None,
+                provider_ref: None,
             })
             .await
             .unwrap_err();
@@ -249,9 +256,51 @@ mod tests {
             .complete(LlmRequest {
                 prompt: "test".into(),
                 model: Some("gpt-4o".into()),
+                provider_ref: None,
             })
             .await
             .unwrap();
         assert_eq!(out.text, "bound");
+    }
+
+    /// Same seam as the compatible engine: a binding may point this engine at
+    /// a provider other than the built-in "openai" (an OpenAI-shaped gateway,
+    /// say). Reading `self.provider_ref` regardless would take the wrong key.
+    #[tokio::test]
+    async fn request_provider_ref_beats_the_registered_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"choices":[{"message":{"content":"gateway"}}]}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let configs = FakeConfigs::with_config(
+            "omni",
+            ProviderConfig {
+                base_url: format!("{}/v1", server.uri()),
+                default_model: "omni-large".into(),
+            },
+        );
+        let creds = FakeCredentials::with_key("omni", "omni-key");
+
+        let engine = OpenAiLlmEngine {
+            http: Arc::new(ReqwestHttpClient::new()),
+            credentials: creds,
+            configs,
+            provider_ref: "openai".into(),
+        };
+        let out = engine
+            .complete(LlmRequest {
+                prompt: "fix this".into(),
+                model: None,
+                provider_ref: Some("omni".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.text, "gateway");
     }
 }

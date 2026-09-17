@@ -79,6 +79,7 @@ pub fn build_meeting_notes_request(
     LlmRequest {
         prompt: format!("{}\n\n{user_prompt}", meeting_notes_system_prompt()),
         model: None,
+        provider_ref: None,
     }
 }
 
@@ -87,6 +88,7 @@ pub fn build_meeting_title_request(summary: &str) -> LlmRequest {
     LlmRequest {
         prompt: format!("{}\n\n{user_prompt}", meeting_title_system_prompt()),
         model: None,
+        provider_ref: None,
     }
 }
 

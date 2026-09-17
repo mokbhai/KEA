@@ -36,6 +36,19 @@ pub struct LlmRequest {
     pub prompt: String,
     #[serde(default)]
     pub model: Option<String>,
+    /// Which provider's key and base URL to use for this one call.
+    ///
+    /// An engine is registered once, under its own id, so a single
+    /// `openai-compatible` instance serves *every* user-added provider. Its
+    /// own `provider_ref` field is therefore only a default — the binding the
+    /// resolver picked is what actually names the provider. Without this the
+    /// binding's `provider_ref` died at the engine boundary and every custom
+    /// provider was billed to the built-in `local-llm` ref, whose keychain
+    /// entry does not exist: "missing api key" for a key the user had just
+    /// saved. `SttOpts`/`TtsOpts` already carry the same field; the LLM path
+    /// was the one that did not.
+    #[serde(default)]
+    pub provider_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
