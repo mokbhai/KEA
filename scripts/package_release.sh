@@ -171,7 +171,40 @@ find "$DIST_DIR" -maxdepth 1 -type f -print | sed 's/^/  /'
 # `*.AppImage.tar.gz` in the bundler), and the Windows one has changed shape
 # across 2.x releases. Whatever `x.sig` sits next to IS the payload, on every
 # platform and every version, so that is what this reads.
-SIG_FILE="$(find "${BUNDLE_DIRS[@]}" -type f -name '*.sig' 2>/dev/null | head -n 1 || true)"
+# WHICH signature, not just any. The bundler signs every updater-capable
+# bundle it made — on Linux that is three of them (deb, rpm, AppImage) — and
+# tauri-plugin-updater can only INSTALL one format per platform. v0.3.0 shipped
+# a manifest pointing Linux clients at KEA_0.3.0_amd64.deb purely because
+# `find` walks bundle/deb/ before bundle/appimage/, and a .deb is not something
+# the updater can apply. The format is chosen deliberately here instead.
+case "$HOST_OS" in
+    macos) SIG_PATTERNS=("*.app.tar.gz.sig") ;;
+    # AppImage only. The .deb and .rpm are for people who install them by hand.
+    linux) SIG_PATTERNS=("*.AppImage.tar.gz.sig" "*.AppImage.sig") ;;
+    # Both installers are updatable; MSI first because that is what shipped.
+    windows) SIG_PATTERNS=("*.msi.zip.sig" "*.msi.sig" "*-setup.exe.zip.sig" "*-setup.exe.sig") ;;
+esac
+
+SIG_FILE=""
+for pattern in "${SIG_PATTERNS[@]}"; do
+    # `sort` so two matches cannot resolve differently between runs.
+    SIG_FILE="$(find "${BUNDLE_DIRS[@]}" -type f -name "$pattern" 2>/dev/null | sort | head -n 1 || true)"
+    [[ -n "$SIG_FILE" ]] && break
+done
+
+# Signed something, but nothing this platform's updater could install. Distinct
+# from "signed nothing", and a hard error: silently falling back to a format
+# the client cannot apply is the bug this block exists to prevent.
+if [[ -z "$SIG_FILE" ]]; then
+    STRAY="$(find "${BUNDLE_DIRS[@]}" -type f -name '*.sig' 2>/dev/null | sort || true)"
+    if [[ -n "$STRAY" ]]; then
+        echo "The bundler signed updater artifacts, but none in a format the ${PLATFORM_KEY} updater can install." >&2
+        echo "Wanted one of: ${SIG_PATTERNS[*]}" >&2
+        echo "Found:" >&2
+        echo "$STRAY" | sed 's/^/  /' >&2
+        exit 1
+    fi
+fi
 
 if [[ -z "$SIG_FILE" ]]; then
     # Updater artifacts exist only when bundle.updater.pubkey is set,
@@ -205,6 +238,12 @@ if [[ -z "$EXT" ]]; then
     # Unknown shape: keep the bundler's own name rather than inventing one, and
     # say so, because the manifest URL has to match the uploaded asset exactly.
     echo "Unrecognised updater payload name '$PAYLOAD_BASE'; publishing it unrenamed." >&2
+    OUT_PAYLOAD="$PAYLOAD_BASE"
+elif [[ "$PAYLOAD_BASE" == *"$VERSION"* ]]; then
+    # Already self-describing, so renaming it only publishes the same bytes
+    # twice under two names — v0.3.0 shipped both KEA_0.3.0_x64_en-US.msi and
+    # KEA_0.3.0_x86_64.msi, 15 MB each. The rename exists for macOS, whose
+    # payload the bundler calls a bare KEA.app.tar.gz.
     OUT_PAYLOAD="$PAYLOAD_BASE"
 else
     OUT_PAYLOAD="${APP_NAME}_${VERSION}_${UPDATER_ARCH}.${EXT}"

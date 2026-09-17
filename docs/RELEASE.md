@@ -100,14 +100,33 @@ the macOS artifacts and nothing else.
 Artifacts are copied from the Tauri bundle output under `target/release/bundle/`
 or `src-tauri/target/release/bundle/`.
 
-### The updater payload is discovered, not assumed
+### The updater payload is discovered, but the format is chosen
 
-The script does not look for a payload by name. It finds the `.sig` the bundler
-wrote and takes whatever sits next to it as the payload. This is deliberate:
-Tauri's own documentation and its bundler source disagree about what the Linux
-updater artifact is called (`*.AppImage` in the docs, `*.AppImage.tar.gz` in the
-bundler), and the Windows shape has moved across 2.x releases. Reading the
-signature is the one thing that is true on every platform and every version.
+The script does not look for a payload by an exact name. It finds a `.sig` the
+bundler wrote and takes whatever sits next to it as the payload, because Tauri's
+documentation and its bundler source disagree about what the Linux updater
+artifact is called (`*.AppImage` in the docs, `*.AppImage.tar.gz` in the
+bundler) and the Windows shape has moved across 2.x releases.
+
+**Which** signature is not left to chance, though. The bundler signs every
+updater-capable bundle it produced — on Linux that is three, deb, rpm and
+AppImage — while `tauri-plugin-updater` can only *install* one format per
+platform:
+
+| Platform | Installable by the updater | Preference order |
+| --- | --- | --- |
+| macOS | the `.app` archive | `*.app.tar.gz.sig` |
+| Linux | AppImage only | `*.AppImage.tar.gz.sig`, `*.AppImage.sig` |
+| Windows | MSI or NSIS | `*.msi.zip.sig`, `*.msi.sig`, `*-setup.exe.zip.sig`, `*-setup.exe.sig` |
+
+v0.3.0 shipped a manifest pointing Linux clients at `KEA_0.3.0_amd64.deb`, which
+the updater cannot apply, purely because `find` walks `bundle/deb/` before
+`bundle/appimage/`. The `.deb` and `.rpm` are still published for people who
+install them by hand; they are simply not what the updater is pointed at.
+
+If the bundler signs something but none of it matches the platform's list, that
+is a hard error rather than a fallback: shipping a manifest a client cannot act
+on is worse than failing the release.
 
 The payload is then renamed to `KEA_<version>_<arch>.<ext>` before publishing,
 because the macOS bundler names it `KEA.app.tar.gz` — with neither version nor

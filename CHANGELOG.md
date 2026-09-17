@@ -6,6 +6,10 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+### Fixed
+
+- The Linux updater manifest points at the AppImage instead of the `.deb`. The bundler signs every updater-capable bundle it makes — deb, rpm and AppImage — and packaging took whichever signature `find` returned first, which is the `.deb`; `tauri-plugin-updater` can only install an AppImage on Linux, so v0.3.0's `latest.json` offered Linux clients an update they could not apply. The payload format is now chosen per platform rather than by directory order, and a signed set containing no installable format fails the release instead of publishing something unusable. Windows also stops publishing its MSI twice under two names.
+
 ## [0.3.0] - 2026-09-17
 
 ### Added
