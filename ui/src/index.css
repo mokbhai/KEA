@@ -10,11 +10,11 @@
      decorative everywhere: it is also the sole boundary of .kea-icon-btn
      (background: transparent — the outline is the entire affordance),
      .kea-segment, .kea-choice and the unselected meeting button in
-     MeetingsPage, and --btn-border below carries the same value on .kea-btn,
-     whose --btn-bg is identical to --surface in light theme. Those are real
-     1.4.11 shortfalls; they predate this palette pass and are tracked in
-     issue #11. Do not read the floor in palette.contrast.test.ts as a claim
-     that this value is sufficient — it only stops it fading further. */
+     MeetingsPage. Those remain real 1.4.11 shortfalls, tracked in issue #15;
+     .kea-btn no longer shares them because --btn-border was split off and
+     recalibrated below (issue #11).
+     Do not read the floor in palette.contrast.test.ts as a claim that this
+     value is sufficient — it only stops it fading further. */
   --border: #d8dce2;
   /* The .kea-table row rules only. Row grouping is conveyed by the table
      markup and row state by a background fill, so this is not a 1.4.11 3:1
@@ -27,7 +27,17 @@
   --accent-text: #ffffff;
   --btn-bg: #ffffff;
   --btn-text: #1a1d21;
-  --btn-border: #d8dce2;
+  /* The 1px box is the only boundary of a secondary .kea-btn: --btn-bg is
+     #ffffff, identical to --surface, so at the old #d8dce2 (1.38:1) a button
+     on a card was delimited by nothing. A 1.4.11 non-text boundary, measured
+     against all three backdrops a .kea-btn actually sits on — --surface
+     (cards), --bg (page level) and --surface-2 (.kea-provider-detail). The
+     binding one is --surface-2, the darkest: it caps luminance at 0.2566.
+     Deliberately within a hair of --input-border (#888f99), which fails only
+     the --surface-2 case, because buttons and inputs sit side by side in
+     .kea-provider-detail__control and must not read as two different weights.
+     Measures 3.58 / 3.31 / 3.14:1. */
+  --btn-border: #818891;
   --btn-hover-bg: #eef0f3;
   --input-bg: #ffffff;
   --input-text: #1a1d21;
@@ -77,7 +87,12 @@
   --accent-text: #16181d;
   --btn-bg: #262a33;
   --btn-text: #e6e8eb;
-  --btn-border: #30343c;
+  /* See the light-theme note: 1.4.11 control boundary, was #30343c at 1.29:1
+     against --surface. Here --surface-2 is the lightest backdrop, so it sets a
+     luminance floor of 0.1692 rather than a ceiling — which is why this is a
+     shade lighter than --input-border (#6a717d, L 0.1636, just under it).
+     Measures 3.87 / 3.51 / 3.13:1 against --bg / --surface / --surface-2. */
+  --btn-border: #6e7682;
   --btn-hover-bg: #30343c;
   --input-bg: #1e2128;
   --input-text: #e6e8eb;

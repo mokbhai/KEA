@@ -39,16 +39,18 @@ const NON_TEXT = 3.0;
  */
 const SEPARATOR_FLOOR = 2.0;
 /**
- * Not a WCAG threshold, and NOT a statement that these values pass.
+ * Not a WCAG threshold, and NOT a statement that this value passes.
  *
- * --border and --btn-border are known 1.4.11 shortfalls at 1.38:1 / 1.29:1 —
+ * --border is a known 1.4.11 shortfall at 1.38:1 light / 1.29:1 dark —
  * decorative on card, topbar and sidebar edges, but also the sole boundary of
  * .kea-icon-btn (transparent fill, so the outline is the entire affordance),
- * .kea-segment, .kea-choice, the unselected meeting button in MeetingsPage,
- * and every .kea-btn (whose --btn-bg equals --surface in light theme). They
- * predate this palette pass and are tracked in issue #11. This floor exists
- * only so the values cannot fade further while that issue is open; raising
- * them to NON_TEXT is #11's job.
+ * .kea-segment, .kea-choice and the unselected meeting button in MeetingsPage.
+ * This floor exists only so the value cannot fade further while that is open;
+ * raising it to NON_TEXT is issue #15's job, after which this constant and its
+ * one remaining entry go away.
+ *
+ * --btn-border was the other half of this and is no longer here: issue #11
+ * split it off and recalibrated it, so it is measured at NON_TEXT below.
  */
 const PENDING_FLOOR = 1.25;
 
@@ -89,17 +91,29 @@ const PAIRS: Pair[] = [
   { fg: "--accent-text", bg: "--accent", min: TEXT, why: ".kea-btn--primary label" },
   { fg: "--accent", bg: "--surface-2", min: TEXT, why: ".kea-nav-item--active, current picker option" },
   { fg: "--accent", bg: "--surface", min: TEXT, why: ".kea-table__select at rest, inside .kea-table-wrap" },
-  // Known gap, tracked in issue #11: .kea-status--* also render inside table
+  // Known gap, tracked in issue #15: .kea-status--* also render inside table
   // cells (HistoryPanel.tsx:66) and so take the hovered and aria-current row
   // fills, which are not measured here. Light --ok on either is 4.39:1 —
-  // below the floor. Pre-existing and identical on main, so adding the pair
-  // would fail the suite for a fault this branch did not introduce.
+  // below the floor. Pre-existing, so adding the pair would fail the suite
+  // for a fault no branch that touched this file introduced.
   { fg: "--ok", bg: "--surface", min: TEXT, why: ".kea-status--ok" },
   { fg: "--warn", bg: "--surface", min: TEXT, why: "warning status text" },
   { fg: "--danger", bg: "--surface", min: TEXT, why: ".kea-status--error" },
 
   // ── Non-text: 1.4.11 ───────────────────────────────────────────────
   { fg: "--input-border", bg: "--surface", min: NON_TEXT, why: "the only boundary of .kea-input / .kea-select" },
+  // Three backdrops, not one: a .kea-btn is the only control here that renders
+  // on all of them, and --surface-2 (.kea-provider-detail) is the binding case
+  // in both themes — the darkest backdrop in light, the lightest in dark. A
+  // value measured against --surface alone passes at 3.26:1 and still fails
+  // where the button actually sits, which is how #11 outlived #10 — and is
+  // still true of --input-border above, tracked in #15.
+  { fg: "--btn-border", bg: "--surface", min: NON_TEXT, why: "the only boundary of .kea-btn, whose fill matches --surface in light theme" },
+  { fg: "--btn-border", bg: "--bg", min: NON_TEXT, why: ".kea-btn at page level, outside any card" },
+  { fg: "--btn-border", bg: "--surface-2", min: NON_TEXT, why: ".kea-btn inside .kea-provider-detail" },
+  // .kea-btn--primary overrides both fill and border to --accent, so its
+  // boundary is carried by the --accent pairs above (5.17:1 light / 5.20:1
+  // dark on --surface, and >= 4.5:1 on --bg and --surface-2 in both themes).
   { fg: "--toggle-track", bg: "--surface", min: NON_TEXT, why: ".kea-toggle outer edge" },
   { fg: "--toggle-track", bg: "--toggle-thumb", min: NON_TEXT, why: ".kea-toggle unchecked thumb against its track" },
   { fg: "--accent", bg: "--toggle-thumb", min: NON_TEXT, why: ".kea-toggle checked thumb against its track" },
@@ -112,9 +126,8 @@ const PAIRS: Pair[] = [
   { fg: "--border-strong", bg: "--btn-hover-bg", min: SEPARATOR_FLOOR, why: ".kea-table separator, hovered row" },
   { fg: "--border-strong", bg: "--surface-2", min: SEPARATOR_FLOOR, why: ".kea-table separator, aria-current row" },
 
-  // ── Known shortfalls, pinned not blessed (issue #11) ───────────────
+  // ── Known shortfalls, pinned not blessed (issue #15) ───────────────
   { fg: "--border", bg: "--surface", min: PENDING_FLOOR, why: "card edges, but also the .kea-icon-btn / .kea-segment / .kea-choice boundary" },
-  { fg: "--btn-border", bg: "--surface", min: PENDING_FLOOR, why: "the only boundary of .kea-btn, whose fill matches --surface in light theme" },
 ];
 
 /**
