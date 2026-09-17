@@ -6,6 +6,8 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-17
+
 ### Added
 
 - Press-and-hold dictation on ⌥⇧: hold both modifiers anywhere to record, release either one to transcribe and type. Off by default, and switched on beside the dictation shortcut. A quick tap does nothing, and neither does holding ⌥⇧ as the modifier for another shortcut, so ⌥⇧+arrow still selects text by word.
