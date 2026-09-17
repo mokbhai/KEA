@@ -9,17 +9,77 @@ permissions:
   contents: write
 
 jobs:
-  build-and-publish:
-    runs-on: macos-15
+  # Cheap gate ahead of the matrix. A mistyped tag or a missing changelog entry
+  # used to be discovered inside the build job, after a cold Tauri compile had
+  # already run — now three of them, in parallel, for up to two hours each.
+  # Everything here reads files and finishes in seconds.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Verify tag matches package version
+        run: |
+          PACKAGE_VERSION="$(./scripts/current_version.sh)"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$PACKAGE_VERSION" != "$TAG_VERSION" ]]; then
+            echo "Tag version $TAG_VERSION does not match package version $PACKAGE_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Verify release notes exist for this tag
+        run: ./scripts/extract_release_notes.sh "${GITHUB_REF_NAME#v}" > release-notes.md
+
+      # Carried to the publish job rather than re-extracted there, so the notes
+      # that get published are provably the ones this gate accepted.
+      - name: Upload release notes
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-notes
+          if-no-files-found: error
+          path: release-notes.md
+
+  build:
+    needs: verify
+    strategy:
+      # Every leg runs to completion even when one fails, because a release
+      # failing only on Windows is worth knowing about at the same time as the
+      # macOS result rather than an hour later. Nothing is published unless all
+      # three succeed: `publish` needs this job in full.
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            platform: darwin-aarch64
+          # ubuntu-latest rather than a pinned older image: the AppImage links
+          # against the runner's glibc and so inherits its minimum supported
+          # distro. Pinning an older Ubuntu would widen that support floor, but
+          # only until GitHub retires the image — which has broken more release
+          # pipelines than the glibc floor has. Revisit if users report
+          # "GLIBC_2.xx not found".
+          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: windows-latest
+            platform: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
     # A cold Tauri release build of this workspace (whisper, parakeet, cpal,
     # rodio) plus the tests does not fit in 60 minutes on a macOS runner.
     timeout-minutes: 120
+
+    defaults:
+      run:
+        # Git Bash on the Windows runner, so package_release.sh and the steps
+        # below are one script rather than one per shell. GNU make is NOT
+        # assumed anywhere here for the same reason.
+        shell: bash
 
     env:
       # Promoted to job-level env so later steps can gate on presence: the
       # `secrets` context is NOT allowed in step-level `if:` expressions (it
       # fails workflow validation), but `env` is. This is also what makes the
-      # bundler emit the signed *.app.tar.gz + .sig instead of refusing to build.
+      # bundler emit signed updater artifacts instead of refusing to build.
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
       # Keeps the updater manifest URLs pointed at whatever repo built them.
@@ -35,14 +95,28 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
+      # libfuse2 is not a Tauri dependency but an appimagetool one: the bundler
+      # downloads appimagetool and runs it, and on runner images without FUSE
+      # that invocation fails with a bare "AppImages require FUSE to run".
+      - name: Linux Tauri/webkit deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            libasound2-dev libfuse2
+
       # `cargo install tauri-cli` compiles the CLI from source and costs several
       # minutes on every run; cache the resulting binary keyed on the pinned
-      # major so it is built once per runner image.
+      # major so it is built once per runner image. Both names are listed
+      # because the Windows runner produces cargo-tauri.exe.
       - name: Cache Tauri CLI
         id: cache-tauri-cli
         uses: actions/cache@v4
         with:
-          path: ~/.cargo/bin/cargo-tauri
+          path: |
+            ~/.cargo/bin/cargo-tauri
+            ~/.cargo/bin/cargo-tauri.exe
           key: ${{ runner.os }}-cargo-tauri-v2
 
       - name: Install Tauri CLI
@@ -59,75 +133,136 @@ jobs:
       - name: Install UI dependencies
         run: npm --prefix ui ci
 
-      - name: Verify tag matches package version
-        run: |
-          PACKAGE_VERSION="$(./scripts/current_version.sh)"
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          if [[ "$PACKAGE_VERSION" != "$TAG_VERSION" ]]; then
-            echo "Tag version $TAG_VERSION does not match package version $PACKAGE_VERSION" >&2
-            exit 1
-          fi
-
-      - name: Verify release notes exist for this tag
-        run: ./scripts/extract_release_notes.sh "${GITHUB_REF_NAME#v}" > release-notes.md
-
-      # Lint and test only. The bundle build deliberately does NOT run here:
-      # `make release-check` would build the app once, and package_release.sh
-      # then ran `make clean` + a second full build, discarding the first. The
-      # single signed build below replaces both.
+      # Lint runs once, not three times: typecheck and the hygiene script read
+      # the tree, not the platform, so the other two legs would be re-checking
+      # identical files. The tests below DO run everywhere — they are the part
+      # that is platform-specific.
       - name: Lint
-        run: make lint
+        if: runner.os == 'macOS'
+        run: |
+          npm --prefix ui run typecheck
+          cargo check --workspace
+          ./scripts/check_kea_hygiene.sh
 
       - name: Test
-        run: make test
+        run: |
+          npm --prefix ui run build
+          npm --prefix ui test
+          cargo test --workspace
 
       - name: Build and package release artifacts
         run: ./scripts/package_release.sh --features updater
 
-      - name: Verify updater artifacts were signed
+      # Catches the case where the bundler silently produced no signature — an
+      # unsigned release still yields installers, so without this check the job
+      # would go green and ship a latest.json missing this platform, which
+      # every client on it reads as "no update available".
+      - name: Verify this platform signed its updater payload
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          if [[ ! -f "dist/latest.json" ]]; then
-            echo "dist/latest.json missing - the bundler produced no signed updater artifacts." >&2
+          FRAGMENT="dist/updater/${{ matrix.platform }}.json"
+          if [[ ! -f "$FRAGMENT" ]]; then
+            echo "$FRAGMENT missing - the bundler produced no signed updater artifacts for ${{ matrix.platform }}." >&2
             echo "Check that TAURI_SIGNING_PRIVATE_KEY is set and bundle.createUpdaterArtifacts is true." >&2
+            ls -R dist >&2 || true
             exit 1
           fi
-          node -e '
-            const fs = require("fs");
-            const m = JSON.parse(fs.readFileSync("dist/latest.json", "utf8"));
-            const expected = "v" + process.argv[1];
-            if (m.version !== expected) {
-              throw new Error(`latest.json version ${m.version} != ${expected}`);
-            }
-            const p = m.platforms["darwin-aarch64"];
-            if (!p || !p.signature || !p.url) {
-              throw new Error("latest.json is missing a darwin-aarch64 signature/url");
-            }
-          ' "$VERSION"
-          echo "Updater manifest verified:"
-          cat dist/latest.json
+          cat "$FRAGMENT"
 
-      - name: Upload workflow artifacts
+      # Named `installers-*`, not `release-*`: the publish job downloads every
+      # artifact into one tree and then globs for the platform ones, and the
+      # release-notes artifact must not fall into that glob — it would be
+      # copied into dist/ and published as a release asset of its own.
+      - name: Upload platform artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: KEA-${{ github.ref_name }}
+          name: installers-${{ matrix.platform }}
           if-no-files-found: error
-          path: |
-            dist/KEA-*.zip
-            dist/KEA_*.dmg
-            dist/KEA_*.app.tar.gz
-            dist/KEA_*.app.tar.gz.sig
-            dist/latest.json
+          path: dist/**
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      # The merge script is plain node, but the runner default is not pinned.
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Download every platform's artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      # Each matrix leg uploaded its own dist/, so the download lands as
+      # artifacts/release-<platform>/{installers..., updater/<platform>.json}.
+      # Installers are flattened into dist/ and the fragments are pooled into a
+      # SIBLING directory, not a subdirectory of dist/: the publish step below
+      # ships `dist/*` wholesale, and build plumbing living under that path
+      # would be uploaded as a release asset.
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist fragments
+          find artifacts -mindepth 2 -maxdepth 2 -type f -path 'artifacts/installers-*' -exec cp {} dist/ \;
+          find artifacts -path 'artifacts/installers-*/updater/*.json' -exec cp {} fragments/ \;
+          echo "Installers:"
+          find dist -maxdepth 1 -type f -print | sort | sed 's/^/  /'
+          echo "Updater fragments:"
+          find fragments -type f -print | sort | sed 's/^/  /'
+
+      - name: Merge updater manifest
+        run: |
+          ./scripts/merge_updater_manifest.sh fragments dist/latest.json "${GITHUB_REF_NAME#v}"
+          cat dist/latest.json
+
+      # Every platform the matrix builds must appear, or the release ships an
+      # update path for some users and silently not for others.
+      - name: Verify the manifest covers every platform
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs");
+            const manifest = JSON.parse(fs.readFileSync("dist/latest.json", "utf8"));
+            const expectedVersion = "v" + process.argv[1];
+            if (manifest.version !== expectedVersion) {
+              throw new Error(`latest.json version ${manifest.version} != ${expectedVersion}`);
+            }
+            const required = ["darwin-aarch64", "linux-x86_64", "windows-x86_64"];
+            const missing = required.filter((key) => {
+              const entry = manifest.platforms[key];
+              return !entry || !entry.signature || !entry.url;
+            });
+            if (missing.length > 0) {
+              throw new Error(`latest.json is missing a signature/url for: ${missing.join(", ")}`);
+            }
+          ' "${GITHUB_REF_NAME#v}"
+
+      # Extracted to the working directory, which is where body_path reads it
+      # from. The bulk download above also has a copy under artifacts/, but
+      # pointing the release at this one keeps the path independent of how the
+      # bulk download happens to lay itself out.
+      - name: Fetch release notes
+        uses: actions/download-artifact@v6
+        with:
+          name: release-notes
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           body_path: release-notes.md
           fail_on_unmatched_files: true
-          files: |
-            dist/KEA-*.zip
-            dist/KEA_*.dmg
-            dist/KEA_*.app.tar.gz
-            dist/KEA_*.app.tar.gz.sig
-            dist/latest.json
+          # Everything the matrix produced, by directory rather than by an
+          # enumerated list of extensions. An explicit list has to predict what
+          # the bundler will name things, and it does not name them the same on
+          # every platform or every 2.x release — Tauri's own documentation and
+          # its bundler source disagree about the Linux updater payload alone.
+          # A list that guesses wrong either drops an asset silently or, with
+          # fail_on_unmatched_files, fails a release that was otherwise fine.
+          # package_release.sh already decides what belongs in dist/, and the
+          # fragments are kept out of it, so the directory IS the list.
+          files: dist/*

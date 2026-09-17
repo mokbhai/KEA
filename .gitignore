@@ -31,3 +31,6 @@ docs/superpowers/
 # Agent orchestration / tooling artifacts
 .orchestrate/
 cli/
+
+# Subagent worktrees created by Claude Code
+.claude/worktrees/

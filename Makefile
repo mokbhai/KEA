@@ -96,6 +96,10 @@ clean:
 
 release-check: lint test build
 
+# package_release.sh drives `cargo tauri build` itself rather than calling back
+# into `make build`: the release matrix runs it on a Windows runner too, where
+# GNU make is not guaranteed to exist. The signed/--no-sign selection that used
+# to live only in tauri-build is duplicated there for the same reason.
 release-package:
 	./scripts/package_release.sh
 

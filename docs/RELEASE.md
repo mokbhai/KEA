@@ -48,16 +48,82 @@ git push origin v<version>
 Pushing the tag is what triggers `.github/workflows/release.yml`, which rebuilds,
 signs, and publishes the GitHub release.
 
+## The release workflow
+
+`release.yml` runs three jobs in sequence:
+
+1. **`verify`** — checks the tag against the package version and that
+   `CHANGELOG.md` has an entry for it, then uploads the extracted notes. It is
+   seconds long and gates the matrix, so a mistyped tag fails before three cold
+   Tauri builds start rather than after them.
+2. **`build`** — a matrix over `macos-15`, `ubuntu-latest` and
+   `windows-latest`, each running the tests, building a signed bundle and
+   uploading its installers plus its manifest fragment. Lint runs only on the
+   macOS leg (it reads the tree, not the platform); the tests run everywhere.
+3. **`publish`** — merges the fragments into `latest.json`, asserts that every
+   platform in the matrix is present in it, and creates the GitHub release with
+   everything in `dist/`.
+
+`publish` requires `build` in full, so a failure on any one platform publishes
+nothing at all. That is intended: a release missing one platform's entry in
+`latest.json` is indistinguishable, from that platform's clients, from there
+being no update.
+
+### Still unsigned: what users see
+
+The pipeline signs **updater artifacts** with the ed25519 key in
+`TAURI_SIGNING_PRIVATE_KEY`. It does **not** do OS-level code signing, which is
+a separate thing and needs certificates this repo does not have:
+
+- **macOS** — the `.dmg`/`.app` is not signed with an Apple Developer ID and not
+  notarized, so Gatekeeper shows "cannot be opened because the developer cannot
+  be verified". Needs an Apple Developer account, a Developer ID certificate,
+  `bundle.macOS.signingIdentity` in `tauri.conf.json`, and an `xcrun notarytool`
+  step.
+- **Windows** — the MSI/NSIS installer is unsigned, so SmartScreen warns. Needs
+  a code-signing certificate, which is a procurement item.
+- **Linux** — AppImage and `.deb` carry no signature expectation, so nothing is
+  missing here.
+
 ## Release Artifacts
 
-`scripts/package_release.sh` produces artifacts under `dist/`:
+`scripts/package_release.sh` packages whatever the host it runs on can build,
+into `dist/`. It is host-aware, not cross-compiling: a macOS machine produces
+the macOS artifacts and nothing else.
 
-- `dist/KEA-<version>.zip`
-- Tauri-generated DMG files such as `dist/KEA_<version>_<arch>.dmg`
-- When a signing key is present: `dist/KEA_<version>_<arch>.app.tar.gz`,
-  its `.sig`, and `dist/latest.json`
+| Host | Installers | Updater payload |
+| --- | --- | --- |
+| macOS | `KEA-<version>.zip`, `KEA_<version>_<arch>.dmg` | `KEA_<version>_<arch>.app.tar.gz` + `.sig` |
+| Linux | `*.AppImage`, `*.deb` | the AppImage archive + `.sig` |
+| Windows | `*.msi`, `*-setup.exe` | the signed installer archive + `.sig` |
 
-Artifacts are copied from the Tauri bundle output under `target/release/bundle/` or `src-tauri/target/release/bundle/`.
+Artifacts are copied from the Tauri bundle output under `target/release/bundle/`
+or `src-tauri/target/release/bundle/`.
+
+### The updater payload is discovered, not assumed
+
+The script does not look for a payload by name. It finds the `.sig` the bundler
+wrote and takes whatever sits next to it as the payload. This is deliberate:
+Tauri's own documentation and its bundler source disagree about what the Linux
+updater artifact is called (`*.AppImage` in the docs, `*.AppImage.tar.gz` in the
+bundler), and the Windows shape has moved across 2.x releases. Reading the
+signature is the one thing that is true on every platform and every version.
+
+The payload is then renamed to `KEA_<version>_<arch>.<ext>` before publishing,
+because the macOS bundler names it `KEA.app.tar.gz` — with neither version nor
+architecture in it — so an aarch64 and an x86_64 build of the same release would
+otherwise overwrite each other as release assets.
+
+### Per-platform manifest fragments
+
+Each platform is built on its own runner and can only sign for itself, so
+`package_release.sh` writes `dist/updater/<os>-<arch>.json` — a fragment, not a
+manifest. `scripts/merge_updater_manifest.sh` combines the fragments into the
+single `latest.json` clients fetch.
+
+Running the script locally on one machine also leaves a `dist/latest.json`
+behind covering just that host, which is what makes a local
+`./scripts/package_release.sh` still useful on its own.
 
 ### Build once, package once
 
@@ -104,7 +170,7 @@ Open `src-tauri/tauri.conf.json` and replace the empty `"pubkey"` value with thi
   "updater": {
     "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6I...",
     "endpoints": [
-      "https://github.com/mokbhai/vox/releases/latest/download/latest.json"
+      "https://github.com/mokbhai/KEA/releases/latest/download/latest.json"
     ]
   }
 }
@@ -117,7 +183,15 @@ Copy the private key from `~/.tauri/kea-updater.key` and add it as a repository 
 - **`TAURI_SIGNING_PRIVATE_KEY`**: the full contents of the key file.
 - **`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`** (optional): password if you encrypted the key.
 
-Without these secrets, the release workflow skips updater artifact generation but still publishes the normal `.zip` and `.dmg` artifacts.
+Without these secrets the bundler produces no signature, and the release
+workflow **fails** rather than publishing: the `Verify this platform signed its
+updater payload` step treats a missing fragment as an error. That is on purpose
+— an unsigned release still yields perfectly good installers, so the job would
+otherwise go green while shipping a `latest.json` that no client can use.
+
+A local `./scripts/package_release.sh` without the key is a different case and
+is fine: it prints `No signed updater artifacts produced` and packages the
+installers only.
 
 #### 4. Enable updater artifact generation
 
@@ -133,10 +207,12 @@ With the pubkey set, the signing secret in the environment, and `createUpdaterAr
 
 ### How latest.json Works
 
-The release workflow (`release.yml`) generates `latest.json` from the bundler's signature when `TAURI_SIGNING_PRIVATE_KEY` is present. This manifest is published to:
+The release workflow (`release.yml`) generates `latest.json` by merging one
+fragment per platform, each produced from that platform's own bundler signature,
+when `TAURI_SIGNING_PRIVATE_KEY` is present. This manifest is published to:
 
 ```
-https://github.com/mokbhai/vox/releases/latest/download/latest.json
+https://github.com/mokbhai/KEA/releases/latest/download/latest.json
 ```
 
 The manifest structure:
@@ -149,8 +225,10 @@ The manifest structure:
   "platforms": {
     "darwin-aarch64": {
       "signature": "<ed25519-signature-from-.sig-file>",
-      "url": "https://github.com/mokbhai/vox/releases/download/v0.1.0/KEA_0.1.0_aarch64.app.tar.gz"
-    }
+      "url": "https://github.com/mokbhai/KEA/releases/download/v0.1.0/KEA_0.1.0_aarch64.app.tar.gz"
+    },
+    "linux-x86_64": { "signature": "...", "url": "..." },
+    "windows-x86_64": { "signature": "...", "url": "..." }
   }
 }
 ```
