@@ -118,6 +118,7 @@ describe("DictationPage", () => {
         get_dictation_settings: () => ({
           post_process: false,
           active_model: "whisper-base",
+          hold_to_talk: false,
         }),
       },
     });
@@ -134,7 +135,11 @@ describe("DictationPage", () => {
       engines: { stt: ["whisper"], llm: ["openai", "openai-compatible"] },
       extra: {
         get_dictation_state: () => "idle",
-        get_dictation_settings: () => ({ post_process: true, active_model: null }),
+        get_dictation_settings: () => ({
+          post_process: true,
+          active_model: null,
+          hold_to_talk: false,
+        }),
       },
     });
     render(<DictationPage />);
@@ -205,7 +210,42 @@ describe("DictationPage", () => {
 
     await waitFor(() => expect(invokeCalls("set_dictation_settings")).toHaveLength(1));
     expect(invokeCalls("set_dictation_settings")[0]).toEqual({
-      settings: { post_process: true, active_model: null },
+      settings: { post_process: true, active_model: null, hold_to_talk: false },
     });
+  });
+
+  it("offers hold-to-talk beside the shortcut and saves it", async () => {
+    mockWorld({ bindings: { "default/stt": whisperBinding } });
+    render(<DictationPage />);
+
+    const toggle = await screen.findByRole("switch", { name: "Hold to talk" });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    await userEvent.click(toggle);
+
+    await waitFor(() => expect(invokeCalls("set_dictation_settings")).toHaveLength(1));
+    expect(invokeCalls("set_dictation_settings")[0]).toEqual({
+      settings: { post_process: false, active_model: null, hold_to_talk: true },
+    });
+  });
+
+  it("shows hold-to-talk already on when it is saved", async () => {
+    mockWorld({
+      bindings: { "default/stt": whisperBinding },
+      extra: {
+        get_dictation_state: () => "idle",
+        get_dictation_settings: () => ({
+          post_process: false,
+          active_model: null,
+          hold_to_talk: true,
+        }),
+      },
+    });
+    render(<DictationPage />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("switch", { name: "Hold to talk" }).getAttribute("aria-checked"),
+      ).toBe("true"),
+    );
   });
 });

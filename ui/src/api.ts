@@ -191,6 +191,8 @@ export type DictationState = "idle" | "listening" | "processing";
 export type DictationSettings = {
   post_process: boolean;
   active_model: string | null;
+  /** Hold ⌥⇧ to record, release to transcribe and insert. */
+  hold_to_talk: boolean;
 };
 
 export type WhisperModel = {

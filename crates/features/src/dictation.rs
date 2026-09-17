@@ -463,6 +463,7 @@ mod tests {
         let settings = DictationSettings {
             post_process: false,
             active_model: None,
+            hold_to_talk: false,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
@@ -513,6 +514,7 @@ mod tests {
         let settings = DictationSettings {
             post_process: true,
             active_model: None,
+            hold_to_talk: false,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
@@ -569,6 +571,7 @@ mod tests {
         let settings = DictationSettings {
             post_process: true,
             active_model: None,
+            hold_to_talk: false,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
@@ -662,6 +665,7 @@ mod tests {
         let settings = DictationSettings {
             post_process: true,
             active_model: None,
+            hold_to_talk: false,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {

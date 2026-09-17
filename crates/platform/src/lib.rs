@@ -12,7 +12,10 @@ pub use audio::{
     AudioIo, AudioIoError, Cue, DictationState, MeetingState, PcmBuffer, PcmFrame,
     SystemAudioCapability,
 };
-pub use hotkeys::{parse_accelerator, ActionId, HotkeyBinding, HotkeyError, Hotkeys};
+pub use hotkeys::hold::{HoldAction, HoldModifiers, HoldToTalk, DEFAULT_MIN_HOLD};
+pub use hotkeys::{
+    parse_accelerator, spawn_hold_to_talk, ActionId, HotkeyBinding, HotkeyError, Hotkeys,
+};
 pub use permissions::{new_permissions, PermError, PermKind, PermStatus, Permissions};
 pub use textio::{ClipboardPlan, ReplaceMode, TextIo, TextIoError};
 

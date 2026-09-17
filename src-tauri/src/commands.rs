@@ -31,8 +31,8 @@ use kea_features::run_rewrite_with_storage;
 use kea_core::resolve::SlotResolver;
 use kea_infer::{temp_file_for, StreamedFile, DownloadTransport, InferError, ModelDownloader, ModelRegistry, ModelStorage, OnnxModelEntry};
 use kea_platform::{
-    new_text_io, parse_accelerator, AudioIo, AudioIoError, Cue, DictationState, HotkeyBinding,
-    Hotkeys, MeetingState, PermKind, PermStatus, PcmFrame, SystemAudioCapability,
+    new_text_io, parse_accelerator, AudioIo, AudioIoError, Cue, DictationState, HoldAction,
+    HotkeyBinding, Hotkeys, MeetingState, PermKind, PermStatus, PcmFrame, SystemAudioCapability,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -42,7 +42,7 @@ use tauri_plugin_notification::NotificationExt;
 use tokio::sync::watch;
 
 use crate::events::{
-    emit_dictation_level, emit_dictation_state, emit_meeting_error,
+    emit_dictation_error, emit_dictation_level, emit_dictation_state, emit_meeting_error,
     emit_meeting_level, emit_meeting_segment, emit_meeting_state,
     emit_model_download_complete, emit_model_download_error, emit_model_download_progress,
     emit_tts_state, MeetingSegmentPayload,
@@ -974,6 +974,114 @@ pub fn dictation_hotkey_action(current: DictationState, meeting_active: bool, in
         DictationState::Idle => DictationHotkeyAction::Start,
         DictationState::Processing => DictationHotkeyAction::Ignore,
     }
+}
+
+/// Maps a hold-to-talk edge onto the dictation state machine.
+///
+/// Hold-to-talk is directional where the accelerator is a toggle: the chord
+/// going down can only ever start, and coming up can only ever stop. Routing it
+/// through [`dictation_hotkey_action`] keeps one set of rules about when
+/// dictation may run at all (meetings, a run still finishing), and this narrows
+/// that answer to the direction the edge asked for — so a hold that begins
+/// while a recording is already running cannot restart it, and a release that
+/// arrives after the run ended some other way cannot stop the next one.
+pub fn hold_dictation_action(
+    event: HoldAction,
+    current: DictationState,
+    meeting_active: bool,
+    in_flight: bool,
+) -> DictationHotkeyAction {
+    let toggle = dictation_hotkey_action(current, meeting_active, in_flight);
+    match (event, toggle) {
+        (HoldAction::Start, DictationHotkeyAction::Start) => DictationHotkeyAction::Start,
+        (HoldAction::Stop, DictationHotkeyAction::Stop) => DictationHotkeyAction::Stop,
+        _ => DictationHotkeyAction::Ignore,
+    }
+}
+
+/// Brings the ⌥⇧ hold-to-talk listener in line with the setting.
+///
+/// Installing is one-way (the platform listener outlives any disable), so this
+/// is safe to call on every settings write and at startup; turning the mode off
+/// only clears the flag the listener consults.
+///
+/// A failure to install is surfaced as a dictation error rather than swallowed:
+/// the realistic cause is missing Accessibility permission, and a hold-to-talk
+/// that silently does nothing is the exact failure this release set out to
+/// remove. `installed` stays false in that case so granting the permission and
+/// toggling the setting again retries.
+pub fn sync_hold_to_talk(state: &Arc<AppState>, app: &AppHandle, enabled: bool) {
+    state.hold_to_talk_enabled.store(enabled, Ordering::SeqCst);
+    if !enabled {
+        return;
+    }
+
+    {
+        let mut installed = match state.hold_to_talk_installed.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *installed {
+            return;
+        }
+
+        let events = match kea_platform::spawn_hold_to_talk(state.hold_to_talk_enabled.clone()) {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::warn!(%error, "hold-to-talk listener could not start");
+                emit_dictation_error(app, &error.to_string());
+                return;
+            }
+        };
+        *installed = true;
+        spawn_hold_to_talk_dispatch(state, app, events);
+    }
+}
+
+fn spawn_hold_to_talk_dispatch(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<HoldAction>,
+) {
+    let state = state.clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = events.recv().await {
+            // Same busy flag as the accelerator path, so a chord and a
+            // Cmd+Shift+D landing together cannot both start a run.
+            let Some(_busy) = try_acquire_busy(&state.dictation_busy) else {
+                tracing::debug!(?event, "hold-to-talk ignored: dictation handler in flight");
+                continue;
+            };
+
+            let meeting_active = state
+                .active_meeting
+                .lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(false)
+                || state.meeting_processing.load(Ordering::SeqCst);
+            let in_flight = state
+                .dictation_current_run
+                .lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(false);
+            let current = state.audio.lock().await.state();
+
+            match hold_dictation_action(event, current, meeting_active, in_flight) {
+                DictationHotkeyAction::Start => {
+                    if let Err(error) = start_dictation_inner(&state, &app).await {
+                        emit_dictation_error(&app, &error);
+                    }
+                }
+                DictationHotkeyAction::Stop => {
+                    if let Err(error) = stop_dictation_inner(&state, &app).await {
+                        emit_dictation_error(&app, &error);
+                    }
+                }
+                DictationHotkeyAction::Ignore => {}
+            }
+        }
+    });
 }
 
 /// Meeting hotkey toggle decision (pure, testable).
@@ -2511,12 +2619,17 @@ pub async fn get_dictation_settings(
 #[tauri::command]
 pub async fn set_dictation_settings(
     state: State<'_, Arc<AppState>>,
+    app: AppHandle,
     settings: DictationSettings,
 ) -> Result<(), String> {
     DictationSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
         .set(&settings)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Only after the write succeeds: a listener armed against a setting that
+    // did not persist would come back disarmed on the next launch.
+    sync_hold_to_talk(&state, &app, settings.hold_to_talk);
+    Ok(())
 }
 
 #[tauri::command]
@@ -3606,6 +3719,7 @@ mod tests {
             .set(&DictationSettings {
                 post_process: true,
                 active_model: Some("ggml-base.en".into()),
+                hold_to_talk: false,
             })
             .await
             .unwrap();
@@ -4037,6 +4151,52 @@ mod tests {
         // Meeting active + in-flight → still Ignore
         assert_eq!(
             dictation_hotkey_action(DictationState::Idle, true, true),
+            DictationHotkeyAction::Ignore
+        );
+    }
+
+    #[test]
+    fn a_hold_starts_only_from_idle_and_a_release_stops_only_while_listening() {
+        assert_eq!(
+            hold_dictation_action(HoldAction::Start, DictationState::Idle, false, false),
+            DictationHotkeyAction::Start
+        );
+        assert_eq!(
+            hold_dictation_action(HoldAction::Stop, DictationState::Listening, false, false),
+            DictationHotkeyAction::Stop
+        );
+    }
+
+    #[test]
+    fn a_hold_edge_never_toggles_the_other_way() {
+        // The chord going down while a recording is already running must not
+        // stop it, and coming up while idle must not start one. The accelerator
+        // is a toggle; this is not, and routing it through the same rules would
+        // otherwise invert on a missed edge.
+        assert_eq!(
+            hold_dictation_action(HoldAction::Start, DictationState::Listening, false, false),
+            DictationHotkeyAction::Ignore
+        );
+        assert_eq!(
+            hold_dictation_action(HoldAction::Stop, DictationState::Idle, false, false),
+            DictationHotkeyAction::Ignore
+        );
+    }
+
+    #[test]
+    fn a_hold_defers_to_meetings_and_to_a_run_still_finishing() {
+        assert_eq!(
+            hold_dictation_action(HoldAction::Start, DictationState::Idle, true, false),
+            DictationHotkeyAction::Ignore,
+            "a meeting owns the microphone"
+        );
+        assert_eq!(
+            hold_dictation_action(HoldAction::Start, DictationState::Idle, false, true),
+            DictationHotkeyAction::Ignore,
+            "the previous transcript is still being inserted"
+        );
+        assert_eq!(
+            hold_dictation_action(HoldAction::Stop, DictationState::Processing, false, false),
             DictationHotkeyAction::Ignore
         );
     }

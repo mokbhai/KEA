@@ -12,7 +12,7 @@ import {
 } from "../api";
 import FeatureAiCard from "../components/FeatureAiCard";
 import FeatureBanner, { type FixNavigate } from "../components/FeatureBanner";
-import HotkeyRow, { formatAccelerator } from "../components/HotkeyRow";
+import HotkeyRow, { formatAccelerator, KeyChips } from "../components/HotkeyRow";
 import LevelMeter from "../components/LevelMeter";
 import { Row, RowGroup } from "../components/SettingsRow";
 import Spinner from "../components/Spinner";
@@ -56,6 +56,7 @@ type Props = {
 
 export default function DictationPage({ onNavigate }: Props) {
   const [postProcess, setPostProcess] = useState(false);
+  const [holdToTalk, setHoldToTalk] = useState(false);
   const ai = useFeatureAi(postProcess ? SLOTS_WITH_CLEANUP : SLOTS_PLAIN);
   const [settingsStatus, setSettingsStatus] = useState<string | null>(null);
   const [settingsLoading, setSettingsLoading] = useState(true);
@@ -70,7 +71,10 @@ export default function DictationPage({ onNavigate }: Props) {
 
   useEffect(() => {
     getDictationSettings()
-      .then((settings) => setPostProcess(settings.post_process))
+      .then((settings) => {
+        setPostProcess(settings.post_process);
+        setHoldToTalk(settings.hold_to_talk);
+      })
       .catch((e) => setSettingsStatus(e instanceof Error ? e.message : String(e)))
       .finally(() => setSettingsLoading(false));
 
@@ -108,6 +112,28 @@ export default function DictationPage({ onNavigate }: Props) {
       flash("post_process");
     } catch (e) {
       setPostProcess(previous);
+      setSettingsStatus(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * Re-reads before writing for the same reason `savePostProcess` does: these
+   * settings are saved whole, so writing a stale copy of the other fields would
+   * quietly revert them.
+   */
+  const saveHoldToTalk = async (enabled: boolean) => {
+    const previous = holdToTalk;
+    setHoldToTalk(enabled);
+    setBusy(true);
+    setSettingsStatus(null);
+    try {
+      const current = await getDictationSettings();
+      await setDictationSettings({ ...current, hold_to_talk: enabled });
+      flash("hold_to_talk");
+    } catch (e) {
+      setHoldToTalk(previous);
       setSettingsStatus(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
@@ -170,6 +196,19 @@ export default function DictationPage({ onNavigate }: Props) {
                 onSaved={setAccelerator}
                 checkRegistration
               />
+              <Row
+                label="Hold to talk"
+                hint="Hold ⌥⇧ anywhere to record, then let go and KEA types what you said. A quick tap does nothing, and neither does holding ⌥⇧ for one of your own shortcuts."
+              >
+                <KeyChips accelerator="Option+Shift" />
+                {savedKey === "hold_to_talk" && <span className="kea-saved">Saved ✓</span>}
+                <Toggle
+                  label="Hold to talk"
+                  checked={holdToTalk}
+                  disabled={busy}
+                  onChange={(next) => void saveHoldToTalk(next)}
+                />
+              </Row>
               <Row
                 label="Clean up text with AI"
                 hint="Removes filler words and fixes punctuation before typing. Needs the Rewrite AI — dictation fails outright without it."

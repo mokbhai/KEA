@@ -6,12 +6,39 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+pub mod hold;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "macos")]
+pub mod macos_hold;
 #[cfg(not(target_os = "macos"))]
 pub mod stub;
 
 pub type ActionId = String;
+
+/// Starts the press-and-hold ⌥⇧ listener, if this OS has one.
+///
+/// Separate from [`Hotkeys`] on purpose: that trait is about accelerators that
+/// the OS registers and reports as presses, and a modifier-only press-and-hold
+/// chord is neither — see [`hold`] for why.
+///
+/// `enabled` is polled by the listener rather than passed by value so the
+/// settings toggle can silence it without a restart.
+pub fn spawn_hold_to_talk(
+    enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<tokio::sync::mpsc::UnboundedReceiver<hold::HoldAction>, HotkeyError> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_hold::spawn(enabled)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = enabled;
+        Err(HotkeyError::Other(
+            "hold-to-talk is not yet implemented on this platform".into(),
+        ))
+    }
+}
 
 /// User-facing accelerator string (e.g. `"CommandOrControl+Shift+R"`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

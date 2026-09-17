@@ -69,7 +69,11 @@ export function featureHandlers({
       source: "default",
     }),
     get_hotkey_registration_status: () => [],
-    get_dictation_settings: () => ({ post_process: false, active_model: null }),
+    get_dictation_settings: () => ({
+      post_process: false,
+      active_model: null,
+      hold_to_talk: false,
+    }),
     set_dictation_settings: () => undefined,
     get_tts_settings: () => ({ active_voice: null, active_model: null }),
     set_tts_settings: () => undefined,

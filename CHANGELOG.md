@@ -6,6 +6,10 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+### Added
+
+- Press-and-hold dictation on ⌥⇧: hold both modifiers anywhere to record, release either one to transcribe and type. Off by default, and switched on beside the dictation shortcut. A quick tap does nothing, and neither does holding ⌥⇧ as the modifier for another shortcut, so ⌥⇧+arrow still selects text by word.
+
 ### Fixed
 
 - Dictation no longer reports success when it inserted nothing. macOS drops synthetic keystrokes from a process that has not been granted Accessibility, and `CGEventPost` reports nothing back, so a transcript could be recorded, transcribed and logged as `ok` while the focused text field stayed empty. Both synthetic paths now check Accessibility trust first and fail with the grant instructions.

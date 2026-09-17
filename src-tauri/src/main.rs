@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use kea_core::dictation::DictationSettingsRepo;
 use kea_core::rewrite::{CredentialSourceAdapter, ProviderConfigRepo};
 use kea_core::secrets::KeyringCredentialStore;
 use kea_core::store::db::{open_pool, run_config_migrations, run_data_migrations};
@@ -89,6 +90,19 @@ pub struct AppState {
     /// (STT + synthesis, after `active_meeting` was taken). Consulted so a
     /// hotkey press can't park on the audio lock and replay as a fresh start.
     pub meeting_processing: AtomicBool,
+    /// Serialises dictation handlers so a trigger arriving during one is
+    /// dropped rather than queued. Shared state rather than a local of the
+    /// hotkey loop because hold-to-talk drives the same handlers from its own
+    /// task, and the two must not be able to start a run each.
+    pub dictation_busy: Arc<AtomicBool>,
+    /// Whether ⌥⇧ hold-to-talk is armed. Read by the platform listener on every
+    /// event, so the settings toggle takes effect immediately.
+    pub hold_to_talk_enabled: Arc<AtomicBool>,
+    /// Whether the hold-to-talk listener has been installed. It cannot be taken
+    /// back down (see `kea_platform::hotkeys::macos_hold`), so this guards
+    /// against installing a second one — while still allowing a retry after the
+    /// first attempt failed for want of Accessibility permission.
+    pub hold_to_talk_installed: Mutex<bool>,
 }
 
 fn on_tray_menu_event(app: &tauri::AppHandle, e: tauri::menu::MenuEvent) {
@@ -421,6 +435,9 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
         dictation_current_run: Mutex::new(None),
         preview_playing: AtomicBool::new(false),
         meeting_processing: AtomicBool::new(false),
+        dictation_busy: Arc::new(AtomicBool::new(false)),
+        hold_to_talk_enabled: Arc::new(AtomicBool::new(false)),
+        hold_to_talk_installed: Mutex::new(false),
     });
 
     // Hotkey dispatcher: register rewrite + dictation shortcuts and spawn listener.
@@ -534,7 +551,10 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
         // handlers so presses queued during a long handler are dropped
         // (rather than replaying as fresh starts).
         let rewrite_busy  = Arc::new(AtomicBool::new(false));
-        let dictation_busy = Arc::new(AtomicBool::new(false));
+        // Dictation's lives on the state instead: hold-to-talk drives the same
+        // handlers from its own task, and a chord and a Cmd+Shift+D arriving
+        // together must contend for one flag, not one each.
+        let dictation_busy = state_for_task.dictation_busy.clone();
         let tts_busy      = Arc::new(AtomicBool::new(false));
         let meetings_busy = Arc::new(AtomicBool::new(false));
 
@@ -684,6 +704,29 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+
+    // Re-arm ⌥⇧ hold-to-talk if the user left it on. Deliberately after the
+    // hotkey dispatcher is up: the listener drives the same dictation handlers,
+    // and a chord held through launch should find them ready.
+    {
+        let state_for_hold = state.clone();
+        let app_for_hold = app.handle().clone();
+        let config_pool = config_pool.clone();
+        tauri::async_runtime::spawn(async move {
+            let settings = DictationSettingsRepo::new(SettingsRepo::new(config_pool))
+                .get()
+                .await;
+            match settings {
+                Ok(settings) if settings.hold_to_talk => {
+                    crate::commands::sync_hold_to_talk(&state_for_hold, &app_for_hold, true);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "could not read dictation settings to arm hold-to-talk")
+                }
+            }
+        });
+    }
 
     app.manage(state);
 
