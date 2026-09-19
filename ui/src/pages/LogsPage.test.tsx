@@ -31,6 +31,30 @@ describe("LogsPage", () => {
     await waitFor(() => expect(invokeCalls("open_log_folder")).toHaveLength(1));
   });
 
+  it("re-reads the tail on a timer while Live is on, and stops when it is off", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      onInvoke({ tail_logs: () => "INFO kea started", open_log_folder: () => undefined });
+      render(<LogsPage />);
+      await waitFor(() => expect(invokeCalls("tail_logs")).toHaveLength(1));
+
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      await user.click(screen.getByRole("button", { name: "Live" }));
+
+      // Polling is what makes a once-an-hour paste failure observable at all;
+      // without it the user only ever sees the log after the fact.
+      await vi.advanceTimersByTimeAsync(2100);
+      await waitFor(() => expect(invokeCalls("tail_logs").length).toBeGreaterThan(1));
+
+      const whileLive = invokeCalls("tail_logs").length;
+      await user.click(screen.getByRole("button", { name: "Stop live" }));
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(invokeCalls("tail_logs")).toHaveLength(whileLive);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("surfaces a read failure as an error banner", async () => {
     onInvoke({
       tail_logs: () => {

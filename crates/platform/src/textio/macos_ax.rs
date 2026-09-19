@@ -100,6 +100,136 @@ pub fn prompt_ax_trust() -> bool {
     }
 }
 
+/// A one-line description of where a synthetic paste is about to land.
+///
+/// This is diagnostics, not control flow: the most common "paste did nothing"
+/// report is a paste that went exactly where it was told, into an app or an
+/// element that was not the one the user was looking at — the transcript is in
+/// the search box, or the frontmost app changed while the LLM was thinking, or
+/// nothing at all has keyboard focus because the user clicked the desktop.
+/// None of that is visible from a `CGEventPost` that returns `void`, so it is
+/// recorded before every copy and paste instead.
+///
+/// Returns something like `TextEdit/AXTextArea`. The two halves fail
+/// independently and on purpose — `Slack/none` (the app is frontmost but
+/// nothing in it has keyboard focus) is a different bug report from
+/// `KEA/AXTextField` (we pasted into ourselves), and both are invisible if the
+/// whole thing collapses to one "unknown".
+pub fn focus_summary() -> String {
+    format!("{}/{}", frontmost_app_name(), focused_element_role())
+}
+
+/// The app that will receive a synthetic keystroke, from `NSWorkspace`.
+///
+/// Deliberately *not* read from AX: `AXFocusedApplication` needs the
+/// Accessibility grant and returns nothing at all in several ordinary
+/// situations, which would blank out the diagnostic exactly when the grant is
+/// the thing being diagnosed. `NSWorkspace.frontmostApplication` needs no
+/// permission and answers whenever there is a GUI session.
+pub fn frontmost_app_name() -> String {
+    // SAFETY: `sharedWorkspace` and `frontmostApplication` return shared,
+    // autoreleased objects that outlive the call, and `localizedName` is a
+    // plain property read on the result. The class lookups return `None`
+    // rather than a dangling pointer when AppKit is not loaded.
+    unsafe {
+        let Some(class) = objc2::runtime::AnyClass::get(c"NSWorkspace") else {
+            return "<no AppKit>".into();
+        };
+        let workspace: *mut objc2::runtime::AnyObject =
+            objc2::msg_send![class, sharedWorkspace];
+        if workspace.is_null() {
+            return "<no workspace>".into();
+        }
+        let app: *mut objc2::runtime::AnyObject =
+            objc2::msg_send![workspace, frontmostApplication];
+        if app.is_null() {
+            return "<no frontmost app>".into();
+        }
+        let name: *mut objc2_foundation::NSString = objc2::msg_send![app, localizedName];
+        if name.is_null() {
+            return "<unnamed app>".into();
+        }
+        (*name).to_string()
+    }
+}
+
+/// The AX role of whatever has keyboard focus, e.g. `AXTextArea`.
+///
+/// `none` is a real and common answer: it means the keystroke has nowhere to
+/// go, which is what "I pressed the key and nothing happened" usually is.
+fn focused_element_role() -> String {
+    if !is_ax_trusted() {
+        return "unknown (not trusted for Accessibility)".to_string();
+    }
+    // SAFETY: every raw element below is owned (the AX "Copy" functions follow
+    // the Core Foundation create rule) and released exactly once by `AxRef`.
+    unsafe {
+        let Some(system) = AxRef::new(AXUIElementCreateSystemWide()) else {
+            return "unknown (no system-wide AX element)".to_string();
+        };
+        let Some(focused) = system.copy_attr("AXFocusedUIElement") else {
+            return "none".to_string();
+        };
+        focused
+            .copy_string_attr("AXRole")
+            .unwrap_or_else(|| "<unknown role>".into())
+    }
+}
+
+/// An owned `AXUIElementRef` (or any CF value an AX copy handed back).
+///
+/// The AX copy functions follow Core Foundation's create rule, so each one
+/// returns a +1 reference the caller must release. `focus_summary` runs on
+/// every dictation and every rewrite, so leaking two elements a run is a real
+/// leak in a process that stays open all day, not a rounding error.
+struct AxRef(*mut c_void);
+
+impl AxRef {
+    /// Takes ownership of a +1 reference, or `None` if it is null.
+    unsafe fn new(raw: *mut c_void) -> Option<Self> {
+        if raw.is_null() {
+            None
+        } else {
+            Some(Self(raw))
+        }
+    }
+
+    /// Reads one AX attribute as an owned value, or `None` on any AX error.
+    unsafe fn copy_attr(&self, attribute: &str) -> Option<Self> {
+        let attr = core_foundation::string::CFString::new(attribute);
+        let mut out: *const c_void = ptr::null();
+        let err = AXUIElementCopyAttributeValue(self.0, attr.as_concrete_TypeRef(), &mut out);
+        if err != K_AX_ERROR_SUCCESS {
+            return None;
+        }
+        Self::new(out as *mut c_void)
+    }
+
+    /// Reads one AX attribute as a `String`, or `None` when it is absent or is
+    /// not a `CFString` (AXTitle is occasionally a number or an AXValue).
+    unsafe fn copy_string_attr(&self, attribute: &str) -> Option<String> {
+        let value = self.copy_attr(attribute)?;
+        let cf_type = value.0 as core_foundation_sys::base::CFTypeRef;
+        if core_foundation::base::CFGetTypeID(cf_type) != core_foundation::string::CFString::type_id()
+        {
+            return None;
+        }
+        // Get rule: `value` still owns the reference and releases it on drop.
+        let s = core_foundation::string::CFString::wrap_under_get_rule(
+            value.0 as core_foundation_sys::string::CFStringRef,
+        );
+        Some(s.to_string())
+    }
+}
+
+impl Drop for AxRef {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a non-null, owned CF reference (see `new`), and
+        // this is the only place it is released.
+        unsafe { core_foundation_sys::base::CFRelease(self.0 as *const _) };
+    }
+}
+
 /// Insert `text` into the focused element via AX (`AXSelectedText` on focused UI element).
 pub fn insert_via_accessibility(text: &str) -> Result<(), String> {
     if let Some(insert) = test_ax_slot().lock().unwrap().as_ref() {

@@ -13,7 +13,6 @@ serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 arboard.workspace = true
-enigo.workspace = true
 global-hotkey.workspace = true
 tracing.workspace = true
 cpal.workspace = true

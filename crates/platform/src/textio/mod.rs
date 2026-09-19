@@ -8,6 +8,10 @@ use thiserror::Error;
 pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod macos_ax;
+#[cfg(target_os = "macos")]
+pub mod macos_keys;
+#[cfg(target_os = "macos")]
+pub mod macos_pasteboard;
 #[cfg(not(target_os = "macos"))]
 pub mod stub;
 

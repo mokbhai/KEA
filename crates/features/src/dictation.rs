@@ -166,6 +166,13 @@ pub async fn run_dictation_with_storage(
     };
 
     let mut final_text = transcript.text;
+    tracing::info!(
+        action_id = %action_id,
+        engine = %engine_id,
+        chars = final_text.chars().count(),
+        post_process = settings.post_process,
+        "dictation: transcribed"
+    );
 
     if settings.post_process {
         let transcript_text = final_text.clone();
@@ -284,6 +291,12 @@ pub async fn run_dictation_with_storage(
                     }
                     return Err(e);
                 }
+                tracing::info!(
+                    action_id = %action_id,
+                    engine = %llm_engine_id,
+                    chars = resp.text.chars().count(),
+                    "dictation: post-processed"
+                );
                 resp.text
             }
             Err(e) => {
@@ -302,7 +315,23 @@ pub async fn run_dictation_with_storage(
         };
     }
 
+    // The paste is the one step whose outcome the OS will not report (see
+    // kea_platform::textio::macos), so both edges of it are logged: a run that
+    // reaches "inserting" and never reaches "inserted" is the signature of a
+    // synthetic keystroke that went nowhere.
+    tracing::info!(
+        action_id = %action_id,
+        chars = final_text.chars().count(),
+        "dictation: inserting into the focused app"
+    );
+    let insert_started = std::time::Instant::now();
     if let Err(e) = textio.insert_at_cursor(&final_text).await {
+        tracing::error!(
+            action_id = %action_id,
+            error = %e,
+            elapsed_ms = insert_started.elapsed().as_millis() as u64,
+            "dictation: insertion failed"
+        );
         if let Err(inner) = actions.finish(action_id, "error", Some(&e.to_string())).await {
             tracing::warn!(
                 error = %inner,
@@ -312,6 +341,12 @@ pub async fn run_dictation_with_storage(
         }
         return Err(e.to_string());
     }
+
+    tracing::info!(
+        action_id = %action_id,
+        elapsed_ms = insert_started.elapsed().as_millis() as u64,
+        "dictation: inserted"
+    );
 
     if let Err(e) = actions.finish(action_id, "ok", None).await {
         tracing::warn!(
