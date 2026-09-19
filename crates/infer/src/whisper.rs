@@ -3,16 +3,27 @@ use std::path::Path;
 use async_trait::async_trait;
 
 use crate::error::InferError;
-pub use crate::types::{AudioPcm, WhisperOpts};
+pub use crate::types::{AudioPcm, SttResult, TimedSegment, WhisperOpts};
 
 #[async_trait]
 pub trait WhisperInference: Send + Sync {
+    /// Decodes `pcm`, returning the joined text plus whisper's per-segment
+    /// timing. Offsets are relative to the start of `pcm`.
     async fn transcribe(
         &self,
         pcm: AudioPcm,
         model_path: &Path,
         opts: WhisperOpts,
-    ) -> Result<String, InferError>;
+    ) -> Result<SttResult, InferError>;
+}
+
+/// whisper.cpp reports segment bounds in centiseconds (10 ms units).
+///
+/// Converting this wrong is silent: every subtitle is uniformly ten times too
+/// early and the transcript itself is unchanged, so nothing about the output
+/// looks broken until someone plays it against the audio.
+pub fn centiseconds_to_ms(cs: i64) -> u64 {
+    cs.max(0) as u64 * 10
 }
 
 #[cfg(feature = "whisper")]
@@ -130,7 +141,7 @@ impl WhisperInference for WhisperRsInference {
         pcm: AudioPcm,
         model_path: &Path,
         opts: WhisperOpts,
-    ) -> Result<String, InferError> {
+    ) -> Result<SttResult, InferError> {
         let model_path = model_path.to_path_buf();
         let pcm_rate_hz = pcm.sample_rate_hz;
         let samples = pcm.samples;
@@ -217,18 +228,33 @@ impl WhisperInference for WhisperRsInference {
                 .full_n_segments()
                 .map_err(|e| InferError::Other(format!("failed to read segments: {e}")))?;
 
-            let mut text = String::new();
+            // The timing was always here and always thrown away: t0/t1 come
+            // back from the same state the text does, at no extra decode cost.
+            // Word-level timing would need `set_token_timestamps(true)`, which
+            // costs decode time and which subtitles do not need.
+            let mut segments = Vec::with_capacity(num_segments.max(0) as usize);
             for i in 0..num_segments {
-                let segment = state
+                let text = state
                     .full_get_segment_text(i)
                     .map_err(|e| InferError::Other(format!("failed to read segment: {e}")))?;
-                if !text.is_empty() && !segment.is_empty() {
-                    text.push(' ');
-                }
-                text.push_str(&segment);
+                let t0 = state
+                    .full_get_segment_t0(i)
+                    .map_err(|e| InferError::Other(format!("failed to read segment start: {e}")))?;
+                let t1 = state
+                    .full_get_segment_t1(i)
+                    .map_err(|e| InferError::Other(format!("failed to read segment end: {e}")))?;
+                let start_ms = centiseconds_to_ms(t0);
+                segments.push(TimedSegment {
+                    start_ms,
+                    end_ms: centiseconds_to_ms(t1).max(start_ms),
+                    text,
+                });
             }
 
-            Ok(text)
+            Ok(SttResult {
+                text: crate::types::join_segment_text(&segments),
+                segments,
+            })
         })
         .await
         .map_err(|e| InferError::Other(format!("whisper task join failed: {e}")))?
@@ -248,8 +274,11 @@ mod tests {
             pcm: AudioPcm,
             _model_path: &Path,
             _opts: WhisperOpts,
-        ) -> Result<String, InferError> {
-            Ok(format!("heard {} samples", pcm.samples.len()))
+        ) -> Result<SttResult, InferError> {
+            Ok(SttResult::text_only(format!(
+                "heard {} samples",
+                pcm.samples.len()
+            )))
         }
     }
 
@@ -267,7 +296,19 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out, "heard 100 samples");
+        assert_eq!(out.text, "heard 100 samples");
+        assert!(out.segments.is_empty());
+    }
+
+    /// The likely bug in this item, and a silent one: centiseconds handed
+    /// through as milliseconds put every subtitle ten times too early.
+    #[test]
+    fn whisper_segment_bounds_are_centiseconds() {
+        assert_eq!(centiseconds_to_ms(0), 0);
+        assert_eq!(centiseconds_to_ms(123), 1_230);
+        assert_eq!(centiseconds_to_ms(360_000), 3_600_000);
+        // whisper.cpp reports -1 for a segment it could not bound.
+        assert_eq!(centiseconds_to_ms(-1), 0);
     }
 
     #[cfg(feature = "whisper")]

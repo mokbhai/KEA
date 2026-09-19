@@ -7,6 +7,7 @@ pub mod resolve;
 pub mod rewrite;
 pub mod secrets;
 pub mod store;
+pub mod transcript;
 pub mod tts;
 
 pub use store::conversations::{

@@ -10,6 +10,7 @@ export type Page =
   | "rewrite"
   | "dictation"
   | "meetings"
+  | "transcribe"
   | "read-aloud"
   | "ai-providers"
   | "models"

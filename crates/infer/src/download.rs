@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::error::InferError;
-use crate::registry::{ModelRegistry, OnnxModelEntry};
+use crate::registry::{ModelRegistry, OnnxBundleShape, OnnxModelEntry};
 use crate::storage::ModelStorage;
 
 #[cfg(unix)]
@@ -82,15 +82,21 @@ fn verify_digest(model_id: &str, expected: &str, actual: &str) -> Result<(), Inf
     Ok(())
 }
 
-fn find_onnx_bundle_root(dir: &Path) -> Option<PathBuf> {
-    if dir.join("tokens.txt").is_file() {
+/// The deepest directory in `dir` holding `marker`.
+///
+/// The marker is a parameter rather than a hardcoded `tokens.txt` because a
+/// bundle's root is only ever identifiable by *some* file it is guaranteed to
+/// contain, and which file that is depends on the family. A segmentation
+/// bundle has no vocabulary, so hardcoding one made it impossible to install.
+fn find_onnx_bundle_root(dir: &Path, marker: &str) -> Option<PathBuf> {
+    if dir.join(marker).is_file() {
         return Some(dir.to_path_buf());
     }
     let entries = std::fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if let Some(found) = find_onnx_bundle_root(&path) {
+            if let Some(found) = find_onnx_bundle_root(&path, marker) {
                 return Some(found);
             }
         }
@@ -113,7 +119,11 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), InferError> {
     Ok(())
 }
 
-fn install_onnx_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), InferError> {
+fn install_onnx_archive(
+    archive_path: &Path,
+    dest_dir: &Path,
+    marker: &str,
+) -> Result<(), InferError> {
     use bzip2::read::BzDecoder;
     use tar::{Archive, EntryType};
 
@@ -195,8 +205,9 @@ fn install_onnx_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), Infe
         }
     }
 
-    let bundle_root = find_onnx_bundle_root(&temp_root)
-        .ok_or_else(|| InferError::Other("onnx archive missing tokens.txt bundle".to_string()))?;
+    let bundle_root = find_onnx_bundle_root(&temp_root, marker).ok_or_else(|| {
+        InferError::Other(format!("onnx archive has no {marker} at any bundle root"))
+    })?;
 
     if let Some(parent) = dest_dir.parent() {
         std::fs::create_dir_all(parent)?;
@@ -219,6 +230,28 @@ fn install_onnx_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), Infe
         std::fs::remove_dir_all(dest_dir)?;
     }
     std::fs::rename(&staging, dest_dir)?;
+    Ok(())
+}
+
+/// Installs a bare `.onnx` download: no archive, no extraction.
+///
+/// Its own function rather than a branch inside `install_onnx_archive`,
+/// because there is nothing of the archive path to reuse — no decoder, no
+/// traversal hardening, no bundle root to find. Bolting it on would mean an
+/// extractor that sometimes does not extract.
+fn install_single_onnx(
+    temp_path: &Path,
+    dest_dir: &Path,
+    filename: &str,
+) -> Result<(), InferError> {
+    std::fs::create_dir_all(dest_dir)?;
+    let dest = dest_dir.join(filename);
+    // Rename first: same filesystem in the normal case, since the temp file
+    // is staged beside the destination. Copy is the cross-device fallback.
+    if std::fs::rename(temp_path, &dest).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(temp_path, &dest)?;
     Ok(())
 }
 
@@ -369,14 +402,28 @@ impl ModelDownloader {
                 url: &entry.url,
                 sha256: &entry.sha256,
                 size_bytes: entry.size_bytes,
-                // The archive and the bundle it unpacks to are on disk at the
-                // same time.
-                required_bytes: entry.size_bytes.saturating_mul(2),
+                // An archive and the bundle it unpacks to are on disk at the
+                // same time; a bare file is moved, so it only ever needs its
+                // own size.
+                required_bytes: if entry.bundle.is_archive() {
+                    entry.size_bytes.saturating_mul(2)
+                } else {
+                    entry.size_bytes
+                },
             },
             &temp,
             &on_progress,
+            // The shape decides the tail; everything before it — the space
+            // preflight, the stream, the sha256 check, the partial-file
+            // cleanup — is the shared spine in `install_verified` and stays
+            // the same for all three.
             |temp| {
-                let installed = install_onnx_archive(temp, &dest);
+                let installed = match &entry.bundle {
+                    OnnxBundleShape::SingleFile { filename } => {
+                        install_single_onnx(temp, &dest, filename)
+                    }
+                    shape => install_onnx_archive(temp, &dest, shape.marker()),
+                };
                 let _ = std::fs::remove_file(temp);
                 installed
             },
@@ -516,7 +563,8 @@ mod tests {
         let dest_parent = tempfile::tempdir().unwrap();
         let dest = dest_parent.path().join("vits-piper-en-us-lessac-medium");
 
-        install_onnx_archive(&archive_path, &dest).expect("a valid bundle must install");
+        install_onnx_archive(&archive_path, &dest, "tokens.txt")
+            .expect("a valid bundle must install");
 
         // The bundle root is unwrapped, not the directory that contained it:
         // callers look for tokens.txt directly under the model dir.
@@ -539,7 +587,7 @@ mod tests {
         let dest_parent = tempfile::tempdir().unwrap();
         let dest = dest_parent.path().join("model");
 
-        let err = install_onnx_archive(&archive_path, &dest).unwrap_err();
+        let err = install_onnx_archive(&archive_path, &dest, "tokens.txt").unwrap_err();
         assert!(
             err.to_string().contains("archive path escapes staging"),
             "expected a traversal rejection, got: {err}"
@@ -563,11 +611,109 @@ mod tests {
         let dest_parent = tempfile::tempdir().unwrap();
         let dest = dest_parent.path().join("model");
 
-        let err = install_onnx_archive(&archive_path, &dest).unwrap_err();
+        let err = install_onnx_archive(&archive_path, &dest, "tokens.txt").unwrap_err();
         assert!(
             err.to_string().contains("unsupported symlink"),
             "expected a symlink rejection, got: {err}"
         );
+    }
+
+    /// The regression test for the blocker this item names. Both halves must
+    /// fail against the pre-fix code: `install_onnx_archive` refused a bare
+    /// `.onnx` twice over (not a tar, and no `tokens.txt`), and
+    /// `is_onnx_installed` then reported it missing forever.
+    #[tokio::test]
+    async fn a_bare_onnx_installs_without_a_tokens_file_and_reports_installed() {
+        let payload = b"pretend these are onnx weights".to_vec();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ModelStorage::new(dir.path().to_path_buf());
+
+        let entry = OnnxModelEntry {
+            id: "campplus-sv-en-voxceleb-16k".into(),
+            display_name: "CAM++".into(),
+            language: "multilingual".into(),
+            url: "https://example.com/campplus.onnx".into(),
+            size_bytes: payload.len() as u64,
+            sha256: sha256_hex(&payload),
+            kind: crate::registry::OnnxModelKind::SpeakerEmbedding,
+            bundle: OnnxBundleShape::SingleFile {
+                filename: "model.onnx".into(),
+            },
+            deprecated: false,
+        };
+
+        let dl = ModelDownloader::new(Arc::new(FakeTransport::new(payload.clone())), storage);
+        dl.download_onnx(&entry, |_| {}).await.unwrap();
+
+        let installed_dir = dir.path().join(&entry.id);
+        assert_eq!(
+            std::fs::read(installed_dir.join("model.onnx")).unwrap(),
+            payload
+        );
+        assert!(
+            !installed_dir.join("tokens.txt").exists(),
+            "a diarization model has no vocabulary and must not need one"
+        );
+
+        // The second half: install detection has to agree with the installer.
+        let storage = ModelStorage::new(dir.path().to_path_buf());
+        assert!(storage.is_onnx_entry_installed(&entry));
+        assert!(
+            !storage.is_onnx_installed(&entry.id),
+            "the tokens.txt check is exactly what used to make this invisible"
+        );
+    }
+
+    /// An archive with no `tokens.txt` in it — a pyannote segmentation
+    /// bundle — installs when its own marker names the root.
+    #[test]
+    fn an_archive_is_rooted_at_its_declared_marker() {
+        let archive = build_archive(&[
+            (tar::EntryType::Directory, "seg/", &[], None),
+            (tar::EntryType::Regular, "seg/model.onnx", b"weights", None),
+            (tar::EntryType::Regular, "seg/LICENSE", b"mit", None),
+        ]);
+        let (_archive_dir, archive_path) = write_archive(&archive);
+        let dest_parent = tempfile::tempdir().unwrap();
+        let dest = dest_parent.path().join("pyannote-segmentation-3-0");
+
+        // Today's marker cannot find it; the bundle's own marker can.
+        assert!(install_onnx_archive(&archive_path, &dest, "tokens.txt").is_err());
+        install_onnx_archive(&archive_path, &dest, "model.onnx").unwrap();
+        assert!(dest.join("model.onnx").is_file());
+
+        let storage = ModelStorage::new(dest_parent.path().to_path_buf());
+        assert!(storage.is_onnx_bundle_installed(
+            "pyannote-segmentation-3-0",
+            &OnnxBundleShape::ArchiveWithMarker {
+                marker: "model.onnx".into(),
+            }
+        ));
+    }
+
+    /// A bad digest must not leave a half-installed model behind, whichever
+    /// shape it is — the check happens on the shared spine, before the
+    /// installer closure runs at all.
+    #[tokio::test]
+    async fn a_single_file_with_a_bad_digest_installs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ModelStorage::new(dir.path().to_path_buf());
+        let entry = OnnxModelEntry {
+            id: "tampered".into(),
+            display_name: "Tampered".into(),
+            language: "en-US".into(),
+            url: "https://example.com/m.onnx".into(),
+            size_bytes: 4,
+            sha256: "0".repeat(64),
+            kind: crate::registry::OnnxModelKind::SpeakerEmbedding,
+            bundle: OnnxBundleShape::SingleFile {
+                filename: "model.onnx".into(),
+            },
+            deprecated: false,
+        };
+        let dl = ModelDownloader::new(Arc::new(FakeTransport::new(b"junk".to_vec())), storage);
+        assert!(dl.download_onnx(&entry, |_| {}).await.is_err());
+        assert!(!dir.path().join("tampered").join("model.onnx").exists());
     }
 
     fn sha256_hex(data: &[u8]) -> String {
@@ -595,6 +741,7 @@ mod tests {
             size_bytes: payload.len() as u64,
             sha256: hash,
             kind: crate::registry::OnnxModelKind::Parakeet,
+            bundle: OnnxBundleShape::TokensBundle,
             deprecated: false,
         };
 
@@ -637,6 +784,7 @@ mod tests {
             size_bytes: payload.len() as u64,
             sha256: hash,
             kind: crate::registry::OnnxModelKind::Parakeet,
+            bundle: OnnxBundleShape::TokensBundle,
             deprecated: false,
         };
 
@@ -708,6 +856,7 @@ mod tests {
             size_bytes: payload.len() as u64,
             sha256: hash,
             kind: crate::registry::OnnxModelKind::Parakeet,
+            bundle: OnnxBundleShape::TokensBundle,
             deprecated: false,
         };
 
@@ -748,6 +897,7 @@ mod tests {
             size_bytes: 100,
             sha256: "a".repeat(64),
             kind: crate::registry::OnnxModelKind::Parakeet,
+            bundle: OnnxBundleShape::TokensBundle,
             deprecated: false,
         };
 
@@ -801,6 +951,7 @@ mod tests {
             size_bytes: payload.len() as u64,
             sha256: hash,
             kind: crate::registry::OnnxModelKind::Parakeet,
+            bundle: OnnxBundleShape::TokensBundle,
             deprecated: false,
         };
 
@@ -835,6 +986,7 @@ mod tests {
             size_bytes: u64::MAX,
             sha256: "a".repeat(64),
             kind: crate::registry::OnnxModelKind::Parakeet,
+            bundle: OnnxBundleShape::TokensBundle,
             deprecated: false,
         };
 
@@ -867,6 +1019,7 @@ mod tests {
             size_bytes: 16,
             sha256: hash.clone(),
             kind: crate::registry::OnnxModelKind::Parakeet,
+            bundle: OnnxBundleShape::TokensBundle,
             deprecated: false,
         };
 

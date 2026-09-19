@@ -344,6 +344,83 @@ pub fn emit_meeting_error(app: &AppHandle, message: &str) {
     );
 }
 
+/// Progress for one file-transcription job.
+///
+/// Keyed by `job_id`, not by path — the same reason `model:download:*` keys
+/// by `model_id`: two files dropped at once would otherwise interleave into
+/// one progress bar. Audio time, not wall time, so the bar is honest about
+/// how much of the recording is done rather than how fast the machine is.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct TranscribeFileProgressPayload {
+    pub job_id: String,
+    pub audio_ms_done: u64,
+    pub audio_ms_total: u64,
+    pub chunk_index: usize,
+    pub chunk_count: usize,
+}
+
+/// One cue, already rebased onto the source timeline.
+///
+/// Mirrors [`MeetingSegmentPayload`] so the page can stream text as it lands
+/// instead of waiting for the whole file — which for a 40-minute recording is
+/// the difference between a usable feature and a spinner.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct TranscribeFileSegmentPayload {
+    pub job_id: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct TranscribeFileCompletePayload {
+    pub job_id: String,
+    pub transcript_id: String,
+    /// True when the user stopped it. The partial transcript is kept and is
+    /// still exportable, so this is not an error.
+    pub cancelled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct TranscribeFileErrorPayload {
+    pub job_id: String,
+    pub message: String,
+}
+
+pub fn emit_transcribe_file_progress(app: &AppHandle, payload: &TranscribeFileProgressPayload) {
+    let _ = app.emit("transcribe:file:progress", payload.clone());
+}
+
+pub fn emit_transcribe_file_segment(app: &AppHandle, payload: &TranscribeFileSegmentPayload) {
+    let _ = app.emit("transcribe:file:segment", payload.clone());
+}
+
+pub fn emit_transcribe_file_complete(
+    app: &AppHandle,
+    job_id: &str,
+    transcript_id: &str,
+    cancelled: bool,
+) {
+    let _ = app.emit(
+        "transcribe:file:complete",
+        TranscribeFileCompletePayload {
+            job_id: job_id.to_string(),
+            transcript_id: transcript_id.to_string(),
+            cancelled,
+        },
+    );
+}
+
+pub fn emit_transcribe_file_error(app: &AppHandle, job_id: &str, message: &str) {
+    let _ = app.emit(
+        "transcribe:file:error",
+        TranscribeFileErrorPayload {
+            job_id: job_id.to_string(),
+            message: message.to_string(),
+        },
+    );
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct TtsStatePayload {
     pub state: String,
@@ -598,6 +675,64 @@ mod tests {
             json,
             r#"{"requested":"Yeti","using":"MacBook Air Microphone"}"#
         );
+    }
+
+    #[test]
+    fn transcribe_file_progress_payload_serializes() {
+        let json = serde_json::to_string(&TranscribeFileProgressPayload {
+            job_id: "job-1".into(),
+            audio_ms_done: 30_000,
+            audio_ms_total: 95_000,
+            chunk_index: 0,
+            chunk_count: 3,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"job_id":"job-1","audio_ms_done":30000,"audio_ms_total":95000,"chunk_index":0,"chunk_count":3}"#
+        );
+    }
+
+    #[test]
+    fn transcribe_file_segment_payload_serializes() {
+        let json = serde_json::to_string(&TranscribeFileSegmentPayload {
+            job_id: "job-1".into(),
+            start_ms: 30_200,
+            end_ms: 32_000,
+            text: "hello".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"job_id":"job-1","start_ms":30200,"end_ms":32000,"text":"hello"}"#
+        );
+    }
+
+    /// A cancel completes the job rather than failing it: the partial
+    /// transcript is intact and exportable, so the UI must be able to tell
+    /// the two apart from the payload alone.
+    #[test]
+    fn transcribe_file_complete_payload_carries_the_cancel_flag() {
+        let json = serde_json::to_string(&TranscribeFileCompletePayload {
+            job_id: "job-1".into(),
+            transcript_id: "t-1".into(),
+            cancelled: true,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"job_id":"job-1","transcript_id":"t-1","cancelled":true}"#
+        );
+    }
+
+    #[test]
+    fn transcribe_file_error_payload_serializes() {
+        let json = serde_json::to_string(&TranscribeFileErrorPayload {
+            job_id: "job-1".into(),
+            message: "no audio track".into(),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"job_id":"job-1","message":"no audio track"}"#);
     }
 
     #[test]

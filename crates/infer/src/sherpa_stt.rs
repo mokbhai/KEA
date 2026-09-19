@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 
 use crate::error::InferError;
-use crate::types::AudioPcm;
+#[cfg(feature = "sherpa")]
+use crate::types::{group_tokens_into_segments, TOKEN_GROUP_GAP_MS, TOKEN_GROUP_MAX_CUE_MS};
+use crate::types::{AudioPcm, SttResult};
 
 #[async_trait]
 pub trait SherpaSttInference: Send + Sync {
@@ -17,7 +19,7 @@ pub trait SherpaSttInference: Send + Sync {
     /// could only ever be accepted and dropped, which is what this signature
     /// used to do. A parameter that looks honoured all the way down from the
     /// STT setting is worse than one that was never plumbed.
-    async fn transcribe(&self, pcm: AudioPcm, model_dir: &Path) -> Result<String, InferError>;
+    async fn transcribe(&self, pcm: AudioPcm, model_dir: &Path) -> Result<SttResult, InferError>;
 }
 
 #[cfg(feature = "sherpa")]
@@ -72,7 +74,7 @@ fn find_first_existing(dir: &Path, names: &[&str]) -> Result<PathBuf, InferError
 #[cfg(feature = "sherpa")]
 #[async_trait]
 impl SherpaSttInference for SherpaOnnxSttInference {
-    async fn transcribe(&self, pcm: AudioPcm, model_dir: &Path) -> Result<String, InferError> {
+    async fn transcribe(&self, pcm: AudioPcm, model_dir: &Path) -> Result<SttResult, InferError> {
         let model_dir = model_dir.to_path_buf();
         let samples = pcm.samples;
         let sample_rate = pcm.sample_rate_hz;
@@ -108,7 +110,25 @@ impl SherpaSttInference for SherpaOnnxSttInference {
                 .get_result()
                 .ok_or_else(|| InferError::Other("sherpa parakeet returned no result".into()))?;
 
-            Ok(result.text)
+            // sherpa reports one timestamp per *token*, so these have to be
+            // grouped into cues before they are readable as subtitles — one
+            // cue per word is not a subtitle. A model or build that reports
+            // none leaves `segments` empty rather than inventing a span.
+            let segments = match result.timestamps.as_deref() {
+                Some(starts) => group_tokens_into_segments(
+                    &result.tokens,
+                    starts,
+                    result.durations.as_deref(),
+                    TOKEN_GROUP_GAP_MS,
+                    TOKEN_GROUP_MAX_CUE_MS,
+                ),
+                None => Vec::new(),
+            };
+
+            Ok(SttResult {
+                text: result.text,
+                segments,
+            })
         })
         .await
         .map_err(|e| InferError::Other(format!("sherpa stt task join failed: {e}")))?
@@ -123,8 +143,15 @@ mod tests {
 
     #[async_trait]
     impl SherpaSttInference for FakeSherpaSttInference {
-        async fn transcribe(&self, pcm: AudioPcm, _model_dir: &Path) -> Result<String, InferError> {
-            Ok(format!("parakeet: {} samples", pcm.samples.len()))
+        async fn transcribe(
+            &self,
+            pcm: AudioPcm,
+            _model_dir: &Path,
+        ) -> Result<SttResult, InferError> {
+            Ok(SttResult::text_only(format!(
+                "parakeet: {} samples",
+                pcm.samples.len()
+            )))
         }
     }
 
@@ -146,7 +173,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.contains("parakeet"));
-        assert!(out.contains("1600"));
+        assert!(out.text.contains("parakeet"));
+        assert!(out.text.contains("1600"));
     }
 }

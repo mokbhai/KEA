@@ -1,4 +1,7 @@
-use kea_core::dictation::{apply_vocabulary, hint_terms, DictationSettings};
+use kea_core::dictation::{
+    apply_vocabulary, apply_voice_commands, hint_terms, DictationSettings, VoiceCommandConfig,
+    VoiceCommandSettings,
+};
 use kea_core::resolve::SlotResolver;
 use kea_core::rewrite::{build_llm_request, RewriteInput};
 use kea_core::rewrite::{PresetRepo, PromptOverrideRepo, RewriteMode};
@@ -173,6 +176,51 @@ pub async fn run_dictation_with_opts(
     profile: &ProfileOverrides,
     opts: DictationRunOpts<'_>,
 ) -> Result<String, String> {
+    run_dictation_with_commands(
+        engines,
+        bindings,
+        actions,
+        presets,
+        overrides,
+        audio,
+        textio,
+        settings,
+        vocabulary,
+        profile,
+        opts,
+        &VoiceCommandSettings::default(),
+    )
+    .await
+}
+
+/// The full entry point: everything [`run_dictation_with_opts`] takes, plus
+/// the voice-command pass's two settings.
+///
+/// A separate argument rather than a field on [`DictationRunOpts`] only
+/// because the app layer builds that struct as an exhaustive literal, in a
+/// crate this one must not edit. Fold it in and delete this wrapper the moment
+/// `src-tauri` moves over.
+///
+/// It takes the raw `VoiceCommandSettings` rather than a resolved
+/// [`VoiceCommandConfig`] on purpose: the language gate needs the model the
+/// run actually bound, and that is not known until the slot has resolved, in
+/// here. Leaving the gate to the caller would give every caller a chance to
+/// get it wrong.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_dictation_with_commands(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    actions: &ActionRepo,
+    presets: &PresetRepo,
+    overrides: &PromptOverrideRepo,
+    audio: &mut dyn AudioIo,
+    textio: &dyn TextIo,
+    settings: &DictationSettings,
+    vocabulary: &[VocabularyEntry],
+    profile: &ProfileOverrides,
+    opts: DictationRunOpts<'_>,
+    voice_commands: &VoiceCommandSettings,
+) -> Result<String, String> {
     let _frame_rx = audio.start_mic().await.map_err(|e| e.to_string())?;
     let pcm = audio.stop_mic().await.map_err(|e| e.to_string())?;
 
@@ -196,8 +244,19 @@ pub async fn run_dictation_with_opts(
     // From here the ledger row exists, so every exit closes it.
     let guard = ActionGuard::new(actions, action_id, "dictation");
     let result = run_dictation_inner(
-        engines, &resolver, presets, overrides, textio, settings, vocabulary, profile, opts,
-        &binding, action_id, pcm,
+        engines,
+        &resolver,
+        presets,
+        overrides,
+        textio,
+        settings,
+        vocabulary,
+        profile,
+        opts,
+        voice_commands,
+        &binding,
+        action_id,
+        pcm,
     )
     .await;
     match result {
@@ -220,6 +279,7 @@ async fn run_dictation_inner(
     vocabulary: &[VocabularyEntry],
     profile: &ProfileOverrides,
     opts: DictationRunOpts<'_>,
+    voice_commands: &VoiceCommandSettings,
     binding: &Binding,
     action_id: i64,
     pcm: PcmFrame,
@@ -246,6 +306,17 @@ async fn run_dictation_inner(
         vocabulary: hint_terms(vocabulary),
     };
 
+    // Resolved here because the gate reads the model the slot actually bound,
+    // which the caller does not know. An un-set language plus a multilingual
+    // model resolves to off: the command table is English-only, and matching
+    // English phrases against a transcript the user asked to be decoded as
+    // German would corrupt it silently.
+    let commands = VoiceCommandConfig::resolve(
+        voice_commands,
+        settings.language.as_deref(),
+        stt_opts.model.as_deref(),
+    );
+
     // The second pass, and the only one whose output is ever inserted. Any
     // live partials the user watched came from a different decoder and are
     // discarded here.
@@ -263,7 +334,7 @@ async fn run_dictation_inner(
                         error = %message,
                         "dictation: the offline decode failed; inserting the live draft instead"
                     );
-                    Transcript { text: draft }
+                    Transcript::text_only(draft)
                 }
                 Some(draft) => {
                     tracing::warn!(
@@ -280,10 +351,42 @@ async fn run_dictation_inner(
         }
     };
 
+    // Three passes over the transcript, and the order is the part that is easy
+    // to get wrong on a later edit:
+    //
+    // 1. Voice commands first, because the vocabulary pass rewrites tokens and
+    //    could manufacture or destroy a command phrase. A vocabulary entry
+    //    whose `sounds_like` is "period" is perfectly legal and would
+    //    otherwise eat every full stop in the transcript.
+    // 2. Vocabulary second, because the punctuation the command pass inserts
+    //    changes word boundaries — and `apply_vocabulary`'s rule 4 is written
+    //    to match phrases across punctuation, so it is designed for punctuated
+    //    input.
+    // 3. The LLM refinement last, now seeing both correct proper nouns and
+    //    correct structure.
+    //
+    // Both of the first two are pure and infallible, so nothing here can leave
+    // the ledger row open; the `ActionGuard` in the caller stays the only
+    // thing that closes it.
+    let spoken = apply_voice_commands(&transcript.text, &commands);
+    if !spoken.applied.is_empty() {
+        tracing::info!(
+            action_id = %action_id,
+            commands = spoken.applied.len(),
+            ids = %spoken
+                .applied
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            "dictation: voice commands applied"
+        );
+    }
+
     // Before the refinement pass so the LLM sees correct proper nouns, and
     // before `transcript_text` is snapshotted below so History shows what was
     // actually inserted rather than what the decoder first guessed.
-    let mut final_text = apply_vocabulary(&transcript.text, vocabulary);
+    let mut final_text = apply_vocabulary(&spoken.text, vocabulary);
     tracing::info!(
         action_id = %action_id,
         engine = %engine_id,
@@ -535,9 +638,7 @@ mod tests {
             opts: SttOpts,
         ) -> Result<Transcript, EngineError> {
             *self.seen.lock().unwrap() = Some(opts);
-            Ok(Transcript {
-                text: self.text.clone(),
-            })
+            Ok(Transcript::text_only(self.text.clone()))
         }
     }
 
@@ -568,9 +669,7 @@ mod tests {
             _audio: AudioPcm,
             _opts: SttOpts,
         ) -> Result<Transcript, EngineError> {
-            Ok(Transcript {
-                text: self.text.clone(),
-            })
+            Ok(Transcript::text_only(self.text.clone()))
         }
     }
 
@@ -739,14 +838,12 @@ mod tests {
             if self.index == 0 {
                 return Err(EngineError::Other("nothing was ever fed".into()));
             }
-            Ok(Transcript {
-                text: self
-                    .script
+            Ok(Transcript::text_only(
+                self.script
                     .get(self.index.min(self.script.len()).saturating_sub(1))
                     .copied()
-                    .unwrap_or_default()
-                    .to_string(),
-            })
+                    .unwrap_or_default(),
+            ))
         }
     }
 
@@ -1097,6 +1194,172 @@ mod tests {
             Some("i pushed it to KittyClaw today"),
             "the corrected text is what reaches the app, not the raw transcript"
         );
+    }
+
+    /// A run with the voice-command pass on, which the app layer configures
+    /// with two standalone settings keys.
+    async fn run_with_commands(
+        transcript: &str,
+        vocabulary: &[VocabularyEntry],
+        language: Option<&str>,
+        voice: &VoiceCommandSettings,
+    ) -> String {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: transcript.into(),
+        }));
+        let textio = Arc::new(FakeTextIo::new());
+        let (bindings, actions, presets, overrides) = test_repos().await;
+        let settings = DictationSettings {
+            language: language.map(str::to_string),
+            ..test_settings()
+        };
+        let mut audio = FakeAudioIo::with_pcm(frame(1600));
+
+        let out = run_dictation_with_commands(
+            &reg,
+            &bindings,
+            &actions,
+            &presets,
+            &overrides,
+            &mut audio,
+            textio.as_ref(),
+            &settings,
+            vocabulary,
+            &ProfileOverrides::default(),
+            DictationRunOpts::default(),
+            voice,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            textio.inserted.lock().unwrap().as_deref(),
+            Some(out.as_str()),
+            "what is returned and what is typed must be the same text"
+        );
+        out
+    }
+
+    /// The commands-on settings the app layer would hand in: master switch on,
+    /// per-command defaults.
+    fn commands_on() -> VoiceCommandSettings {
+        VoiceCommandSettings {
+            enabled: true,
+            enabled_ids: None,
+        }
+    }
+
+    /// **The ordering, at the feature seam.** Commands run before vocabulary,
+    /// so a phrase the decoder misheard is still corrected *after* the full
+    /// stop has been taken out of the word stream.
+    #[tokio::test]
+    async fn voice_commands_compose_with_the_vocabulary_pass() {
+        let out = run_with_commands(
+            "kitty claw period",
+            &[vocab("KittyClaw", Some("kitty claw"), true)],
+            Some("en"),
+            &commands_on(),
+        )
+        .await;
+        assert_eq!(out, "KittyClaw.");
+    }
+
+    /// The row that actually pins the order rather than merely surviving it. A
+    /// vocabulary entry that *sounds like* a command word is perfectly legal,
+    /// and if the vocabulary pass ran first it would eat every full stop in
+    /// the transcript before the command pass ever saw one.
+    #[tokio::test]
+    async fn the_vocabulary_pass_cannot_eat_a_command_word() {
+        let out = run_with_commands(
+            "hello period",
+            &[vocab("Periodic", Some("period"), true)],
+            Some("en"),
+            &commands_on(),
+        )
+        .await;
+        assert_eq!(
+            out, "hello.",
+            "vocabulary first would have produced 'hello Periodic'"
+        );
+    }
+
+    /// The language gate, honestly. The command list is English-only, so a run
+    /// the user asked to decode as German gets its words left alone.
+    #[tokio::test]
+    async fn a_non_english_run_leaves_the_command_words_alone() {
+        let out = run_with_commands("hallo period", &[], Some("de"), &commands_on()).await;
+        assert_eq!(out, "hallo period");
+    }
+
+    /// And the master switch, which beats the language gate rather than
+    /// sitting beside it.
+    #[tokio::test]
+    async fn the_pass_does_nothing_until_it_is_switched_on() {
+        let out = run_with_commands(
+            "hello world period",
+            &[],
+            Some("en"),
+            &VoiceCommandSettings::default(),
+        )
+        .await;
+        assert_eq!(out, "hello world period");
+    }
+
+    /// Auto-detect resolves the gate from the bound model, which is only known
+    /// inside the run — so this is the test that fails if the gate is ever
+    /// moved out to the caller.
+    #[tokio::test]
+    async fn auto_detect_runs_the_pass_only_for_an_english_only_model() {
+        for (model, expected) in [
+            ("ggml-base.en", "hello world."),
+            ("ggml-large-v3", "hello world period"),
+        ] {
+            let mut reg = EngineRegistry::default();
+            reg.register_stt(Arc::new(FakeStt {
+                text: "hello world period".into(),
+            }));
+            let textio = Arc::new(FakeTextIo::new());
+            let (bindings, actions, presets, overrides) = test_repos().await;
+            let settings = DictationSettings {
+                active_model: Some(model.to_string()),
+                language: None,
+                ..test_settings()
+            };
+            let mut audio = FakeAudioIo::with_pcm(frame(1600));
+
+            let out = run_dictation_with_commands(
+                &reg,
+                &bindings,
+                &actions,
+                &presets,
+                &overrides,
+                &mut audio,
+                textio.as_ref(),
+                &settings,
+                &[],
+                &ProfileOverrides::default(),
+                DictationRunOpts::default(),
+                &commands_on(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(out, expected, "model {model}");
+        }
+    }
+
+    /// A retraction is a deletion, and the deletion has to reach the app — a
+    /// pass that only changes the returned string would type the words.
+    #[tokio::test]
+    async fn a_retraction_removes_text_before_it_is_typed() {
+        let out = run_with_commands(
+            "the meeting is monday scratch that tuesday",
+            &[],
+            Some("en-US"),
+            &commands_on(),
+        )
+        .await;
+        assert_eq!(out, "tuesday");
     }
 
     /// The hint layer. Only canonical spellings go to the engine, and only from

@@ -17,6 +17,17 @@ global-hotkey.workspace = true
 tracing.workspace = true
 cpal.workspace = true
 rodio.workspace = true
+# Audio-file decoding for the file-transcription feature.
+#
+# Direct, not through `rodio::Decoder`, which is only ever constructed for
+# playback here. rodio 0.19 pulls symphonia in with *only* `bundle-mp3`
+# enabled (Cargo.lock), so routing through it would decode WAV, FLAC, Ogg and
+# MP3 and reject exactly the containers this feature exists for: Voice Memos
+# and iPhone recordings are `.m4a`, meeting and screen recordings `.mp4`/
+# `.mov`. `all` turns on the ISO-MP4/CAF/MKV demuxers and the AAC/ALAC
+# decoders alongside them, and it is symphonia's own feature name rather than
+# a list that silently goes stale.
+symphonia = { version = "0.5", features = ["all"] }
 screencapturekit = { version = "7", optional = true, features = ["macos_13_0", "async"] }
 # Region captures are pictures of someone's screen. NamedTempFile/TempDir own
 # the file so Drop removes it on every path, including a panic, rather than

@@ -238,6 +238,80 @@ pub fn chunk_pcm_by_duration(frame: &PcmFrame, chunk_secs: u32) -> Vec<PcmFrame>
         .collect()
 }
 
+/// Where to cut a long buffer into chunks, avoiding mid-word boundaries.
+///
+/// `chunk_pcm_by_duration` splits on a hard sample count, which cuts through
+/// whatever was being said. For a live meeting nobody sees that; for a
+/// subtitle it is a word sliced in half across two cues. So near each target
+/// boundary this searches +/-`search_secs` for the quietest 20 ms frame and
+/// cuts there.
+///
+/// Deliberately no overlap between chunks. Overlapping windows mean the same
+/// words are decoded twice and the seams have to be de-duplicated in text,
+/// which is the approach that goes wrong — two decodes of the same audio
+/// rarely produce the same string, so there is nothing reliable to match on.
+///
+/// How much quieter than the hard boundary a candidate frame must be before
+/// the cut moves to it. Half the energy; see [`cut_points`] for why a bar
+/// exists at all.
+const QUIET_ENOUGH: f32 = 0.5;
+
+/// Returns interior cut indices only: neither `0` nor `samples.len()`, so the
+/// caller's chunk count is `cut_points(..).len() + 1`.
+pub fn cut_points(samples: &[f32], rate_hz: u32, target_secs: u32, search_secs: u32) -> Vec<usize> {
+    if rate_hz == 0 || target_secs == 0 || samples.is_empty() {
+        return Vec::new();
+    }
+    let target = rate_hz as usize * target_secs as usize;
+    if target == 0 || samples.len() <= target {
+        return Vec::new();
+    }
+    let search = rate_hz as usize * search_secs as usize;
+    // 20 ms, the shortest window whose RMS still means "quiet" rather than
+    // "happened to land between two glottal pulses".
+    let frame = (rate_hz as usize / 50).max(1);
+
+    let mut cuts = Vec::new();
+    let mut boundary = target;
+    while boundary < samples.len() {
+        let lo = boundary
+            .saturating_sub(search)
+            .max(cuts.last().copied().unwrap_or(0) + frame);
+        let hi = (boundary + search).min(samples.len().saturating_sub(frame));
+        let mut best = boundary.min(samples.len().saturating_sub(frame));
+        if lo < hi && best + frame <= samples.len() {
+            // The bar a candidate has to clear, not `f32::MAX`. Taking the
+            // window minimum outright is what the naive version does, and on
+            // continuous speech — where no frame is actually quiet — it picks
+            // whichever frame happened to be marginally softest, usually near
+            // the start of the search. Each cut then reseeds the next
+            // boundary from there, so the chunks march steadily shorter: a
+            // 30 s target produced 1 s chunks. A candidate must be
+            // meaningfully quieter than the hard boundary to move the cut at
+            // all; otherwise the boundary stands.
+            let mut best_rms = rms_level(&samples[best..best + frame]) * QUIET_ENOUGH;
+            let mut at = lo;
+            while at < hi {
+                let level = rms_level(&samples[at..at + frame]);
+                if level < best_rms {
+                    best_rms = level;
+                    best = at;
+                }
+                at += frame;
+            }
+        }
+        // Cut in the middle of the quiet frame, not at its leading edge:
+        // that keeps the trailing consonant with the chunk it belongs to.
+        let cut = (best + frame / 2).min(samples.len());
+        if cut <= cuts.last().copied().unwrap_or(0) || cut >= samples.len() {
+            break;
+        }
+        cuts.push(cut);
+        boundary = cut + target;
+    }
+    cuts
+}
+
 /// Concatenate frames assumed to share the same sample rate.
 pub fn accumulate_frames(frames: &[PcmFrame]) -> PcmFrame {
     if frames.is_empty() {
@@ -386,6 +460,74 @@ pub fn choose_input_device(devices: &[InputDevice], preferred: Option<&str>) -> 
 
 #[cfg(test)]
 mod tests {
+
+    /// The point of the search: land in the silence, not on the arithmetic
+    /// boundary that falls mid-word.
+    #[test]
+    fn cut_points_prefer_the_quiet_gap_near_the_boundary() {
+        let rate = 16_000u32;
+        // 6 s of tone with a 200 ms silence starting 0.5 s *after* the 3 s
+        // boundary, well inside the +/-2 s search window.
+        let mut samples = vec![0.0f32; rate as usize * 6];
+        for (i, s) in samples.iter_mut().enumerate() {
+            let t = i as f32 / rate as f32;
+            *s = (std::f32::consts::TAU * 200.0 * t).sin() * 0.5;
+        }
+        let gap_start = (rate as f32 * 3.5) as usize;
+        let gap_end = gap_start + (rate as usize) / 5;
+        for s in &mut samples[gap_start..gap_end] {
+            *s = 0.0;
+        }
+
+        let cuts = cut_points(&samples, rate, 3, 2);
+        assert_eq!(cuts.len(), 1, "{cuts:?}");
+        assert!(
+            cuts[0] >= gap_start && cuts[0] <= gap_end,
+            "cut at {} is outside the silence {gap_start}..{gap_end}",
+            cuts[0]
+        );
+    }
+
+    /// With no quiet anywhere, the hard boundary is still the answer — a
+    /// chunker that refused to cut a loud file would never chunk a podcast.
+    #[test]
+    fn a_uniformly_loud_buffer_still_cuts_near_the_target() {
+        let rate = 16_000u32;
+        let samples: Vec<f32> = (0..rate as usize * 6)
+            .map(|i| ((i % 37) as f32 / 37.0) - 0.5)
+            .collect();
+        let cuts = cut_points(&samples, rate, 3, 2);
+        assert_eq!(cuts.len(), 1);
+        let boundary = rate as i64 * 3;
+        assert!(
+            (cuts[0] as i64 - boundary).abs() <= rate as i64 * 2,
+            "cut {} strayed outside the search window around {boundary}",
+            cuts[0]
+        );
+    }
+
+    #[test]
+    fn a_buffer_shorter_than_one_chunk_is_never_cut() {
+        let samples = vec![0.1f32; 16_000];
+        assert!(cut_points(&samples, 16_000, 30, 2).is_empty());
+        assert!(cut_points(&[], 16_000, 30, 2).is_empty());
+        assert!(cut_points(&samples, 0, 30, 2).is_empty());
+        assert!(cut_points(&samples, 16_000, 0, 2).is_empty());
+    }
+
+    /// Cuts are interior and strictly increasing: anything else makes the
+    /// chunk driver produce an empty or a backwards chunk.
+    #[test]
+    fn cuts_are_interior_and_monotonic() {
+        let rate = 16_000u32;
+        let samples: Vec<f32> = (0..rate as usize * 95)
+            .map(|i| ((i % 101) as f32 / 101.0) - 0.5)
+            .collect();
+        let cuts = cut_points(&samples, rate, 30, 2);
+        assert!(cuts.len() >= 2, "{} cuts over 95s", cuts.len());
+        assert!(cuts.iter().all(|&c| c > 0 && c < samples.len()));
+        assert!(cuts.windows(2).all(|w| w[0] < w[1]));
+    }
     use super::*;
 
     fn frame(n: usize) -> PcmFrame {

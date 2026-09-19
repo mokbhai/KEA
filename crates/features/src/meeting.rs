@@ -608,9 +608,7 @@ mod tests {
             _audio: AudioPcm,
             _opts: SttOpts,
         ) -> Result<Transcript, EngineError> {
-            Ok(Transcript {
-                text: self.text.clone(),
-            })
+            Ok(Transcript::text_only(self.text.clone()))
         }
     }
 
@@ -642,7 +640,7 @@ mod tests {
                 .get(idx)
                 .cloned()
                 .unwrap_or_else(|| format!("segment-{idx}"));
-            Ok(Transcript { text })
+            Ok(Transcript::text_only(text))
         }
     }
 

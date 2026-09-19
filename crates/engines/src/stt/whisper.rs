@@ -6,6 +6,7 @@ use kea_infer::{
 };
 
 use crate::stt::audio::{resample_to_rate, STT_SAMPLE_RATE_HZ};
+use crate::stt::segments::from_infer;
 use crate::traits::{AudioPcm, EngineCaps, EngineError, SttEngine, SttOpts, Transcript};
 
 pub struct WhisperSttEngine {
@@ -61,13 +62,13 @@ impl SttEngine for WhisperSttEngine {
             vocabulary: opts.vocabulary,
         };
 
-        let text = self
+        let result = self
             .inference
             .transcribe(pcm, &model_path, whisper_opts)
             .await
             .map_err(|e| EngineError::Other(e.to_string()))?;
 
-        Ok(Transcript { text })
+        Ok(from_infer(result))
     }
 }
 
@@ -96,8 +97,17 @@ mod tests {
             pcm: InferAudioPcm,
             _model_path: &Path,
             _opts: WhisperOpts,
-        ) -> Result<String, kea_infer::InferError> {
-            Ok(format!("whisper heard {} samples", pcm.samples.len()))
+        ) -> Result<kea_infer::SttResult, kea_infer::InferError> {
+            Ok(kea_infer::SttResult {
+                text: format!("whisper heard {} samples", pcm.samples.len()),
+                // Centiseconds in whisper.cpp; this fake reports what the real
+                // conversion would already have produced, in milliseconds.
+                segments: vec![kea_infer::TimedSegment {
+                    start_ms: 0,
+                    end_ms: 1_230,
+                    text: format!("whisper heard {} samples", pcm.samples.len()),
+                }],
+            })
         }
     }
 
@@ -122,6 +132,10 @@ mod tests {
             .await
             .unwrap();
         assert!(out.text.contains("16000"));
+        // The seam this item exists for: timing reported by the inference
+        // layer has to survive the engine boundary.
+        assert_eq!(out.segments.len(), 1);
+        assert_eq!(out.segments[0].end_ms, 1_230);
     }
 
     /// A retired model is not offered, but a binding that already names one

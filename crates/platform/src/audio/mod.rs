@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod cues;
+pub mod decode;
 #[cfg(target_os = "macos")]
 pub mod loopback;
 #[cfg(target_os = "macos")]
@@ -18,9 +19,10 @@ pub mod stub;
 pub mod util;
 
 pub use cues::{cue_pcm, Cue};
+pub use decode::{decode_file, is_probably_decodable, DecodeError, DECODE_SAMPLE_RATE_HZ};
 pub use util::{
-    accumulate_frames, choose_input_device, chunk_pcm_by_duration, downmix_to_mono, mix_frames,
-    resample_linear, rms_level, DeviceChoice, FrameCounters, RingBuffer,
+    accumulate_frames, choose_input_device, chunk_pcm_by_duration, cut_points, downmix_to_mono,
+    mix_frames, resample_linear, rms_level, DeviceChoice, FrameCounters, RingBuffer,
 };
 
 /// Mono PCM samples at a specific sample rate (alias: capture buffer unit).

@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use kea_infer::{ModelRegistry, ModelStorage, SherpaSttInference};
 
 use crate::stt::audio::{resample_to_rate, STT_SAMPLE_RATE_HZ};
+use crate::stt::segments::from_infer;
 use crate::traits::{AudioPcm, EngineCaps, EngineError, SttEngine, SttOpts, Transcript};
 
 pub struct ParakeetSttEngine {
@@ -68,13 +69,13 @@ impl SttEngine for ParakeetSttEngine {
 
         // No language is passed on: the NeMo transducer behind this trait has
         // no language setting, so `opts.language` could only be dropped.
-        let text = self
+        let result = self
             .inference
             .transcribe(pcm, &model_dir)
             .await
             .map_err(|e| EngineError::Other(e.to_string()))?;
 
-        Ok(Transcript { text })
+        Ok(from_infer(result))
     }
 }
 
@@ -102,8 +103,11 @@ mod tests {
             &self,
             pcm: InferAudioPcm,
             _model_dir: &Path,
-        ) -> Result<String, kea_infer::InferError> {
-            Ok(format!("parakeet: {} samples", pcm.samples.len()))
+        ) -> Result<kea_infer::SttResult, kea_infer::InferError> {
+            Ok(kea_infer::SttResult::text_only(format!(
+                "parakeet: {} samples",
+                pcm.samples.len()
+            )))
         }
     }
 

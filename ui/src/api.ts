@@ -928,3 +928,117 @@ export type UpdateStatus = {
 };
 
 export const checkUpdate = () => invoke<UpdateStatus>("check_update");
+
+// ---------------------------------------------------------------------------
+// File transcription (drag-drop, SRT/VTT export)
+// ---------------------------------------------------------------------------
+
+export type TranscriptStatus = "running" | "completed" | "cancelled" | "error";
+
+export type TranscriptRow = {
+  id: string;
+  source_path: string;
+  source_filename: string;
+  duration_ms: number;
+  stt_engine_id: string | null;
+  model: string | null;
+  language: string | null;
+  status: TranscriptStatus;
+  error: string | null;
+  created_at: string;
+};
+
+export type TranscriptSegmentRow = {
+  id: number;
+  transcript_id: string;
+  sequence: number;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  /** Diarization label, or null when nothing was run. */
+  speaker_key: string | null;
+};
+
+export type TranscriptDetail = {
+  transcript: TranscriptRow;
+  segments: TranscriptSegmentRow[];
+};
+
+export type SubtitleFormat = "srt" | "vtt";
+
+export type TranscribeFileProgress = {
+  job_id: string;
+  audio_ms_done: number;
+  audio_ms_total: number;
+  chunk_index: number;
+  chunk_count: number;
+};
+
+export type TranscribeFileSegment = {
+  job_id: string;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+};
+
+export type TranscribeFileComplete = {
+  job_id: string;
+  transcript_id: string;
+  /** A stop, not a failure: the partial transcript is kept and exportable. */
+  cancelled: boolean;
+};
+
+export const transcribeFile = (path: string) =>
+  invoke<string>("transcribe_file", { path });
+
+export const cancelFileTranscription = () =>
+  invoke<void>("cancel_file_transcription");
+
+export const listTranscripts = () => invoke<TranscriptRow[]>("list_transcripts");
+
+export const getTranscript = (id: string) =>
+  invoke<TranscriptDetail>("get_transcript", { id });
+
+export const deleteTranscript = (id: string) =>
+  invoke<void>("delete_transcript", { id });
+
+export const renderTranscriptSubtitles = (id: string, format: SubtitleFormat) =>
+  invoke<string>("render_transcript_subtitles", { id, format });
+
+/** Returns where the file landed. `destination` omitted writes beside the source. */
+export const exportTranscript = (
+  id: string,
+  format: SubtitleFormat,
+  destination?: string,
+) => invoke<string>("export_transcript", { id, format, destination });
+
+export const onTranscribeFileProgress = (
+  handler: (p: TranscribeFileProgress) => void,
+): Promise<UnlistenFn> =>
+  listen<TranscribeFileProgress>("transcribe:file:progress", (event) =>
+    handler(event.payload),
+  );
+
+export const onTranscribeFileSegment = (
+  handler: (s: TranscribeFileSegment) => void,
+): Promise<UnlistenFn> =>
+  listen<TranscribeFileSegment>("transcribe:file:segment", (event) =>
+    handler(event.payload),
+  );
+
+export const onTranscribeFileComplete = (
+  handler: (c: TranscribeFileComplete) => void,
+): Promise<UnlistenFn> =>
+  listen<TranscribeFileComplete>("transcribe:file:complete", (event) =>
+    handler(event.payload),
+  );
+
+export const onTranscribeFileError = (
+  handler: (message: string) => void,
+): Promise<UnlistenFn> =>
+  listen<{ job_id: string; message: string }>("transcribe:file:error", (event) =>
+    handler(event.payload.message),
+  );
+
+/** Opens the system file picker; resolves to null when the user cancelled. */
+export const pickAudioFile = () => invoke<string | null>("pick_audio_file");

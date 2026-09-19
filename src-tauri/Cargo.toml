@@ -50,6 +50,11 @@ kea-infer = { path = "../crates/infer" }
 tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-notification = "2"
+# The "Choose file…" half of file transcription. Drag-and-drop alone is
+# unusable with a keyboard, and the same plugin covers "Save as…" for the
+# subtitle export. Its `dialog:default` permission is added to
+# capabilities/default.json alongside the others.
+tauri-plugin-dialog = "2"
 tauri-plugin-updater = { version = "2", optional = true }
 tokio.workspace = true
 serde.workspace = true

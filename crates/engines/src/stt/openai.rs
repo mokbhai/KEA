@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use crate::http::{Auth, HttpClient, MultipartPart};
 use crate::provider::{self, CredentialSource, Defaults, ProviderConfigSource, OPENAI_BASE_URL};
 use crate::stt::audio::pcm_to_wav_bytes;
+use crate::stt::segments::from_openai_verbose;
 use crate::traits::{AudioPcm, EngineCaps, EngineError, SttEngine, SttOpts, Transcript};
 
 const DEFAULT_MODEL: &str = "whisper-1";
@@ -62,6 +63,19 @@ impl SttEngine for OpenAiSttEngine {
                 content_type: None,
                 data: model.as_bytes().to_vec(),
             },
+            // Asks for per-segment timing, which the subtitle writers need.
+            // Sent unconditionally because the response is parsed
+            // defensively: an endpoint that ignores this field answers with
+            // the plain body it always did, and that still parses. Word-level
+            // granularity is deliberately not requested — subtitles do not
+            // need it and it is another field for a compatible endpoint to
+            // reject outright.
+            MultipartPart {
+                name: "response_format".into(),
+                filename: None,
+                content_type: None,
+                data: b"verbose_json".to_vec(),
+            },
         ];
         // The endpoint's `prompt` field biases decoding toward spellings it
         // would otherwise guess at. Sent only when there is something to say:
@@ -86,6 +100,7 @@ impl SttEngine for OpenAiSttEngine {
             .ok_or_else(|| EngineError::Other("missing text field".into()))?;
         Ok(Transcript {
             text: content.to_string(),
+            segments: from_openai_verbose(&parsed),
         })
     }
 }
@@ -183,6 +198,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.text, "dictated text");
+        // The bare body an OpenAI-compatible endpoint answers with: no
+        // timing, and emphatically not an error.
+        assert!(out.segments.is_empty());
+    }
+
+    /// The other half of the same contract: when the endpoint *does* honour
+    /// `verbose_json`, the timing has to land in the transcript.
+    #[tokio::test]
+    async fn verbose_json_segments_reach_the_transcript() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"text":"one two","segments":[{"start":0.0,"end":1.5,"text":" one"},{"start":1.5,"end":3.0,"text":" two"}]}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let configs = FakeConfigs::with_config(
+            "openai",
+            ProviderConfig {
+                base_url: format!("{}/v1", server.uri()),
+                default_model: "whisper-1".into(),
+            },
+        );
+        let engine = OpenAiSttEngine {
+            http: Arc::new(ReqwestHttpClient::new()),
+            credentials: FakeCredentials::with_key("openai", "sk-test"),
+            configs,
+            provider_ref: "openai".into(),
+        };
+        let out = engine
+            .transcribe(
+                AudioPcm {
+                    samples: vec![0.0; 1600],
+                    sample_rate_hz: 16_000,
+                },
+                SttOpts::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.text, "one two");
+        assert_eq!(out.segments.len(), 2);
+        assert_eq!(out.segments[0].end_ms, 1_500);
+        assert_eq!(out.segments[1].text, "two");
     }
 
     #[tokio::test]

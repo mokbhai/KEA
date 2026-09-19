@@ -25,7 +25,10 @@ import {
 } from "../api";
 import FeatureAiCard from "../components/FeatureAiCard";
 import FeatureBanner from "../components/FeatureBanner";
-import HotkeyRow, { formatAccelerator, KeyChips } from "../components/HotkeyRow";
+import HotkeyRow, {
+  formatAccelerator,
+  KeyChips,
+} from "../components/HotkeyRow";
 import LevelMeter from "../components/LevelMeter";
 import LoadingBlock from "../components/LoadingBlock";
 import { Row, RowGroup } from "../components/SettingsRow";
@@ -109,6 +112,143 @@ const persistLiveTranscript = (next: LiveTranscript) =>
     setSetting(STREAMING_FALLBACK_KEY, String(next.fallback)),
   ]);
 
+/**
+ * The voice-command pass's two keys, also plain key/value rows. They are
+ * deliberately not part of `DictationSettings`: that payload is written whole
+ * and a field added to it has to be added to every literal that builds it.
+ */
+const VOICE_COMMANDS_ENABLED_KEY = "dictation.voice_commands_enabled";
+const VOICE_COMMANDS_KEY = "dictation.voice_commands";
+
+type VoiceCommandFamily = "punctuation" | "structure" | "retraction";
+
+type VoiceCommandRow = {
+  /** Must match `CommandSpec::id` — it is what gets persisted. */
+  id: string;
+  say: string;
+  produces: string;
+  family: VoiceCommandFamily;
+};
+
+/**
+ * Mirrors `EN_COMMANDS` in crates/core/src/dictation/commands.rs, which is the
+ * only thing that actually matches phrases. The ids are the contract between
+ * the two; `the_command_ids_are_stable` over there pins them, and this table
+ * exists only so the page can say out loud what a command does. Keep them in
+ * step — a row here with no spec there is a promise nothing keeps.
+ */
+const VOICE_COMMANDS: VoiceCommandRow[] = [
+  { id: "period", say: "period", produces: ".", family: "punctuation" },
+  { id: "comma", say: "comma", produces: ",", family: "punctuation" },
+  {
+    id: "question_mark",
+    say: "question mark",
+    produces: "?",
+    family: "punctuation",
+  },
+  {
+    id: "exclamation",
+    say: "exclamation point",
+    produces: "!",
+    family: "punctuation",
+  },
+  { id: "colon", say: "colon", produces: ":", family: "punctuation" },
+  { id: "semicolon", say: "semicolon", produces: ";", family: "punctuation" },
+  {
+    id: "ellipsis",
+    say: "ellipsis",
+    produces: "…",
+    family: "punctuation",
+  },
+  {
+    id: "open_quote",
+    say: "open quote",
+    produces: "“",
+    family: "punctuation",
+  },
+  {
+    id: "close_quote",
+    say: "close quote",
+    produces: "”",
+    family: "punctuation",
+  },
+  { id: "hyphen", say: "hyphen", produces: "-", family: "punctuation" },
+  { id: "dash", say: "dash", produces: "—", family: "punctuation" },
+  {
+    id: "new_line",
+    say: "new line",
+    produces: "a line break",
+    family: "structure",
+  },
+  {
+    id: "new_paragraph",
+    say: "new paragraph",
+    produces: "a blank line",
+    family: "structure",
+  },
+  {
+    id: "scratch_that",
+    say: "scratch that",
+    produces: "deletes the sentence you just said",
+    family: "retraction",
+  },
+];
+
+/**
+ * Which families are on for someone who has never opened this table — the
+ * same split as `CommandFamily::default_enabled`.
+ *
+ * The structure commands are off because "new line" and "new paragraph" are
+ * ordinary English about text, and the people who dictate because typing is
+ * hard are the ones a wrong guess costs most.
+ */
+const DEFAULT_ON: Record<VoiceCommandFamily, boolean> = {
+  punctuation: true,
+  retraction: true,
+  structure: false,
+};
+
+const defaultCommandIds = () =>
+  VOICE_COMMANDS.filter((c) => DEFAULT_ON[c.family]).map((c) => c.id);
+
+/**
+ * The stored list, or the defaults when there is nothing stored.
+ *
+ * An empty *array* is a decision — every command off — and is kept. Only a
+ * missing or unreadable row falls back to the defaults, which is the same rule
+ * the Rust reader applies.
+ */
+const readCommandIds = (raw: string | null): string[] => {
+  if (raw === null || raw.trim() === "") return defaultCommandIds();
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((v): v is string => typeof v === "string")
+      : defaultCommandIds();
+  } catch {
+    return defaultCommandIds();
+  }
+};
+
+type VoiceCommands = {
+  enabled: boolean;
+  ids: string[];
+};
+
+/** Both keys together, so the stored state is never half a decision. */
+const persistVoiceCommands = (next: VoiceCommands) =>
+  Promise.all([
+    setSetting(VOICE_COMMANDS_ENABLED_KEY, String(next.enabled)),
+    setSetting(VOICE_COMMANDS_KEY, JSON.stringify(next.ids)),
+  ]);
+
+/**
+ * Mirrors `model_is_english_only` in commands.rs: whisper spells its
+ * English-only builds with a `.en` suffix and everything else in the catalog
+ * is multilingual.
+ */
+const ENGLISH_ONLY_MODEL = /[.-]en$/;
+
 const STATE_LABELS: Record<DictationState, string> = {
   idle: "Idle",
   listening: "Listening",
@@ -177,15 +317,28 @@ export default function DictationPage({ onNavigate }: Props) {
     initial: { model: STREAMING_OFF, showPartials: true, fallback: false },
     persist: persistLiveTranscript,
   });
-  const { model: streamingModel, showPartials, fallback: draftFallback } = live.value;
+  const {
+    model: streamingModel,
+    showPartials,
+    fallback: draftFallback,
+  } = live.value;
   const { setValue: setLiveValue } = live;
+  // Same shape again: two standalone keys saved together, no reread because
+  // nothing else writes them.
+  const voice = useOptimisticSetting<VoiceCommands>({
+    initial: { enabled: false, ids: defaultCommandIds() },
+    persist: persistVoiceCommands,
+  });
+  const { enabled: voiceOn, ids: voiceIds } = voice.value;
+  const { setValue: setVoiceValue } = voice;
   const ai = useFeatureAi(postProcess ? SLOTS_WITH_CLEANUP : SLOTS_PLAIN);
   const [settingsLoading, setSettingsLoading] = useState(true);
   const [liveLoading, setLiveLoading] = useState(true);
+  const [voiceLoading, setVoiceLoading] = useState(true);
   const [streamingModels, setStreamingModels] = useState<OnnxModel[]>([]);
-  const [streamingCatalogError, setStreamingCatalogError] = useState<string | null>(
-    null,
-  );
+  const [streamingCatalogError, setStreamingCatalogError] = useState<
+    string | null
+  >(null);
   const [dictationStatus, setDictationStatus] = useState<string | null>(null);
   const [transcript, setTranscript] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -203,13 +356,16 @@ export default function DictationPage({ onNavigate }: Props) {
   // What the backend will actually transcribe with: the speech-to-text slot's
   // effective binding, and the model it carries — or the saved fallback it
   // reads when the binding carries none (dictation.rs).
-  const stt = ai.statuses?.find((s) => s.spec.capability === "stt")?.effective ?? null;
+  const stt =
+    ai.statuses?.find((s) => s.spec.capability === "stt")?.effective ?? null;
   const sttCatalog =
-    stt && acceptsLanguage(stt.engine_id) ? engineSpec(stt.engine_id)?.catalog : undefined;
+    stt && acceptsLanguage(stt.engine_id)
+      ? engineSpec(stt.engine_id)?.catalog
+      : undefined;
   const sttModel = stt?.model ?? settings.value.active_model;
   // One flag for the page: a save and a run both lock the whole panel, as
   // they did when this was a single `busy`.
-  const anyBusy = busy || settings.busy || live.busy;
+  const anyBusy = busy || settings.busy || live.busy || voice.busy;
 
   useEffect(() => {
     getDictationSettings()
@@ -219,7 +375,9 @@ export default function DictationPage({ onNavigate }: Props) {
 
     getDictationStateApi()
       .then(setDictationState)
-      .catch(() => {}); /* best-effort — event subscription covers ongoing updates */
+      .catch(
+        () => {},
+      ); /* best-effort — event subscription covers ongoing updates */
 
     getEffectiveHotkey(DICTATION_FEATURE, DICTATION_COMMAND)
       .then((hk) => setAccelerator(hk ? hk.accelerator : null))
@@ -227,7 +385,9 @@ export default function DictationPage({ onNavigate }: Props) {
 
     listInputDevices()
       .then(setDevices)
-      .catch(() => setDevices([])); /* the dropdown falls back to the saved name */
+      .catch(() =>
+        setDevices([]),
+      ); /* the dropdown falls back to the saved name */
 
     // Each key degrades on its own, and a failed read means off rather than
     // broken: a model cleared by the Models page is stored as the JSON literal
@@ -247,6 +407,20 @@ export default function DictationPage({ onNavigate }: Props) {
         }),
       )
       .finally(() => setLiveLoading(false));
+
+    // Same degrade-to-off rule as the three keys above, and the same reason:
+    // a row this page cannot read is not a choice the user made.
+    Promise.all([
+      getSetting(VOICE_COMMANDS_ENABLED_KEY).catch(() => null),
+      getSetting(VOICE_COMMANDS_KEY).catch(() => null),
+    ])
+      .then(([enabled, ids]) =>
+        setVoiceValue({
+          enabled: readBool(enabled, false),
+          ids: readCommandIds(ids),
+        }),
+      )
+      .finally(() => setVoiceLoading(false));
 
     // Only the installed ones are offered: a model that is not on disk would
     // be a choice that silently does nothing, so the empty state sends the
@@ -286,7 +460,8 @@ export default function DictationPage({ onNavigate }: Props) {
   useEffect(() => {
     // Levels arrive from a recording and from the preview alike; a stale bar
     // left standing after either ends reads as a mic that never closed.
-    const metered = dictationState === "listening" || dictationState === "locked";
+    const metered =
+      dictationState === "listening" || dictationState === "locked";
     if (!metered && !previewing) setLevel(0);
   }, [dictationState, previewing]);
 
@@ -325,6 +500,24 @@ export default function DictationPage({ onNavigate }: Props) {
     acceptsLanguage(stt.engine_id) &&
     !!sttModel &&
     catalogLanguages.get(sttModel)?.toLowerCase() === MULTILINGUAL;
+
+  /**
+   * Whether the backend's language gate will actually let a command fire.
+   *
+   * The same rule `resolve_language` applies: an explicit English tag, or
+   * auto-detect plus an English-only build. Anything else is off, and the page
+   * says so rather than showing a table of commands that will never run —
+   * which is the same defect as a control that writes a setting nothing reads.
+   */
+  const commandsWillRun = language
+    ? language.toLowerCase().startsWith("en")
+    : !!sttModel && ENGLISH_ONLY_MODEL.test(sttModel.toLowerCase());
+
+  const toggleCommand = (id: string, next: boolean) =>
+    void voice.save(
+      { ids: next ? [...voiceIds, id] : voiceIds.filter((v) => v !== id) },
+      id,
+    );
 
   // A selected model is the whole on/off state of the feature, so the two
   // dependent rows follow it: showing them while nothing can produce a partial
@@ -377,7 +570,9 @@ export default function DictationPage({ onNavigate }: Props) {
     try {
       const text = await stopDictation();
       setTranscript(text || null);
-      setDictationStatus(text ? "Typed into the app you were last in." : "Nothing was heard.");
+      setDictationStatus(
+        text ? "Typed into the app you were last in." : "Nothing was heard.",
+      );
     } catch (e) {
       setDictationStatus(toMessage(e));
     } finally {
@@ -390,7 +585,8 @@ export default function DictationPage({ onNavigate }: Props) {
       <header>
         <h1 style={{ marginTop: 0 }}>Dictation</h1>
         <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
-          Hold the shortcut anywhere on your Mac, talk, and KEA types what you said.
+          Hold the shortcut anywhere on your Mac, talk, and KEA types what you
+          said.
         </p>
       </header>
 
@@ -424,7 +620,9 @@ export default function DictationPage({ onNavigate }: Props) {
                   show as the selection, or the dropdown would silently look
                   like the user had picked the default. */}
               {inputDevice && !devices.some((d) => d.id === inputDevice) && (
-                <option value={inputDevice}>{inputDevice} (not connected)</option>
+                <option value={inputDevice}>
+                  {inputDevice} (not connected)
+                </option>
               )}
             </select>
           </Row>
@@ -442,7 +640,13 @@ export default function DictationPage({ onNavigate }: Props) {
           </Row>
         </RowGroup>
         {fallbackNotice && (
-          <p style={{ marginTop: 8, fontSize: "0.8125rem", color: "var(--warn)" }}>
+          <p
+            style={{
+              marginTop: 8,
+              fontSize: "0.8125rem",
+              color: "var(--warn)",
+            }}
+          >
             {fallbackNotice}
           </p>
         )}
@@ -482,7 +686,9 @@ export default function DictationPage({ onNavigate }: Props) {
                       void settings.save(
                         {
                           language:
-                            e.target.value === AUTO_DETECT ? null : e.target.value,
+                            e.target.value === AUTO_DETECT
+                              ? null
+                              : e.target.value,
                         },
                         "language",
                       )
@@ -497,9 +703,10 @@ export default function DictationPage({ onNavigate }: Props) {
                     {/* A tag this build does not list — saved by a newer one,
                         or a full locale — still has to show as the selection,
                         or the dropdown would read as auto-detect. */}
-                    {language && !DICTATION_LANGUAGES.some((l) => l.tag === language) && (
-                      <option value={language}>{language}</option>
-                    )}
+                    {language &&
+                      !DICTATION_LANGUAGES.some((l) => l.tag === language) && (
+                        <option value={language}>{language}</option>
+                      )}
                   </select>
                 </Row>
               )}
@@ -515,7 +722,9 @@ export default function DictationPage({ onNavigate }: Props) {
                   label="Hold to talk"
                   checked={holdToTalk}
                   disabled={anyBusy}
-                  onChange={(next) => void settings.save({ hold_to_talk: next }, "hold_to_talk")}
+                  onChange={(next) =>
+                    void settings.save({ hold_to_talk: next }, "hold_to_talk")
+                  }
                 />
               </Row>
               <Row
@@ -529,7 +738,9 @@ export default function DictationPage({ onNavigate }: Props) {
                   label="Catch the first word"
                   checked={preroll}
                   disabled={anyBusy}
-                  onChange={(next) => void settings.save({ preroll: next }, "preroll")}
+                  onChange={(next) =>
+                    void settings.save({ preroll: next }, "preroll")
+                  }
                 />
               </Row>
               <Row
@@ -543,13 +754,139 @@ export default function DictationPage({ onNavigate }: Props) {
                   label="Clean up text with AI"
                   checked={postProcess}
                   disabled={anyBusy}
-                  onChange={(next) => void settings.save({ post_process: next }, "post_process")}
+                  onChange={(next) =>
+                    void settings.save({ post_process: next }, "post_process")
+                  }
                 />
               </Row>
             </RowGroup>
             {settings.error && (
-              <p style={{ marginTop: 8, fontSize: "0.8125rem", color: "var(--danger)" }}>
+              <p
+                style={{
+                  marginTop: 8,
+                  fontSize: "0.8125rem",
+                  color: "var(--danger)",
+                }}
+              >
                 {settings.error}
+              </p>
+            )}
+          </>
+        )}
+      </section>
+
+      <section style={{ marginBottom: 24 }}>
+        <h2 style={{ margin: "0 0 12px" }}>Voice commands</h2>
+        {voiceLoading ? (
+          <LoadingBlock label="Loading settings…" minHeight={44} />
+        ) : (
+          <>
+            <RowGroup aria-label="Voice commands">
+              <Row
+                label="Run spoken commands"
+                hint='Say "period" and get a full stop; say "scratch that" and the last sentence goes away. KEA only does this when the words stand on their own — "add a comma here" is typed exactly as you said it.'
+              >
+                {voice.savedKey === "enabled" && (
+                  <span className="kea-saved">Saved ✓</span>
+                )}
+                <Toggle
+                  label="Run spoken commands"
+                  checked={voiceOn}
+                  disabled={anyBusy}
+                  onChange={(next) =>
+                    void voice.save({ enabled: next }, "enabled")
+                  }
+                />
+              </Row>
+            </RowGroup>
+            {voiceOn && !commandsWillRun && (
+              <p
+                style={{
+                  marginTop: 8,
+                  fontSize: "0.8125rem",
+                  color: "var(--warn)",
+                }}
+              >
+                The command list is English only, so nothing will fire right
+                now. Set the dictation language to English above, or pick an
+                English-only speech model.
+              </p>
+            )}
+            {voiceOn && (
+              <div className="kea-card" style={{ marginTop: 12 }}>
+                <div className="kea-table-wrap">
+                  <table className="kea-table" aria-label="Spoken commands">
+                    <thead>
+                      <tr>
+                        <th scope="col">Say</th>
+                        <th scope="col">You get</th>
+                        <th scope="col">On</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {VOICE_COMMANDS.map((command) => (
+                        <tr key={command.id}>
+                          <th
+                            scope="row"
+                            style={{ fontWeight: 400, textAlign: "left" }}
+                          >
+                            &ldquo;{command.say}&rdquo;
+                          </th>
+                          <td style={{ whiteSpace: "pre-wrap" }}>
+                            {command.produces}
+                          </td>
+                          <td>
+                            <Toggle
+                              label={command.say}
+                              checked={voiceIds.includes(command.id)}
+                              disabled={anyBusy}
+                              onChange={(next) =>
+                                toggleCommand(command.id, next)
+                              }
+                            />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {/* Directly beneath the table on purpose: it is the only
+                    recourse when the rules get it wrong, and a recourse nobody
+                    can find is not one. */}
+                <p
+                  style={{
+                    marginTop: 12,
+                    marginBottom: 0,
+                    fontSize: "0.8125rem",
+                  }}
+                >
+                  To type one of these words instead of running it, say{" "}
+                  <strong>literally</strong> or <strong>the words</strong> first
+                  — &ldquo;literally period&rdquo; types <em>period</em>.
+                </p>
+                <p
+                  className="kea-muted"
+                  style={{
+                    marginTop: 8,
+                    marginBottom: 0,
+                    fontSize: "0.8125rem",
+                  }}
+                >
+                  A word straight after <em>a</em>, <em>the</em>, <em>for</em>,{" "}
+                  <em>say</em>, <em>type</em>, <em>write</em>, <em>insert</em>{" "}
+                  or <em>word</em> is always typed, not run.
+                </p>
+              </div>
+            )}
+            {voice.error && (
+              <p
+                style={{
+                  marginTop: 8,
+                  fontSize: "0.8125rem",
+                  color: "var(--danger)",
+                }}
+              >
+                {voice.error}
               </p>
             )}
           </>
@@ -572,7 +909,9 @@ export default function DictationPage({ onNavigate }: Props) {
                     Couldn&apos;t check which previews are downloaded.
                   </span>
                 ) : noStreamingChoice ? (
-                  <span className="kea-muted">No preview model is downloaded yet.</span>
+                  <span className="kea-muted">
+                    No preview model is downloaded yet.
+                  </span>
                 ) : (
                   <>
                     {live.savedKey === "model" && (
@@ -583,7 +922,9 @@ export default function DictationPage({ onNavigate }: Props) {
                       aria-label="Live preview model"
                       value={streamingModel}
                       disabled={anyBusy}
-                      onChange={(e) => void live.save({ model: e.target.value }, "model")}
+                      onChange={(e) =>
+                        void live.save({ model: e.target.value }, "model")
+                      }
                     >
                       <option value={STREAMING_OFF}>Off</option>
                       {streamingModels.map((model) => (
@@ -595,7 +936,9 @@ export default function DictationPage({ onNavigate }: Props) {
                           show as the selection, or the dropdown would read as
                           Off while the setting says otherwise. */}
                       {streamingOn &&
-                        !streamingModels.some((m) => m.id === streamingModel) && (
+                        !streamingModels.some(
+                          (m) => m.id === streamingModel,
+                        ) && (
                           <option value={streamingModel}>
                             {streamingModel} (not downloaded)
                           </option>
@@ -647,14 +990,22 @@ export default function DictationPage({ onNavigate }: Props) {
                       label="Type the preview if the second pass fails"
                       checked={draftFallback}
                       disabled={anyBusy}
-                      onChange={(next) => void live.save({ fallback: next }, "fallback")}
+                      onChange={(next) =>
+                        void live.save({ fallback: next }, "fallback")
+                      }
                     />
                   </Row>
                 </>
               )}
             </RowGroup>
             {(streamingCatalogError || live.error) && (
-              <p style={{ marginTop: 8, fontSize: "0.8125rem", color: "var(--danger)" }}>
+              <p
+                style={{
+                  marginTop: 8,
+                  fontSize: "0.8125rem",
+                  color: "var(--danger)",
+                }}
+              >
                 {streamingCatalogError ?? live.error}
               </p>
             )}
@@ -670,17 +1021,21 @@ export default function DictationPage({ onNavigate }: Props) {
           <p style={{ marginTop: 0 }}>
             {accelerator ? (
               <>
-                Hold <strong>{formatAccelerator(accelerator)}</strong> and say something —
-                or use the buttons below.
+                Hold <strong>{formatAccelerator(accelerator)}</strong> and say
+                something — or use the buttons below.
               </>
             ) : (
               "Start listening, say something, then stop."
             )}
           </p>
           {holdToTalk && (
-            <p className="kea-muted" style={{ marginTop: 0, fontSize: "0.8125rem" }}>
-              Tap <KeyChips accelerator="Option+Shift" /> twice to keep recording
-              hands-free. Tap again to finish, or press Esc to throw it away.
+            <p
+              className="kea-muted"
+              style={{ marginTop: 0, fontSize: "0.8125rem" }}
+            >
+              Tap <KeyChips accelerator="Option+Shift" /> twice to keep
+              recording hands-free. Tap again to finish, or press Esc to throw
+              it away.
             </p>
           )}
           <div

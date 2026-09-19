@@ -229,7 +229,9 @@ impl SttStream for SherpaSttStream {
         // already queued are still delivered first.
         drop(this.audio_tx);
         match this.final_rx.await {
-            Ok(Ok(text)) => Ok(Transcript { text }),
+            // No timing: a streaming decode is display-only and the offline
+            // pass is what produces the text that is inserted.
+            Ok(Ok(text)) => Ok(Transcript::text_only(text)),
             Ok(Err(e)) => Err(EngineError::Other(e)),
             // The blocking task panicked. Display-only work must never take
             // the dictation run down with it.

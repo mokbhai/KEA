@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use crate::registry::{OnnxBundleShape, OnnxModelEntry};
+
 /// Rejects ids that could escape the storage root: `root.join(id)` replaces
 /// the root entirely for absolute paths and `..`/separators walk out of it.
 fn validate_removable_id(model_id: &str) -> std::io::Result<()> {
@@ -67,9 +69,29 @@ impl ModelStorage {
         self.root.join(model_id)
     }
 
+    /// Whether a `tokens.txt`-rooted bundle is installed.
+    ///
+    /// Kept for the callers that only have an id — every STT and TTS bundle
+    /// in the tree is this shape. Anything that has the catalog entry in hand
+    /// should use [`ModelStorage::is_onnx_entry_installed`] instead, which
+    /// asks the entry's own shape.
     pub fn is_onnx_installed(&self, model_id: &str) -> bool {
+        self.is_onnx_bundle_installed(model_id, &OnnxBundleShape::TokensBundle)
+    }
+
+    /// Whether the asset this catalog entry describes is on disk.
+    ///
+    /// Dispatches through the entry's [`OnnxBundleShape`], which is the same
+    /// value the installer dispatched on — so a model that installs correctly
+    /// cannot then report itself missing forever, which is exactly what a
+    /// second hardcoded `tokens.txt` check here would have caused.
+    pub fn is_onnx_entry_installed(&self, entry: &OnnxModelEntry) -> bool {
+        self.is_onnx_bundle_installed(&entry.id, &entry.bundle)
+    }
+
+    pub fn is_onnx_bundle_installed(&self, model_id: &str, shape: &OnnxBundleShape) -> bool {
         let dir = self.onnx_dir_for(model_id);
-        dir.is_dir() && dir.join("tokens.txt").is_file()
+        dir.is_dir() && dir.join(shape.marker()).is_file()
     }
 
     /// Remove an installed whisper model file. Removing a model that is not
@@ -106,6 +128,12 @@ impl ModelStorage {
     /// apart inside one directory.
     pub fn default_streaming_root(app_data: &Path) -> PathBuf {
         app_data.join("models").join("streaming")
+    }
+
+    /// See [`ModelStorage::default_streaming_root`] for why every kind gets
+    /// its own root.
+    pub fn default_diarization_root(app_data: &Path) -> PathBuf {
+        app_data.join("models").join("diarization")
     }
 }
 
@@ -153,8 +181,10 @@ mod tests {
             ModelStorage::default_parakeet_root(app_data),
             ModelStorage::default_tts_root(app_data),
             ModelStorage::default_streaming_root(app_data),
+            ModelStorage::default_diarization_root(app_data),
         ];
         assert!(roots[3].ends_with("models/streaming"));
+        assert!(roots[4].ends_with("models/diarization"));
         let unique: std::collections::HashSet<_> = roots.iter().collect();
         assert_eq!(unique.len(), roots.len());
     }

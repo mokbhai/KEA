@@ -4,6 +4,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::InferError;
 
+/// The segmentation half of the diarization pair, by catalog id.
+///
+/// Named constants rather than string literals at each site: the runtime
+/// resolves both models by id, and a typo would surface as "model not
+/// installed" for a model the user had just downloaded.
+pub const DIARIZATION_SEGMENTATION_ID: &str = "pyannote-segmentation-3-0";
+
+/// The embedding half of the diarization pair, by catalog id.
+pub const DIARIZATION_EMBEDDING_ID: &str = "campplus-sv-en-voxceleb-16k";
+
 /// The model families the app can install.
 ///
 /// The variant names are also the wire strings: the UI already sends
@@ -24,6 +34,16 @@ pub enum ModelKind {
     /// binds to it, which is what [`ModelKind::default_slot`] answers `None`
     /// for.
     Streaming,
+    /// Speaker diarization: a pyannote segmentation model *and* a speaker
+    /// embedding model, which are two catalog rows rather than one.
+    ///
+    /// The first family whose members do not share a bundle shape — the
+    /// segmentation model ships as a `.tar.bz2`, the embedding model as a
+    /// bare `.onnx` — which is why [`OnnxModelEntry::bundle`] exists. It is
+    /// still one kind: one storage root, one download-key namespace, one
+    /// section in the picker. Nothing binds to it (see
+    /// [`ModelKind::default_slot`]); the mode is a setting.
+    Diarization,
 }
 
 impl ModelKind {
@@ -33,6 +53,7 @@ impl ModelKind {
             ModelKind::Parakeet => "parakeet",
             ModelKind::Tts => "tts",
             ModelKind::Streaming => "streaming",
+            ModelKind::Diarization => "diarization",
         }
     }
 
@@ -49,7 +70,10 @@ impl ModelKind {
         match self {
             ModelKind::Whisper | ModelKind::Parakeet => Some("stt"),
             ModelKind::Tts => Some("tts"),
-            ModelKind::Streaming => None,
+            // Neither is bound: the streaming model is chosen by a setting,
+            // and diarization is a mode (`meetings.diarization`) rather than
+            // a capability anything resolves through.
+            ModelKind::Streaming | ModelKind::Diarization => None,
         }
     }
 
@@ -61,6 +85,11 @@ impl ModelKind {
             ModelKind::Parakeet => Some(OnnxModelKind::Parakeet),
             ModelKind::Tts => Some(OnnxModelKind::TtsVits),
             ModelKind::Streaming => Some(OnnxModelKind::StreamingZipformer),
+            // Both diarization assets are authored with their own
+            // `onnx_kind`, because a segmentation model and an embedding
+            // model load through different sherpa configs. The family default
+            // is the segmentation one.
+            ModelKind::Diarization => Some(OnnxModelKind::SpeakerSegmentation),
         }
     }
 
@@ -84,6 +113,7 @@ impl FromStr for ModelKind {
             "parakeet" => Ok(ModelKind::Parakeet),
             "tts" => Ok(ModelKind::Tts),
             "streaming" => Ok(ModelKind::Streaming),
+            "diarization" => Ok(ModelKind::Diarization),
             other => Err(InferError::UnknownModelKind(other.to_string())),
         }
     }
@@ -129,6 +159,10 @@ pub struct ModelEntry {
     /// storage root and the download-key namespace.
     #[serde(default)]
     pub onnx_kind: Option<OnnxModelKind>,
+    /// How this asset is packaged, when it is not the default `.tar.bz2`
+    /// rooted at a `tokens.txt`. See [`OnnxBundleShape`].
+    #[serde(default)]
+    pub bundle: OnnxBundleShape,
     /// Still resolvable, no longer offered.
     ///
     /// Dropping a catalog row outright is not retirement: `find` is what
@@ -166,6 +200,7 @@ impl ModelEntry {
             size_bytes: self.size_bytes,
             sha256: self.sha256,
             kind,
+            bundle: self.bundle,
             deprecated: self.deprecated,
         })
     }
@@ -186,6 +221,56 @@ pub enum OnnxModelKind {
     TtsVits,
     TtsKokoro,
     TtsKitten,
+    /// pyannote segmentation, loaded through
+    /// `OfflineSpeakerSegmentationModelConfig`.
+    SpeakerSegmentation,
+    /// A speaker-embedding extractor, loaded through
+    /// `SpeakerEmbeddingExtractorConfig`.
+    SpeakerEmbedding,
+}
+
+/// How an ONNX asset arrives, and therefore how it is installed and how its
+/// presence on disk is detected.
+///
+/// The shape used to be implicit — every ONNX entry was a `.tar.bz2` whose
+/// root was found by looking for `tokens.txt` — and that assumption is what
+/// made the diarization models uninstallable: a segmentation bundle has no
+/// vocabulary file and can never have one, and an embedding model is not an
+/// archive at all. Making the shape data rather than a hardcoded rule is what
+/// lets the installer dispatch instead of growing a special case per model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnnxBundleShape {
+    /// A `.tar.bz2` rooted at the directory containing `tokens.txt` — every
+    /// entry that existed before this enum did, which is why it is the
+    /// `#[serde(default)]` and keeps those entries byte-identical.
+    #[default]
+    TokensBundle,
+    /// A `.tar.bz2` rooted at the directory containing `marker`.
+    ArchiveWithMarker { marker: String },
+    /// A bare `.onnx` file, no archive. Installed by moving the verified
+    /// download into the model directory under `filename`.
+    SingleFile { filename: String },
+}
+
+impl OnnxBundleShape {
+    /// The file whose presence in the model directory means "installed".
+    ///
+    /// One function for install detection and for bundle-root detection, so
+    /// the two cannot disagree — a model that installs correctly and then
+    /// reports itself missing forever is the failure that pairing avoids.
+    pub fn marker(&self) -> &str {
+        match self {
+            OnnxBundleShape::TokensBundle => "tokens.txt",
+            OnnxBundleShape::ArchiveWithMarker { marker } => marker,
+            OnnxBundleShape::SingleFile { filename } => filename,
+        }
+    }
+
+    /// Whether this asset arrives as an archive that has to be unpacked.
+    pub fn is_archive(&self) -> bool {
+        !matches!(self, OnnxBundleShape::SingleFile { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +283,9 @@ pub struct OnnxModelEntry {
     pub size_bytes: u64,
     pub sha256: String,
     pub kind: OnnxModelKind,
+    /// How this asset is packaged. See [`OnnxBundleShape`].
+    #[serde(default)]
+    pub bundle: OnnxBundleShape,
     /// See [`ModelEntry::deprecated`].
     #[serde(default)]
     pub deprecated: bool,
@@ -298,6 +386,7 @@ impl ModelRegistry {
             ModelKind::Parakeet => Self::parakeet_entries(),
             ModelKind::Tts => Self::tts_entries(),
             ModelKind::Streaming => Self::streaming_entries(),
+            ModelKind::Diarization => Self::diarization_entries(),
         }
     }
 
@@ -416,6 +505,7 @@ impl ModelRegistry {
                 sha256: "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002".into(),
                 kind: ModelKind::Whisper,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -428,6 +518,7 @@ impl ModelRegistry {
                 sha256: "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d".into(),
                 kind: ModelKind::Whisper,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -440,6 +531,7 @@ impl ModelRegistry {
                 sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2".into(),
                 kind: ModelKind::Whisper,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -452,6 +544,7 @@ impl ModelRegistry {
                 sha256: "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1".into(),
                 kind: ModelKind::Whisper,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             // Retired, not removed: 1.5 GB for a worse result than the 574 MB
@@ -468,6 +561,7 @@ impl ModelRegistry {
                 sha256: "cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356".into(),
                 kind: ModelKind::Whisper,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: true,
             },
         ]
@@ -486,6 +580,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Parakeet,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -499,6 +594,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Parakeet,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
         ]
@@ -522,8 +618,61 @@ impl ModelRegistry {
                 .into(),
             kind: ModelKind::Streaming,
             onnx_kind: None,
+            bundle: OnnxBundleShape::TokensBundle,
             deprecated: false,
         }]
+    }
+
+    /// The two assets speaker diarization needs. Both, or neither is usable:
+    /// segmentation finds the turns and the embedding model tells the turns
+    /// apart, and sherpa's `OfflineSpeakerDiarizationConfig` takes both paths.
+    ///
+    /// Written as two rows rather than one because they are genuinely two
+    /// downloads of two different shapes — the whole reason
+    /// [`OnnxBundleShape`] exists. See [`super::DIARIZATION_SEGMENTATION_ID`]
+    /// and [`super::DIARIZATION_EMBEDDING_ID`] for the ids the runtime
+    /// resolves them by.
+    fn diarization_entries() -> Vec<ModelEntry> {
+        vec![
+            ModelEntry {
+                id: DIARIZATION_SEGMENTATION_ID.into(),
+                display_name: "Pyannote Segmentation 3.0 (speaker turns)".into(),
+                language: "multilingual".into(),
+                url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+                    .into(),
+                size_bytes: 6_958_444,
+                sha256: "24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488"
+                    .into(),
+                kind: ModelKind::Diarization,
+                onnx_kind: Some(OnnxModelKind::SpeakerSegmentation),
+                // An archive, but with no `tokens.txt` anywhere in it and no
+                // way to have one: a segmentation model emits frames, not
+                // tokens, so there is no vocabulary to ship. The bundle root
+                // is found by its weights file instead.
+                bundle: OnnxBundleShape::ArchiveWithMarker {
+                    marker: "model.onnx".into(),
+                },
+                deprecated: false,
+            },
+            ModelEntry {
+                id: DIARIZATION_EMBEDDING_ID.into(),
+                display_name: "3D-Speaker CAM++ (speaker embeddings)".into(),
+                language: "multilingual".into(),
+                url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx"
+                    .into(),
+                size_bytes: 29_596_978,
+                sha256: "357a834f702b80161e5b981182c038e18553c1f2ca752ed6cec2052365d4129b"
+                    .into(),
+                kind: ModelKind::Diarization,
+                onnx_kind: Some(OnnxModelKind::SpeakerEmbedding),
+                // Not an archive at all: the k2-fsa speaker-recognition
+                // release publishes bare `.onnx` files.
+                bundle: OnnxBundleShape::SingleFile {
+                    filename: "model.onnx".into(),
+                },
+                deprecated: false,
+            },
+        ]
     }
 
     fn tts_entries() -> Vec<ModelEntry> {
@@ -543,6 +692,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Tts,
                 onnx_kind: Some(OnnxModelKind::TtsKitten),
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             // The int8 builds, not the fp32 ones: 103 MB against 320 MB and
@@ -559,6 +709,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Tts,
                 onnx_kind: Some(OnnxModelKind::TtsKokoro),
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -572,6 +723,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Tts,
                 onnx_kind: Some(OnnxModelKind::TtsKokoro),
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -585,6 +737,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Tts,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -598,6 +751,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Tts,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -611,6 +765,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Tts,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -624,6 +779,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Tts,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -637,6 +793,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Tts,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -650,6 +807,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Tts,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -663,6 +821,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Tts,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -676,6 +835,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Tts,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -689,6 +849,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Tts,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -702,6 +863,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Tts,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
             ModelEntry {
@@ -715,6 +877,7 @@ impl ModelRegistry {
                     .into(),
                 kind: ModelKind::Tts,
                 onnx_kind: None,
+                bundle: OnnxBundleShape::TokensBundle,
                 deprecated: false,
             },
         ]
@@ -1110,5 +1273,76 @@ mod tests {
         for entry in ModelRegistry::tts_catalog() {
             assert_eq!(ModelRegistry::find_tts(&entry.id), Some(entry));
         }
+    }
+    /// The point of `OnnxBundleShape`: one family, two assets, two shapes.
+    /// Written as a test because the failure mode is an install that
+    /// "succeeds" and then reports the model missing forever.
+    #[test]
+    fn the_diarization_pair_declares_two_different_shapes() {
+        let catalog = ModelRegistry::onnx_catalog(ModelKind::Diarization).unwrap();
+        assert_eq!(catalog.len(), 2, "{catalog:?}");
+
+        let segmentation = catalog
+            .iter()
+            .find(|e| e.id == DIARIZATION_SEGMENTATION_ID)
+            .expect("segmentation entry");
+        assert_eq!(segmentation.kind, OnnxModelKind::SpeakerSegmentation);
+        assert!(segmentation.url.ends_with(".tar.bz2"));
+        assert!(segmentation.bundle.is_archive());
+        assert_eq!(segmentation.bundle.marker(), "model.onnx");
+        assert_eq!(segmentation.size_bytes, 6_958_444);
+
+        let embedding = catalog
+            .iter()
+            .find(|e| e.id == DIARIZATION_EMBEDDING_ID)
+            .expect("embedding entry");
+        assert_eq!(embedding.kind, OnnxModelKind::SpeakerEmbedding);
+        assert!(
+            embedding.url.ends_with(".onnx"),
+            "a bare file, not an archive"
+        );
+        assert!(!embedding.bundle.is_archive());
+        assert_eq!(embedding.size_bytes, 29_596_978);
+    }
+
+    /// Every existing entry must keep the shape it had before the enum
+    /// existed, or a released model becomes uninstallable on upgrade.
+    #[test]
+    fn every_non_diarization_entry_is_still_a_tokens_bundle() {
+        for kind in [ModelKind::Parakeet, ModelKind::Tts, ModelKind::Streaming] {
+            for entry in ModelRegistry::onnx_catalog(kind).unwrap() {
+                assert_eq!(
+                    entry.bundle,
+                    OnnxBundleShape::TokensBundle,
+                    "{} changed shape",
+                    entry.id
+                );
+            }
+        }
+    }
+
+    /// The download key namespaces every kind, including the new one — start
+    /// and cancel derive it from the same place or a cancel silently misses.
+    #[test]
+    fn diarization_downloads_get_their_own_cancel_key() {
+        assert_eq!(
+            ModelKind::Diarization.download_key("x"),
+            "onnx:diarization:x"
+        );
+        assert_eq!(
+            ModelKind::try_from("diarization").unwrap(),
+            ModelKind::Diarization
+        );
+        assert_eq!(ModelKind::Diarization.default_slot(), None);
+    }
+
+    /// A shape written before the enum existed deserializes to the default,
+    /// which is what keeps stored/serialized entries readable.
+    #[test]
+    fn an_entry_without_a_bundle_field_reads_as_a_tokens_bundle() {
+        let json = r#"{"id":"x","display_name":"X","language":"en-US","url":"u",
+            "size_bytes":1,"sha256":"h","kind":"Parakeet"}"#;
+        let entry: OnnxModelEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.bundle, OnnxBundleShape::TokensBundle);
     }
 }

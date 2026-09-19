@@ -1,3 +1,4 @@
+use super::tokens::{match_at, tokenize, word_tokens};
 use crate::store::vocabulary::VocabularyEntry;
 
 /// Rewrites known misrecognitions in a transcript back to their stored
@@ -137,75 +138,6 @@ fn build_patterns(entries: &[VocabularyEntry]) -> Vec<Pattern> {
 
 fn pattern_len(p: &Pattern) -> usize {
     p.words.iter().map(String::len).sum()
-}
-
-/// Tries `words` against the token stream starting at `start`. Returns the
-/// index of the last token consumed, which is always a word token — so the
-/// replaced span never swallows trailing punctuation.
-fn match_at(tokens: &[Token], start: usize, words: &[String], text: &str) -> Option<usize> {
-    let mut idx = start;
-    for (n, word) in words.iter().enumerate() {
-        if n > 0 {
-            // Rule 4: exactly one separator run sits between any two word
-            // tokens, and any of it may be skipped — except a line break.
-            // Crossing one would let a phrase match across a paragraph gap,
-            // where two adjacent words are almost certainly unrelated.
-            let gap = tokens.get(idx)?;
-            if gap.is_word || text[gap.start..gap.end].contains(['\n', '\r']) {
-                return None;
-            }
-            idx += 1;
-        }
-        let token = tokens.get(idx)?;
-        if !token.is_word || token.lower != *word {
-            return None;
-        }
-        if n + 1 < words.len() {
-            idx += 1;
-        }
-    }
-    Some(idx)
-}
-
-struct Token {
-    start: usize,
-    end: usize,
-    is_word: bool,
-    /// Lowercased slice, for word tokens only; empty for separators.
-    lower: String,
-}
-
-/// Splits into alternating runs of alphanumeric and non-alphanumeric
-/// characters. `char::is_alphanumeric` is Unicode-aware, which is what gives
-/// rule 2 its word boundaries for free at either end of the string — a run is
-/// maximal, so a single-word pattern can only ever match a whole word.
-fn tokenize(text: &str) -> Vec<Token> {
-    let mut tokens: Vec<Token> = Vec::new();
-    for (i, ch) in text.char_indices() {
-        let is_word = ch.is_alphanumeric();
-        let end = i + ch.len_utf8();
-        match tokens.last_mut() {
-            Some(last) if last.is_word == is_word => last.end = end,
-            _ => tokens.push(Token {
-                start: i,
-                end,
-                is_word,
-                lower: String::new(),
-            }),
-        }
-    }
-    for token in tokens.iter_mut().filter(|t| t.is_word) {
-        token.lower = text[token.start..token.end].to_lowercase();
-    }
-    tokens
-}
-
-fn word_tokens(spelling: &str) -> Vec<String> {
-    tokenize(spelling)
-        .into_iter()
-        .filter(|t| t.is_word)
-        .map(|t| t.lower)
-        .collect()
 }
 
 #[cfg(test)]

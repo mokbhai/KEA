@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Core IPC for KEA's windows. Without a capability file at all, Tauri v2 resolves an empty ACL and rejects every `plugin:` command — which silently killed `listen()`, so no dictation, meeting or download event ever reached the frontend. KEA's own #[tauri::command]s are not ACL-gated (no app manifest), which is why the rest of the UI worked.",
+  "description": "Core IPC for KEA's windows. Without a capability file at all, Tauri v2 resolves an empty ACL and rejects every `plugin:` command — which silently killed `listen()`, so no dictation, meeting or download event ever reached the frontend. KEA's own #[tauri::command]s are not ACL-gated (no app manifest), which is why the rest of the UI worked. Drag-and-drop needs nothing added: the payload arrives on the webview's own `tauri://drag-drop` event, which `core:default` already covers — but note the corollary, that with Tauri v2's native drag-drop on (the default, since tauri.conf.json sets no `dragDropEnabled`) an HTML5 `ondrop` handler never fires at all. The \"Choose file…\" picker deliberately runs through a KEA command using the dialog plugin's Rust API rather than its JS package, so it needs no entry here either — KEA's own commands are not ACL-gated.",
   "local": true,
   "windows": ["main", "overlay"],
   "permissions": ["core:default", "notification:default", "autostart:default"]

@@ -192,3 +192,240 @@ mod streaming_cfg_tests {
         assert_eq!(StreamingCfg::default().num_threads, 2);
     }
 }
+
+/// One timed span reported by a local recognizer.
+///
+/// This crate's own shape rather than `kea_engines::traits::SttSegment`: the
+/// dependency runs engines -> infer, so infer naming an engines type would
+/// invert it. The engine layer converts at its boundary, which is the same
+/// place it already converts [`AudioPcm`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimedSegment {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+}
+
+/// What a local STT pass produced: the joined text plus whatever timing the
+/// backend reported.
+///
+/// `segments` is empty when the backend reports none — never a single span
+/// spanning the buffer. Only the caller knows the buffer's extent, and an
+/// engine inventing one here is how a whole-file cue ends up looking like a
+/// real measurement.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SttResult {
+    pub text: String,
+    pub segments: Vec<TimedSegment>,
+}
+
+impl SttResult {
+    pub fn text_only(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            segments: Vec::new(),
+        }
+    }
+}
+
+/// Joins segment texts the way a transcript reads: single-spaced, with
+/// whatever leading space the model emitted trimmed off each piece.
+///
+/// whisper.cpp prefixes almost every segment with a space, so a naive
+/// concatenation double-spaces the entire transcript.
+pub fn join_segment_text(segments: &[TimedSegment]) -> String {
+    let mut text = String::new();
+    for seg in segments {
+        let piece = seg.text.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(piece);
+    }
+    text
+}
+
+/// Groups token-level timings into cues.
+///
+/// sherpa's offline transducer reports one timestamp per *token*, not per
+/// utterance, so a subtitle built straight from them would be one cue per
+/// word. Cues break on a silence gap, after sentence-final punctuation, or at
+/// `max_cue_ms` — the three things a human reader perceives as a line break.
+///
+/// `tokens` and `starts_s` are parallel; a mismatch means sherpa reported
+/// timings for only part of the decode, in which case the common prefix is
+/// used rather than the whole thing being discarded.
+pub fn group_tokens_into_segments(
+    tokens: &[String],
+    starts_s: &[f32],
+    durations_s: Option<&[f32]>,
+    gap_ms: u64,
+    max_cue_ms: u64,
+) -> Vec<TimedSegment> {
+    let n = tokens.len().min(starts_s.len());
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // sherpa's tokens are SentencePiece pieces: "▁" marks a word start, and
+    // gluing them without stripping it produces "▁hello▁world".
+    let piece_text = |raw: &str| raw.replace('\u{2581}', " ");
+    let token_ms = |i: usize| -> (u64, u64) {
+        let start = (starts_s[i].max(0.0) * 1000.0).round() as u64;
+        let dur = durations_s
+            .and_then(|d| d.get(i))
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
+        (start, start + (dur * 1000.0).round() as u64)
+    };
+
+    let mut out: Vec<TimedSegment> = Vec::new();
+    let mut text = String::new();
+    let mut start_ms = 0u64;
+    let mut end_ms = 0u64;
+
+    for (i, raw_token) in tokens.iter().enumerate().take(n) {
+        let (t_start, t_end) = token_ms(i);
+        if text.is_empty() {
+            start_ms = t_start;
+        } else if t_start.saturating_sub(end_ms) >= gap_ms
+            || t_start.saturating_sub(start_ms) >= max_cue_ms
+        {
+            out.push(TimedSegment {
+                start_ms,
+                end_ms: end_ms.max(start_ms),
+                text: text.trim().to_string(),
+            });
+            text.clear();
+            start_ms = t_start;
+        }
+        text.push_str(&piece_text(raw_token));
+        end_ms = t_end.max(t_start);
+
+        // Sentence-final punctuation closes the cue after the token that
+        // carries it, not before the next one — otherwise the period lands at
+        // the head of the following line.
+        if text.trim_end().ends_with(['.', '?', '!', '。', '？', '！'])
+            && end_ms.saturating_sub(start_ms) > 0
+        {
+            out.push(TimedSegment {
+                start_ms,
+                end_ms,
+                text: text.trim().to_string(),
+            });
+            text.clear();
+        }
+    }
+
+    if !text.trim().is_empty() {
+        out.push(TimedSegment {
+            start_ms,
+            end_ms: end_ms.max(start_ms),
+            text: text.trim().to_string(),
+        });
+    }
+    out.retain(|s| !s.text.is_empty());
+    out
+}
+
+/// A silence longer than this between two tokens starts a new cue.
+pub const TOKEN_GROUP_GAP_MS: u64 = 700;
+/// The longest a grouped cue may run before it is broken regardless of gaps.
+pub const TOKEN_GROUP_MAX_CUE_MS: u64 = 7_000;
+
+#[cfg(test)]
+mod stt_result_tests {
+    use super::*;
+
+    fn tok(s: &str) -> String {
+        s.to_string()
+    }
+
+    #[test]
+    fn joining_segments_does_not_double_space_whisper_output() {
+        // whisper.cpp prefixes nearly every segment with a space.
+        let segs = vec![
+            TimedSegment {
+                start_ms: 0,
+                end_ms: 1_000,
+                text: " Hello".into(),
+            },
+            TimedSegment {
+                start_ms: 1_000,
+                end_ms: 2_000,
+                text: " world.".into(),
+            },
+            TimedSegment {
+                start_ms: 2_000,
+                end_ms: 2_100,
+                text: "   ".into(),
+            },
+        ];
+        assert_eq!(join_segment_text(&segs), "Hello world.");
+    }
+
+    #[test]
+    fn tokens_group_on_a_silence_gap() {
+        let tokens = vec![tok("\u{2581}one"), tok("\u{2581}two"), tok("\u{2581}three")];
+        // 0.0s, 0.1s, then a 1.5s gap.
+        let starts = vec![0.0, 0.1, 1.6];
+        let segs = group_tokens_into_segments(
+            &tokens,
+            &starts,
+            None,
+            TOKEN_GROUP_GAP_MS,
+            TOKEN_GROUP_MAX_CUE_MS,
+        );
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert_eq!(segs[0].text, "one two");
+        assert_eq!(segs[1].text, "three");
+        assert_eq!(segs[1].start_ms, 1_600);
+    }
+
+    #[test]
+    fn a_sentence_end_closes_the_cue() {
+        let tokens = vec![tok("\u{2581}hi"), tok("."), tok("\u{2581}next")];
+        let starts = vec![0.0, 0.2, 0.3];
+        let segs = group_tokens_into_segments(&tokens, &starts, None, 700, 7_000);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "hi.");
+        assert_eq!(segs[1].text, "next");
+    }
+
+    /// A cue that never hits a gap or a full stop still has to break, or a
+    /// dense speaker produces one unreadable subtitle for the whole file.
+    #[test]
+    fn a_long_run_of_tokens_is_capped() {
+        let tokens: Vec<String> = (0..40).map(|i| tok(&format!("\u{2581}w{i}"))).collect();
+        let starts: Vec<f32> = (0..40).map(|i| i as f32 * 0.4).collect();
+        let segs = group_tokens_into_segments(&tokens, &starts, None, 700, 7_000);
+        assert!(segs.len() > 1);
+        for seg in &segs {
+            assert!(
+                seg.start_ms.saturating_sub(segs[0].start_ms) < 40 * 400 + 1,
+                "sane bounds"
+            );
+        }
+    }
+
+    /// Timing for only part of the decode is still timing: the common prefix
+    /// is used rather than the whole thing being thrown away.
+    #[test]
+    fn a_short_timestamp_array_uses_the_common_prefix() {
+        let tokens = vec![tok("\u{2581}a"), tok("\u{2581}b"), tok("\u{2581}c")];
+        let starts = vec![0.0, 0.1];
+        let segs = group_tokens_into_segments(&tokens, &starts, None, 700, 7_000);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "a b");
+    }
+
+    #[test]
+    fn no_timestamps_means_no_segments() {
+        assert!(group_tokens_into_segments(&[], &[], None, 700, 7_000).is_empty());
+        assert!(SttResult::text_only("hi").segments.is_empty());
+    }
+}

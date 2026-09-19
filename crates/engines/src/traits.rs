@@ -110,9 +110,68 @@ pub struct SttOpts {
     pub vocabulary: Vec<String>,
 }
 
+/// One timed span of recognized speech.
+///
+/// Offsets are milliseconds from the start of *whatever audio the caller
+/// handed the engine*, and it is the caller — the file-transcription chunk
+/// driver, the meeting poll — that rebases them onto the source timeline. An
+/// engine has no way to know where its buffer sat in a longer recording, so a
+/// segment that claimed absolute time would be lying at every call site but
+/// one.
+///
+/// Integers rather than floats: these are written to SQLite, compared for
+/// overlap, and formatted into subtitle timestamps, and a float would make
+/// every one of those three answer "00:00:01,000" or "00:00:00,999"
+/// depending on the rounding of the day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SttSegment {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+}
+
+impl SttSegment {
+    pub fn new(start_ms: u64, end_ms: u64, text: impl Into<String>) -> Self {
+        Self {
+            start_ms,
+            end_ms,
+            text: text.into(),
+        }
+    }
+
+    /// Shifts this segment onto a longer timeline. Saturating, because a
+    /// chunk base plus a bogus engine offset must not wrap into the past.
+    pub fn shifted(&self, base_ms: u64) -> Self {
+        Self {
+            start_ms: self.start_ms.saturating_add(base_ms),
+            end_ms: self.end_ms.saturating_add(base_ms),
+            text: self.text.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transcript {
     pub text: String,
+    /// Timed spans, when the engine reported any.
+    ///
+    /// Empty is the honest answer for a backend that reports no timing, not a
+    /// reason to synthesize one span covering the whole buffer: the chunk
+    /// driver already knows the chunk's extent and can do that far better
+    /// than an engine that only knows it decoded *something*. `serde(default)`
+    /// so a payload written before this field still deserializes.
+    #[serde(default)]
+    pub segments: Vec<SttSegment>,
+}
+
+impl Transcript {
+    /// A transcript with no timing, which is what most call sites want.
+    pub fn text_only(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            segments: Vec::new(),
+        }
+    }
 }
 
 #[async_trait]
@@ -260,9 +319,38 @@ mod stt_types_tests {
     fn transcript_roundtrips_json() {
         let t = Transcript {
             text: "hello world".into(),
+            segments: vec![SttSegment::new(0, 1_200, "hello world")],
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: Transcript = serde_json::from_str(&json).unwrap();
         assert_eq!(back, t);
+    }
+
+    /// A payload serialized before `segments` existed still has to decode —
+    /// the field is `serde(default)` for exactly this.
+    #[test]
+    fn a_transcript_without_segments_still_decodes() {
+        let back: Transcript = serde_json::from_str(r#"{"text":"hi"}"#).unwrap();
+        assert_eq!(back, Transcript::text_only("hi"));
+        assert!(back.segments.is_empty());
+    }
+
+    /// The chunk driver rebases every engine's segments onto the source
+    /// timeline; getting this wrong makes every cue after the first chunk
+    /// land at the wrong time, which is the item's named silent failure.
+    #[test]
+    fn shifting_moves_both_ends_by_the_base() {
+        let seg = SttSegment::new(500, 1_500, "second chunk");
+        let moved = seg.shifted(30_000);
+        assert_eq!(moved.start_ms, 30_500);
+        assert_eq!(moved.end_ms, 31_500);
+        assert_eq!(moved.text, seg.text);
+        // Saturating, so a nonsense offset cannot wrap into the past.
+        assert_eq!(
+            SttSegment::new(u64::MAX, u64::MAX, "x")
+                .shifted(10)
+                .start_ms,
+            u64::MAX
+        );
     }
 }

@@ -38,9 +38,10 @@ impl SttEngine for NoopSttEngine {
     }
 
     async fn transcribe(&self, audio: AudioPcm, _opts: SttOpts) -> Result<Transcript, EngineError> {
-        Ok(Transcript {
-            text: format!("heard: {} samples", audio.samples.len()),
-        })
+        Ok(Transcript::text_only(format!(
+            "heard: {} samples",
+            audio.samples.len()
+        )))
     }
 }
 

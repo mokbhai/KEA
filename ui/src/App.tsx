@@ -16,6 +16,7 @@ import GeneralPage from "./pages/GeneralPage";
 import HistoryPage from "./pages/HistoryPage";
 import LogsPage from "./pages/LogsPage";
 import MeetingsPage from "./pages/MeetingsPage";
+import TranscribePage from "./pages/TranscribePage";
 import ModelsPage from "./pages/ModelsPage";
 import ProfilesPage from "./pages/ProfilesPage";
 import ReadAloudPage from "./pages/ReadAloudPage";
@@ -252,6 +253,8 @@ function AppShell() {
         return <DictationPage onNavigate={navigate} />;
       case "meetings":
         return <MeetingsPage onNavigate={navigate} />;
+      case "transcribe":
+        return <TranscribePage onNavigate={navigate} />;
       case "read-aloud":
         return <ReadAloudPage onNavigate={navigate} />;
       case "ai-providers":
@@ -334,6 +337,7 @@ function AppShell() {
             {navItem("rewrite", "Rewrite", "✏️")}
             {navItem("dictation", "Dictation", "🎙")}
             {navItem("meetings", "Meetings", "👥")}
+            {navItem("transcribe", "Transcribe", "🎞")}
             {navItem("read-aloud", "Read-aloud", "🔊")}
 
             <div className="kea-drawer__group-label">Activity</div>

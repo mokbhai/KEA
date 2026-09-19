@@ -9,6 +9,8 @@ const KEY_HOLD_TO_TALK: &str = "dictation.hold_to_talk";
 const KEY_INPUT_DEVICE: &str = "dictation.input_device";
 const KEY_PREROLL: &str = "dictation.preroll";
 const KEY_LANGUAGE: &str = "dictation.language";
+const KEY_VOICE_COMMANDS_ENABLED: &str = "dictation.voice_commands_enabled";
+const KEY_VOICE_COMMANDS: &str = "dictation.voice_commands";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DictationSettings {
@@ -61,6 +63,82 @@ fn preroll_default() -> bool {
     true
 }
 
+/// The two standalone keys behind the voice-command pass.
+///
+/// Deliberately *not* fields on [`DictationSettings`]. That struct crosses the
+/// Tauri boundary as one payload written whole, so a field added to it has to
+/// be added to every literal that builds it, in a crate this module does not
+/// own — and a settings blob is exactly the shape the one-row-per-key store
+/// exists to avoid. These two are read on their own, next to each other,
+/// because either alone is half a decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceCommandSettings {
+    /// The master switch.
+    pub enabled: bool,
+    /// The ids of the commands that may fire.
+    ///
+    /// `None` means the key has never been written, which takes the per-family
+    /// defaults. `Some(vec![])` means the user switched everything off, which
+    /// is a different thing and must survive a reread.
+    pub enabled_ids: Option<Vec<String>>,
+}
+
+impl Default for VoiceCommandSettings {
+    /// Off. A pass that rewrites what the user said starts from "not until
+    /// something says so", including when a read fails.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            enabled_ids: None,
+        }
+    }
+}
+
+/// Reads a boolean that may have been written in either encoding.
+///
+/// The generic `set_setting` command takes a `String` and JSON-encodes it, so
+/// a toggle saved from the UI lands as the JSON string `"true"` while a typed
+/// caller writes a JSON bool. A reader that assumes one shape does not fail
+/// loudly — it fails to deserialize, falls back to its default, and the toggle
+/// is silently inert. That is how two app-context capture flags shipped dead,
+/// and it is why this accepts both. (`src-tauri`'s `bool_setting` is the same
+/// rule at the app layer.)
+fn lenient_bool(value: Option<&serde_json::Value>, default: bool) -> bool {
+    match value {
+        Some(serde_json::Value::Bool(v)) => *v,
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => default,
+        },
+        Some(other) => {
+            tracing::warn!(value = %other, "unexpected boolean setting shape, using the default");
+            default
+        }
+        None => default,
+    }
+}
+
+/// The same trap one level up: a JSON array, or a JSON string holding one,
+/// because the UI's only writer stringifies before `set_setting` stringifies
+/// again.
+///
+/// A value that is neither is reported as `None` — "never configured" — rather
+/// than as an empty list, so a corrupt row falls back to the defaults instead
+/// of silently disabling every command.
+fn lenient_string_list(value: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    match value? {
+        serde_json::Value::Array(_) => serde_json::from_value(value?.clone()).ok(),
+        serde_json::Value::String(s) => serde_json::from_str(s).ok(),
+        // What `set` writes for a `None`: never configured, said out loud.
+        serde_json::Value::Null => None,
+        other => {
+            tracing::warn!(value = %other, "unexpected list setting shape, using the defaults");
+            None
+        }
+    }
+}
+
 pub struct DictationSettingsRepo {
     settings: SettingsRepo,
 }
@@ -96,6 +174,40 @@ impl DictationSettingsRepo {
             .await?;
         self.settings.set(KEY_LANGUAGE, &cfg.language).await?;
         self.settings.set(KEY_PREROLL, &cfg.preroll).await?;
+        Ok(())
+    }
+
+    /// The voice-command pass's two keys.
+    ///
+    /// Read together and never from `get`, so a caller cannot end up with the
+    /// master switch from one moment and the command set from another.
+    pub async fn voice_commands(&self) -> Result<VoiceCommandSettings, KeaError> {
+        let enabled = self
+            .settings
+            .get::<serde_json::Value>(KEY_VOICE_COMMANDS_ENABLED)
+            .await?;
+        let ids = self
+            .settings
+            .get::<serde_json::Value>(KEY_VOICE_COMMANDS)
+            .await?;
+        Ok(VoiceCommandSettings {
+            enabled: lenient_bool(enabled.as_ref(), false),
+            enabled_ids: lenient_string_list(ids.as_ref()),
+        })
+    }
+
+    /// Writes both keys in the typed encoding (a JSON bool, a JSON array).
+    ///
+    /// The UI writes the stringified forms through the generic `set_setting`
+    /// command instead; [`lenient_bool`] and [`lenient_string_list`] are what
+    /// let the two writers coexist.
+    pub async fn set_voice_commands(&self, cfg: &VoiceCommandSettings) -> Result<(), KeaError> {
+        self.settings
+            .set(KEY_VOICE_COMMANDS_ENABLED, &cfg.enabled)
+            .await?;
+        self.settings
+            .set(KEY_VOICE_COMMANDS, &cfg.enabled_ids)
+            .await?;
         Ok(())
     }
 }
@@ -226,5 +338,95 @@ mod tests {
         .await
         .unwrap();
         assert!(!repo.get().await.unwrap().preroll);
+    }
+
+    /// Both writers. The UI stringifies everything through the generic
+    /// `set_setting` command; a typed caller writes real JSON. A reader that
+    /// only understood one of them would leave the settings page's toggles
+    /// inert without saying anything, which is the defect this whole pair of
+    /// helpers exists to prevent.
+    #[tokio::test]
+    async fn voice_command_settings_read_both_encodings() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let settings = SettingsRepo::new(pool.clone());
+        let repo = DictationSettingsRepo::new(SettingsRepo::new(pool));
+
+        // Nothing written at all: off, and "never configured".
+        let got = repo.voice_commands().await.unwrap();
+        assert_eq!(got, VoiceCommandSettings::default());
+
+        // Exactly what the settings page writes.
+        settings
+            .set("dictation.voice_commands_enabled", &"true".to_string())
+            .await
+            .unwrap();
+        settings
+            .set(
+                "dictation.voice_commands",
+                &r#"["period","comma"]"#.to_string(),
+            )
+            .await
+            .unwrap();
+        let got = repo.voice_commands().await.unwrap();
+        assert!(got.enabled);
+        assert_eq!(
+            got.enabled_ids,
+            Some(vec!["period".to_string(), "comma".to_string()])
+        );
+
+        // And what a typed caller writes.
+        repo.set_voice_commands(&VoiceCommandSettings {
+            enabled: true,
+            enabled_ids: Some(vec!["scratch_that".to_string()]),
+        })
+        .await
+        .unwrap();
+        let got = repo.voice_commands().await.unwrap();
+        assert!(got.enabled);
+        assert_eq!(got.enabled_ids, Some(vec!["scratch_that".to_string()]));
+    }
+
+    /// An empty list is a decision — "every command off" — and must not read
+    /// back as "never configured", which would turn the defaults back on.
+    #[tokio::test]
+    async fn an_empty_command_list_survives_a_reread() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let repo = DictationSettingsRepo::new(SettingsRepo::new(pool));
+        repo.set_voice_commands(&VoiceCommandSettings {
+            enabled: true,
+            enabled_ids: Some(Vec::new()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.voice_commands().await.unwrap().enabled_ids,
+            Some(Vec::new())
+        );
+
+        // Whereas a cleared key — the JSON literal `null` — is not.
+        repo.set_voice_commands(&VoiceCommandSettings {
+            enabled: false,
+            enabled_ids: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(repo.voice_commands().await.unwrap().enabled_ids, None);
+    }
+
+    /// A garbled row falls back to the defaults rather than to "everything
+    /// off": a setting nobody can read is not a setting the user chose.
+    #[test]
+    fn an_unreadable_row_reads_as_never_configured() {
+        use serde_json::json;
+        assert_eq!(lenient_string_list(Some(&json!(42))), None);
+        assert_eq!(lenient_string_list(Some(&json!("not json"))), None);
+        assert_eq!(lenient_string_list(None), None);
+        assert!(!lenient_bool(Some(&json!("yes")), false));
+        assert!(lenient_bool(None, true));
+        assert!(lenient_bool(Some(&json!(true)), false));
+        assert!(lenient_bool(Some(&json!("true")), false));
+        assert!(!lenient_bool(Some(&json!("false")), true));
     }
 }

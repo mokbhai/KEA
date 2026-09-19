@@ -68,7 +68,11 @@ fn model_filenames(kind: OnnxModelKind) -> &'static [&'static str] {
         // so there is no list to match against — see `find_sole_onnx`. The
         // recognizer bundles have no single model file at all: they are
         // encoder/decoder/joiner triples, found by their own finders.
-        OnnxModelKind::TtsVits | OnnxModelKind::Parakeet | OnnxModelKind::StreamingZipformer => &[],
+        OnnxModelKind::TtsVits
+        | OnnxModelKind::Parakeet
+        | OnnxModelKind::StreamingZipformer
+        | OnnxModelKind::SpeakerSegmentation
+        | OnnxModelKind::SpeakerEmbedding => &[],
     }
 }
 
@@ -188,12 +192,15 @@ pub fn find_tts_bundle(model_dir: &Path, kind: OnnxModelKind) -> Result<TtsBundl
             dict_dir: optional_dir(model_dir, "dict"),
             lexicon: joined_lexicons(model_dir),
         }),
-        // Both recognizer shapes, one arm: the reason they cannot be a voice
-        // is the same, and an arm per STT family would have to be remembered
-        // every time one is added.
-        OnnxModelKind::Parakeet | OnnxModelKind::StreamingZipformer => Err(InferError::Other(
-            format!("{kind:?} is a speech-to-text bundle, not a voice"),
-        )),
+        // Every non-voice shape, one arm: the reason none of them can be a
+        // voice is the same, and an arm per family would have to be
+        // remembered every time one is added.
+        OnnxModelKind::Parakeet
+        | OnnxModelKind::StreamingZipformer
+        | OnnxModelKind::SpeakerSegmentation
+        | OnnxModelKind::SpeakerEmbedding => {
+            Err(InferError::Other(format!("{kind:?} is not a voice bundle")))
+        }
     }
 }
 
@@ -269,10 +276,11 @@ fn model_config_for(
             },
             ..base
         },
-        OnnxModelKind::Parakeet | OnnxModelKind::StreamingZipformer => {
-            return Err(InferError::Other(format!(
-                "{kind:?} is a speech-to-text bundle, not a voice"
-            )))
+        OnnxModelKind::Parakeet
+        | OnnxModelKind::StreamingZipformer
+        | OnnxModelKind::SpeakerSegmentation
+        | OnnxModelKind::SpeakerEmbedding => {
+            return Err(InferError::Other(format!("{kind:?} is not a voice bundle")))
         }
     })
 }
@@ -494,11 +502,24 @@ mod tests {
         assert_eq!(bundle.model, dir.path().join("model.int8.onnx"));
     }
 
+    /// Every non-voice family is refused by name, including the diarization
+    /// pair added with `ModelKind::Diarization` — a new shape that silently
+    /// fell through to a voice loader would be a model-load failure with no
+    /// clue in it.
     #[test]
-    fn a_speech_to_text_bundle_is_not_a_voice() {
+    fn a_bundle_that_is_not_a_voice_is_refused_by_name() {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("tokens.txt"));
-        let err = find_tts_bundle(dir.path(), OnnxModelKind::Parakeet).unwrap_err();
-        assert!(err.to_string().contains("speech-to-text"), "{err}");
+        for kind in [
+            OnnxModelKind::Parakeet,
+            OnnxModelKind::StreamingZipformer,
+            OnnxModelKind::SpeakerSegmentation,
+            OnnxModelKind::SpeakerEmbedding,
+        ] {
+            let err = find_tts_bundle(dir.path(), kind).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("not a voice"), "{message}");
+            assert!(message.contains(&format!("{kind:?}")), "{message}");
+        }
     }
 }

@@ -5,6 +5,10 @@ edition = "2021"
 
 [dependencies]
 kea-engines = { path = "../engines" }
+# For `SpeakerSpan` only — the diarization *value* type, so the pure
+# cue-to-speaker assignment in `transcript::speakers` can name it without the
+# caller converting at every site. No inference happens in this crate.
+kea-infer = { path = "../infer" }
 tokio.workspace = true
 async-trait.workspace = true
 serde.workspace = true

@@ -1,6 +1,8 @@
+pub mod attribution;
 pub mod settings;
 pub mod synthesis;
 
+pub use attribution::{attribute_segment, SpeakerChannel};
 pub use settings::{MeetingSettings, MeetingSettingsRepo};
 pub use synthesis::{
     build_meeting_notes_request, build_meeting_title_request, format_transcript_for_synthesis,

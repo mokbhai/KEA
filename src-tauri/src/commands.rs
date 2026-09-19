@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kea_core::app_context::{resolve_profile, AppProfile, ProfileQuery};
-use kea_core::dictation::{apply_vocabulary, DictationSettings, DictationSettingsRepo};
+use kea_core::dictation::{apply_vocabulary, hint_terms, DictationSettings, DictationSettingsRepo};
 use kea_core::log::{current_log_path, tail_log_file};
 use kea_core::meetings::{MeetingSettings, MeetingSettingsRepo};
 use kea_core::resolve::Resolution;
@@ -17,7 +17,7 @@ use kea_core::rewrite::{
     build_llm_request, PresetRepo, PromptOverrideRepo, ProviderConfig, ProviderConfigRepo,
     RewriteInput, RewriteMode, RewritePreset,
 };
-use kea_core::store::actions::{ActionDetail, ActionRepo, ActionRow};
+use kea_core::store::actions::{ActionDetail, ActionRepo, ActionRow, NewAction};
 use kea_core::store::app_profiles::AppProfileRepo;
 use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_core::store::conversations::{ConversationRepo, ConversationSummary, Message};
@@ -25,24 +25,29 @@ use kea_core::store::hotkeys::{HotkeyBindingRepo, HotkeyBindingRow};
 use kea_core::store::meetings::{Meeting, MeetingDetail};
 use kea_core::store::settings::SettingsRepo;
 use kea_core::store::vocabulary::{VocabularyEntry, VocabularyRepo};
+use kea_core::transcript::{
+    assign_speakers, plan_chunks, segments_from_rows, transcribe_chunks, NewTranscript,
+    SubtitleFormat, SubtitleOpts, TranscribeSink, TranscriptDetail, TranscriptRepo, TranscriptRow,
+    TranscriptStatus, DEFAULT_CHUNK_SECS,
+};
 use kea_core::tts::{TtsSettings, TtsSettingsRepo};
 use kea_engines::traits::SttOpts;
 use kea_engines::{EngineRegistry, TtsOpts};
 use kea_features::demo::{run_ping, DemoFeature};
-use kea_features::dictation::{run_dictation_with_opts, spawn_partials, DictationRunOpts};
+use kea_features::dictation::{run_dictation_with_commands, spawn_partials, DictationRunOpts};
 use kea_features::run_rewrite_with_storage;
 use kea_features::tts::run_tts_with_player;
 use kea_features::ProfileOverrides;
 use kea_features::{
     drain_and_stop_meeting, run_meeting_poll_segment, run_meeting_start, run_meeting_stop,
-    ActiveMeeting, CapKind, ContentStorageOpts, DictationFeature, FeatureRegistry, MeetingFeature,
-    MeetingRunContext, RewriteFeature, TtsFeature,
+    ActionGuard, ActiveMeeting, CapKind, ContentStorageOpts, DictationFeature, FeatureRegistry,
+    MeetingFeature, MeetingRunContext, RewriteFeature, TranscribeFeature, TtsFeature,
 };
 use kea_infer::{
     temp_file_for, DownloadTransport, InferError, ModelDownloader, ModelKind, ModelRegistry,
     ModelStorage, OnnxModelEntry, StreamedFile,
 };
-use kea_platform::audio::InputDevice;
+use kea_platform::audio::{cut_points, decode_file, InputDevice};
 use kea_platform::{
     new_text_io, parse_accelerator, AudioIo, AudioIoError, Cue, DictationState, HoldAction,
     HotkeyBinding, Hotkeys, MeetingState, PcmFrame, PermKind, PermStatus, SystemAudioCapability,
@@ -58,8 +63,10 @@ use crate::events::{
     dictation_state_wire, emit_device_fallback, emit_dictation_error, emit_dictation_level,
     emit_dictation_partial, emit_dictation_preview, emit_dictation_state, emit_meeting_error,
     emit_meeting_level, emit_meeting_segment, emit_meeting_state, emit_model_download_complete,
-    emit_model_download_error, emit_model_download_progress, emit_tts_state, meeting_state_wire,
-    MeetingSegmentPayload, PartialThrottle, TtsState,
+    emit_model_download_error, emit_model_download_progress, emit_transcribe_file_complete,
+    emit_transcribe_file_error, emit_transcribe_file_progress, emit_transcribe_file_segment,
+    emit_tts_state, meeting_state_wire, MeetingSegmentPayload, PartialThrottle,
+    TranscribeFileProgressPayload, TranscribeFileSegmentPayload, TtsState,
 };
 use crate::{ActiveDownload, AppState};
 
@@ -160,6 +167,7 @@ pub fn feature_registry() -> &'static FeatureRegistry {
         reg.register(Arc::new(DictationFeature));
         reg.register(Arc::new(MeetingFeature));
         reg.register(Arc::new(TtsFeature));
+        reg.register(Arc::new(TranscribeFeature));
         reg
     })
 }
@@ -391,14 +399,20 @@ pub fn parse_model_kind(kind: &str) -> Result<ModelKind, String> {
 }
 
 pub fn onnx_catalog_for_kind(kind: ModelKind) -> Result<Vec<OnnxModelEntry>, String> {
-    ModelRegistry::onnx_catalog(kind)
-        .ok_or_else(|| format!("unknown onnx model kind: {kind} (expected parakeet or tts)"))
+    ModelRegistry::onnx_catalog(kind).ok_or_else(|| {
+        format!(
+            "unknown onnx model kind: {kind} (expected parakeet, tts, streaming or diarization)"
+        )
+    })
 }
 
 pub fn installed_onnx_model_ids(storage: &ModelStorage, catalog: &[OnnxModelEntry]) -> Vec<String> {
     catalog
         .iter()
-        .filter(|entry| storage.is_onnx_installed(&entry.id))
+        // Through the entry's own bundle shape, not a hardcoded `tokens.txt`:
+        // the diarization models have no vocabulary file and would otherwise
+        // install correctly and then report themselves missing forever.
+        .filter(|entry| storage.is_onnx_entry_installed(entry))
         .map(|entry| entry.id.clone())
         .collect()
 }
@@ -903,6 +917,19 @@ pub const SHOW_PARTIALS_SETTING: &str = "dictation.show_partials";
 /// Whether a failed offline decode may insert the live draft instead of
 /// nothing. Default **off** — see `DictationRunOpts::draft_fallback`.
 pub const STREAMING_FALLBACK_SETTING: &str = "dictation.streaming_fallback";
+
+/// Whether to run speaker diarization on a transcribed file.
+///
+/// Off by default: it needs a 36 MB download and a second inference pass over
+/// the whole recording. See `diarize_if_enabled` for why the model — not
+/// channel attribution — is what answers here.
+pub const TRANSCRIBE_DIARIZE_SETTING: &str = "transcribe.diarization";
+
+/// How far either side of a chunk boundary to search for a quiet frame.
+///
+/// Two seconds: far enough to clear a sentence, short enough that the chunks
+/// stay near the target length and the progress bar stays honest.
+const CHUNK_CUT_SEARCH_SECS: u32 = 2;
 
 /// The selected streaming model, or `None` when the feature is off.
 ///
@@ -1640,6 +1667,7 @@ fn onnx_storage_for(state: &AppState, kind: ModelKind) -> Result<&ModelStorage, 
         ModelKind::Parakeet => Ok(&state.parakeet_storage),
         ModelKind::Tts => Ok(&state.tts_storage),
         ModelKind::Streaming => Ok(&state.streaming_storage),
+        ModelKind::Diarization => Ok(&state.diarization_storage),
         ModelKind::Whisper => Err(format!("unknown onnx model kind: {kind}")),
     }
 }
@@ -2401,7 +2429,15 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
     let profile = profile_for(&state.config_pool, app_context.as_ref()).await;
     let profile = ProfileOverrides::from_profile(profile.as_ref());
 
-    let result = run_dictation_with_opts(
+    // Read through the repo rather than the two raw keys: it already tolerates
+    // both the UI's stringified encoding and the typed one, which is the trap
+    // that shipped two other toggles inert.
+    let voice_commands = DictationSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
+        .voice_commands()
+        .await
+        .unwrap_or_default();
+
+    let result = run_dictation_with_commands(
         &state.engines,
         &bindings,
         &actions,
@@ -2422,6 +2458,7 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
             )
             .await,
         },
+        &voice_commands,
     )
     .await;
 
@@ -4162,6 +4199,539 @@ pub fn check_update() -> Result<UpdateStatus, String> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// File transcription (plan items 14 and 15)
+// ---------------------------------------------------------------------------
+
+/// Bridges the pure chunk driver to Tauri events and the cancel slot.
+///
+/// A struct rather than two closures because both callbacks need the same
+/// `AppHandle` and job id, and two closures capturing it is two clones of the
+/// same state — which is the shape [`TranscribeSink`] exists to avoid.
+struct EventSink {
+    app: AppHandle,
+    job_id: String,
+    cancel: watch::Receiver<bool>,
+}
+
+impl TranscribeSink for EventSink {
+    fn progress(&self, chunk_index: usize, chunk_count: usize, done_ms: u64, total_ms: u64) {
+        emit_transcribe_file_progress(
+            &self.app,
+            &TranscribeFileProgressPayload {
+                job_id: self.job_id.clone(),
+                audio_ms_done: done_ms,
+                audio_ms_total: total_ms,
+                chunk_index,
+                chunk_count,
+            },
+        );
+    }
+
+    fn segment(&self, segment: &kea_engines::traits::SttSegment) {
+        emit_transcribe_file_segment(
+            &self.app,
+            &TranscribeFileSegmentPayload {
+                job_id: self.job_id.clone(),
+                start_ms: segment.start_ms,
+                end_ms: segment.end_ms,
+                text: segment.text.clone(),
+            },
+        );
+    }
+
+    fn cancelled(&self) -> bool {
+        *self.cancel.borrow()
+    }
+}
+
+/// Releases `file_transcribe_busy` however the job ends.
+///
+/// An owner rather than a `store(false)` at each early return: the job has
+/// six of them (decode failure, engine resolution, every `?` in the body),
+/// and one missed reset leaves the feature permanently refusing new files
+/// with no way back short of a restart.
+struct FileTranscribeGuard {
+    state: Arc<AppState>,
+}
+
+impl Drop for FileTranscribeGuard {
+    fn drop(&mut self) {
+        self.state
+            .file_transcribe_busy
+            .store(false, Ordering::SeqCst);
+        stop_poll(&self.state.file_transcribe_cancel);
+    }
+}
+
+fn new_job_id() -> String {
+    format!(
+        "job-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
+}
+
+/// How many cues the UI is handed at once when it asks for a transcript.
+const TRANSCRIPT_LIST_LIMIT: i64 = 200;
+
+/// Transcribes an audio or video file, streaming cues as they land.
+///
+/// Returns the transcript id immediately-ish — the work is awaited here
+/// rather than detached, so the frontend's `invoke` resolves when the job is
+/// done and the `transcribe:file:*` events carry everything in between.
+#[tauri::command]
+pub async fn transcribe_file(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+    path: String,
+) -> Result<String, String> {
+    let state = state.inner().clone();
+    // One job at a time, and emphatically *not* the capture gate: this never
+    // opens a device, and taking that lock would block dictation for the
+    // length of a podcast.
+    if state
+        .file_transcribe_busy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("a file is already being transcribed; wait for it to finish".into());
+    }
+    let _guard = FileTranscribeGuard {
+        state: state.clone(),
+    };
+
+    let job_id = new_job_id();
+    match transcribe_file_inner(&state, &app, &job_id, &path).await {
+        Ok((transcript_id, cancelled)) => {
+            emit_transcribe_file_complete(&app, &job_id, &transcript_id, cancelled);
+            Ok(transcript_id)
+        }
+        Err(e) => {
+            emit_transcribe_file_error(&app, &job_id, &e);
+            Err(e)
+        }
+    }
+}
+
+async fn transcribe_file_inner(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    job_id: &str,
+    path: &str,
+) -> Result<(String, bool), String> {
+    let source = PathBuf::from(path);
+    let filename = source
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+
+    let bindings = BindingRepo::new(state.config_pool.clone());
+    let binding = SlotResolver::new(&state.engines, &bindings)
+        .require_stt("transcribe")
+        .await
+        .map_err(|e| e.to_string())?;
+    let engine = state
+        .engines
+        .stt(&binding.engine_id)
+        .ok_or_else(|| format!("no stt engine '{}'", binding.engine_id))?;
+
+    // Decoding is blocking and can take seconds on a long video, so it goes
+    // to the blocking pool rather than stalling the async runtime.
+    let decode_path = source.clone();
+    let audio = tokio::task::spawn_blocking(move || decode_file(&decode_path))
+        .await
+        .map_err(|e| format!("decode task failed: {e}"))?
+        .map_err(|e| e.to_string())?;
+
+    let repo = TranscriptRepo::new(state.data_pool.clone());
+    let transcript_id = format!("tr-{job_id}");
+    repo.create(&NewTranscript {
+        id: transcript_id.clone(),
+        source_path: source.to_string_lossy().into_owned(),
+        source_filename: filename,
+        stt_engine_id: Some(binding.engine_id.clone()),
+        model: binding.model.clone(),
+        language: None,
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // The ledger row, so a file transcription shows up in Logs and History
+    // like every other feature's run even though its body lives elsewhere.
+    let actions = ActionRepo::new(state.data_pool.clone());
+    let action_id = actions
+        .record(NewAction {
+            feature_id: "transcribe".into(),
+            command: "transcribe_file".into(),
+            engine_id: binding.engine_id.clone(),
+            model: binding.model.clone(),
+            provider_ref: binding.provider_ref.clone(),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let guard = ActionGuard::new(&actions, action_id, "transcribe");
+
+    let outcome = run_file_transcription(
+        state,
+        app,
+        job_id,
+        engine.as_ref(),
+        &binding,
+        audio,
+        &repo,
+        &transcript_id,
+    )
+    .await;
+
+    match outcome {
+        Ok(cancelled) => {
+            guard.succeed().await;
+            Ok((transcript_id, cancelled))
+        }
+        Err(e) => {
+            let message = guard.fail(e).await;
+            let _ = repo
+                .complete(&transcript_id, TranscriptStatus::Error, 0, Some(&message))
+                .await;
+            Err(message)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_file_transcription(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    job_id: &str,
+    engine: &dyn kea_engines::traits::SttEngine,
+    binding: &Binding,
+    // By value: one hour of 16 kHz mono f32 is ~230 MB, so every gratuitous
+    // clone of the decoded buffer is another 230 MB resident. The frame is
+    // moved into the engine-layer `AudioPcm` below rather than copied.
+    audio: PcmFrame,
+    repo: &TranscriptRepo,
+    transcript_id: &str,
+) -> Result<bool, String> {
+    let sample_rate_hz = audio.sample_rate_hz;
+    let duration_ms = if sample_rate_hz > 0 {
+        (audio.samples.len() as u64 * 1_000) / sample_rate_hz as u64
+    } else {
+        0
+    };
+
+    // Another slot beside the two poll cancels rather than new machinery.
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    if let Ok(mut slot) = state.file_transcribe_cancel.lock() {
+        *slot = Some(cancel_tx);
+    }
+
+    let cuts = cut_points(
+        &audio.samples,
+        sample_rate_hz,
+        DEFAULT_CHUNK_SECS,
+        CHUNK_CUT_SEARCH_SECS,
+    );
+    let spans = plan_chunks(audio.samples.len(), sample_rate_hz, &cuts);
+
+    let vocabulary = load_vocabulary(&state.config_pool).await;
+    let opts = SttOpts {
+        model: binding.model.clone(),
+        // No language: file transcription has no language setting of its own,
+        // and borrowing dictation's would decode a dropped foreign-language
+        // recording as English with nothing in this UI to explain why.
+        language: None,
+        provider_ref: binding.provider_ref.clone(),
+        vocabulary: hint_terms(&vocabulary),
+    };
+
+    let sink = EventSink {
+        app: app.clone(),
+        job_id: job_id.to_string(),
+        cancel: cancel_rx,
+    };
+    let pcm = kea_engines::traits::AudioPcm {
+        samples: audio.samples,
+        sample_rate_hz,
+    };
+    let outcome = transcribe_chunks(engine, &pcm, &spans, &opts, &sink)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let speakers = diarize_if_enabled(state, &pcm, &outcome.segments).await;
+    repo.replace_segments(transcript_id, &outcome.segments, &speakers)
+        .await
+        .map_err(|e| e.to_string())?;
+    repo.complete(
+        transcript_id,
+        if outcome.cancelled {
+            TranscriptStatus::Cancelled
+        } else {
+            TranscriptStatus::Completed
+        },
+        duration_ms as i64,
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(outcome.cancelled)
+}
+
+/// Runs speaker diarization when the setting asks for it and both models are
+/// installed; otherwise every cue is unlabelled, which renders exactly as it
+/// did before this feature existed.
+///
+/// Off by default. Channel attribution ("You"/"Others") is the better default
+/// where it is available, because it is grounded in which device the audio
+/// arrived on rather than in a clustering threshold — but a dropped file is a
+/// single mixed stream, so it has no channels to attribute and the model is
+/// the only thing that can answer. It stays opt-in because it costs a 36 MB
+/// download and a second inference pass over the whole recording.
+async fn diarize_if_enabled(
+    state: &Arc<AppState>,
+    audio: &kea_engines::traits::AudioPcm,
+    segments: &[kea_engines::traits::SttSegment],
+) -> Vec<Option<String>> {
+    let unlabelled = vec![None; segments.len()];
+    if segments.is_empty() {
+        return unlabelled;
+    }
+    if !read_bool_setting(&state.config_pool, TRANSCRIBE_DIARIZE_SETTING, false).await {
+        return unlabelled;
+    }
+
+    let spans = match run_diarization(state, audio).await {
+        Ok(spans) => spans,
+        Err(e) => {
+            // Never fatal: a transcript without speaker labels is still the
+            // transcript the user asked for.
+            tracing::warn!(error = %e, "diarization unavailable; the transcript has no speaker labels");
+            return unlabelled;
+        }
+    };
+    assign_speakers(segments, &spans)
+}
+
+#[cfg(feature = "sherpa")]
+async fn run_diarization(
+    state: &Arc<AppState>,
+    audio: &kea_engines::traits::AudioPcm,
+) -> Result<Vec<kea_infer::SpeakerSpan>, String> {
+    use kea_infer::{
+        DiarizationModels, DiarizationOpts, SherpaOnnxDiarization, SpeakerDiarization,
+        DIARIZATION_EMBEDDING_ID, DIARIZATION_SEGMENTATION_ID,
+    };
+
+    let storage = &state.diarization_storage;
+    let models = DiarizationModels::locate(
+        &storage.onnx_dir_for(DIARIZATION_SEGMENTATION_ID),
+        &storage.onnx_dir_for(DIARIZATION_EMBEDDING_ID),
+    )
+    .map_err(|e| e.to_string())?;
+
+    SherpaOnnxDiarization::new()
+        .diarize(
+            kea_infer::AudioPcm {
+                samples: audio.samples.clone(),
+                sample_rate_hz: audio.sample_rate_hz,
+            },
+            &models,
+            DiarizationOpts::default(),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "sherpa"))]
+async fn run_diarization(
+    _state: &Arc<AppState>,
+    _audio: &kea_engines::traits::AudioPcm,
+) -> Result<Vec<kea_infer::SpeakerSpan>, String> {
+    Err("this build has no diarization runtime (the `sherpa` feature is off)".into())
+}
+
+/// Opens the system file picker and returns the chosen path, or `None` when
+/// the user cancelled.
+///
+/// A Rust command driving `tauri-plugin-dialog`'s own API rather than the
+/// JS plugin package: KEA's `#[tauri::command]`s are not ACL-gated, so this
+/// needs neither a `dialog:default` capability entry nor an npm dependency,
+/// and the extension filter stays next to `is_probably_decodable`, which is
+/// the list the drop zone filters on.
+#[tauri::command]
+pub async fn pick_audio_file(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("Audio and video", AUDIO_FILE_EXTENSIONS)
+        .pick_file(move |path| {
+            let _ = tx.send(path);
+        });
+    let picked = rx.await.map_err(|e| e.to_string())?;
+    Ok(picked
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned()))
+}
+
+/// Extensions offered in the picker.
+///
+/// Advisory, exactly like `kea_platform::audio::is_probably_decodable`: the
+/// decoder probes the bytes, so a mislabelled file still works and a filter
+/// that was too narrow would only hide it from the picker.
+const AUDIO_FILE_EXTENSIONS: &[&str] = &[
+    "wav", "mp3", "m4a", "m4b", "mp4", "mov", "aac", "flac", "ogg", "opus", "caf", "aiff", "mkv",
+    "webm",
+];
+
+/// Asks a running file transcription to stop.
+///
+/// Worst-case latency is one chunk: a decode already inside `spawn_blocking`
+/// cannot be interrupted, which is why the UI says "Stopping…" rather than
+/// pretending the stop is instant.
+#[tauri::command]
+pub fn cancel_file_transcription(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    stop_poll(&state.file_transcribe_cancel);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_transcripts(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<TranscriptRow>, String> {
+    TranscriptRepo::new(state.data_pool.clone())
+        .list(TRANSCRIPT_LIST_LIMIT)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_transcript(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<TranscriptDetail, String> {
+    TranscriptRepo::new(state.data_pool.clone())
+        .get(&id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("transcript {id} not found"))
+}
+
+#[tauri::command]
+pub async fn delete_transcript(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
+    TranscriptRepo::new(state.data_pool.clone())
+        .delete(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Renders a stored transcript as SRT or VTT without writing a file, for the
+/// copy button and for the page's preview.
+#[tauri::command]
+pub async fn render_transcript_subtitles(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    format: String,
+) -> Result<String, String> {
+    let format = SubtitleFormat::from_str(&format)
+        .ok_or_else(|| format!("unknown subtitle format: {format}"))?;
+    let detail = TranscriptRepo::new(state.data_pool.clone())
+        .get(&id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("transcript {id} not found"))?;
+    Ok(format.render(
+        &segments_from_rows(&detail.segments),
+        &SubtitleOpts::default(),
+    ))
+}
+
+/// Where an export lands when the user does not pick a path.
+///
+/// Beside the source file, which is what a subtitle is for — a player looks
+/// for `movie.srt` next to `movie.mp4`. Falls back to Downloads when that
+/// directory is not writable: a read-only volume, or an iCloud placeholder
+/// whose "directory" is not really there.
+fn export_destination(source: &Path, format: SubtitleFormat) -> Result<PathBuf, String> {
+    let name = format!(
+        "{}.{}",
+        source
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "transcript".into()),
+        format.extension()
+    );
+    if let Some(dir) = source.parent() {
+        if is_writable_dir(dir) {
+            return Ok(dir.join(name));
+        }
+    }
+    let downloads = dirs_download_dir()
+        .ok_or_else(|| "cannot find a writable directory to export into".to_string())?;
+    Ok(downloads.join(name))
+}
+
+/// Probes writability by writing, not by reading permissions: a read-only
+/// volume, a sandbox denial and an iCloud placeholder all report plausible
+/// permissions and then fail the write.
+fn is_writable_dir(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let probe = dir.join(".kea-export-probe");
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// The user's Downloads directory.
+///
+/// Resolved from `$HOME` rather than through a Tauri plugin: `download_dir`
+/// is not part of core v2's command surface, and adding a plugin plus its ACL
+/// entry for one path would be a larger change than the path.
+fn dirs_download_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let dir = PathBuf::from(home).join("Downloads");
+    dir.is_dir().then_some(dir)
+}
+
+/// Writes a transcript as a subtitle file and returns where it landed.
+#[tauri::command]
+pub async fn export_transcript(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    format: String,
+    destination: Option<String>,
+) -> Result<String, String> {
+    let format = SubtitleFormat::from_str(&format)
+        .ok_or_else(|| format!("unknown subtitle format: {format}"))?;
+    let detail = TranscriptRepo::new(state.data_pool.clone())
+        .get(&id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("transcript {id} not found"))?;
+
+    let body = format.render(
+        &segments_from_rows(&detail.segments),
+        &SubtitleOpts::default(),
+    );
+    let target = match destination {
+        Some(path) => PathBuf::from(path),
+        None => export_destination(Path::new(&detail.transcript.source_path), format)?,
+    };
+    std::fs::write(&target, body)
+        .map_err(|e| format!("could not write {}: {e}", target.display()))?;
+    Ok(target.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5595,6 +6165,74 @@ mod tests {
         assert!(list_whisper_models()
             .iter()
             .any(|m| m.id == "ggml-medium.en" && m.deprecated));
+    }
+
+    #[test]
+    fn a_subtitle_export_lands_beside_its_source_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Team sync.m4a");
+        std::fs::write(&source, b"x").unwrap();
+
+        let target = export_destination(&source, SubtitleFormat::Srt).unwrap();
+        assert_eq!(target.parent(), Some(dir.path()));
+        assert_eq!(
+            target.file_name().unwrap().to_string_lossy(),
+            "Team sync.srt",
+            "a player looks for <stem>.srt next to <stem>.m4a"
+        );
+        assert!(export_destination(&source, SubtitleFormat::Vtt)
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".vtt"));
+    }
+
+    /// The read-only-volume / iCloud-placeholder case. Probed by writing,
+    /// because all three of those report plausible permissions and then fail.
+    #[test]
+    fn an_unwritable_source_directory_falls_back_rather_than_failing() {
+        let missing = Path::new("/definitely/not/a/directory/clip.mp3");
+        match export_destination(missing, SubtitleFormat::Srt) {
+            // With a HOME/Downloads present, the fallback is used.
+            Ok(target) => assert!(target.to_string_lossy().ends_with("clip.srt")),
+            // Without one, it says so rather than writing somewhere random.
+            Err(e) => assert!(e.contains("writable"), "{e}"),
+        }
+        assert!(!is_writable_dir(Path::new("/definitely/not/a/directory")));
+    }
+
+    #[test]
+    fn the_diarization_kind_has_a_storage_root_of_its_own() {
+        // Every kind but whisper resolves to a root, and no two share one —
+        // an exhaustive match, so a new kind is a compile error here rather
+        // than a runtime "unknown kind".
+        for kind in [
+            ModelKind::Parakeet,
+            ModelKind::Tts,
+            ModelKind::Streaming,
+            ModelKind::Diarization,
+        ] {
+            assert!(onnx_catalog_for_kind(kind).is_ok(), "{kind}");
+        }
+        assert!(onnx_catalog_for_kind(ModelKind::Whisper).is_err());
+    }
+
+    /// The pair is listed as installed only through the entry's own shape.
+    /// With the old `tokens.txt` check both would be invisible forever.
+    #[test]
+    fn diarization_models_are_listed_installed_by_their_own_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ModelStorage::new(dir.path().to_path_buf());
+        let catalog = onnx_catalog_for_kind(ModelKind::Diarization).unwrap();
+        assert!(installed_onnx_model_ids(&storage, &catalog).is_empty());
+
+        for entry in &catalog {
+            let model_dir = storage.onnx_dir_for(&entry.id);
+            std::fs::create_dir_all(&model_dir).unwrap();
+            std::fs::write(model_dir.join(entry.bundle.marker()), b"w").unwrap();
+        }
+        let installed = installed_onnx_model_ids(&storage, &catalog);
+        assert_eq!(installed.len(), 2, "{installed:?}");
+        assert!(!dir.path().join(&catalog[1].id).join("tokens.txt").exists());
     }
 
     #[test]

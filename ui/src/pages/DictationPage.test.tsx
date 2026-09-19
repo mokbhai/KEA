@@ -778,4 +778,175 @@ describe("DictationPage", () => {
     await waitFor(() => expect(picker.value).toBe(""));
     expect(screen.queryByRole("switch", { name: "Show the preview" })).toBeNull();
   });
+
+  describe("voice commands", () => {
+    /**
+     * A world whose dictation language and speech model are known, with the
+     * generic settings table seeded. The language matters: the backend gate
+     * only runs the English command table, and the page mirrors that.
+     */
+    function voiceWorld(
+      settings: Record<string, string> = {},
+      language: string | null = "en",
+      model: string | null = "whisper-base",
+    ) {
+      return {
+        bindings: {
+          "default/stt": { engine_id: "whisper", model, provider_ref: null },
+        },
+        extra: {
+          get_dictation_state: () => "idle",
+          get_dictation_settings: () => ({
+            post_process: false,
+            active_model: null,
+            hold_to_talk: false,
+            input_device: null,
+            preroll: true,
+            language,
+          }),
+          get_setting: (args?: Record<string, unknown>) =>
+            settings[args?.key as string] ?? null,
+          set_setting: () => undefined,
+        },
+      };
+    }
+
+    /** The last value written for a key, decoded from its JSON. */
+    const lastWrite = (key: string) => {
+      const calls = wroteSetting(key);
+      return calls.length ? (calls[calls.length - 1]?.value as string) : null;
+    };
+
+    it("starts off and shows no command table", async () => {
+      mockWorld(voiceWorld());
+      render(<DictationPage />);
+
+      const toggle = await screen.findByRole("switch", {
+        name: "Run spoken commands",
+      });
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      expect(screen.queryByRole("table", { name: "Spoken commands" })).toBeNull();
+    });
+
+    it("switches on with punctuation and retraction, and structure off", async () => {
+      mockWorld(voiceWorld());
+      render(<DictationPage />);
+
+      await userEvent.click(
+        await screen.findByRole("switch", { name: "Run spoken commands" }),
+      );
+
+      await waitFor(() =>
+        expect(lastWrite("dictation.voice_commands_enabled")).toBe("true"),
+      );
+      // The shipping defaults, and the reason for them: "new paragraph" and
+      // "new line" are things people say literally.
+      const ids = JSON.parse(lastWrite("dictation.voice_commands") ?? "[]");
+      expect(ids).toContain("period");
+      expect(ids).toContain("scratch_that");
+      expect(ids).not.toContain("new_paragraph");
+      expect(ids).not.toContain("new_line");
+    });
+
+    it("reads the stored command set back, including an empty one", async () => {
+      // Empty is a decision — everything off — not "never configured".
+      mockWorld(
+        voiceWorld({
+          "dictation.voice_commands_enabled": "true",
+          "dictation.voice_commands": "[]",
+        }),
+      );
+      render(<DictationPage />);
+
+      await screen.findByRole("table", { name: "Spoken commands" });
+      for (const name of ["period", "scratch that", "new paragraph"]) {
+        expect(
+          screen.getByRole("switch", { name }).getAttribute("aria-checked"),
+        ).toBe("false");
+      }
+    });
+
+    it("turns one command on without disturbing the others", async () => {
+      mockWorld(
+        voiceWorld({
+          "dictation.voice_commands_enabled": "true",
+          "dictation.voice_commands": JSON.stringify(["period"]),
+        }),
+      );
+      render(<DictationPage />);
+
+      await userEvent.click(
+        await screen.findByRole("switch", { name: "new paragraph" }),
+      );
+
+      await waitFor(() =>
+        expect(
+          JSON.parse(lastWrite("dictation.voice_commands") ?? "[]"),
+        ).toEqual(["period", "new_paragraph"]),
+      );
+    });
+
+    it("names the escape phrase and the words that force a literal", async () => {
+      mockWorld(
+        voiceWorld({ "dictation.voice_commands_enabled": "true" }),
+      );
+      render(<DictationPage />);
+
+      // The escape is the user's only recourse when the rules get it wrong,
+      // so it has to be on the page and not in the docs.
+      expect(await screen.findByText(/literally period/)).toBeTruthy();
+      expect(screen.getByText(/is always typed, not run/)).toBeTruthy();
+    });
+
+    it("says so when the language gate will stop every command", async () => {
+      mockWorld(
+        voiceWorld({ "dictation.voice_commands_enabled": "true" }, "de"),
+      );
+      render(<DictationPage />);
+
+      expect(
+        await screen.findByText(/command list is English only/),
+      ).toBeTruthy();
+    });
+
+    it("stays quiet when the language is English", async () => {
+      mockWorld(
+        voiceWorld({ "dictation.voice_commands_enabled": "true" }, "en-US"),
+      );
+      render(<DictationPage />);
+
+      await screen.findByRole("table", { name: "Spoken commands" });
+      expect(screen.queryByText(/command list is English only/)).toBeNull();
+    });
+
+    it("accepts an English-only model when the language is auto-detect", async () => {
+      // Mirrors model_is_english_only: whisper spells those builds ".en".
+      mockWorld(
+        voiceWorld(
+          { "dictation.voice_commands_enabled": "true" },
+          null,
+          "ggml-base.en",
+        ),
+      );
+      render(<DictationPage />);
+
+      await screen.findByRole("table", { name: "Spoken commands" });
+      expect(screen.queryByText(/command list is English only/)).toBeNull();
+    });
+
+    it("warns on auto-detect with a multilingual model", async () => {
+      mockWorld(
+        voiceWorld(
+          { "dictation.voice_commands_enabled": "true" },
+          null,
+          "whisper-turbo",
+        ),
+      );
+      render(<DictationPage />);
+
+      expect(
+        await screen.findByText(/command list is English only/),
+      ).toBeTruthy();
+    });
+  });
 });

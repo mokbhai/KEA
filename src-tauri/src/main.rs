@@ -58,6 +58,10 @@ pub struct AppState {
     /// A root of its own, so the kind-to-root map stays 1:1 and listing and
     /// delete need no new cases.
     pub streaming_storage: ModelStorage,
+    /// Holds both diarization assets — the segmentation bundle and the bare
+    /// embedding `.onnx` — each under its own model id. One root per kind,
+    /// as above.
+    pub diarization_storage: ModelStorage,
     pub log_dir: PathBuf,
     /// Shared mic/meeting capture (mutually exclusive with dictation).
     pub audio: AsyncMutex<Box<dyn kea_platform::AudioIo>>,
@@ -75,6 +79,16 @@ pub struct AppState {
     /// the slot and hand its stale draft to the *next* run.
     pub dictation_partials_generation: AtomicU64,
     pub segment_poll_cancel: Mutex<Option<watch::Sender<bool>>>,
+    /// Cancels a file-transcription job. Another slot beside the two poll
+    /// cancels rather than new machinery: the job checks it between chunks,
+    /// which is as granular as cancellation can be while a `full()` call
+    /// inside `spawn_blocking` is uninterruptible.
+    pub file_transcribe_cancel: Mutex<Option<watch::Sender<bool>>>,
+    /// True while a file-transcription job is running. Its own flag rather
+    /// than the capture gate: file transcription never opens a device, and
+    /// taking the audio lock would block dictation for the length of a
+    /// podcast. One job at a time.
+    pub file_transcribe_busy: AtomicBool,
     /// Per-feature hotkey registration outcomes recorded at startup; updated
     /// on re-registration via `set_hotkey`.
     pub hotkey_reg_status: Mutex<HashMap<String, HotkeyRegStatus>>,
@@ -161,7 +175,8 @@ fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
-        .plugin(tauri_plugin_notification::init());
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init());
 
     // Updater plugin: gated behind `cfg(feature = "updater")` so the
     // default build stays green without a signing key. See docs/RELEASE.md.
@@ -284,6 +299,14 @@ fn main() {
             commands::get_autostart,
             commands::show_notification,
             commands::check_update,
+            commands::transcribe_file,
+            commands::pick_audio_file,
+            commands::cancel_file_transcription,
+            commands::list_transcripts,
+            commands::get_transcript,
+            commands::delete_transcript,
+            commands::render_transcript_subtitles,
+            commands::export_transcript,
         ])
         .build(tauri::generate_context!())
         .expect("error while building KEA")
@@ -307,6 +330,7 @@ struct ModelStorages {
     parakeet: ModelStorage,
     tts: ModelStorage,
     streaming: ModelStorage,
+    diarization: ModelStorage,
 }
 
 /// A model directory, created up front so a download does not have to. A
@@ -399,6 +423,7 @@ fn build_engines(
         parakeet: ensure_storage(ModelStorage::default_parakeet_root(dir), "parakeet"),
         tts: ensure_storage(ModelStorage::default_tts_root(dir), "tts"),
         streaming: ensure_storage(ModelStorage::default_streaming_root(dir), "streaming"),
+        diarization: ensure_storage(ModelStorage::default_diarization_root(dir), "diarization"),
     };
 
     #[cfg(feature = "whisper")]
@@ -522,6 +547,7 @@ fn build_state(
         parakeet_storage: storages.parakeet,
         tts_storage: storages.tts,
         streaming_storage: storages.streaming,
+        diarization_storage: storages.diarization,
         log_dir,
         audio: AsyncMutex::new(new_audio_io()),
         active_meeting: Mutex::new(None),
@@ -529,6 +555,8 @@ fn build_state(
         dictation_partials: Mutex::new(None),
         dictation_partials_generation: AtomicU64::new(0),
         segment_poll_cancel: Mutex::new(None),
+        file_transcribe_cancel: Mutex::new(None),
+        file_transcribe_busy: AtomicBool::new(false),
         hotkey_reg_status: Mutex::new(HashMap::new()),
         active_downloads: Mutex::new(HashMap::new()),
         dictation_run_counter: AtomicU64::new(0),
