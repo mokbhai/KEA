@@ -55,6 +55,7 @@ impl SttEngine for WhisperSttEngine {
 
         let whisper_opts = WhisperOpts {
             language: opts.language,
+            vocabulary: opts.vocabulary,
         };
 
         let text = self

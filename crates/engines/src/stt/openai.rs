@@ -49,7 +49,7 @@ impl SttEngine for OpenAiSttEngine {
             "{}/audio/transcriptions",
             provider.base_url.trim_end_matches('/')
         );
-        let parts = vec![
+        let mut parts = vec![
             MultipartPart {
                 name: "file".into(),
                 filename: Some("audio.wav".into()),
@@ -63,6 +63,18 @@ impl SttEngine for OpenAiSttEngine {
                 data: model.as_bytes().to_vec(),
             },
         ];
+        // The endpoint's `prompt` field biases decoding toward spellings it
+        // would otherwise guess at. Sent only when there is something to say:
+        // an empty prompt is not neutral, it is a prompt that says nothing and
+        // still costs a multipart field.
+        if !opts.vocabulary.is_empty() {
+            parts.push(MultipartPart {
+                name: "prompt".into(),
+                filename: None,
+                content_type: None,
+                data: opts.vocabulary.join(", ").into_bytes(),
+            });
+        }
         let text = self
             .http
             .post_multipart(&url, Auth::Bearer(api_key), parts)
@@ -165,6 +177,7 @@ mod tests {
                     model: None,
                     language: None,
                     provider_ref: Some("openai".into()),
+                    vocabulary: Vec::new(),
                 },
             )
             .await
@@ -206,6 +219,7 @@ mod tests {
                     model: None,
                     language: None,
                     provider_ref: Some("openai".into()),
+                    vocabulary: Vec::new(),
                 },
             )
             .await

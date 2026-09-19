@@ -26,6 +26,15 @@ export type RewritePreset = {
   instruction: string;
 };
 
+export type VocabularyEntry = {
+  id: string;
+  term: string;
+  /** Comma-separated misrecognitions to rewrite to `term`; null when none. */
+  sounds_like: string | null;
+  enabled: boolean;
+  created_at: string;
+};
+
 export type RewriteEventPayload = { message: string };
 
 export const REWRITE_MODES: { value: RewriteMode; label: string }[] = [
@@ -112,6 +121,22 @@ export const upsertPreset = (preset: RewritePreset) =>
   invoke<void>("upsert_preset", { preset });
 
 export const deletePreset = (id: string) => invoke<void>("delete_preset", { id });
+
+export const listVocabulary = () => invoke<VocabularyEntry[]>("list_vocabulary");
+
+export const upsertVocabularyEntry = (entry: VocabularyEntry) =>
+  invoke<void>("upsert_vocabulary_entry", { entry });
+
+export const deleteVocabularyEntry = (id: string) =>
+  invoke<void>("delete_vocabulary_entry", { id });
+
+/**
+ * Runs the transcript replacement pass over `text` with the enabled entries —
+ * the same code path dictation uses, so the settings page can show what the
+ * vocabulary would actually do rather than reimplementing the rules in TS.
+ */
+export const previewVocabulary = (text: string) =>
+  invoke<string>("preview_vocabulary", { text });
 
 export const getPromptOverride = (mode: RewriteMode) =>
   invoke<string | null>("get_prompt_override", { mode });

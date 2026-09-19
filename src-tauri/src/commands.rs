@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use kea_core::dictation::{DictationSettings, DictationSettingsRepo};
+use kea_core::dictation::{apply_vocabulary, DictationSettings, DictationSettingsRepo};
 use kea_core::log::{current_log_path, tail_log_file};
 use kea_core::meetings::{MeetingSettings, MeetingSettingsRepo};
 use kea_core::resolve::Resolution;
@@ -22,6 +22,7 @@ use kea_core::store::conversations::{ConversationRepo, ConversationSummary, Mess
 use kea_core::store::hotkeys::{HotkeyBindingRepo, HotkeyBindingRow};
 use kea_core::store::meetings::{Meeting, MeetingDetail};
 use kea_core::store::settings::SettingsRepo;
+use kea_core::store::vocabulary::{VocabularyEntry, VocabularyRepo};
 use kea_core::tts::{TtsSettings, TtsSettingsRepo};
 use kea_engines::{EngineRegistry, TtsOpts};
 use kea_features::demo::{run_ping, DemoFeature};
@@ -1450,10 +1451,20 @@ fn spawn_meeting_level_poll(state: &Arc<AppState>, app: &AppHandle) {
 /// how promptly a pause is noticed.
 const SEGMENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-fn spawn_segment_poll(state: &Arc<AppState>, app: &AppHandle, interval_secs: u32) {
+/// `vocabulary` is read once by the caller when the meeting starts and shared
+/// across every tick, rather than re-read here per segment: a transcript whose
+/// spelling changed halfway through because the user edited their vocabulary
+/// mid-recording would be worse than either answer taken consistently.
+fn spawn_segment_poll(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    interval_secs: u32,
+    vocabulary: Arc<Vec<VocabularyEntry>>,
+) {
     // The configured length is passed to the cut logic as the hard cap, not
     // used as the tick rate.
     let _ = interval_secs;
+    let vocabulary_for_poll = vocabulary;
     let state_for_poll = state.clone();
     let app_for_poll = app.clone();
     spawn_cancellable_poll(
@@ -1462,6 +1473,7 @@ fn spawn_segment_poll(state: &Arc<AppState>, app: &AppHandle, interval_secs: u32
         move || {
             let state = state_for_poll.clone();
             let app = app_for_poll.clone();
+            let vocabulary = vocabulary_for_poll.clone();
             async move {
                 let poll_state = {
                     let guard = state.active_meeting.lock().expect("active_meeting lock");
@@ -1502,6 +1514,7 @@ fn spawn_segment_poll(state: &Arc<AppState>, app: &AppHandle, interval_secs: u32
                         meetings,
                         audio: audio.as_mut(),
                         settings: &settings,
+                        vocabulary: &vocabulary,
                     };
                     run_meeting_poll_segment(&mut ctx, &meeting_id, &mut sequence, &mut elapsed_ms)
                         .await
@@ -1572,6 +1585,9 @@ pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Resu
     let actions = ActionRepo::new(state.data_pool.clone());
     let meetings = &state.meeting_repo;
 
+    // One read, shared by the start context, the segment poll and the stop.
+    let vocabulary = Arc::new(load_vocabulary(&state.config_pool).await);
+
     let session = {
         let mut audio = state.audio.lock().await;
         let mut ctx = MeetingRunContext {
@@ -1581,6 +1597,7 @@ pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Resu
             meetings,
             audio: audio.as_mut(),
             settings: &settings,
+            vocabulary: &vocabulary,
         };
         run_meeting_start(&mut ctx).await?
     };
@@ -1597,7 +1614,12 @@ pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Resu
 
     emit_meeting_state(app, MeetingState::Recording);
     spawn_meeting_level_poll(state, app);
-    spawn_segment_poll(state, app, settings.segment_duration_secs);
+    spawn_segment_poll(
+        state,
+        app,
+        settings.segment_duration_secs,
+        vocabulary.clone(),
+    );
 
     Ok(meeting_id)
 }
@@ -1642,6 +1664,8 @@ pub async fn stop_meeting_inner(
         drain_and_stop_meeting(audio.as_mut()).await
     };
 
+    let vocabulary = load_vocabulary(&state.config_pool).await;
+
     let detail = run_meeting_stop(
         &state.engines,
         &bindings,
@@ -1649,6 +1673,7 @@ pub async fn stop_meeting_inner(
         meetings,
         &session.session,
         drain_result,
+        &vocabulary,
     )
     .await;
 
@@ -1816,6 +1841,8 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
         ContentStorageOpts::default()
     };
 
+    let vocabulary = load_vocabulary(&state.config_pool).await;
+
     let result = run_dictation_with_storage(
         &state.engines,
         &bindings,
@@ -1825,6 +1852,7 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
         &mut replay,
         textio.as_ref(),
         &settings,
+        &vocabulary,
         storage,
     )
     .await;
@@ -2100,6 +2128,74 @@ pub async fn remove_custom_provider(
         return Err(format!("No custom provider \"{provider_ref}\""));
     }
     save_custom_providers(&settings, &custom).await
+}
+
+/// Reads the enabled vocabulary, failing open.
+///
+/// Deliberately returns an empty list rather than an error on a read failure:
+/// vocabulary is an accuracy aid, and a transcript with the wrong spelling of a
+/// product name is enormously better than a dictation run that refuses to
+/// insert anything because a settings table could not be read.
+async fn load_vocabulary(config_pool: &SqlitePool) -> Vec<VocabularyEntry> {
+    match VocabularyRepo::new(config_pool.clone())
+        .list_enabled()
+        .await
+    {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!("vocabulary unavailable, continuing without it: {e}");
+            Vec::new()
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn list_vocabulary(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<VocabularyEntry>, String> {
+    VocabularyRepo::new(state.config_pool.clone())
+        .list()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn upsert_vocabulary_entry(
+    state: State<'_, Arc<AppState>>,
+    entry: VocabularyEntry,
+) -> Result<(), String> {
+    VocabularyRepo::new(state.config_pool.clone())
+        .upsert(&entry)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_vocabulary_entry(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<(), String> {
+    VocabularyRepo::new(state.config_pool.clone())
+        .delete(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Runs the replacement pass over `text` for the settings page's live preview.
+///
+/// Goes through the backend rather than reimplementing the rules in TypeScript
+/// so the box cannot drift from what dictation actually does — a preview that
+/// disagrees with the feature is worse than no preview.
+#[tauri::command]
+pub async fn preview_vocabulary(
+    state: State<'_, Arc<AppState>>,
+    text: String,
+) -> Result<String, String> {
+    let entries = VocabularyRepo::new(state.config_pool.clone())
+        .list_enabled()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(apply_vocabulary(&text, &entries))
 }
 
 #[tauri::command]

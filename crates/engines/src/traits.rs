@@ -101,6 +101,13 @@ pub struct SttOpts {
     pub model: Option<String>,
     pub language: Option<String>,
     pub provider_ref: Option<String>,
+    /// Canonical spellings to bias decoding toward (names, acronyms, jargon).
+    ///
+    /// Advisory: every backend takes these differently and some ignore them
+    /// entirely, which is why the transcript also goes through
+    /// `kea_core::dictation::apply_vocabulary` afterwards. Empty means no hint,
+    /// never an error.
+    pub vocabulary: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -32,6 +32,62 @@ impl Default for WhisperRsInference {
     }
 }
 
+/// whisper.cpp truncates the initial prompt to 224 tokens, so a longer list is
+/// not merely wasteful — the tail is silently discarded and the user's last
+/// terms are the ones that go missing.
+///
+/// Budgeted in characters rather than tokens because tokenizing here would mean
+/// loading the model's vocabulary just to decide what to send. Four characters
+/// per token is the usual rough ratio for English word fragments, and 200
+/// tokens leaves headroom under the hard 224 for the separators.
+#[cfg(feature = "whisper")]
+const INITIAL_PROMPT_CHAR_BUDGET: usize = 200 * 4;
+
+/// The most terms worth sending regardless of length.
+///
+/// Past roughly this many, the prompt stops reading as a glossary and starts
+/// steering punctuation and casing style, which is a different and unwanted
+/// effect — see the risk noted against item 5 in the feature plan.
+#[cfg(feature = "whisper")]
+const INITIAL_PROMPT_MAX_TERMS: usize = 100;
+
+/// Renders vocabulary terms into a whisper initial prompt, or `None` when there
+/// is nothing to say.
+///
+/// Returns the prompt plus how many terms were dropped, so the caller can log a
+/// truncation the user would otherwise never learn about.
+#[cfg(feature = "whisper")]
+fn initial_prompt_for(terms: &[String]) -> Option<(String, usize)> {
+    let mut prompt = String::new();
+    let mut used = 0usize;
+
+    for term in terms.iter().take(INITIAL_PROMPT_MAX_TERMS) {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+        let addition = if prompt.is_empty() {
+            term.chars().count()
+        } else {
+            term.chars().count() + 2
+        };
+        if prompt.chars().count() + addition > INITIAL_PROMPT_CHAR_BUDGET {
+            break;
+        }
+        if !prompt.is_empty() {
+            prompt.push_str(", ");
+        }
+        prompt.push_str(term);
+        used += 1;
+    }
+
+    if prompt.is_empty() {
+        return None;
+    }
+    let non_empty = terms.iter().filter(|t| !t.trim().is_empty()).count();
+    Some((prompt, non_empty.saturating_sub(used)))
+}
+
 /// Which whisper.cpp backend this binary was compiled with.
 ///
 /// `metal` and `coreml` are separate axes, not alternatives: `metal` moves the
@@ -79,6 +135,7 @@ impl WhisperInference for WhisperRsInference {
         let pcm_rate_hz = pcm.sample_rate_hz;
         let samples = pcm.samples;
         let language = opts.language;
+        let vocabulary = opts.vocabulary;
 
         tokio::task::spawn_blocking(move || {
             use whisper_rs::{
@@ -116,6 +173,21 @@ impl WhisperInference for WhisperRsInference {
 
             if let Some(ref lang) = language {
                 params.set_language(Some(lang.as_str()));
+            }
+
+            // Held in scope for as long as `params`: whisper-rs stores the
+            // prompt as a borrowed C string, so a temporary would dangle.
+            let initial_prompt = initial_prompt_for(&vocabulary);
+            if let Some((ref prompt, dropped)) = initial_prompt {
+                if dropped > 0 {
+                    tracing::warn!(
+                        dropped,
+                        "whisper: vocabulary too long for the initial prompt; \
+                         {} terms were not sent",
+                        dropped
+                    );
+                }
+                params.set_initial_prompt(prompt);
             }
 
             // Timed rather than asserted: wall-clock assertions are flaky in CI,
@@ -200,9 +272,63 @@ mod tests {
 
     #[cfg(feature = "whisper")]
     #[test]
+    fn no_terms_means_no_prompt() {
+        assert!(initial_prompt_for(&[]).is_none());
+        assert!(initial_prompt_for(&["".into(), "   ".into()]).is_none());
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn terms_are_joined_and_nothing_is_dropped_when_they_fit() {
+        let (prompt, dropped) = initial_prompt_for(&["KittyClaw".into(), "KEA".into()]).unwrap();
+        assert_eq!(prompt, "KittyClaw, KEA");
+        assert_eq!(dropped, 0);
+    }
+
+    /// whisper.cpp silently truncates the prompt at 224 tokens, so the overflow
+    /// has to be counted here — otherwise the user's last terms vanish with no
+    /// way to find out.
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn too_many_terms_are_dropped_and_counted() {
+        let terms: Vec<String> = (0..INITIAL_PROMPT_MAX_TERMS + 25)
+            .map(|i| format!("t{i}"))
+            .collect();
+        let (prompt, dropped) = initial_prompt_for(&terms).unwrap();
+        assert_eq!(dropped, 25);
+        assert!(prompt.starts_with("t0, t1, "));
+        assert!(!prompt.contains("t100"));
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn a_long_term_list_is_cut_to_the_character_budget() {
+        // Ten terms, each far too long to all fit, so the budget bites before
+        // the term count does.
+        let terms: Vec<String> = (0..10).map(|i| format!("{}{i}", "x".repeat(120))).collect();
+        let (prompt, dropped) = initial_prompt_for(&terms).unwrap();
+        assert!(prompt.chars().count() <= INITIAL_PROMPT_CHAR_BUDGET);
+        assert!(dropped > 0, "a budget that drops nothing is not a budget");
+        assert_eq!(dropped, 10 - prompt.split(", ").count());
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn blank_terms_are_skipped_without_counting_as_dropped() {
+        let (prompt, dropped) =
+            initial_prompt_for(&["KEA".into(), "  ".into(), "KittyClaw".into()]).unwrap();
+        assert_eq!(prompt, "KEA, KittyClaw");
+        assert_eq!(dropped, 0, "a blank term was never going to be sent");
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
     fn compiled_backend_is_one_of_the_known_names() {
         assert!(
-            matches!(compiled_backend(), "cpu" | "metal" | "coreml" | "metal+coreml"),
+            matches!(
+                compiled_backend(),
+                "cpu" | "metal" | "coreml" | "metal+coreml"
+            ),
             "unexpected backend name: {}",
             compiled_backend()
         );

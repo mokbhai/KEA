@@ -19,6 +19,7 @@ import MeetingsPage from "./pages/MeetingsPage";
 import ModelsPage from "./pages/ModelsPage";
 import ReadAloudPage from "./pages/ReadAloudPage";
 import RewritePage from "./pages/RewritePage";
+import VocabularyPage from "./pages/VocabularyPage";
 import type { Page } from "./lib/nav";
 import { ThemeProvider, useTheme } from "./theme";
 
@@ -256,6 +257,8 @@ function AppShell() {
         return <AiProvidersPage />;
       case "models":
         return <ModelsPage />;
+      case "vocabulary":
+        return <VocabularyPage />;
       case "general":
         return <GeneralPage onRunSetup={runSetup} />;
       case "history":
@@ -336,6 +339,7 @@ function AppShell() {
             <div className="kea-drawer__group-label">Settings</div>
             {navItem("ai-providers", "AI Providers", "🤖")}
             {navItem("models", "Models", "📦")}
+            {navItem("vocabulary", "Vocabulary", "📖")}
             {navItem("general", "General", "⚙️")}
             {navItem("logs", "Logs", "🛠")}
           </nav>

@@ -1,9 +1,10 @@
-use kea_core::dictation::DictationSettings;
+use kea_core::dictation::{apply_vocabulary, hint_terms, DictationSettings};
 use kea_core::resolve::SlotResolver;
 use kea_core::rewrite::{build_llm_request, RewriteInput};
 use kea_core::rewrite::{PresetRepo, PromptOverrideRepo, RewriteMode};
 use kea_core::store::actions::{ActionRepo, NewAction};
 use kea_core::store::bindings::{Binding, BindingRepo};
+use kea_core::store::vocabulary::VocabularyEntry;
 use kea_engines::traits::{AudioPcm, SttOpts};
 use kea_engines::EngineRegistry;
 use kea_platform::audio::util::resample_linear;
@@ -71,6 +72,7 @@ pub async fn run_dictation(
     audio: &mut dyn AudioIo,
     textio: &dyn TextIo,
     settings: &DictationSettings,
+    vocabulary: &[VocabularyEntry],
 ) -> Result<String, String> {
     run_dictation_with_storage(
         engines,
@@ -81,6 +83,7 @@ pub async fn run_dictation(
         audio,
         textio,
         settings,
+        vocabulary,
         ContentStorageOpts::default(),
     )
     .await
@@ -96,6 +99,7 @@ pub async fn run_dictation_with_storage(
     audio: &mut dyn AudioIo,
     textio: &dyn TextIo,
     settings: &DictationSettings,
+    vocabulary: &[VocabularyEntry],
     storage: ContentStorageOpts<'_>,
 ) -> Result<String, String> {
     let _frame_rx = audio.start_mic().await.map_err(|e| e.to_string())?;
@@ -121,7 +125,8 @@ pub async fn run_dictation_with_storage(
     // From here the ledger row exists, so every exit closes it.
     let guard = ActionGuard::new(actions, action_id, "dictation");
     let result = run_dictation_inner(
-        engines, &resolver, presets, overrides, textio, settings, storage, &binding, action_id, pcm,
+        engines, &resolver, presets, overrides, textio, settings, vocabulary, storage, &binding,
+        action_id, pcm,
     )
     .await;
     match result {
@@ -141,6 +146,7 @@ async fn run_dictation_inner(
     overrides: &PromptOverrideRepo,
     textio: &dyn TextIo,
     settings: &DictationSettings,
+    vocabulary: &[VocabularyEntry],
     storage: ContentStorageOpts<'_>,
     binding: &Binding,
     action_id: i64,
@@ -158,6 +164,7 @@ async fn run_dictation_inner(
             .or_else(|| settings.active_model.clone()),
         language: None,
         provider_ref: binding.provider_ref.clone(),
+        vocabulary: hint_terms(vocabulary),
     };
 
     let transcript = engine
@@ -165,7 +172,10 @@ async fn run_dictation_inner(
         .await
         .map_err(|e| e.to_string())?;
 
-    let mut final_text = transcript.text;
+    // Before the refinement pass so the LLM sees correct proper nouns, and
+    // before `transcript_text` is snapshotted below so History shows what was
+    // actually inserted rather than what the decoder first guessed.
+    let mut final_text = apply_vocabulary(&transcript.text, vocabulary);
     tracing::info!(
         action_id = %action_id,
         engine = %engine_id,
@@ -265,6 +275,7 @@ mod tests {
     use kea_core::store::actions::ActionStatus;
     use kea_core::store::conversations::{ConversationRepo, MessageRole};
     use kea_core::store::db::{open_pool, run_config_migrations, run_data_migrations};
+    use kea_core::store::vocabulary::VocabularyEntry;
     use kea_engines::noop::NoopLlmEngine;
     use kea_engines::traits::{EngineCaps, EngineError, SttEngine, Transcript};
     use kea_platform::{AudioIoError, DictationState, ReplaceMode, TextIoError};
@@ -272,6 +283,47 @@ mod tests {
 
     struct FakeStt {
         text: String,
+    }
+
+    /// Like [`FakeStt`], but keeps the options it was called with so a test can
+    /// assert what actually reached the engine rather than only what came back.
+    struct RecordingStt {
+        text: String,
+        seen: Arc<Mutex<Option<SttOpts>>>,
+    }
+
+    #[async_trait]
+    impl SttEngine for RecordingStt {
+        fn id(&self) -> &str {
+            "fake-stt"
+        }
+
+        fn capabilities(&self) -> EngineCaps {
+            EngineCaps {
+                models: vec!["fake".into()],
+            }
+        }
+
+        async fn transcribe(
+            &self,
+            _audio: AudioPcm,
+            opts: SttOpts,
+        ) -> Result<Transcript, EngineError> {
+            *self.seen.lock().unwrap() = Some(opts);
+            Ok(Transcript {
+                text: self.text.clone(),
+            })
+        }
+    }
+
+    fn vocab(term: &str, sounds_like: Option<&str>, enabled: bool) -> VocabularyEntry {
+        VocabularyEntry {
+            id: format!("v-{term}"),
+            term: term.into(),
+            sounds_like: sounds_like.map(str::to_string),
+            enabled,
+            created_at: "2026-09-19T00:00:00Z".into(),
+        }
     }
 
     #[async_trait]
@@ -382,6 +434,103 @@ mod tests {
         assert_eq!(f.commands()[0].id, "push_to_talk");
     }
 
+    /// The end-to-end shape of the feature: the engine mishears, and what the
+    /// user's text field receives is nonetheless the stored spelling.
+    #[tokio::test]
+    async fn vocabulary_is_applied_before_the_text_is_inserted() {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: "i pushed it to kitty claw today".into(),
+        }));
+
+        let textio = Arc::new(FakeTextIo {
+            inserted: Mutex::new(None),
+        });
+
+        let (bindings, actions, presets, overrides) = test_repos().await;
+        let settings = DictationSettings {
+            post_process: false,
+            active_model: None,
+            hold_to_talk: false,
+        };
+        let mut audio = FakeAudioIo::with_pcm(PcmFrame {
+            samples: vec![0.0; 1600],
+            sample_rate_hz: 16_000,
+        });
+
+        let out = run_dictation(
+            &reg,
+            &bindings,
+            &actions,
+            &presets,
+            &overrides,
+            &mut audio,
+            textio.as_ref(),
+            &settings,
+            &[vocab("KittyClaw", Some("kitty claw"), true)],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "i pushed it to KittyClaw today");
+        assert_eq!(
+            textio.inserted.lock().unwrap().as_deref(),
+            Some("i pushed it to KittyClaw today"),
+            "the corrected text is what reaches the app, not the raw transcript"
+        );
+    }
+
+    /// The hint layer. Only canonical spellings go to the engine, and only from
+    /// enabled entries — biasing a decoder toward a term the user switched off
+    /// would reintroduce the spelling they disabled.
+    #[tokio::test]
+    async fn only_enabled_terms_reach_the_engine_as_hints() {
+        let seen = Arc::new(Mutex::new(None));
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(RecordingStt {
+            text: "anything".into(),
+            seen: seen.clone(),
+        }));
+
+        let textio = Arc::new(FakeTextIo {
+            inserted: Mutex::new(None),
+        });
+        let (bindings, actions, presets, overrides) = test_repos().await;
+        let settings = DictationSettings {
+            post_process: false,
+            active_model: None,
+            hold_to_talk: false,
+        };
+        let mut audio = FakeAudioIo::with_pcm(PcmFrame {
+            samples: vec![0.0; 1600],
+            sample_rate_hz: 16_000,
+        });
+
+        run_dictation(
+            &reg,
+            &bindings,
+            &actions,
+            &presets,
+            &overrides,
+            &mut audio,
+            textio.as_ref(),
+            &settings,
+            &[
+                vocab("KittyClaw", Some("kitty claw"), true),
+                vocab("Disabled", None, false),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let opts = seen.lock().unwrap().clone().expect("engine was called");
+        assert_eq!(
+            opts.vocabulary,
+            vec!["KittyClaw".to_string()],
+            "sounds_like values are the wrong spellings and must not be hinted"
+        );
+    }
+
     #[tokio::test]
     async fn run_dictation_transcribes_and_inserts() {
         let mut reg = EngineRegistry::default();
@@ -414,6 +563,7 @@ mod tests {
             &mut audio,
             textio.as_ref(),
             &settings,
+            &[],
         )
         .await
         .unwrap();
@@ -465,6 +615,7 @@ mod tests {
             &mut audio,
             textio.as_ref(),
             &settings,
+            &[],
         )
         .await
         .unwrap();
@@ -525,6 +676,7 @@ mod tests {
             &mut audio,
             textio.as_ref(),
             &settings,
+            &[],
             ContentStorageOpts::enabled(&conversations),
         )
         .await
@@ -629,6 +781,7 @@ mod tests {
             &mut audio,
             textio.as_ref(),
             &settings,
+            &[],
             ContentStorageOpts::disabled(),
         )
         .await

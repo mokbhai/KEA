@@ -13,6 +13,7 @@ export type Page =
   | "read-aloud"
   | "ai-providers"
   | "models"
+  | "vocabulary"
   | "general"
   | "history"
   | "logs";

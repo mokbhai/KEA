@@ -1,3 +1,4 @@
+use kea_core::dictation::{apply_vocabulary, hint_terms};
 use kea_core::meetings::{
     build_meeting_notes_request, build_meeting_title_request, format_transcript_for_synthesis,
     parse_meeting_notes_json, sanitize_meeting_title, MeetingSettings,
@@ -10,6 +11,7 @@ use kea_core::store::meetings::{
     CaptureMode, Meeting, MeetingDetail, MeetingNotes, MeetingRepo, MeetingStatus, NewMeeting,
     NewSegment,
 };
+use kea_core::store::vocabulary::VocabularyEntry;
 use kea_engines::traits::{AudioPcm, SttOpts, Transcript};
 use kea_engines::EngineRegistry;
 use kea_platform::audio::util::resample_linear;
@@ -117,6 +119,7 @@ pub async fn transcribe_meeting_segment(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
     audio: &PcmFrame,
+    vocabulary: &[VocabularyEntry],
 ) -> Result<String, String> {
     let binding = SlotResolver::new(engines, bindings)
         .require_stt("meetings")
@@ -132,6 +135,7 @@ pub async fn transcribe_meeting_segment(
         model: binding.model.clone(),
         language: None,
         provider_ref: binding.provider_ref.clone(),
+        vocabulary: hint_terms(vocabulary),
     };
 
     let transcript = transcribe_pcm_segment(engine.as_ref(), audio, stt_opts)
@@ -206,6 +210,11 @@ pub struct MeetingRunContext<'a> {
     pub meetings: &'a MeetingRepo,
     pub audio: &'a mut dyn AudioIo,
     pub settings: &'a MeetingSettings,
+    /// Terms to bias transcription toward and to normalize spelling against.
+    /// Read once when the meeting starts rather than per segment: a meeting
+    /// whose transcript changed spelling halfway through because the user
+    /// edited their vocabulary mid-recording would be worse than either answer.
+    pub vocabulary: &'a [VocabularyEntry],
 }
 
 pub struct ActiveMeeting {
@@ -277,6 +286,7 @@ pub struct MeetingSegmentEvent {
     pub end_offset_ms: i64,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn append_transcribed_segment(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
@@ -285,11 +295,16 @@ async fn append_transcribed_segment(
     pcm: PcmFrame,
     sequence: i32,
     start_offset_ms: i64,
+    vocabulary: &[VocabularyEntry],
 ) -> Result<MeetingSegmentEvent, String> {
     let duration_ms = pcm_duration_ms(&pcm);
     let end_offset_ms = start_offset_ms + duration_ms;
 
-    let text = transcribe_meeting_segment(engines, bindings, &pcm).await?;
+    let text = transcribe_meeting_segment(engines, bindings, &pcm, vocabulary).await?;
+    // Same reason as dictation: the stored segment is what the notes are
+    // synthesized from and what the user reads, so it carries the corrected
+    // spelling rather than the decoder's first guess.
+    let text = apply_vocabulary(&text, vocabulary);
 
     meetings
         .append_segment(
@@ -431,6 +446,7 @@ pub async fn run_meeting_poll_segment(
         pcm,
         *sequence,
         *elapsed_ms,
+        ctx.vocabulary,
     )
     .await?;
     *sequence += 1;
@@ -457,6 +473,7 @@ pub async fn drain_and_stop_meeting(audio: &mut dyn AudioIo) -> Result<PcmFrame,
 /// segment, synthesize notes/title, and finalize the meeting + action rows.
 /// Takes no audio handle — the caller has already drained and released
 /// capture via [`drain_and_stop_meeting`] and passes the drained result in.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_meeting_stop(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
@@ -464,6 +481,7 @@ pub async fn run_meeting_stop(
     meetings: &MeetingRepo,
     session: &ActiveMeeting,
     drain_result: Result<PcmFrame, String>,
+    vocabulary: &[VocabularyEntry],
 ) -> Result<MeetingDetail, String> {
     let meeting_id = &session.meeting_id;
 
@@ -482,6 +500,7 @@ pub async fn run_meeting_stop(
         session,
         &existing,
         drain_result,
+        vocabulary,
     )
     .await
     {
@@ -501,6 +520,7 @@ pub async fn run_meeting_stop(
 /// segment, synthesize notes and a title, and persist both. Every step here
 /// closes the meeting and the action rows as an error via the one epilogue in
 /// [`run_meeting_stop`].
+#[allow(clippy::too_many_arguments)]
 async fn finalize_meeting(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
@@ -508,6 +528,7 @@ async fn finalize_meeting(
     session: &ActiveMeeting,
     existing: &MeetingDetail,
     drain_result: Result<PcmFrame, String>,
+    vocabulary: &[VocabularyEntry],
 ) -> Result<(), String> {
     let meeting_id = &session.meeting_id;
 
@@ -522,7 +543,7 @@ async fn finalize_meeting(
 
     if has_min_audio(&final_pcm) {
         append_transcribed_segment(
-            engines, bindings, meetings, meeting_id, final_pcm, sequence, elapsed_ms,
+            engines, bindings, meetings, meeting_id, final_pcm, sequence, elapsed_ms, vocabulary,
         )
         .await?;
     }
@@ -838,7 +859,7 @@ mod tests {
             .await
             .unwrap();
 
-        let out = transcribe_meeting_segment(&reg, &bindings, &one_second_pcm())
+        let out = transcribe_meeting_segment(&reg, &bindings, &one_second_pcm(), &[])
             .await
             .unwrap();
 
@@ -963,6 +984,7 @@ mod tests {
             meetings: &meetings,
             audio: &mut audio,
             settings: &settings,
+            vocabulary: &[],
         };
 
         let session = run_meeting_start(&mut ctx).await.unwrap();
@@ -989,6 +1011,7 @@ mod tests {
             ctx.meetings,
             &session,
             drain_result,
+            &[],
         )
         .await
         .unwrap();
@@ -1069,6 +1092,7 @@ mod tests {
             meetings: &meetings,
             audio: &mut audio,
             settings: &settings,
+            vocabulary: &[],
         };
 
         let session = run_meeting_start(&mut ctx).await.unwrap();
@@ -1091,6 +1115,7 @@ mod tests {
             ctx.meetings,
             &session,
             drain_result,
+            &[],
         )
         .await
         .unwrap();
@@ -1179,6 +1204,7 @@ mod tests {
             meetings: &meetings,
             audio: &mut audio,
             settings: &settings,
+            vocabulary: &[],
         };
 
         let session = run_meeting_start(&mut ctx).await.unwrap();
@@ -1190,6 +1216,7 @@ mod tests {
             ctx.meetings,
             &session,
             drain_result,
+            &[],
         )
         .await
         .unwrap_err();

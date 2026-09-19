@@ -21,4 +21,7 @@ pub struct AudioPcm {
 #[derive(Debug, Clone, Default)]
 pub struct WhisperOpts {
     pub language: Option<String>,
+    /// Terms to seed whisper's initial prompt with. See
+    /// [`crate::whisper`] for the token budget this is trimmed to.
+    pub vocabulary: Vec<String>,
 }

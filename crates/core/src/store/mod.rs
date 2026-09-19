@@ -6,3 +6,4 @@ pub mod hotkeys;
 pub mod meetings;
 pub mod presets;
 pub mod settings;
+pub mod vocabulary;
