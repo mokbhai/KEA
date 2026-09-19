@@ -2614,6 +2614,7 @@ name = "kea-engines"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "kea-infer",
  "kea-platform",
  "keyring",

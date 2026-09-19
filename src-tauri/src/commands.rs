@@ -29,7 +29,9 @@ use kea_core::store::hotkeys::{HotkeyBindingRepo, HotkeyBindingRow};
 use kea_core::store::meetings::{
     ActionItemStatus, Meeting, MeetingDetail, NewActionItem, TitleSource,
 };
+use kea_core::store::rates::{priced, LlmRate, RateRepo, UsageSpend};
 use kea_core::store::settings::SettingsRepo;
+use kea_core::store::usage::{UsageDay, UsageRepo};
 use kea_core::store::vocabulary::{VocabularyEntry, VocabularyRepo};
 use kea_core::transcript::{
     assign_speakers, plan_chunks, segments_from_rows, transcribe_chunks, NewTranscript,
@@ -44,7 +46,7 @@ use kea_features::dictation::{run_dictation_with_commands, spawn_partials, Dicta
 use kea_features::meeting::{
     run_interim_notes_pass, run_meeting_stop_with, InterimSchedule, MeetingStopOptions,
 };
-use kea_features::rewrite::{complete_rewrite, OCR_COMMAND, PALETTE_COMMAND};
+use kea_features::rewrite::{complete_rewrite, OCR_COMMAND, PALETTE_COMMAND, UNDO_COMMAND};
 use kea_features::run_rewrite_with_storage;
 use kea_features::tts::run_tts_with_player;
 use kea_features::ProfileOverrides;
@@ -104,6 +106,7 @@ pub const TTS_COMMAND_ID: &str = "read_selection";
 /// for the same synthetic-keystroke path. See `RewriteFeature::commands`.
 pub const PALETTE_ACTION_ID: &str = "rewrite:prompt_palette";
 pub const OCR_ACTION_ID: &str = "rewrite:ocr_capture";
+pub const UNDO_ACTION_ID: &str = "rewrite:undo_rewrite";
 
 pub const MEETINGS_ACTION_ID: &str = "meetings:toggle_meeting";
 pub const MEETINGS_FEATURE_ID: &str = "meetings";
@@ -160,13 +163,14 @@ impl HotkeyAction {
 /// `set_hotkey`, its rebind cleanup, collision detection and the
 /// effective-hotkey lookup — so adding a feature hotkey is a row here rather
 /// than another arm in five matches.
-pub const HOTKEY_ACTIONS: [HotkeyAction; 6] = [
+pub const HOTKEY_ACTIONS: [HotkeyAction; 7] = [
     HotkeyAction::fixed(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID),
     HotkeyAction::fixed(DICTATION_FEATURE_ID, DICTATION_COMMAND_ID),
     HotkeyAction::fixed(TTS_FEATURE_ID, TTS_COMMAND_ID),
     HotkeyAction::fixed(MEETINGS_FEATURE_ID, MEETINGS_COMMAND_ID),
     HotkeyAction::fixed(REWRITE_FEATURE_ID, PALETTE_COMMAND),
     HotkeyAction::fixed(REWRITE_FEATURE_ID, OCR_COMMAND),
+    HotkeyAction::fixed(REWRITE_FEATURE_ID, UNDO_COMMAND),
 ];
 
 /// The command-id prefix of the per-language translate shortcuts.
@@ -474,11 +478,12 @@ pub fn system_audio_capability_dto(cap: SystemAudioCapability) -> String {
 /// The permission kinds the UI can ask about, paired with the snake_case names
 /// the IPC layer speaks. One table, so the parser and the status list cannot
 /// drift apart.
-const PERM_KINDS: [(&str, PermKind); 4] = [
+const PERM_KINDS: [(&str, PermKind); 5] = [
     ("microphone", PermKind::Microphone),
     ("screen_recording", PermKind::ScreenRecording),
     ("accessibility", PermKind::Accessibility),
     ("calendar", PermKind::Calendar),
+    ("speech", PermKind::Speech),
 ];
 
 fn parse_perm_kind(kind: &str) -> Result<PermKind, String> {
@@ -534,8 +539,22 @@ pub fn installed_onnx_model_ids(storage: &ModelStorage, catalog: &[OnnxModelEntr
 }
 
 /// Providers that ship with the app and can never be removed.
-pub const BUILT_IN_PROVIDERS: [(&str, &str); 2] =
-    [("openai", "OpenAI"), ("local-llm", "Local server")];
+///
+/// Every entry resolves its base URL and default model from
+/// [`kea_engines::WELL_KNOWN_PROVIDERS`] with nothing stored, so connecting one
+/// is entering a key and nothing else. A provider that needed a URL typed in
+/// belongs in the custom list, not here — `local-llm` is the exception that
+/// proves it, and it is keyless.
+pub const BUILT_IN_PROVIDERS: [(&str, &str); 6] = [
+    ("openai", "OpenAI"),
+    ("anthropic", "Anthropic"),
+    // Groq has no engine of its own: it is an OpenAI-shaped server, so
+    // `openai-stt` and `openai-compatible` reach it through this ref.
+    ("groq", "Groq"),
+    ("deepgram", "Deepgram"),
+    ("elevenlabs", "ElevenLabs"),
+    ("local-llm", "Local server"),
+];
 
 /// Settings key holding the JSON list of user-added providers.
 pub const CUSTOM_PROVIDERS_KEY: &str = "providers.custom";
@@ -1005,15 +1024,186 @@ pub async fn run_selection_rewrite(
     over: &RewriteOverride,
 ) -> Result<String, String> {
     let ctx = capture_app_context_now(state).await;
+    // Read with the context, for the same reason: the app that owns the text
+    // is the one that is frontmost *now*, and undo may be pressed from
+    // somewhere else entirely.
+    let target_pid = crate::macfocus::frontmost_pid();
     let profile = profile_for(&state.config_pool, ctx.as_ref()).await;
     let mut input = rewrite_input_for_profile(&state.config_pool, profile.as_ref()).await;
     over.apply(&mut input, &state.config_pool).await;
-    execute_rewrite(
+    let outcome = execute_rewrite(
         state,
         input,
         &ProfileOverrides::from_profile(profile.as_ref()),
     )
-    .await
+    .await?;
+    offer_undo(state, &outcome, target_pid);
+    Ok(outcome.text)
+}
+
+// ===========================================================================
+// Undoing the last rewrite
+// ===========================================================================
+
+/// How long a rewrite stays undoable.
+///
+/// An undo is a reaction to *reading* the result: the user looks at what came
+/// back, decides they preferred their own sentence, and reaches for the key.
+/// That takes tens of seconds, so anything much shorter would expire while
+/// they were still reading. Two minutes covers it with room.
+///
+/// It does not run longer because of what the undo actually does. The
+/// selection is gone, so the only handle left is the text KEA wrote, found by
+/// searching the focused field for it (see `TextIo::swap_in_focused`). That
+/// search is a good guard for a minute or two and a weak one after an
+/// afternoon of editing, by which time the user has typed around it, the
+/// surrounding text has changed, and a stale offer firing is an edit nobody
+/// asked for. The offer is also single-use and replaced by the next rewrite:
+/// there is one step of undo, not a stack.
+pub const UNDO_WINDOW: Duration = Duration::from_secs(120);
+
+/// The last rewrite, while it can still be taken back.
+///
+/// Both halves of the swap are kept because neither can be recovered later:
+/// `original` was a selection that no longer exists, and `inserted` is what
+/// has to be found again in a document the user may have gone on editing.
+pub struct UndoOffer {
+    /// What KEA wrote into the document.
+    pub inserted: String,
+    /// What it replaced, and what goes back.
+    pub original: String,
+    /// The app to bring forward before writing. `None` when nothing could be
+    /// identified, which the undo treats as "do not type anywhere".
+    pub target_pid: Option<i32>,
+    /// When the rewrite landed. Compared against [`UNDO_WINDOW`].
+    pub made_at: std::time::Instant,
+}
+
+impl UndoOffer {
+    fn is_live(&self) -> bool {
+        self.made_at.elapsed() < UNDO_WINDOW
+    }
+}
+
+/// Hand-written rather than derived: both strings are the user's own document
+/// text, and a derive would put a sentence they wrote into any log line or
+/// test failure that happened to print the offer. Lengths answer every
+/// question a debug view is actually asked.
+impl std::fmt::Debug for UndoOffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UndoOffer")
+            .field("inserted_chars", &self.inserted.chars().count())
+            .field("original_chars", &self.original.chars().count())
+            .field("target_pid", &self.target_pid)
+            .field("live", &self.is_live())
+            .finish()
+    }
+}
+
+/// Records a finished rewrite as undoable, replacing any earlier offer.
+///
+/// See [`is_undoable`] for the rewrites that are deliberately not offered.
+fn offer_undo(state: &AppState, outcome: &kea_features::RewriteOutcome, target_pid: Option<i32>) {
+    if !is_undoable(outcome) {
+        return;
+    }
+    match state.last_rewrite.lock() {
+        Ok(mut slot) => {
+            *slot = Some(UndoOffer {
+                inserted: outcome.text.clone(),
+                original: outcome.source_text.clone(),
+                target_pid,
+                made_at: std::time::Instant::now(),
+            })
+        }
+        // A poisoned slot means some other thread panicked holding it; losing
+        // the undo offer is the mildest possible consequence and is not worth
+        // taking a rewrite down for.
+        Err(e) => tracing::warn!(error = %e, "the undo slot is poisoned; not offering an undo"),
+    }
+}
+
+/// Whether a finished rewrite is worth offering an undo for.
+///
+/// Two rewrites are not:
+///
+/// * one that replaced nothing — no selection, so the text went in at the
+///   caret. "Undo" would have to mean *deleting* the insertion, and the swap
+///   this feature is built on can only exchange one string for another; asking
+///   it to delete would leave the surrounding text to guesswork. Not offering
+///   beats offering something that refuses when pressed.
+/// * one that changed nothing. The provider handed back exactly what it was
+///   given, so there is nothing to put back, and the swap would be a no-op
+///   that looked like a success.
+fn is_undoable(outcome: &kea_features::RewriteOutcome) -> bool {
+    !outcome.source_text.is_empty() && outcome.source_text != outcome.text
+}
+
+/// The offer a press of the undo key should act on, or why there is none.
+///
+/// Split out from the slot so the rule — "there has to be one, and it has to
+/// still be live" — is testable without an `AppState`, and so both refusals
+/// carry a message the user can act on.
+fn undo_target(offer: Option<&UndoOffer>) -> Result<&UndoOffer, String> {
+    let offer = offer.ok_or_else(|| "there is no recent rewrite to undo".to_string())?;
+    if !offer.is_live() {
+        return Err("that rewrite is too old to undo safely".into());
+    }
+    Ok(offer)
+}
+
+/// The live offer, cloned rather than taken.
+///
+/// Taken only on success (see [`undo_last_rewrite`]): a failed attempt — the
+/// app would not come back, the element would not give its text up — must
+/// leave the offer where it was, or one unlucky press would silently spend
+/// the user's only chance to get their sentence back.
+fn peek_undo_offer(state: &AppState) -> Result<(String, String, Option<i32>), String> {
+    let slot = state
+        .last_rewrite
+        .lock()
+        .map_err(|_| "KEA lost track of the last rewrite".to_string())?;
+    let offer = undo_target(slot.as_ref())?;
+    Ok((
+        offer.inserted.clone(),
+        offer.original.clone(),
+        offer.target_pid,
+    ))
+}
+
+fn clear_undo_offer(state: &AppState) {
+    if let Ok(mut slot) = state.last_rewrite.lock() {
+        *slot = None;
+    }
+}
+
+/// Puts the text the last rewrite replaced back where it was.
+///
+/// The order matters and is the same one the palette's delivery uses: bring
+/// the app forward and **wait for the activation to land** before writing
+/// anything, because a write into whatever happens to be frontmost is the one
+/// outcome worse than not undoing at all. Then verify — the swap refuses
+/// unless the text KEA wrote is still there, exactly once — and only then
+/// spend the offer.
+pub async fn undo_last_rewrite(state: &Arc<AppState>) -> Result<String, String> {
+    let (inserted, original, target_pid) = peek_undo_offer(state)?;
+
+    let reactivation =
+        tokio::task::spawn_blocking(move || crate::macfocus::restore_focus(target_pid))
+            .await
+            .map_err(|e| e.to_string())?;
+    if !reactivation.can_deliver() {
+        return Err(
+            "KEA could not bring that app back to the front, so nothing was changed".into(),
+        );
+    }
+
+    new_text_io()
+        .swap_in_focused(&inserted, &original)
+        .await
+        .map_err(|e| e.to_string())?;
+    clear_undo_offer(state);
+    Ok(original)
 }
 
 /// The frontmost app's selection, as text.
@@ -1232,18 +1422,22 @@ pub async fn execute_rewrite(
     state: &AppState,
     input: RewriteInput,
     profile: &ProfileOverrides,
-) -> Result<String, String> {
+) -> Result<kea_features::RewriteOutcome, String> {
     let bindings = BindingRepo::new(state.config_pool.clone());
     let actions = ActionRepo::new(state.data_pool.clone());
     let presets = PresetRepo::new(state.config_pool.clone());
     let overrides = PromptOverrideRepo::new(state.config_pool.clone());
     let textio = new_text_io();
     let conversations = ConversationRepo::new(state.data_pool.clone());
+    let usage = UsageRepo::new(state.data_pool.clone());
+    // The usage ledger is added whether or not content is stored: the counts
+    // are not the user's words. See `ContentStorageOpts`.
     let storage = if store_conversations_enabled(&state.config_pool).await {
         ContentStorageOpts::enabled(&conversations)
     } else {
         ContentStorageOpts::default()
-    };
+    }
+    .with_usage(&usage);
     run_rewrite_with_storage(
         &state.engines,
         &bindings,
@@ -2054,12 +2248,14 @@ fn spawn_interim_notes_pass(
         // if it panics — rather than when this function returns.
         let _guard = guard;
         let bindings = BindingRepo::new(state.config_pool.clone());
+        let usage = UsageRepo::new(state.data_pool.clone());
         let result = run_interim_notes_pass(
             &state.engines,
             &bindings,
             &state.meeting_repo,
             &meeting_id,
             from_sequence,
+            Some(&usage),
         )
         .await;
 
@@ -2361,6 +2557,7 @@ pub async fn stop_meeting_inner(
         MeetingStopOptions {
             calendar: state.calendar.clone(),
             calendar_titles: settings.calendar_titles,
+            usage: Some(UsageRepo::new(state.data_pool.clone())),
         },
     )
     .await;
@@ -2750,11 +2947,15 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
     let textio = new_text_io();
     let mut replay = ReplayAudioIo::new(pcm);
     let conversations = ConversationRepo::new(state.data_pool.clone());
+    let usage = UsageRepo::new(state.data_pool.clone());
+    // The usage ledger is added whether or not content is stored: the counts
+    // are not the user's words. See `ContentStorageOpts`.
     let storage = if store_conversations_enabled(&state.config_pool).await {
         ContentStorageOpts::enabled(&conversations)
     } else {
         ContentStorageOpts::default()
-    };
+    }
+    .with_usage(&usage);
 
     let vocabulary = load_vocabulary(&state.config_pool).await;
     let app_context = state
@@ -3025,6 +3226,19 @@ pub async fn test_provider(
     } else {
         result
     })
+}
+
+/// Probes the well-known local LLM ports and reports what answered.
+///
+/// Infallible on purpose: a port nobody is listening on is the *normal*
+/// answer, not an error the user should have to read. An empty list means
+/// "nothing found", and the UI says so.
+///
+/// Worst case is one probe timeout (two seconds), because the probes run
+/// concurrently — see `kea_engines::discover_local_llms`.
+#[tauri::command]
+pub async fn discover_local_llms() -> Vec<kea_engines::LocalLlmServer> {
+    kea_engines::discover_local_llms(&kea_engines::ReqwestProbe::new()).await
 }
 
 #[tauri::command]
@@ -3670,6 +3884,14 @@ pub async fn trigger_rewrite(
     // No profile here on purpose: this is the UI asking for one specific mode
     // against the selection, and the frontmost app at that moment is KEA's own
     // window. A per-app rule has nothing to match and nothing to override.
+    //
+    // No undo offer either, and for the same reason: the offer has to record
+    // the app to hand focus back to, and "frontmost" here is the settings
+    // window. An offer aimed at KEA itself would refuse when pressed — see
+    // `undo_last_rewrite` — which is a worse answer than the honest "there is
+    // no recent rewrite to undo". The shortcut, the translate keys, `kea://`
+    // and the HTTP endpoint all go through `run_selection_rewrite`, which does
+    // record one.
     execute_rewrite(
         &state,
         RewriteInput {
@@ -3681,6 +3903,7 @@ pub async fn trigger_rewrite(
         &ProfileOverrides::default(),
     )
     .await
+    .map(|outcome| outcome.text)
 }
 
 /// Runs the configured rewrite prompt over `text` with the Rewrite feature's
@@ -6065,11 +6288,15 @@ async fn run_palette_inner(
     let presets = PresetRepo::new(state.config_pool.clone());
     let prompt_overrides = PromptOverrideRepo::new(state.config_pool.clone());
     let conversations = ConversationRepo::new(state.data_pool.clone());
+    let usage = UsageRepo::new(state.data_pool.clone());
+    // The usage ledger is added whether or not content is stored: the counts
+    // are not the user's words. See `ContentStorageOpts`.
     let storage = if store_conversations_enabled(&state.config_pool).await {
         ContentStorageOpts::enabled(&conversations)
     } else {
         ContentStorageOpts::default()
-    };
+    }
+    .with_usage(&usage);
 
     let (text, action_id) = complete_rewrite(
         &state.engines,
@@ -6196,6 +6423,108 @@ async fn ocr_options(config_pool: &SqlitePool) -> kea_platform::OcrOptions {
 pub fn get_ocr_languages() -> Result<Vec<String>, String> {
     kea_platform::new_text_recognizer()
         .supported_languages()
+        .map_err(|e| e.to_string())
+}
+
+// ===========================================================================
+// Undo, usage and rates
+// ===========================================================================
+
+/// Puts the last rewrite back, from the settings window's button.
+///
+/// Takes the same flag the shortcut does. The undo brings another app forward
+/// and writes into it, so it must not interleave with a rewrite, a palette
+/// delivery or a capture — all four are edits to the same document.
+#[tauri::command]
+pub async fn undo_last_rewrite_command(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let state = state.inner().clone();
+    let Some(_busy) = try_acquire_busy(&state.selection_busy) else {
+        return Err("KEA is busy with the text in another app".into());
+    };
+    undo_last_rewrite(&state).await
+}
+
+/// Everything the usage view shows, in one round trip.
+///
+/// One command rather than three because the three answers have to agree: a
+/// breakdown priced against one snapshot of the rate table and a daily strip
+/// read a moment later would be two views of two different windows.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageReport {
+    /// Per feature and per provider/model, most tokens first.
+    pub totals: Vec<UsageSpend>,
+    /// The same window, one row per day with any activity.
+    pub daily: Vec<UsageDay>,
+    /// Whether the user has entered any rate at all. The view uses it to
+    /// explain an all-blank money column once, rather than per row.
+    pub any_rates: bool,
+    /// The window actually used, after clamping — so the heading says what
+    /// was measured rather than what was asked for.
+    pub days: i64,
+}
+
+#[tauri::command]
+pub async fn get_usage_report(
+    state: State<'_, Arc<AppState>>,
+    days: i64,
+) -> Result<UsageReport, String> {
+    let days = usage_window(days);
+    let usage = UsageRepo::new(state.data_pool.clone());
+    let rates = RateRepo::new(state.config_pool.clone())
+        .list()
+        .await
+        .map_err(|e| e.to_string())?;
+    let totals = usage.totals(days).await.map_err(|e| e.to_string())?;
+    let daily = usage.daily(days).await.map_err(|e| e.to_string())?;
+    Ok(UsageReport {
+        totals: priced(totals, &rates),
+        daily,
+        any_rates: !rates.is_empty(),
+        days,
+    })
+}
+
+#[tauri::command]
+pub async fn clear_usage(state: State<'_, Arc<AppState>>) -> Result<u64, String> {
+    UsageRepo::new(state.data_pool.clone())
+        .clear()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Clamps a requested window to something a SQL date expression can take.
+///
+/// The number reaches `printf('-%d days', ?)`, so a negative one would ask for
+/// rows from the future and quietly return nothing at all.
+fn usage_window(days: i64) -> i64 {
+    days.clamp(1, 3650)
+}
+
+#[tauri::command]
+pub async fn list_llm_rates(state: State<'_, Arc<AppState>>) -> Result<Vec<LlmRate>, String> {
+    RateRepo::new(state.config_pool.clone())
+        .list()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn upsert_llm_rate(state: State<'_, Arc<AppState>>, rate: LlmRate) -> Result<(), String> {
+    RateRepo::new(state.config_pool.clone())
+        .upsert(&rate)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_llm_rate(
+    state: State<'_, Arc<AppState>>,
+    provider_key: String,
+    model: String,
+) -> Result<(), String> {
+    RateRepo::new(state.config_pool.clone())
+        .delete(&provider_key, &model)
+        .await
         .map_err(|e| e.to_string())
 }
 
@@ -6450,8 +6779,8 @@ mod tests {
     fn provider_entries_lists_built_ins_first_then_custom() {
         let custom = vec![
             CustomProvider {
-                provider_ref: "groq".into(),
-                name: "Groq".into(),
+                provider_ref: "mistral".into(),
+                name: "Mistral".into(),
             },
             // shadowed by a built-in ref: dropped
             CustomProvider {
@@ -6460,38 +6789,66 @@ mod tests {
             },
         ];
         let entries = provider_entries(&custom);
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), BUILT_IN_PROVIDERS.len() + 1);
         assert_eq!(entries[0].provider_ref, "openai");
         assert_eq!(entries[0].name, "OpenAI");
         assert!(entries[0].built_in);
-        assert_eq!(entries[1].provider_ref, "local-llm");
-        assert!(entries[1].built_in);
-        assert_eq!(entries[2].provider_ref, "groq");
-        assert!(!entries[2].built_in);
+        assert!(entries[..BUILT_IN_PROVIDERS.len()]
+            .iter()
+            .all(|e| e.built_in));
+        let last = entries.last().unwrap();
+        assert_eq!(last.provider_ref, "mistral");
+        assert!(!last.built_in);
+    }
+
+    /// A built-in provider is one the user only has to hand a key to. That is
+    /// true exactly when `kea_engines::WELL_KNOWN_PROVIDERS` already knows its
+    /// endpoint, so the two tables are pinned to each other here rather than
+    /// left to agree by habit. `local-llm` is the deliberate exception: it is
+    /// keyless and its URL is whatever server the user is running, which is
+    /// what `discover_local_llms` fills in.
+    #[test]
+    fn every_built_in_provider_needs_only_a_key() {
+        assert_eq!(BUILT_IN_PROVIDERS.len(), 6);
+        for (provider_ref, name) in BUILT_IN_PROVIDERS {
+            assert!(!name.is_empty(), "{provider_ref} has no display name");
+            if provider_ref == "local-llm" {
+                continue;
+            }
+            let known = kea_engines::well_known(provider_ref)
+                .unwrap_or_else(|| panic!("{provider_ref} is not a well-known provider"));
+            assert!(!known.base_url.is_empty(), "{provider_ref} has no base URL");
+            assert!(
+                !known.default_model.is_empty(),
+                "{provider_ref} has no default model"
+            );
+        }
     }
 
     #[test]
     fn validate_new_provider_rejects_bad_input() {
         let existing = vec![CustomProvider {
-            provider_ref: "groq".into(),
-            name: "Groq".into(),
+            provider_ref: "together".into(),
+            name: "Together".into(),
         }];
         assert!(validate_new_provider("", "Name", &existing).is_err());
         assert!(validate_new_provider("mistral", "  ", &existing).is_err());
         assert!(validate_new_provider("openai", "Name", &existing).is_err());
+        // Groq ships built in now; re-adding it by hand is the same refusal.
         assert!(validate_new_provider("groq", "Name", &existing).is_err());
+        assert!(validate_new_provider("together", "Name", &existing).is_err());
         assert!(validate_new_provider("mistral", "Mistral", &existing).is_ok());
     }
 
     #[test]
     fn validate_new_provider_trims_before_checking_and_storing() {
         let existing = vec![CustomProvider {
-            provider_ref: "groq".into(),
-            name: "Groq".into(),
+            provider_ref: "together".into(),
+            name: "Together".into(),
         }];
         // Padding must not smuggle a ref past the built-in / duplicate checks.
         assert!(validate_new_provider(" openai", "Name", &existing).is_err());
-        assert!(validate_new_provider("groq ", "Name", &existing).is_err());
+        assert!(validate_new_provider("together ", "Name", &existing).is_err());
 
         let stored = validate_new_provider("  mistral  ", "  Mistral  ", &existing).unwrap();
         assert_eq!(stored.provider_ref, "mistral");
@@ -6515,7 +6872,9 @@ mod tests {
                 "expected {bad:?} to be rejected"
             );
         }
-        for good in ["groq", "my-server", "my_server", "v1.2", "llama3"] {
+        // Not "groq": it is a built-in ref now, and refused for that reason
+        // rather than for its characters.
+        for good in ["mistral", "my-server", "my_server", "v1.2", "llama3"] {
             assert!(
                 validate_new_provider(good, "Name", &[]).is_ok(),
                 "expected {good:?} to be accepted"
@@ -7244,6 +7603,7 @@ mod tests {
                     MEETINGS_ACTION_ID,
                     PALETTE_ACTION_ID,
                     OCR_ACTION_ID,
+                    UNDO_ACTION_ID,
                 ]
                 .contains(&action.action_id().as_str()),
                 "{} is not one of the declared action ids",
@@ -7918,6 +8278,7 @@ mod tests {
             Ok(PermKind::Accessibility)
         );
         assert_eq!(parse_perm_kind("calendar"), Ok(PermKind::Calendar));
+        assert_eq!(parse_perm_kind("speech"), Ok(PermKind::Speech));
         assert!(parse_perm_kind("camera").is_err());
     }
 
@@ -7930,6 +8291,7 @@ mod tests {
         assert!(items.iter().any(|i| i.kind == "screen_recording"));
         assert!(items.iter().any(|i| i.kind == "accessibility"));
         assert!(items.iter().any(|i| i.kind == "calendar"));
+        assert!(items.iter().any(|i| i.kind == "speech"));
     }
 
     /// The table is the only place a kind is spelled, so the two commands and
@@ -7938,7 +8300,7 @@ mod tests {
     /// `"calendar"`-style entry in `ui/src/api.ts` and `PermissionPanel`.
     #[test]
     fn every_perm_kind_round_trips_through_its_wire_name() {
-        assert_eq!(PERM_KINDS.len(), 4);
+        assert_eq!(PERM_KINDS.len(), 5);
         for (name, kind) in PERM_KINDS {
             assert_eq!(parse_perm_kind(name), Ok(kind), "{name}");
         }
@@ -8850,5 +9212,106 @@ mod tests {
             .await
             .unwrap();
         assert!(!palette_history_enabled(&pool).await);
+    }
+
+    // =======================================================================
+    // Undo, usage and rates
+    // =======================================================================
+
+    fn outcome(source: &str, text: &str) -> kea_features::RewriteOutcome {
+        kea_features::RewriteOutcome {
+            text: text.into(),
+            source_text: source.into(),
+        }
+    }
+
+    fn offer(inserted: &str, original: &str, age: Duration) -> UndoOffer {
+        UndoOffer {
+            inserted: inserted.into(),
+            original: original.into(),
+            target_pid: Some(1234),
+            // Subtracting is how an old offer is built without sleeping for
+            // two minutes in a unit test.
+            made_at: std::time::Instant::now()
+                .checked_sub(age)
+                .expect("the test clock is not near the epoch"),
+        }
+    }
+
+    #[test]
+    fn a_rewrite_that_replaced_a_selection_is_undoable() {
+        assert!(is_undoable(&outcome(
+            "i think we should ship",
+            "I think we should ship."
+        )));
+    }
+
+    #[test]
+    fn an_insertion_with_no_selection_is_not_offered() {
+        // Undoing this would mean deleting what was inserted, which the swap
+        // cannot express — see `is_undoable`.
+        assert!(!is_undoable(&outcome("", "Some fresh text.")));
+    }
+
+    #[test]
+    fn a_rewrite_that_changed_nothing_is_not_offered() {
+        assert!(!is_undoable(&outcome(
+            "Already perfect.",
+            "Already perfect."
+        )));
+    }
+
+    #[test]
+    fn there_is_nothing_to_undo_before_the_first_rewrite() {
+        let err = undo_target(None).unwrap_err();
+        assert!(err.contains("no recent rewrite"), "{err}");
+    }
+
+    #[test]
+    fn a_fresh_offer_is_the_one_to_act_on() {
+        let fresh = offer("new", "old", Duration::from_secs(1));
+        assert_eq!(undo_target(Some(&fresh)).unwrap().original, "old");
+    }
+
+    #[test]
+    fn an_expired_offer_is_refused_with_a_reason() {
+        // The guard the undo leans on is "find the text KEA wrote, exactly
+        // once", and that stops being trustworthy as the user keeps typing.
+        let stale = offer("new", "old", UNDO_WINDOW + Duration::from_secs(1));
+        let err = undo_target(Some(&stale)).unwrap_err();
+        assert!(err.contains("too old"), "{err}");
+    }
+
+    #[test]
+    fn the_undo_window_is_long_enough_to_read_the_result() {
+        // Short enough to be a reaction to reading, long enough not to expire
+        // mid-sentence. Both bounds are the point; see `UNDO_WINDOW`.
+        assert!(UNDO_WINDOW >= Duration::from_secs(30));
+        assert!(UNDO_WINDOW <= Duration::from_secs(600));
+    }
+
+    #[test]
+    fn the_undo_shortcut_does_not_steal_the_systems_own_undo() {
+        // Cmd+Z and Cmd+Shift+Z belong to whichever app is in front. A global
+        // registration of either would take them away everywhere.
+        let accel = compiled_default_accelerator(REWRITE_FEATURE_ID, UNDO_COMMAND).unwrap();
+        assert!(
+            !accel.ends_with("Z"),
+            "{accel} collides with the app's own undo"
+        );
+        assert!(
+            validate_accelerator(&accel).is_ok(),
+            "{accel} does not parse"
+        );
+    }
+
+    #[test]
+    fn the_usage_window_is_clamped_to_something_sql_can_take() {
+        // The number reaches printf('-%d days', ?): zero or negative asks for
+        // rows from the future and silently returns none.
+        assert_eq!(usage_window(30), 30);
+        assert_eq!(usage_window(0), 1);
+        assert_eq!(usage_window(-7), 1);
+        assert_eq!(usage_window(i64::MAX), 3650);
     }
 }

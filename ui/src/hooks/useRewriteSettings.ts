@@ -7,6 +7,7 @@ import {
   getPromptOverride,
   getSetting,
   listPresets,
+  newPreset,
   setPromptOverride,
   setSetting,
   systemTranslationTarget,
@@ -77,6 +78,13 @@ export type RewriteSettingsController = {
   savePromptOverride: () => Promise<void>;
   /** Resolves true once the preset is stored, so the form can clear its inputs. */
   addPreset: (name: string, instruction: string) => Promise<boolean>;
+  /**
+   * Writes a whole preset back — the editor's per-preset AI override goes
+   * through this rather than a third "save the llm columns" command, because
+   * `upsert_preset` already takes the whole row and a partial writer would be
+   * a second place that decides what a cleared override means.
+   */
+  savePreset: (preset: RewritePreset) => Promise<void>;
   removePreset: (id: string) => Promise<void>;
 };
 
@@ -259,7 +267,7 @@ export function useRewriteSettings(): RewriteSettingsController {
     setStatus(null);
     try {
       const id = `preset-${Date.now()}`;
-      await upsertPreset({ id, name: name.trim(), instruction: instruction.trim() });
+      await upsertPreset(newPreset(id, name.trim(), instruction.trim()));
       await loadPresets();
       setPresetId(id);
       persist({ ...settings, preset_id: id });
@@ -268,6 +276,26 @@ export function useRewriteSettings(): RewriteSettingsController {
     } catch (e) {
       setStatus(toMessage(e));
       return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const savePreset = async (preset: RewritePreset) => {
+    setBusy(true);
+    setStatus(null);
+    // Shown before the write lands: the pickers are `<select>`s bound to the
+    // stored list, so waiting would leave the one just changed showing its old
+    // value for the length of a round trip.
+    setPresets((current) => current.map((p) => (p.id === preset.id ? preset : p)));
+    try {
+      await upsertPreset(preset);
+      setStatus("Preset saved.");
+    } catch (e) {
+      setStatus(toMessage(e));
+      // Put back whatever is actually stored, rather than leaving the form
+      // showing an override the backend refused.
+      await loadPresets();
     } finally {
       setBusy(false);
     }
@@ -310,6 +338,7 @@ export function useRewriteSettings(): RewriteSettingsController {
     editPromptOverride: setPromptOverrideText,
     savePromptOverride,
     addPreset,
+    savePreset,
     removePreset,
   };
 }

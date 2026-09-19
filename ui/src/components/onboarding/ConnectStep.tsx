@@ -14,6 +14,7 @@ import {
 } from "../../api";
 import {
   applyDefaultChoice,
+  LOCAL_STT_PREFERENCE,
   type Capability,
   type DefaultChoice,
 } from "../../lib/capabilityDefaults";
@@ -95,12 +96,15 @@ export default function ConnectStep({ setCommit, onCommitted }: Props) {
           listSttEngines().catch(() => []),
           listTtsEngines().catch(() => []),
         ]);
-        if (sttEngines.some((e) => e.id === "whisper")) {
-          await setDefaultIfUnset("stt", {
-            engine: "whisper",
-            model: null,
-            providerRef: null,
-          });
+        // The cheapest local recogniser this build actually registered — see
+        // LOCAL_STT_PREFERENCE. `whisper` is no longer named here directly:
+        // on a Mac with on-device recognition the first dictation should cost
+        // zero bytes, not a 148 MB download.
+        const localStt = LOCAL_STT_PREFERENCE.find((choice) =>
+          sttEngines.some((e) => e.id === choice.engine),
+        );
+        if (localStt) {
+          await setDefaultIfUnset("stt", localStt);
         }
         if (ttsEngines.some((e) => e.id === "sherpa-tts")) {
           await setDefaultIfUnset("tts", {
@@ -256,7 +260,7 @@ export default function ConnectStep({ setCommit, onCommitted }: Props) {
                 className="kea-input"
                 value={customName}
                 onChange={(e) => setCustomName(e.target.value)}
-                placeholder="Name (e.g. Groq)"
+                placeholder="Name (e.g. Mistral)"
                 aria-label="Server name"
               />
               <input

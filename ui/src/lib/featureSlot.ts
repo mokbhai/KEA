@@ -14,7 +14,7 @@ import {
   catalogEngines,
   credentialRefFor,
   describeBinding,
-  runsLocally,
+  needsDownload,
   type Capability,
   type LocalModel,
 } from "./engines";
@@ -208,7 +208,7 @@ function blockedReason(
     };
   }
 
-  if (runsLocally(effective.engine_id)) {
+  if (needsDownload(effective.engine_id)) {
     // The backend uses the binding's model, or the feature's saved fallback.
     const model =
       effective.model ??

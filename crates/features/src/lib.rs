@@ -14,7 +14,9 @@ pub use meeting::{
     transcribe_pcm_segment, ActiveMeeting, MeetingFeature, MeetingRunContext, MeetingSegmentEvent,
 };
 pub use registry::FeatureRegistry;
-pub use rewrite::{run_rewrite, run_rewrite_with_storage, ContentStorageOpts, RewriteFeature};
+pub use rewrite::{
+    run_rewrite, run_rewrite_with_storage, ContentStorageOpts, RewriteFeature, RewriteOutcome,
+};
 pub use transcribe::{TranscribeFeature, TRANSCRIBE_FEATURE_ID};
 pub use tts::{run_tts, run_tts_synthesize, TtsFeature};
 

@@ -3,7 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::http::{Auth, HttpClient};
-use crate::llm::post_chat_completion;
+use crate::llm::stream::{LlmStream, StreamingLlmEngine};
+use crate::llm::{post_chat_completion, stream_chat_completion};
 use crate::provider::{self, CredentialSource, Defaults, ProviderConfigSource, OPENAI_BASE_URL};
 use crate::traits::{EngineCaps, EngineError, LlmEngine, LlmRequest, LlmResponse};
 
@@ -14,6 +15,35 @@ pub struct OpenAiLlmEngine {
     pub credentials: Arc<dyn CredentialSource>,
     pub configs: Arc<dyn ProviderConfigSource>,
     pub provider_ref: String,
+}
+
+impl OpenAiLlmEngine {
+    /// The provider and model one call ends up using. Shared by `complete`
+    /// and `stream` so the two cannot resolve differently.
+    async fn resolve(
+        &self,
+        req: &LlmRequest,
+    ) -> Result<(provider::ResolvedProvider, String), EngineError> {
+        // Same seam as the compatible engine: the resolved binding names the
+        // provider, `self.provider_ref` is only the fallback for a binding
+        // that carries none (an auto-resolved slot).
+        let provider = provider::resolve(
+            self.credentials.as_ref(),
+            self.configs.as_ref(),
+            req.provider_ref.as_deref(),
+            &self.provider_ref,
+            Some(Defaults {
+                base_url: OPENAI_BASE_URL,
+                model: DEFAULT_MODEL,
+            }),
+        )
+        .await?;
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| provider.default_model.clone());
+        Ok((provider, model))
+    }
 }
 
 #[async_trait]
@@ -29,28 +59,34 @@ impl LlmEngine for OpenAiLlmEngine {
     }
 
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, EngineError> {
-        // Same seam as the compatible engine: the resolved binding names the
-        // provider, `self.provider_ref` is only the fallback for a binding
-        // that carries none (an auto-resolved slot).
-        let provider = provider::resolve(
-            self.credentials.as_ref(),
-            self.configs.as_ref(),
-            req.provider_ref.as_deref(),
-            &self.provider_ref,
-            Some(Defaults {
-                base_url: OPENAI_BASE_URL,
-                model: DEFAULT_MODEL,
-            }),
-        )
-        .await?;
+        let (provider, model) = self.resolve(&req).await?;
         // api.openai.com cannot serve an unauthenticated call, so say so
         // before the round-trip rather than relaying its 401.
         let api_key = provider.require_key()?;
-        let model = req.model.as_deref().unwrap_or(&provider.default_model);
         post_chat_completion(
             self.http.as_ref(),
             &provider.base_url,
-            model,
+            &model,
+            Auth::Bearer(api_key),
+            &req.prompt,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl StreamingLlmEngine for OpenAiLlmEngine {
+    fn id(&self) -> &str {
+        "openai"
+    }
+
+    async fn stream(&self, req: LlmRequest) -> Result<LlmStream, EngineError> {
+        let (provider, model) = self.resolve(&req).await?;
+        let api_key = provider.require_key()?;
+        stream_chat_completion(
+            self.http.as_ref(),
+            &provider.base_url,
+            &model,
             Auth::Bearer(api_key),
             &req.prompt,
         )
@@ -147,6 +183,103 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.text, "rewritten");
+        // OpenAI reports usage on every completion, and the cost view needs
+        // the provider's own numbers rather than a count we made up — this
+        // body carries none, so the honest answer is a blank.
+        assert_eq!(out.usage, None);
+    }
+
+    /// The same request with one field added, decoded through OpenAI's own
+    /// `data:` framing. Proves `stream: true` actually goes out — a streaming
+    /// call that forgot it would still work, just not incrementally, which is
+    /// the kind of silent downgrade nothing else would catch.
+    #[tokio::test]
+    async fn streams_chat_completion_deltas() {
+        use futures_util::StreamExt;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("\"stream\":true"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"re\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"written\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            )))
+            .mount(&server)
+            .await;
+
+        let engine = OpenAiLlmEngine {
+            http: Arc::new(ReqwestHttpClient::new()),
+            credentials: FakeCredentials::with_key("openai", "sk-test"),
+            configs: FakeConfigs::with_config(
+                "openai",
+                ProviderConfig {
+                    base_url: format!("{}/v1", server.uri()),
+                    default_model: "gpt-4o-mini".into(),
+                },
+            ),
+            provider_ref: "openai".into(),
+        };
+        let mut chunks = StreamingLlmEngine::stream(
+            &engine,
+            LlmRequest {
+                prompt: "fix this".into(),
+                model: None,
+                provider_ref: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut text = String::new();
+        while let Some(chunk) = chunks.next().await {
+            text.push_str(&chunk.unwrap());
+        }
+        assert_eq!(text, "rewritten");
+    }
+
+    /// A reported usage block reaches the response, so the cost view has a
+    /// number that came from the provider rather than from us.
+    #[tokio::test]
+    async fn a_reported_usage_block_reaches_the_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"choices":[{"message":{"content":"ok"}}],
+                    "usage":{"prompt_tokens":21,"completion_tokens":4}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let engine = OpenAiLlmEngine {
+            http: Arc::new(ReqwestHttpClient::new()),
+            credentials: FakeCredentials::with_key("openai", "sk-test"),
+            configs: FakeConfigs::with_config(
+                "openai",
+                ProviderConfig {
+                    base_url: format!("{}/v1", server.uri()),
+                    default_model: "gpt-4o-mini".into(),
+                },
+            ),
+            provider_ref: "openai".into(),
+        };
+        let out = engine
+            .complete(LlmRequest {
+                prompt: "fix this".into(),
+                model: None,
+                provider_ref: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            out.usage,
+            Some(crate::traits::TokenUsage {
+                prompt: 21,
+                completion: 4
+            })
+        );
     }
 
     #[tokio::test]

@@ -22,6 +22,10 @@ pub enum PermKind {
     /// the event it happened during. Read-only, and off unless the user turns
     /// the feature on.
     Calendar,
+    /// Apple's on-device speech recognizer (the `apple-speech` STT engine).
+    /// Nothing leaves the Mac; the grant is what TCC demands before
+    /// `SFSpeechRecognizer` will run at all.
+    Speech,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,5 +79,7 @@ mod tests {
         assert_eq!(json, r#""ScreenRecording""#);
         let json = serde_json::to_string(&PermKind::Calendar).unwrap();
         assert_eq!(json, r#""Calendar""#);
+        let json = serde_json::to_string(&PermKind::Speech).unwrap();
+        assert_eq!(json, r#""Speech""#);
     }
 }

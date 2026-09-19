@@ -158,6 +158,75 @@ mod tests {
         }
     }
 
+    /// Groq's whole integration.
+    ///
+    /// It serves OpenAI's own transcription wire format, so it needs no
+    /// engine of its own — only a `provider_ref` on the binding. This asserts
+    /// the two halves of that claim: that the request goes to Groq's
+    /// endpoint, and that the default model is the one that makes Groq worth
+    /// selecting, with nothing stored in provider config.
+    #[tokio::test]
+    async fn groq_is_reached_through_this_engine_with_no_stored_config() {
+        let resolved = crate::provider::resolve(
+            FakeCredentials::with_key("groq", "gsk-test").as_ref(),
+            // Deliberately empty: a user who added a Groq key configured
+            // nothing else.
+            Arc::new(FakeConfigs {
+                entries: Mutex::new(HashMap::new()),
+            })
+            .as_ref(),
+            Some("groq"),
+            "openai",
+            Some(Defaults {
+                base_url: OPENAI_BASE_URL,
+                model: DEFAULT_MODEL,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.base_url, "https://api.groq.com/openai/v1");
+        assert_eq!(resolved.default_model, "whisper-large-v3-turbo");
+
+        // And the request this engine builds from that lands on the
+        // compatible path.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/audio/transcriptions"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer gsk-test",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"text":"fast"}"#))
+            .mount(&server)
+            .await;
+        let engine = OpenAiSttEngine {
+            http: Arc::new(ReqwestHttpClient::new()),
+            credentials: FakeCredentials::with_key("groq", "gsk-test"),
+            configs: FakeConfigs::with_config(
+                "groq",
+                ProviderConfig {
+                    base_url: format!("{}/openai/v1", server.uri()),
+                    default_model: "whisper-large-v3-turbo".into(),
+                },
+            ),
+            provider_ref: "openai".into(),
+        };
+        let out = engine
+            .transcribe(
+                AudioPcm {
+                    samples: vec![0.0; 1600],
+                    sample_rate_hz: 16_000,
+                },
+                SttOpts {
+                    provider_ref: Some("groq".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.text, "fast");
+    }
+
     #[tokio::test]
     async fn transcribes_against_mock_openai_stt() {
         let server = MockServer::start().await;

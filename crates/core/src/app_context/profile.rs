@@ -122,11 +122,11 @@ impl AppProfile {
     /// `None` unless an engine id is set: a model or a provider ref with no
     /// engine names nothing resolvable, so it inherits rather than half-applying.
     pub fn llm_binding(&self) -> Option<Binding> {
-        Some(Binding {
-            engine_id: self.llm_engine_id.clone()?,
-            model: self.llm_model.clone(),
-            provider_ref: self.llm_provider_ref.clone(),
-        })
+        Binding::from_parts(
+            self.llm_engine_id.clone(),
+            self.llm_model.clone(),
+            self.llm_provider_ref.clone(),
+        )
     }
 
     /// How specific this profile's match keys are; see [`Specificity`].

@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   addCustomProvider,
+  discoverLocalLlms,
   getBinding,
   listOnnxModels,
   listProviders,
   listWhisperModels,
   setProviderConfig,
   type Binding,
+  type LocalLlmServer,
   type Provider,
 } from "../api";
 import Banner from "../components/Banner";
@@ -27,6 +29,9 @@ const CAPABILITIES: { capability: Capability; icon: string }[] = [
   { capability: "tts", icon: "🔊" },
 ];
 
+/** The built-in provider a discovered server is written to. */
+const LOCAL_PROVIDER_REF = "local-llm";
+
 export default function AiProvidersPage() {
   const [providers, setProviders] = useState<Provider[] | null>(null);
   const [bindings, setBindings] = useState<Record<Capability, Binding | null>>({
@@ -40,6 +45,10 @@ export default function AiProvidersPage() {
   const [newName, setNewName] = useState("");
   const [newUrl, setNewUrl] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // null = never looked; [] = looked and found nothing, which is worth saying.
+  const [found, setFound] = useState<LocalLlmServer[] | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [connected, setConnected] = useState<string | null>(null);
 
   const refreshProviders = useCallback(async () => {
     try {
@@ -109,6 +118,41 @@ export default function AiProvidersPage() {
     }
   };
 
+  // Probing takes at most one 2s timeout, so the button just reports busy
+  // rather than growing a spinner of its own.
+  const scanForServers = async () => {
+    setScanning(true);
+    setError(null);
+    setConnected(null);
+    try {
+      setFound(await discoverLocalLlms());
+    } catch (e) {
+      setError(toMessage(e));
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  /**
+   * Points the built-in "Local server" provider at what was found. Nothing
+   * else is needed: `openai-compatible` reads its base URL and default model
+   * straight off this config, so the next pick in Defaults just works.
+   */
+  const useServer = async (server: LocalLlmServer, model: string) => {
+    setError(null);
+    try {
+      await setProviderConfig(LOCAL_PROVIDER_REF, {
+        base_url: server.base_url,
+        default_model: model,
+      });
+      setConnected(`${server.display_name} saved to Local server.`);
+      setFound(null);
+      await refreshProviders();
+    } catch (e) {
+      setError(toMessage(e));
+    }
+  };
+
   const missing = CAPABILITIES.filter(({ capability }) => !bindings[capability]);
 
   return (
@@ -142,7 +186,7 @@ export default function AiProvidersPage() {
                 className="kea-input"
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
-                placeholder="Name (e.g. Groq)"
+                placeholder="Name (e.g. Mistral)"
                 aria-label="Provider name"
               />
               <input
@@ -174,9 +218,43 @@ export default function AiProvidersPage() {
               </button>
             </div>
           ) : (
-            <button type="button" className="kea-btn" onClick={() => setAdding(true)}>
-              ＋ Add provider
-            </button>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <button type="button" className="kea-btn" onClick={() => setAdding(true)}>
+                ＋ Add provider
+              </button>
+              <button
+                type="button"
+                className="kea-btn"
+                onClick={() => void scanForServers()}
+                disabled={scanning}
+              >
+                {scanning ? "Looking…" : "Find local servers"}
+              </button>
+              {connected && <span className="kea-saved">{connected}</span>}
+            </div>
+          )}
+          {found !== null && (
+            <div style={{ marginTop: 12 }}>
+              {found.length === 0 ? (
+                <p className="kea-muted" style={{ margin: 0 }}>
+                  No server answered on this Mac. Start Ollama or LM Studio and look again.
+                </p>
+              ) : (
+                <RowGroup aria-label="Local servers found">
+                  {found.map((server) => (
+                    <Row key={server.id} label={server.display_name} hint={server.base_url}>
+                      {server.models.length === 0 ? (
+                        // A running server with nothing pulled is a real state:
+                        // say so rather than leaving an empty dropdown.
+                        <span className="kea-muted">No models installed</span>
+                      ) : (
+                        <LocalServerPicker server={server} onUse={useServer} />
+                      )}
+                    </Row>
+                  ))}
+                </RowGroup>
+              )}
+            </div>
           )}
         </div>
       </section>
@@ -231,5 +309,39 @@ export default function AiProvidersPage() {
         )}
       </section>
     </div>
+  );
+}
+
+/**
+ * One found server's model list plus the button that commits it. A component
+ * of its own so each row keeps its own selection — a single piece of page
+ * state would make picking a model on one row move the other's dropdown.
+ */
+function LocalServerPicker({
+  server,
+  onUse,
+}: {
+  server: LocalLlmServer;
+  onUse: (server: LocalLlmServer, model: string) => Promise<void>;
+}) {
+  const [model, setModel] = useState(server.models[0]);
+  return (
+    <>
+      <select
+        className="kea-select"
+        aria-label={`${server.display_name} model`}
+        value={model}
+        onChange={(e) => setModel(e.target.value)}
+      >
+        {server.models.map((m) => (
+          <option key={m} value={m}>
+            {m}
+          </option>
+        ))}
+      </select>
+      <button type="button" className="kea-btn" onClick={() => void onUse(server, model)}>
+        Use this
+      </button>
+    </>
   );
 }

@@ -39,6 +39,11 @@ const LOCAL_PROVIDER_REF = "local-llm";
 /** The built-in cloud provider the OpenAI engines fall back to. */
 const OPENAI_PROVIDER_REF = "openai";
 
+/** Built-in providers whose engines are branded rather than OpenAI-shaped. */
+const ANTHROPIC_PROVIDER_REF = "anthropic";
+const DEEPGRAM_PROVIDER_REF = "deepgram";
+const ELEVENLABS_PROVIDER_REF = "elevenlabs";
+
 /**
  * Whether this provider is reached with an API key. Only the local server is
  * keyless — asked here so a second keyless provider, or a rename of
@@ -92,10 +97,14 @@ export type BindingContext = {
 
 export type EngineId =
   | "openai"
+  | "anthropic"
   | "openai-compatible"
   | "whisper"
   | "parakeet"
+  | "apple-speech"
   | "openai-stt"
+  | "deepgram-stt"
+  | "elevenlabs-stt"
   | "sherpa-tts"
   | "system-tts"
   | "openai-tts";
@@ -179,6 +188,13 @@ export const ENGINES: Record<EngineId, EngineSpec> = {
     credentialRef: OPENAI_PROVIDER_REF,
     describe: vendorSummary("OpenAI"),
   },
+  anthropic: {
+    id: "anthropic",
+    capability: "llm",
+    runsLocally: false,
+    credentialRef: ANTHROPIC_PROVIDER_REF,
+    describe: vendorSummary("Anthropic"),
+  },
   "openai-compatible": {
     id: "openai-compatible",
     capability: "llm",
@@ -207,17 +223,58 @@ export const ENGINES: Record<EngineId, EngineSpec> = {
     id: "parakeet",
     capability: "stt",
     runsLocally: true,
-    catalog: onnxCatalog("parakeet", "Speech to text — Parakeet"),
+    // One catalog, two model families: Moonshine and Parakeet install the
+    // same way and load through the same engine, differing only in the
+    // sherpa config their bundle is read through (see `ModelEntry::onnx_kind`).
+    // The section is named for what it holds, not for one of them.
+    catalog: onnxCatalog("parakeet", "Speech to text — Moonshine & Parakeet"),
     describe: localSummary,
+  },
+  // No catalog and no key: Apple's recognizer downloads nothing and manages
+  // nothing, so it is one fixed row like `system-tts`. It is registered only
+  // where the OS reports on-device recognition (see `register_apple_stt_engine`),
+  // which is why nothing here has to ask whether it would work.
+  "apple-speech": {
+    id: "apple-speech",
+    capability: "stt",
+    runsLocally: true,
+    // The recognizer picks its model per locale, so the dictation language
+    // setting genuinely reaches it — unlike the ONNX transducer.
+    acceptsLanguage: true,
+    localOption: {
+      label: "Apple speech",
+      detail: "on this Mac · no download",
+    },
+    describe: () => "Apple speech — on this Mac",
   },
   "openai-stt": {
     id: "openai-stt",
     capability: "stt",
     runsLocally: false,
     credentialRef: OPENAI_PROVIDER_REF,
+    // Also how Groq is reached: an OpenAI-shaped /audio/transcriptions behind
+    // the `groq` provider_ref, which is why Groq has no engine of its own.
     acceptsAnyProvider: true,
     cloudOption: { label: "OpenAI whisper-1", model: "whisper-1" },
     describe: vendorSummary("OpenAI"),
+  },
+  "deepgram-stt": {
+    id: "deepgram-stt",
+    capability: "stt",
+    runsLocally: false,
+    acceptsLanguage: true,
+    credentialRef: DEEPGRAM_PROVIDER_REF,
+    cloudOption: { label: "Deepgram Nova-3", model: "nova-3" },
+    describe: vendorSummary("Deepgram"),
+  },
+  "elevenlabs-stt": {
+    id: "elevenlabs-stt",
+    capability: "stt",
+    runsLocally: false,
+    acceptsLanguage: true,
+    credentialRef: ELEVENLABS_PROVIDER_REF,
+    cloudOption: { label: "ElevenLabs Scribe", model: "scribe_v1" },
+    describe: vendorSummary("ElevenLabs"),
   },
   "sherpa-tts": {
     id: "sherpa-tts",
@@ -260,9 +317,20 @@ export const engineSpec = (engineId: string): EngineSpec | undefined =>
 export const enginesFor = (capability: Capability): EngineSpec[] =>
   ENGINE_LIST.filter((e) => e.capability === capability);
 
-/** Engines that run on this Mac and therefore need a downloaded model. */
+/** Engines that run on this Mac. */
 export const runsLocally = (engineId: string): boolean =>
   engineSpec(engineId)?.runsLocally ?? false;
+
+/**
+ * Whether this engine has anything to download at all.
+ *
+ * Not the same question as [`runsLocally`], and the difference is load-bearing:
+ * Apple's recognizer and the system voices run here and install nothing, so
+ * diagnosing them against the "is that model on disk?" rule would report a
+ * missing download for a binding that works perfectly.
+ */
+export const needsDownload = (engineId: string): boolean =>
+  engineSpec(engineId)?.catalog !== undefined;
 
 /** Whether a dictation language can be chosen for this engine at all. */
 export const acceptsLanguage = (engineId: string): boolean =>

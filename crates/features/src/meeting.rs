@@ -16,6 +16,7 @@ use kea_core::store::meetings::{
     ActionItem, CaptureMode, Meeting, MeetingDetail, MeetingNotes, MeetingRepo, MeetingSpeaker,
     MeetingStatus, NewActionItem, NewMeeting, NewSegment, TitleSource,
 };
+use kea_core::store::usage::{NewUsageEvent, UsageRepo};
 use kea_core::store::vocabulary::VocabularyEntry;
 use kea_engines::traits::{AudioPcm, LlmEngine, SttOpts, Transcript};
 use kea_engines::EngineRegistry;
@@ -208,6 +209,35 @@ async fn meetings_llm(
     Ok((engine, binding))
 }
 
+/// Writes one meeting LLM call to the usage ledger.
+///
+/// Best effort on purpose: a failed ledger write must not fail a meeting the
+/// user has already sat through, so it is logged and swallowed. The counts are
+/// the provider's own or absent — never a guess.
+///
+/// `action_id` stays `None` for every meeting call. The stop path owns a
+/// ledger row and the interim passes deliberately own none (see
+/// [`run_interim_notes_pass`]), so attributing only some of a meeting's calls
+/// would make the per-action view lie about the rest; the feature and the
+/// model are what the usage view groups by anyway.
+async fn record_meeting_usage(
+    usage: Option<&UsageRepo>,
+    binding: &Binding,
+    reported: Option<kea_engines::traits::TokenUsage>,
+) {
+    let Some(repo) = usage else { return };
+    let event = NewUsageEvent {
+        model: binding.model.clone(),
+        provider_ref: binding.provider_ref.clone(),
+        prompt_tokens: reported.map(|u| i64::from(u.prompt)),
+        completion_tokens: reported.map(|u| i64::from(u.completion)),
+        ..NewUsageEvent::new("meetings", &binding.engine_id)
+    };
+    if let Err(error) = repo.record(&event).await {
+        tracing::warn!(%error, "meeting: could not record token usage");
+    }
+}
+
 /// Complete `req` and parse the reply as notes, with exactly one repair round
 /// trip if it will not parse.
 ///
@@ -225,10 +255,14 @@ async fn complete_notes(
     engine: &dyn LlmEngine,
     binding: &Binding,
     mut req: kea_engines::LlmRequest,
+    usage: Option<&UsageRepo>,
 ) -> Result<ParsedMeetingNotes, String> {
     req.model = binding.model.clone();
     req.provider_ref = binding.provider_ref.clone();
     let first = engine.complete(req).await.map_err(|e| e.to_string())?;
+    // Recorded before the parse: a reply that will not parse still cost the
+    // user, and the repair round trip below costs them again.
+    record_meeting_usage(usage, binding, first.usage).await;
 
     match parse_meeting_notes_json(&first.text) {
         Ok(parsed) => Ok(parsed),
@@ -238,6 +272,7 @@ async fn complete_notes(
             repair.model = binding.model.clone();
             repair.provider_ref = binding.provider_ref.clone();
             let second = engine.complete(repair).await.map_err(|e| e.to_string())?;
+            record_meeting_usage(usage, binding, second.usage).await;
             parse_meeting_notes_json(&second.text).map_err(|e| {
                 // Carried up so the caller can keep the raw text as the
                 // summary rather than failing a meeting the user already paid
@@ -352,13 +387,14 @@ async fn synthesize_notes_parsed(
     meeting: &Meeting,
     segments: &[kea_core::MeetingSegment],
     speakers: &[MeetingSpeaker],
+    usage: Option<&UsageRepo>,
 ) -> Result<(ParsedMeetingNotes, Binding), String> {
     let (engine, binding) = meetings_llm(engines, bindings).await?;
 
     let transcript = format_transcript_for_synthesis(segments, speakers);
     let req = build_meeting_notes_request(&meeting.title, &meeting.started_at, &transcript);
 
-    let parsed = match complete_notes(engine.as_ref(), &binding, req).await {
+    let parsed = match complete_notes(engine.as_ref(), &binding, req, usage).await {
         Ok(parsed) => parsed,
         Err(e) => match unparsable_reply_text(&e) {
             Some(raw) => {
@@ -377,9 +413,10 @@ pub async fn synthesize_meeting_notes(
     meeting: &Meeting,
     segments: &[kea_core::MeetingSegment],
     speakers: &[MeetingSpeaker],
+    usage: Option<&UsageRepo>,
 ) -> Result<MeetingNotes, String> {
     let (parsed, binding) =
-        synthesize_notes_parsed(engines, bindings, meeting, segments, speakers).await?;
+        synthesize_notes_parsed(engines, bindings, meeting, segments, speakers, usage).await?;
 
     Ok(MeetingNotes {
         meeting_id: meeting.id.clone(),
@@ -414,6 +451,7 @@ pub async fn run_interim_notes_pass(
     meetings: &MeetingRepo,
     meeting_id: &str,
     from_sequence: i32,
+    usage: Option<&UsageRepo>,
 ) -> Result<InterimPass, String> {
     let detail = meetings
         .get(meeting_id)
@@ -453,7 +491,7 @@ pub async fn run_interim_notes_pass(
 
     let (engine, binding) = meetings_llm(engines, bindings).await?;
     let req = build_interim_notes_request(&previous, &new_segments, &detail.speakers);
-    let parsed = match complete_notes(engine.as_ref(), &binding, req).await {
+    let parsed = match complete_notes(engine.as_ref(), &binding, req, usage).await {
         Ok(parsed) => parsed,
         // An interim pass that cannot be parsed keeps the previous notes
         // rather than replacing good notes with a raw error string; the final
@@ -581,6 +619,7 @@ pub async fn synthesize_meeting_title(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
     summary: &str,
+    usage: Option<&UsageRepo>,
 ) -> Result<String, String> {
     let (engine, binding) = meetings_llm(engines, bindings).await?;
 
@@ -588,6 +627,7 @@ pub async fn synthesize_meeting_title(
     req.model = binding.model.clone();
     req.provider_ref = binding.provider_ref.clone();
     let resp = engine.complete(req).await.map_err(|e| e.to_string())?;
+    record_meeting_usage(usage, &binding, resp.usage).await;
     Ok(sanitize_meeting_title(&resp.text))
 }
 
@@ -924,6 +964,12 @@ pub struct MeetingStopOptions {
     /// The `meetings.calendar_titles` setting. `false` skips the lookup
     /// entirely — no permission check, no EventKit initialization, nothing.
     pub calendar_titles: bool,
+    /// Where the stop's LLM calls are counted, or `None` to count nothing.
+    ///
+    /// Owned rather than borrowed because this struct is built by value at the
+    /// call site and `UsageRepo` is a pool handle — a clone of an `Arc`, not a
+    /// connection.
+    pub usage: Option<UsageRepo>,
 }
 
 /// How long the calendar read is given before the stop gives up on it.
@@ -1055,6 +1101,7 @@ async fn finalize_meeting(
         &partial.meeting,
         &partial.segments,
         &partial.speakers,
+        opts.usage.as_ref(),
     )
     .await?;
 
@@ -1083,7 +1130,8 @@ async fn finalize_meeting(
             .map_err(|e| e.to_string());
     }
 
-    let title = synthesize_meeting_title(engines, bindings, &notes.summary).await?;
+    let title =
+        synthesize_meeting_title(engines, bindings, &notes.summary, opts.usage.as_ref()).await?;
 
     meetings
         .set_title_with_source(meeting_id, &title, TitleSource::Llm)
@@ -1218,14 +1266,11 @@ mod tests {
 
         async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, EngineError> {
             if req.prompt.contains("<summary>") {
-                return Ok(LlmResponse {
-                    text: "Sprint Planning".into(),
-                });
+                return Ok(LlmResponse::untracked("Sprint Planning"));
             }
-            Ok(LlmResponse {
-                text: r#"{"summary":"kickoff summary","decisions":"","action_items":"follow up","follow_ups":"","open_questions":""}"#
-                    .into(),
-            })
+            Ok(LlmResponse::untracked(
+                r#"{"summary":"kickoff summary","decisions":"","action_items":"follow up","follow_ups":"","open_questions":""}"#,
+            ))
         }
     }
 
@@ -1490,7 +1535,7 @@ mod tests {
             title_source: TitleSource::Llm,
         };
 
-        let notes = synthesize_meeting_notes(&reg, &bindings, &meeting, &[], &[])
+        let notes = synthesize_meeting_notes(&reg, &bindings, &meeting, &[], &[], None)
             .await
             .unwrap();
 
@@ -1518,7 +1563,7 @@ mod tests {
             .await
             .unwrap();
 
-        let title = synthesize_meeting_title(&reg, &bindings, "kickoff summary")
+        let title = synthesize_meeting_title(&reg, &bindings, "kickoff summary", None)
             .await
             .unwrap();
         assert_eq!(title, "Sprint Planning");
@@ -2086,16 +2131,12 @@ mod item_16_17_tests {
                 return Err(EngineError::Other("provider is down".into()));
             }
             if let Some(text) = self.replies.lock().unwrap().pop_front() {
-                return Ok(LlmResponse { text });
+                return Ok(LlmResponse::untracked(text));
             }
             if req.prompt.contains("<summary>") {
-                return Ok(LlmResponse {
-                    text: "Sprint Planning".into(),
-                });
+                return Ok(LlmResponse::untracked("Sprint Planning"));
             }
-            Ok(LlmResponse {
-                text: VALID_NOTES.into(),
-            })
+            Ok(LlmResponse::untracked(VALID_NOTES))
         }
     }
 
@@ -2207,6 +2248,7 @@ mod item_16_17_tests {
             &meeting_row("m1", "2026-09-19 10:00:00"),
             &[],
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -2231,6 +2273,7 @@ mod item_16_17_tests {
             &meeting_row("m1", "2026-09-19 10:00:00"),
             &[],
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -2249,7 +2292,8 @@ mod item_16_17_tests {
             &bindings,
             &meeting_row("m1", "2026-09-19 10:00:00"),
             &[],
-            &[]
+            &[],
+            None
         )
         .await
         .is_err());
@@ -2264,10 +2308,16 @@ mod item_16_17_tests {
         recording_meeting(&meetings, "m1", &["hello"]).await;
 
         let detail = meetings.get("m1").await.unwrap().unwrap();
-        let (parsed, binding) =
-            synthesize_notes_parsed(&reg, &bindings, &detail.meeting, &detail.segments, &[])
-                .await
-                .unwrap();
+        let (parsed, binding) = synthesize_notes_parsed(
+            &reg,
+            &bindings,
+            &detail.meeting,
+            &detail.segments,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
         let notes = persist_notes(
             &meetings,
             "m1",
@@ -2301,7 +2351,7 @@ mod item_16_17_tests {
         let (reg, bindings, _, meetings) = world(llm.clone()).await;
         recording_meeting(&meetings, "m1", &["opening remarks"]).await;
 
-        let first = run_interim_notes_pass(&reg, &bindings, &meetings, "m1", 0)
+        let first = run_interim_notes_pass(&reg, &bindings, &meetings, "m1", 0, None)
             .await
             .unwrap();
         assert_eq!(first.next_sequence, 1);
@@ -2324,9 +2374,10 @@ mod item_16_17_tests {
             .await
             .unwrap();
 
-        let second = run_interim_notes_pass(&reg, &bindings, &meetings, "m1", first.next_sequence)
-            .await
-            .unwrap();
+        let second =
+            run_interim_notes_pass(&reg, &bindings, &meetings, "m1", first.next_sequence, None)
+                .await
+                .unwrap();
         assert_eq!(second.next_sequence, 2);
         assert_eq!(
             second.notes.as_ref().unwrap().summary,
@@ -2349,7 +2400,7 @@ mod item_16_17_tests {
         let (reg, bindings, _, meetings) = world(llm.clone()).await;
         recording_meeting(&meetings, "m1", &["only segment"]).await;
 
-        let pass = run_interim_notes_pass(&reg, &bindings, &meetings, "m1", 1)
+        let pass = run_interim_notes_pass(&reg, &bindings, &meetings, "m1", 1, None)
             .await
             .unwrap();
         assert_eq!(pass.next_sequence, 1);
@@ -2375,9 +2426,11 @@ mod item_16_17_tests {
             .await
             .unwrap();
 
-        assert!(run_interim_notes_pass(&reg, &bindings, &meetings, "m1", 0)
-            .await
-            .is_err());
+        assert!(
+            run_interim_notes_pass(&reg, &bindings, &meetings, "m1", 0, None)
+                .await
+                .is_err()
+        );
 
         let detail = meetings.get("m1").await.unwrap().unwrap();
         assert_eq!(detail.meeting.status, MeetingStatus::Recording);
@@ -2401,7 +2454,7 @@ mod item_16_17_tests {
             .await
             .unwrap();
 
-        run_interim_notes_pass(&reg, &bindings, &meetings, "m1", 0)
+        run_interim_notes_pass(&reg, &bindings, &meetings, "m1", 0, None)
             .await
             .unwrap();
 
@@ -2510,6 +2563,7 @@ mod item_16_17_tests {
             MeetingStopOptions {
                 calendar: Some(Arc::new(FixedTitle("Q3 Roadmap Review"))),
                 calendar_titles: true,
+                ..MeetingStopOptions::default()
             },
             RecordingLlm::new(&[]),
         )
@@ -2532,6 +2586,7 @@ mod item_16_17_tests {
             MeetingStopOptions {
                 calendar: Some(Arc::new(FixedTitle("1:1 — performance review"))),
                 calendar_titles: true,
+                ..MeetingStopOptions::default()
             },
             RecordingLlm::new(&[]),
         )
@@ -2554,16 +2609,19 @@ mod item_16_17_tests {
             MeetingStopOptions {
                 calendar: Some(Arc::new(FixedTitle("Q3 Roadmap Review"))),
                 calendar_titles: false,
+                ..MeetingStopOptions::default()
             },
             // Feature on, but permission denied / no match / EventKit error.
             MeetingStopOptions {
                 calendar: Some(Arc::new(NoTitle)),
                 calendar_titles: true,
+                ..MeetingStopOptions::default()
             },
             // No calendar on this build at all.
             MeetingStopOptions {
                 calendar: None,
                 calendar_titles: true,
+                ..MeetingStopOptions::default()
             },
             MeetingStopOptions::default(),
         ] {
@@ -2592,6 +2650,7 @@ mod item_16_17_tests {
             MeetingStopOptions {
                 calendar: Some(Arc::new(Panics)),
                 calendar_titles: true,
+                ..MeetingStopOptions::default()
             },
             RecordingLlm::new(&[]),
         )

@@ -27,10 +27,10 @@ use crate::commands::{
     dictation_hotkey_action, hold_dictation_action, hotkey_action_for_id, hotkey_owners,
     lock_cancel_action, meeting_hotkey_action, notify_user, open_palette_session, palette_is_open,
     record_hotkey_reg_status, register_hotkey, resolve_accelerator, run_dictation_action,
-    run_selection_rewrite, start_meeting_inner, stop_meeting_inner, try_acquire_busy, BusyGuard,
-    HotkeyAction, MeetingHotkeyAction, RewriteOverride, DICTATION_ACTION_ID, HOTKEY_ACTIONS,
-    LOCK_CANCEL_ACTION_ID, MEETINGS_ACTION_ID, OCR_ACTION_ID, PALETTE_ACTION_ID, REWRITE_ACTION_ID,
-    TTS_ACTION_ID,
+    run_selection_rewrite, start_meeting_inner, stop_meeting_inner, try_acquire_busy,
+    undo_last_rewrite, BusyGuard, HotkeyAction, MeetingHotkeyAction, RewriteOverride,
+    DICTATION_ACTION_ID, HOTKEY_ACTIONS, LOCK_CANCEL_ACTION_ID, MEETINGS_ACTION_ID, OCR_ACTION_ID,
+    PALETTE_ACTION_ID, REWRITE_ACTION_ID, TTS_ACTION_ID, UNDO_ACTION_ID,
 };
 use crate::events::{
     emit_meeting_error, emit_rewrite_error, emit_rewrite_progress, emit_tts_error,
@@ -76,6 +76,7 @@ fn handler_for(action_id: &str) -> Option<Handler> {
         MEETINGS_ACTION_ID => Some(handle_meetings),
         PALETTE_ACTION_ID => Some(handle_palette),
         OCR_ACTION_ID => Some(handle_ocr_capture),
+        UNDO_ACTION_ID => Some(handle_undo_rewrite),
         // The per-language translate shortcuts are one family rather than a
         // row each, so whether an id names one is asked of the hotkey table's
         // own lookup instead of pattern-matched on a prefix here — same
@@ -103,8 +104,13 @@ fn busy_flag(action_id: &str, state: &Arc<AppState>) -> Arc<AtomicBool> {
         // rewrite shortcut, the palette and the screen-capture shortcut all
         // fire a synthetic Cmd+C or Cmd+V at the same app, and two of those
         // interleaved is a corrupted document rather than a race that can be
-        // lost gracefully. One flag for all three.
-        REWRITE_ACTION_ID | PALETTE_ACTION_ID | OCR_ACTION_ID => state.selection_busy.clone(),
+        // lost gracefully. Undo joins them for the same reason: it brings
+        // another app forward and writes into it, and an undo landing between
+        // a rewrite's ⌘C and its ⌘V corrupts the document just as surely as a
+        // second rewrite would. One flag for all four.
+        REWRITE_ACTION_ID | PALETTE_ACTION_ID | OCR_ACTION_ID | UNDO_ACTION_ID => {
+            state.selection_busy.clone()
+        }
         // Third instance, and it moved here for the same reason the first two
         // did: `kea://read-aloud` and `POST /v1/speak` are now triggers too,
         // and a flag minted inside this table would be invisible to them —
@@ -429,6 +435,28 @@ fn handle_palette<'a>(
 ) -> HandlerFuture<'a> {
     Box::pin(async move {
         open_palette_session(state, app, PaletteOrigin::Selection, None, busy).await;
+    })
+}
+
+/// Put the last rewrite back.
+///
+/// A notification rather than `emit_rewrite_error`, and the same on success:
+/// the key is pressed from someone else's app, where KEA's settings window —
+/// the only place that banner shows — is not on screen. "Nothing happened" is
+/// the one outcome this feature must never produce silently, and every refusal
+/// [`undo_last_rewrite`] returns names its reason.
+fn handle_undo_rewrite<'a>(
+    state: &'a Arc<AppState>,
+    app: &'a AppHandle,
+    _action: &'a HotkeyAction,
+    busy: BusyGuard,
+) -> HandlerFuture<'a> {
+    Box::pin(async move {
+        let _busy = busy;
+        match undo_last_rewrite(state).await {
+            Ok(_) => emit_rewrite_progress(app, "Put your text back"),
+            Err(error) => notify_user(app, &error),
+        }
     })
 }
 

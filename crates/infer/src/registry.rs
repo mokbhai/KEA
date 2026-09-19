@@ -253,6 +253,16 @@ pub enum OnnxModelKind {
     /// A speaker-embedding extractor, loaded through
     /// `SpeakerEmbeddingExtractorConfig`.
     SpeakerEmbedding,
+    /// A Moonshine v1 recognizer, loaded through
+    /// `OfflineMoonshineModelConfig`.
+    ///
+    /// Four ONNX files rather than the transducer's three, with different
+    /// names and different roles (preprocessor / encoder / uncached decoder /
+    /// cached decoder), which is why it is its own shape inside the same
+    /// family: same storage root, same download-key namespace, same picker
+    /// section, different sherpa config. Exactly the reason
+    /// [`ModelEntry::onnx_kind`] exists.
+    Moonshine,
 }
 
 impl OnnxModelKind {
@@ -272,6 +282,7 @@ impl OnnxModelKind {
             | OnnxModelKind::TtsMatcha => true,
             OnnxModelKind::TtsVocoder
             | OnnxModelKind::Parakeet
+            | OnnxModelKind::Moonshine
             | OnnxModelKind::StreamingZipformer
             | OnnxModelKind::SpeakerSegmentation
             | OnnxModelKind::SpeakerEmbedding => false,
@@ -630,8 +641,53 @@ impl ModelRegistry {
         ]
     }
 
+    /// The offline local recognizers, whatever sherpa config they load
+    /// through.
+    ///
+    /// Moonshine lives here rather than in a family of its own on purpose.
+    /// A new [`ModelKind`] would mean a new IPC kind string, a new storage
+    /// root, a new download-key namespace, a new picker section and a new
+    /// engine id — five things to wire for a model that is installed the same
+    /// way, bound to the same `stt` slot and served by the same engine. What
+    /// actually differs is one thing: which sherpa model config the bundle
+    /// is loaded through. That is precisely what [`ModelEntry::onnx_kind`]
+    /// carries, the way Kokoro, Kitten and Matcha share `ModelKind::Tts`.
+    ///
+    /// Moonshine tiny is deliberately first. At 30 MB it is two orders of
+    /// magnitude cheaper to install than the 482 MB Parakeet below, it is
+    /// built for exactly the one-to-three-second utterances push-to-talk
+    /// produces, and "the first installed entry" is the fallback rule the
+    /// rest of the app already uses.
     fn parakeet_entries() -> Vec<ModelEntry> {
         vec![
+            ModelEntry {
+                id: "moonshine-tiny-en".into(),
+                display_name: "Moonshine Tiny (English, 30 MB)".into(),
+                language: "en-US".into(),
+                url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27.tar.bz2"
+                    .into(),
+                size_bytes: 29_858_559,
+                sha256: "9ec31b342d8fa3240c3b81b8f82e1cf7e3ac467c93ca5a999b741d5887164f8d"
+                    .into(),
+                kind: ModelKind::Parakeet,
+                onnx_kind: Some(OnnxModelKind::Moonshine),
+                bundle: OnnxBundleShape::TokensBundle,
+                deprecated: false,
+            },
+            ModelEntry {
+                id: "moonshine-base-en".into(),
+                display_name: "Moonshine Base (English, 111 MB)".into(),
+                language: "en-US".into(),
+                url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-base-en-quantized-2026-02-27.tar.bz2"
+                    .into(),
+                size_bytes: 111_266_225,
+                sha256: "43232c1d13013d37317163baec3135bd771a186a4356f28c889bab453bb0e891"
+                    .into(),
+                kind: ModelKind::Parakeet,
+                onnx_kind: Some(OnnxModelKind::Moonshine),
+                bundle: OnnxBundleShape::TokensBundle,
+                deprecated: false,
+            },
             ModelEntry {
                 id: "parakeet-tdt-0.6b-v2".into(),
                 display_name: "Parakeet TDT v2 (English)".into(),
@@ -1088,8 +1144,35 @@ mod tests {
     fn parakeet_catalog_has_entry() {
         let models = ModelRegistry::parakeet_catalog();
         assert!(!models.is_empty());
-        assert!(models[0].url.starts_with("https://"));
-        assert_eq!(models[0].kind, OnnxModelKind::Parakeet);
+        assert!(models.iter().all(|m| m.url.starts_with("https://")));
+        // The head of the family is what a fresh install falls back to, and
+        // it is Moonshine tiny now: 30 MB against Parakeet's 482 MB, for the
+        // one-to-three-second utterances push-to-talk actually produces.
+        assert_eq!(models[0].id, "moonshine-tiny-en");
+        assert_eq!(models[0].kind, OnnxModelKind::Moonshine);
+        assert!(models.iter().any(|m| m.kind == OnnxModelKind::Parakeet));
+    }
+
+    /// The offline-ASR family holds two sherpa config shapes now. Each entry
+    /// has to say which one it is, because the loader dispatches on exactly
+    /// this value and a wrong one loads four files into the wrong fields.
+    #[test]
+    fn every_offline_asr_entry_declares_its_sherpa_shape() {
+        for entry in ModelRegistry::catalog(ModelKind::Parakeet) {
+            let onnx_kind = entry.onnx_kind.or_else(|| entry.kind.onnx_kind());
+            assert!(
+                matches!(
+                    onnx_kind,
+                    Some(OnnxModelKind::Parakeet) | Some(OnnxModelKind::Moonshine)
+                ),
+                "{} declares {onnx_kind:?}",
+                entry.id
+            );
+            assert_eq!(entry.kind.default_slot(), Some("stt"));
+            assert_eq!(entry.bundle, OnnxBundleShape::TokensBundle);
+            assert_eq!(entry.sha256.len(), 64, "{}", entry.id);
+            assert!(entry.size_bytes > 0, "{}", entry.id);
+        }
     }
 
     #[test]

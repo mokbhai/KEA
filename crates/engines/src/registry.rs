@@ -1,3 +1,4 @@
+use crate::llm::StreamingLlmEngine;
 use crate::traits::{LlmEngine, StreamingSttEngine, SttEngine, TtsEngine};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,6 +13,15 @@ pub struct EngineRegistry {
     /// listed `list_stt_ids`.
     streaming: HashMap<String, Arc<dyn StreamingSttEngine>>,
     tts: HashMap<String, Arc<dyn TtsEngine>>,
+    /// The streaming half of an LLM engine, keyed by the *same* id as its
+    /// buffered half.
+    ///
+    /// A second map rather than a second trait object in `llm`, for the
+    /// reason `streaming` above is separate from `stt`: not every LLM backend
+    /// can stream, so a caller that wants live text looks here and falls back
+    /// to `llm(id)` when there is nothing — a visible downgrade rather than an
+    /// engine that answers "unsupported" at the moment of use.
+    streaming_llm: HashMap<String, Arc<dyn StreamingLlmEngine>>,
 }
 
 impl EngineRegistry {
@@ -23,6 +33,21 @@ impl EngineRegistry {
     }
     pub fn list_llm_ids(&self) -> Vec<String> {
         let mut v: Vec<_> = self.llm.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    pub fn register_streaming_llm(&mut self, e: Arc<dyn StreamingLlmEngine>) {
+        self.streaming_llm.insert(e.id().to_string(), e);
+    }
+
+    /// The streaming half of the engine with this id, if it has one.
+    pub fn streaming_llm(&self, id: &str) -> Option<Arc<dyn StreamingLlmEngine>> {
+        self.streaming_llm.get(id).cloned()
+    }
+
+    pub fn list_streaming_llm_ids(&self) -> Vec<String> {
+        let mut v: Vec<_> = self.streaming_llm.keys().cloned().collect();
         v.sort();
         v
     }

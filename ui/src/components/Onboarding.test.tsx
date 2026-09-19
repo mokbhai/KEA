@@ -407,3 +407,151 @@ describe("Onboarding wizard", () => {
     });
   });
 });
+
+/**
+ * What a brand-new user is pointed at before they have downloaded anything.
+ * The order is `LOCAL_STT_PREFERENCE`; these pin the two ends of it, because
+ * the difference between them is half a gigabyte fetched before a first
+ * dictation and no bytes at all.
+ */
+describe("Onboarding wizard — the local speech recommendation", () => {
+  beforeEach(() => resetTauriMocks());
+
+  const WITH_APPLE = [
+    { id: "apple-speech", models: ["on-device"] },
+    { id: "whisper", models: [] },
+    { id: "parakeet", models: [] },
+    { id: "openai-stt", models: [] },
+  ];
+
+  const MOONSHINE = {
+    id: "moonshine-tiny-en",
+    display_name: "Moonshine Tiny (English, 30 MB)",
+    language: "en-US",
+    url: "",
+    size_bytes: 30 * MB,
+    sha256: "",
+    kind: "Parakeet",
+  };
+
+  it("recommends Apple speech where the OS has it, and downloads nothing", async () => {
+    mockWizardWorld({
+      hasKey: false,
+      extra: {
+        list_stt_engines: () => WITH_APPLE,
+        get_permission_status: () => "Unknown",
+      },
+    });
+    const user = userEvent.setup();
+    render(<Onboarding onFinish={() => {}} />);
+    await goToStep(3, user);
+
+    const local = (await screen.findByRole("radio", {
+      name: /Apple speech/,
+    })) as HTMLInputElement;
+    expect(local.checked).toBe(true);
+    // The copy has to say what the user is actually getting: no bytes, one
+    // permission prompt — not the "148 MB download" the whisper row showed.
+    expect(screen.getByText(/Nothing to download/)).toBeTruthy();
+
+    await user.click(continueBtn());
+    await screen.findByText(/Step 4 of 4/);
+
+    expect(invokeCalls("download_whisper_model")).toHaveLength(0);
+    // The local voice on the same step does fetch a bundle; speech does not.
+    expect(
+      invokeCalls("download_onnx_model").filter((a) => a?.kind === "parakeet"),
+    ).toHaveLength(0);
+    expect(invokeCalls("set_binding").find((a) => a?.slot === "stt")).toEqual({
+      feature: "default",
+      slot: "stt",
+      engine: "apple-speech",
+      model: null,
+      providerRef: null,
+    });
+    // Asked for at the moment the user chose it, exactly like the calendar
+    // toggle — the engine cannot run without it and would otherwise fail on
+    // the first dictation with nothing having asked.
+    expect(invokeCalls("request_permission")).toEqual([{ kind: "speech" }]);
+  });
+
+  it("does not re-ask for a grant that has already been decided", async () => {
+    mockWizardWorld({
+      hasKey: false,
+      extra: {
+        list_stt_engines: () => WITH_APPLE,
+        get_permission_status: () => "Denied",
+      },
+    });
+    const user = userEvent.setup();
+    render(<Onboarding onFinish={() => {}} />);
+    await goToStep(3, user);
+    await screen.findByRole("radio", { name: /Apple speech/ });
+    await user.click(continueBtn());
+    await screen.findByText(/Step 4 of 4/);
+
+    expect(invokeCalls("request_permission")).toHaveLength(0);
+  });
+
+  it("falls back to the 30 MB model, not the 482 MB one, without Apple speech", async () => {
+    mockWizardWorld({
+      hasKey: false,
+      extra: {
+        list_onnx_models: (args) =>
+          args?.kind === "tts" ? TTS_CATALOG : [MOONSHINE, ...PARAKEET_CATALOG],
+      },
+    });
+    const user = userEvent.setup();
+    render(<Onboarding onFinish={() => {}} />);
+    await goToStep(3, user);
+
+    const local = (await screen.findByRole("radio", {
+      name: /Moonshine Tiny/,
+    })) as HTMLInputElement;
+    expect(local.checked).toBe(true);
+
+    await user.click(continueBtn());
+    await screen.findByText(/Step 4 of 4/);
+
+    // Both share the `parakeet` engine, so only the model id distinguishes
+    // them — matching the engine alone would have picked Parakeet here.
+    expect(invokeCalls("set_binding").find((a) => a?.slot === "stt")).toEqual({
+      feature: "default",
+      slot: "stt",
+      engine: "parakeet",
+      model: "moonshine-tiny-en",
+      providerRef: null,
+    });
+    await waitFor(() =>
+      expect(
+        invokeCalls("download_onnx_model").filter((a) => a?.kind === "parakeet"),
+      ).toEqual([{ kind: "parakeet", modelId: "moonshine-tiny-en" }]),
+    );
+  });
+
+  it("binds the same engine from the Connect step's 'Local only' choice", async () => {
+    mockWizardWorld({
+      hasKey: false,
+      extra: {
+        list_stt_engines: () => WITH_APPLE,
+        get_permission_status: () => "Granted",
+      },
+    });
+    const user = userEvent.setup();
+    render(<Onboarding onFinish={() => {}} />);
+    await goToStep(2, user);
+
+    await user.click(screen.getByRole("radio", { name: /Local only/ }));
+    await user.click(continueBtn());
+    await screen.findByText(/Step 3 of 4/);
+
+    expect(invokeCalls("set_binding").find((a) => a?.slot === "stt")).toEqual({
+      feature: "default",
+      slot: "stt",
+      engine: "apple-speech",
+      model: null,
+      providerRef: null,
+    });
+    expect(invokeCalls("request_permission")).toHaveLength(0);
+  });
+});

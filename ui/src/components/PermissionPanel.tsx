@@ -30,6 +30,8 @@ function permissionLabel(kind: string): string {
       return "Accessibility";
     case "calendar":
       return "Calendar";
+    case "speech":
+      return "Speech Recognition";
     default:
       return kind;
   }

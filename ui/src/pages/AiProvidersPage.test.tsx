@@ -128,3 +128,83 @@ describe("AiProvidersPage — adding a custom provider", () => {
     expect((screen.getByLabelText("Provider name") as HTMLInputElement).value).toBe("Groq");
   });
 });
+
+describe("AiProvidersPage — finding a local server", () => {
+  beforeEach(() => resetTauriMocks());
+
+  const OLLAMA = {
+    id: "ollama",
+    display_name: "Ollama",
+    base_url: "http://127.0.0.1:11434/v1",
+    models: ["qwen3:8b", "llama3.2"],
+  };
+
+  /**
+   * The whole point of discovery: the user picks a model and the built-in
+   * "Local server" provider is configured for them — no port, no /v1 suffix
+   * and no model id typed by hand.
+   */
+  it("writes the found server's URL and the chosen model to the local provider", async () => {
+    onInvoke({
+      list_providers: () => BUILT_INS,
+      get_binding: () => null,
+      list_whisper_models: () => [],
+      list_onnx_models: () => [],
+      has_credential: () => false,
+      get_provider_config: () => null,
+      set_provider_config: () => undefined,
+      discover_local_llms: () => [OLLAMA],
+    });
+    render(<AiProvidersPage />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Find local servers" }));
+    const picker = await screen.findByLabelText("Ollama model");
+    // First in the server's own list is preselected, so "Use this" alone works.
+    expect((picker as HTMLSelectElement).value).toBe("qwen3:8b");
+    await userEvent.selectOptions(picker, "llama3.2");
+    await userEvent.click(screen.getByRole("button", { name: "Use this" }));
+
+    await waitFor(() => expect(invokeCalls("set_provider_config")).toHaveLength(1));
+    expect(invokeCalls("set_provider_config")[0]).toEqual({
+      providerRef: "local-llm",
+      config: { base_url: "http://127.0.0.1:11434/v1", default_model: "llama3.2" },
+    });
+    // The list collapses once it has been acted on, and the row confirms.
+    await waitFor(() => expect(screen.queryByLabelText("Ollama model")).toBeNull());
+    expect(screen.getByText(/Ollama saved to Local server/)).toBeTruthy();
+  });
+
+  it("says so when nothing answered, rather than showing an empty list", async () => {
+    onInvoke({
+      list_providers: () => BUILT_INS,
+      get_binding: () => null,
+      list_whisper_models: () => [],
+      list_onnx_models: () => [],
+      has_credential: () => false,
+      get_provider_config: () => null,
+      discover_local_llms: () => [],
+    });
+    render(<AiProvidersPage />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Find local servers" }));
+    expect(await screen.findByText(/No server answered on this Mac/)).toBeTruthy();
+  });
+
+  /** A running server with nothing pulled is a real state worth reporting. */
+  it("reports a server that has no models instead of offering an empty picker", async () => {
+    onInvoke({
+      list_providers: () => BUILT_INS,
+      get_binding: () => null,
+      list_whisper_models: () => [],
+      list_onnx_models: () => [],
+      has_credential: () => false,
+      get_provider_config: () => null,
+      discover_local_llms: () => [{ ...OLLAMA, models: [] }],
+    });
+    render(<AiProvidersPage />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Find local servers" }));
+    expect(await screen.findByText("No models installed")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Use this" })).toBeNull();
+  });
+});

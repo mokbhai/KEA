@@ -81,6 +81,38 @@ pub struct LlmRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct LlmResponse {
     pub text: String,
+    /// Tokens the provider reported for this call. `None` when the
+    /// provider did not say — never a guess, because a fabricated
+    /// number in a cost view is worse than a blank one.
+    pub usage: Option<TokenUsage>,
+}
+
+impl LlmResponse {
+    /// A completion from a backend that reported no usage — the honest
+    /// shape for local servers and for any provider that omits the block.
+    pub fn untracked(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            usage: None,
+        }
+    }
+}
+
+/// What one completion cost, in the provider's own count.
+///
+/// Provider-reported only: every backend tokenizes differently, so a number
+/// we computed ourselves would disagree with the bill the user is checking
+/// it against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt: u32,
+    pub completion: u32,
+}
+
+impl TokenUsage {
+    pub fn total(&self) -> u32 {
+        self.prompt.saturating_add(self.completion)
+    }
 }
 
 #[async_trait]

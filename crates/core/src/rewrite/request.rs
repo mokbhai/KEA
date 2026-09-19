@@ -67,11 +67,7 @@ mod tests {
         let presets = PresetRepo::new(pool.clone());
         let overrides = PromptOverrideRepo::new(pool);
         presets
-            .upsert(&RewritePreset {
-                id: "p1".into(),
-                name: "French".into(),
-                instruction: "Translate to French".into(),
-            })
+            .upsert(&RewritePreset::new("p1", "French", "Translate to French"))
             .await
             .unwrap();
 
@@ -138,11 +134,7 @@ mod tests {
         let presets = PresetRepo::new(pool.clone());
         let overrides = PromptOverrideRepo::new(pool);
         presets
-            .upsert(&RewritePreset {
-                id: "p1".into(),
-                name: "Pirate".into(),
-                instruction: "Rewrite as a pirate".into(),
-            })
+            .upsert(&RewritePreset::new("p1", "Pirate", "Rewrite as a pirate"))
             .await
             .unwrap();
 

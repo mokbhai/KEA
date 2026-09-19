@@ -3,15 +3,18 @@ import {
   downloadOnnxModel,
   downloadWhisperModel,
   getDictationSettings,
+  getPermissionStatus,
   getTtsSettings,
   hasCredential,
   listLlmEngines,
   listSttEngines,
   listTtsEngines,
+  requestPermission,
   setBinding,
   setDictationSettings,
   setTtsSettings,
   type OnnxModel,
+  type PermissionKind,
   type Provider,
   type WhisperModel,
 } from "../api";
@@ -190,6 +193,31 @@ export type DefaultChoice = {
   providerRef: string | null;
 };
 
+/**
+ * What "speech to text, on this Mac" should mean on a fresh install, best
+ * first. Read by the onboarding wizard's two steps, which is why it is one
+ * table and not a preference expressed twice.
+ *
+ * Ordered by what it costs the user before their first dictation, because on
+ * a push-to-talk utterance the accuracy difference between these is small and
+ * the download difference is three orders of magnitude:
+ *
+ * 1. `apple-speech` — nothing to download, nothing to manage, and it is only
+ *    ever registered where macOS reports on-device recognition, so its
+ *    presence in the engine list *is* the support check. It costs one
+ *    permission prompt.
+ * 2. `moonshine-tiny-en` — 30 MB, and built for the one-to-three-second
+ *    utterances push-to-talk produces.
+ * 3. `whisper` — ~148 MB for base, and the only one of the three with a model
+ *    for languages other than English, which is why it stays the last resort
+ *    rather than being dropped.
+ */
+export const LOCAL_STT_PREFERENCE: DefaultChoice[] = [
+  { engine: "apple-speech", model: null, providerRef: null },
+  { engine: "parakeet", model: "moonshine-tiny-en", providerRef: null },
+  { engine: "whisper", model: "whisper-base", providerRef: null },
+];
+
 /** Which binding row a choice is written to. */
 export type BindingTarget = { feature: string; slot: string };
 
@@ -249,6 +277,7 @@ export async function applyDefaultChoice(
 ): Promise<void> {
   const to = target ?? defaultTarget(capability);
   await setBinding(to.feature, to.slot, choice.engine, choice.model, choice.providerRef);
+  await requestEnginePermission(choice.engine);
   if (!ownsSettings(capability, to)) return;
   // Only a pick by the engine that owns the fallback, carrying a model of its
   // own, has anything to say here.
@@ -275,6 +304,37 @@ export async function applyDefaultChoice(
     ) {
       await setTtsSettings(next);
     }
+  }
+}
+
+/**
+ * The macOS grant an engine cannot run without, for the engines that need one.
+ *
+ * A table rather than an `if` at each pick site: the picker, the onboarding
+ * wizard and the per-feature overrides all write through
+ * [`applyDefaultChoice`], and a prompt wired into only some of them would let a
+ * user choose an engine that then refuses for a reason nothing mentioned.
+ */
+const ENGINE_PERMISSIONS: Record<string, PermissionKind> = {
+  "apple-speech": "speech",
+};
+
+/**
+ * Asks for the grant an engine needs, at the moment the user chooses it.
+ *
+ * Choosing it is where the user has said yes to this — the same rule the
+ * calendar toggle follows — and the backend only ever prompts when the status
+ * is still undecided, so re-picking after a denial is silent. Never fatal: the
+ * binding is already written, and an engine without its grant reports exactly
+ * what is missing when it runs.
+ */
+async function requestEnginePermission(engineId: string): Promise<void> {
+  const kind = ENGINE_PERMISSIONS[engineId];
+  if (!kind) return;
+  try {
+    if ((await getPermissionStatus(kind)) === "Unknown") await requestPermission(kind);
+  } catch {
+    // Nothing to tell the user here that the engine will not say better.
   }
 }
 

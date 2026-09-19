@@ -1,8 +1,19 @@
-//! Parakeet STT engine backed by injectable [`SherpaSttInference`].
+//! The offline local STT engine, backed by injectable [`SherpaSttInference`].
 //!
 //! Real ONNX inference is provided by [`SherpaOnnxSttInference`] when the `sherpa`
 //! feature is enabled on `kea-infer`. Engine logic is tested with fakes under default
 //! features.
+//!
+//! ## Why it is still called `parakeet`
+//!
+//! It serves every bundle in `ModelKind::Parakeet` — the NeMo transducers and
+//! the Moonshine recognizers — because they install the same way, bind to the
+//! same `stt` slot and differ only in which sherpa model config loads them.
+//! The id stays `"parakeet"` regardless: it is persisted in every user's
+//! capability binding, and renaming it would silently unbind whoever had
+//! chosen a local recognizer. The catalog entry's [`OnnxModelKind`] is what
+//! actually decides how the bundle is loaded, and it travels down to the
+//! inference layer rather than being guessed from the directory.
 //!
 //! ## D6 `ort` fallback
 //!
@@ -54,7 +65,14 @@ impl SttEngine for ParakeetSttEngine {
             .as_deref()
             .ok_or_else(|| EngineError::Config("parakeet requires a model id".into()))?;
 
-        if !self.storage.is_onnx_installed(model_id) {
+        // The catalog, not the directory listing, says which sherpa config
+        // this bundle loads through. An id that is not in the catalog cannot
+        // be loaded at all, so it is refused here rather than at the point
+        // where four unknown `.onnx` files fail to become a recognizer.
+        let entry = ModelRegistry::find_parakeet(model_id)
+            .ok_or_else(|| EngineError::Config(format!("unknown local stt model: {model_id}")))?;
+
+        if !self.storage.is_onnx_entry_installed(&entry) {
             return Err(EngineError::ModelNotInstalled(format!(
                 "parakeet model not installed: {model_id}"
             )));
@@ -78,7 +96,7 @@ impl SttEngine for ParakeetSttEngine {
         let hotwords = SttHotwords::new(opts.vocabulary);
         let result = self
             .inference
-            .transcribe(pcm, &model_dir, &hotwords)
+            .transcribe(pcm, &model_dir, entry.kind, &hotwords)
             .await
             .map_err(|e| EngineError::Other(e.to_string()))?;
 
@@ -99,7 +117,7 @@ pub fn register_parakeet_stt_engine(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use kea_infer::{AudioPcm as InferAudioPcm, SherpaSttInference};
+    use kea_infer::{AudioPcm as InferAudioPcm, OnnxModelKind, SherpaSttInference};
     use std::path::Path;
     use std::sync::Mutex;
 
@@ -109,6 +127,7 @@ mod tests {
     #[derive(Default)]
     struct FakeSherpaSttInference {
         seen: Mutex<Vec<SttHotwords>>,
+        kinds: Mutex<Vec<OnnxModelKind>>,
     }
 
     #[async_trait]
@@ -117,9 +136,11 @@ mod tests {
             &self,
             pcm: InferAudioPcm,
             _model_dir: &Path,
+            kind: OnnxModelKind,
             hotwords: &SttHotwords,
         ) -> Result<kea_infer::SttResult, kea_infer::InferError> {
             self.seen.lock().unwrap().push(hotwords.clone());
+            self.kinds.lock().unwrap().push(kind);
             Ok(kea_infer::SttResult::text_only(format!(
                 "parakeet: {} samples",
                 pcm.samples.len()
@@ -196,6 +217,89 @@ mod tests {
             let seen = inference.seen.lock().unwrap().last().unwrap().clone();
             assert_eq!(seen.terms(), expected.as_slice());
         }
+    }
+
+    /// The Moonshine rows share this engine, this storage root and this
+    /// binding — what has to differ is the sherpa config, and the only way
+    /// that reaches the loader is the catalog's `OnnxModelKind` travelling
+    /// down. If it stopped here, a Moonshine bundle would be loaded as a
+    /// transducer and fail with four files it cannot name.
+    #[tokio::test]
+    async fn the_catalogs_model_shape_reaches_the_inference_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(ModelStorage::new(dir.path().to_path_buf()));
+        let inference = Arc::new(FakeSherpaSttInference::default());
+        let engine = ParakeetSttEngine::new(inference.clone(), storage.clone());
+
+        for (model_id, expected) in [
+            ("moonshine-tiny-en", OnnxModelKind::Moonshine),
+            ("parakeet-tdt-0.6b-v2", OnnxModelKind::Parakeet),
+        ] {
+            let model_dir = storage.onnx_dir_for(model_id);
+            std::fs::create_dir_all(&model_dir).unwrap();
+            std::fs::write(model_dir.join("tokens.txt"), b"tok").unwrap();
+
+            engine
+                .transcribe(
+                    AudioPcm {
+                        samples: vec![0.0; 160],
+                        sample_rate_hz: 16_000,
+                    },
+                    SttOpts {
+                        model: Some(model_id.into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(*inference.kinds.lock().unwrap().last().unwrap(), expected);
+        }
+    }
+
+    /// Both Moonshine sizes are offered, and the engine advertises them.
+    #[test]
+    fn the_engine_advertises_every_local_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = ParakeetSttEngine::new(
+            Arc::new(FakeSherpaSttInference::default()),
+            Arc::new(ModelStorage::new(dir.path().to_path_buf())),
+        );
+        let models = engine.capabilities().models;
+        for id in [
+            "moonshine-tiny-en",
+            "moonshine-base-en",
+            "parakeet-tdt-0.6b-v2",
+        ] {
+            assert!(
+                models.iter().any(|m| m == id),
+                "{id} missing from {models:?}"
+            );
+        }
+    }
+
+    /// A model id that is not in the catalog cannot be loaded, so it is
+    /// refused by name rather than reaching the loader as an empty directory.
+    #[tokio::test]
+    async fn an_unknown_model_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = ParakeetSttEngine::new(
+            Arc::new(FakeSherpaSttInference::default()),
+            Arc::new(ModelStorage::new(dir.path().to_path_buf())),
+        );
+        let err = engine
+            .transcribe(
+                AudioPcm {
+                    samples: vec![0.0; 100],
+                    sample_rate_hz: 16_000,
+                },
+                SttOpts {
+                    model: Some("not-a-model".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown local stt model"), "{err}");
     }
 
     #[tokio::test]

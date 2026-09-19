@@ -4,17 +4,31 @@ use kea_core::rewrite::{PresetRepo, PromptOverrideRepo};
 use kea_core::store::actions::{ActionRepo, NewAction};
 use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_core::store::conversations::{ConversationRepo, MessageRole, NewConversation, NewMessage};
-use kea_engines::traits::LlmRequest;
+use kea_core::store::usage::{NewUsageEvent, UsageRepo};
+use kea_engines::traits::{LlmRequest, TokenUsage};
 use kea_engines::EngineRegistry;
 use kea_platform::TextIo;
 
 use crate::feature::{ActionGuard, CapKind, CapSlot, Command, Feature, ProfileOverrides};
 
-/// Optional conversation persistence for History (gated by `store_content`).
+/// What a run is allowed to write down about its LLM calls.
+///
+/// Two independent records, which is why they are two fields rather than one
+/// flag:
+///
+/// * the **conversation** — the text that went to the provider and came back —
+///   is gated by `store_content`, because it is the user's own words;
+/// * the **usage ledger** is not, because someone who would rather their words
+///   were not kept still wants to know what they spent. It is written whenever
+///   a repo is here at all.
+///
+/// `Default` is "write nothing", which is what the callers that persist
+/// neither pass.
 #[derive(Clone, Copy, Default)]
 pub struct ContentStorageOpts<'a> {
     pub store_content: bool,
     pub conversations: Option<&'a ConversationRepo>,
+    pub usage: Option<&'a UsageRepo>,
 }
 
 impl std::fmt::Debug for ContentStorageOpts<'_> {
@@ -22,6 +36,7 @@ impl std::fmt::Debug for ContentStorageOpts<'_> {
         f.debug_struct("ContentStorageOpts")
             .field("store_content", &self.store_content)
             .field("conversations", &self.conversations.is_some())
+            .field("usage", &self.usage.is_some())
             .finish()
     }
 }
@@ -31,19 +46,33 @@ impl<'a> ContentStorageOpts<'a> {
         Self {
             store_content: true,
             conversations: Some(repo),
+            usage: None,
         }
     }
 
     pub fn disabled() -> Self {
-        Self {
-            store_content: false,
-            conversations: None,
-        }
+        Self::default()
+    }
+
+    /// Adds the usage ledger, independently of whether content is stored.
+    pub fn with_usage(mut self, usage: &'a UsageRepo) -> Self {
+        self.usage = Some(usage);
+        self
     }
 }
 
+/// Everything one finished LLM call leaves behind: the conversation for
+/// History, and a row in the usage ledger.
+///
+/// One function rather than two calls at every site, because the two records
+/// describe the same call and a site that remembered one and forgot the other
+/// is exactly how `messages.token_count` sat unwritten since it was added.
+///
+/// `usage` is `None` whenever the provider reported nothing, and it stays
+/// `None` all the way down — no zero-filling, no estimating. See
+/// [`kea_core::store::usage`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn maybe_record_conversation(
+pub(crate) async fn record_llm_call(
     storage: ContentStorageOpts<'_>,
     action_id: i64,
     feature_id: &str,
@@ -52,7 +81,21 @@ pub(crate) async fn maybe_record_conversation(
     provider_ref: Option<String>,
     user_content: &str,
     assistant_content: &str,
+    usage: Option<TokenUsage>,
 ) -> Result<(), String> {
+    if let Some(repo) = storage.usage {
+        repo.record(&NewUsageEvent {
+            action_id: Some(action_id),
+            model: model.clone(),
+            provider_ref: provider_ref.clone(),
+            prompt_tokens: usage.map(|u| i64::from(u.prompt)),
+            completion_tokens: usage.map(|u| i64::from(u.completion)),
+            ..NewUsageEvent::new(feature_id, engine_id)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
     if !storage.store_content {
         return Ok(());
     }
@@ -71,11 +114,13 @@ pub(crate) async fn maybe_record_conversation(
         .await
         .map_err(|e| e.to_string())?;
 
+    // The prompt count belongs to what was sent and the completion count to
+    // what came back, which is what the two message rows already are.
     repo.append_message(&NewMessage {
         conversation_id: conv_id,
         role: MessageRole::User,
         content: user_content.into(),
-        token_count: None,
+        token_count: usage.map(|u| i64::from(u.prompt)),
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -84,7 +129,7 @@ pub(crate) async fn maybe_record_conversation(
         conversation_id: conv_id,
         role: MessageRole::Assistant,
         content: assistant_content.into(),
-        token_count: None,
+        token_count: usage.map(|u| i64::from(u.completion)),
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -132,6 +177,11 @@ impl Feature for RewriteFeature {
                 title: "Capture Screen Text".into(),
                 default_accelerator: Some(crate::feature::platform_accelerator('O')),
             },
+            Command {
+                id: UNDO_COMMAND.into(),
+                title: "Undo Last Rewrite".into(),
+                default_accelerator: Some(crate::feature::platform_accelerator('U')),
+            },
         ]
     }
 }
@@ -142,6 +192,21 @@ pub const PALETTE_COMMAND: &str = "prompt_palette";
 /// Command id of the screenshot-OCR shortcut, which opens the palette
 /// prefilled with whatever text was recognised.
 pub const OCR_COMMAND: &str = "ocr_capture";
+
+/// Command id of "put my own words back", the fourth rewrite command.
+///
+/// A rewrite command rather than a feature of its own, for the same reason the
+/// palette is one: it acts on the rewrite this feature just made, and giving
+/// it a `Feature` would give it an `llm` slot it never calls.
+///
+/// **`U`, not `Z`.** `Cmd+Z` and `Cmd+Shift+Z` are every app's own undo and
+/// redo; registering either globally would take them away from every other app
+/// on the Mac for the sake of a shortcut used a few times a day. The app's own
+/// undo is also the *right* first thing to try — a clipboard paste is usually
+/// one `Cmd+Z` away — and this exists for the cases where it is not: an
+/// Accessibility insertion, an editor whose undo stack does not see it, or a
+/// document edited since.
+pub const UNDO_COMMAND: &str = "undo_rewrite";
 
 /// `Cmd+Shift+R/D/T/M` and now `O` are taken by the other four, and the
 /// screenshot keys `Cmd+Shift+3..6` belong to macOS. Space is spelled out
@@ -169,6 +234,20 @@ fn default_rewrite_accelerator() -> &'static str {
     }
 }
 
+/// What a finished rewrite put in the document, and what it took out.
+///
+/// The second half is the whole reason this is a struct: the selection is
+/// gone by the time anyone wants it back, so unless the run hands the original
+/// text to its caller, nothing above can offer to restore it. See
+/// `commands::UndoOffer` in the app layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewriteOutcome {
+    /// What the provider wrote — now in the user's document.
+    pub text: String,
+    /// What it replaced. Empty when there was no selection to begin with.
+    pub source_text: String,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_rewrite(
     engines: &EngineRegistry,
@@ -192,6 +271,7 @@ pub async fn run_rewrite(
         ContentStorageOpts::default(),
     )
     .await
+    .map(|outcome| outcome.text)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -205,7 +285,7 @@ pub async fn run_rewrite_with_storage(
     mut input: RewriteInput,
     profile: &ProfileOverrides,
     storage: ContentStorageOpts<'_>,
-) -> Result<String, String> {
+) -> Result<RewriteOutcome, String> {
     if input.source_text.is_empty() {
         input.source_text = textio
             .capture_selection()
@@ -237,7 +317,10 @@ pub async fn run_rewrite_with_storage(
     {
         Ok(()) => {
             guard.succeed().await;
-            Ok(text)
+            Ok(RewriteOutcome {
+                text,
+                source_text: input.source_text,
+            })
         }
         Err(e) => Err(guard.fail(e).await),
     }
@@ -276,10 +359,13 @@ pub async fn complete_rewrite(
     profile: &ProfileOverrides,
     storage: ContentStorageOpts<'_>,
 ) -> Result<(String, i64), String> {
-    // A profile substitutes for the resolver rather than patching its result:
-    // `llm_binding()` is None unless an engine id is set, so a half-filled
-    // profile inherits the global binding instead of half-applying one.
-    let binding = match profile.llm_binding.clone() {
+    // Three places may name the LLM, and `llm_binding_over` is the one that
+    // says in which order. A profile or a preset substitutes for the resolver
+    // rather than patching its result: `llm_binding()` is None unless an
+    // engine id is set, so a half-filled override inherits the global binding
+    // instead of half-applying one.
+    let preset_binding = preset_llm_binding(presets, input.preset_id.as_deref()).await;
+    let binding = match profile.llm_binding_over(preset_binding) {
         Some(binding) => binding,
         None => SlotResolver::new(engines, bindings)
             .require_llm("rewrite")
@@ -319,6 +405,21 @@ pub async fn complete_rewrite(
     }
 }
 
+/// The LLM a preset asks for, if this run is using one that asks.
+///
+/// A preset that cannot be read is treated as a preset with no override: the
+/// rewrite itself is about to fail on the same missing row inside
+/// `build_llm_request`, with a message that names it, and failing here first
+/// would replace that message with a vaguer one.
+async fn preset_llm_binding(presets: &PresetRepo, preset_id: Option<&str>) -> Option<Binding> {
+    presets
+        .get(preset_id?)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|preset| preset.llm_binding())
+}
+
 /// The LLM call and the optional conversation record — everything that is the
 /// same whether the answer ends up replacing a selection or on the clipboard.
 async fn run_completion(
@@ -336,7 +437,7 @@ async fn run_completion(
 
     let response = engine.complete(llm_req).await.map_err(|e| e.to_string())?;
 
-    maybe_record_conversation(
+    record_llm_call(
         storage,
         action_id,
         "rewrite",
@@ -345,6 +446,7 @@ async fn run_completion(
         binding.provider_ref.clone(),
         &input.source_text,
         &response.text,
+        response.usage,
     )
     .await?;
 

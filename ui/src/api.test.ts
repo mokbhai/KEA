@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   addMeetingActionItem,
+  discoverLocalLlms,
   exportMeetingMarkdown,
   getPermissionStatus,
   meetingMarkdown,
@@ -88,6 +89,40 @@ describe("meeting commands", () => {
     expect(await requestPermission("calendar")).toBe("Denied");
     expect(invokeCalls("get_permission_status")).toEqual([{ kind: "calendar" }]);
     expect(invokeCalls("request_permission")).toEqual([{ kind: "calendar" }]);
+  });
+
+  // Apple's recognizer needs this one, and requesting it is what pops the
+  // system dialog — the kind has to be spelled as PERM_KINDS spells it or the
+  // Grant button reports "unknown permission kind" instead.
+  it("carries the speech permission kind through both commands", async () => {
+    expect(await getPermissionStatus("speech")).toBe("Granted");
+    expect(await requestPermission("speech")).toBe("Denied");
+    expect(invokeCalls("get_permission_status")).toEqual([{ kind: "speech" }]);
+    expect(invokeCalls("request_permission")).toEqual([{ kind: "speech" }]);
+  });
+});
+
+describe("local LLM discovery", () => {
+  beforeEach(() => resetTauriMocks());
+
+  /** No arguments, and an empty list is a normal answer rather than a failure. */
+  it("asks the backend to probe and passes the servers through", async () => {
+    const servers = [
+      {
+        id: "ollama",
+        display_name: "Ollama",
+        base_url: "http://127.0.0.1:11434/v1",
+        models: ["qwen3:8b"],
+      },
+    ];
+    onInvoke({ discover_local_llms: () => servers });
+    expect(await discoverLocalLlms()).toEqual(servers);
+    expect(invokeCalls("discover_local_llms")).toEqual([undefined]);
+  });
+
+  it("reports finding nothing as an empty list", async () => {
+    onInvoke({ discover_local_llms: () => [] });
+    expect(await discoverLocalLlms()).toEqual([]);
   });
 });
 

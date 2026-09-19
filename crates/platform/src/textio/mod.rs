@@ -60,6 +60,64 @@ pub trait TextIo: Send + Sync {
         self.replace_with_mode(text, ReplaceMode::ClipboardPaste)
             .await
     }
+
+    /// Put `from` back where `to` is now, in whatever has keyboard focus.
+    ///
+    /// This is what undoing a rewrite needs and none of the three methods
+    /// above can express. By the time the user wants the original text back
+    /// the *selection* that was rewritten is long gone — the caret sits after
+    /// the inserted text and nothing is highlighted — so there is nothing to
+    /// "replace". What can still be found is the text KEA itself wrote, and
+    /// [`swap_once`] is the rule for finding it: exactly one occurrence, or
+    /// the swap is refused. See its doc for why "exactly".
+    ///
+    /// Defaults to refusing, which is the honest answer on a platform with no
+    /// way to read a focused element's text back.
+    async fn swap_in_focused(&self, from: &str, to: &str) -> Result<(), TextIoError> {
+        let _ = (from, to);
+        Err(TextIoError::Other(
+            "putting text back is not available on this platform".into(),
+        ))
+    }
+}
+
+/// `haystack` with its one occurrence of `needle` replaced by `replacement`.
+///
+/// **Exactly one.** This backs an undo that rewrites a whole text field, and
+/// the alternative to being sure is destroying a span the user did not choose:
+///
+/// * zero occurrences — the text KEA wrote is not there any more. The user
+///   deleted it, the app reformatted it, or focus is in a different field
+///   entirely. Undoing into that would be an edit nobody asked for.
+/// * more than one — the rewrite produced something the document already
+///   contained elsewhere ("OK", a name, a single line). Picking the first is a
+///   coin flip, and losing the toss silently corrupts the wrong paragraph.
+///
+/// Both refusals name what happened, because "undo did nothing" with no reason
+/// is indistinguishable from a broken shortcut.
+pub fn swap_once(haystack: &str, needle: &str, replacement: &str) -> Result<String, TextIoError> {
+    if needle.is_empty() {
+        return Err(TextIoError::Other(
+            "there is nothing to put back".to_string(),
+        ));
+    }
+    let mut found = haystack.match_indices(needle);
+    let Some((at, _)) = found.next() else {
+        return Err(TextIoError::Other(
+            "the text KEA wrote is not there any more, so nothing was changed".to_string(),
+        ));
+    };
+    if found.next().is_some() {
+        return Err(TextIoError::Other(
+            "that text appears more than once here, so KEA cannot tell which one it wrote"
+                .to_string(),
+        ));
+    }
+    let mut out = String::with_capacity(haystack.len() - needle.len() + replacement.len());
+    out.push_str(&haystack[..at]);
+    out.push_str(replacement);
+    out.push_str(&haystack[at + needle.len()..]);
+    Ok(out)
 }
 
 /// Saved clipboard contents restored after a synthetic paste (D4).
@@ -313,6 +371,55 @@ mod tests {
             *fake.last_mode.lock().unwrap(),
             Some(ReplaceMode::Accessibility)
         );
+    }
+
+    #[test]
+    fn swap_once_replaces_the_single_occurrence() {
+        let out = swap_once("before NEW after", "NEW", "OLD").unwrap();
+        assert_eq!(out, "before OLD after");
+    }
+
+    #[test]
+    fn swap_once_refuses_when_the_text_is_gone() {
+        // The user deleted it, the app reformatted it, or focus moved. An
+        // undo here would be an edit nobody asked for.
+        let err = swap_once("nothing like it", "NEW", "OLD").unwrap_err();
+        assert!(err.to_string().contains("not there any more"), "{err}");
+    }
+
+    #[test]
+    fn swap_once_refuses_an_ambiguous_match() {
+        let err = swap_once("OK, then OK", "OK", "okay").unwrap_err();
+        assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn swap_once_refuses_an_empty_needle() {
+        // `match_indices("")` matches at every boundary, so without this guard
+        // an empty rewrite would "succeed" by splicing text in at index 0.
+        assert!(swap_once("anything", "", "OLD").is_err());
+    }
+
+    #[test]
+    fn swap_once_keeps_multibyte_text_intact() {
+        // The splice is by byte index; slicing mid-character would panic, and
+        // a rewrite of "naïve" → "naive" is an entirely ordinary undo.
+        let out = swap_once("il est naive aujourd'hui", "naive", "naïve").unwrap();
+        assert_eq!(out, "il est naïve aujourd'hui");
+    }
+
+    /// Nothing implements the swap by default, and the default must refuse
+    /// rather than pretend: a silent `Ok` would tell the user their text was
+    /// restored when it never was.
+    #[tokio::test]
+    async fn swap_in_focused_defaults_to_refusing() {
+        let fake = FakeTextIo {
+            selection: String::new(),
+            replaced: std::sync::Mutex::new(None),
+            last_mode: std::sync::Mutex::new(None),
+        };
+        assert!(fake.swap_in_focused("new", "old").await.is_err());
+        assert!(fake.replaced.lock().unwrap().is_none());
     }
 
     #[tokio::test]

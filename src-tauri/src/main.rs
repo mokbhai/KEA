@@ -34,7 +34,9 @@ use tauri::{Manager, Wry};
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
-use crate::commands::{feature_registry, ActiveMeetingSession, HotkeyRegStatus, PaletteSession};
+use crate::commands::{
+    feature_registry, ActiveMeetingSession, HotkeyRegStatus, PaletteSession, UndoOffer,
+};
 
 /// A download in flight: what the UI is waiting on, plus everything needed to
 /// stop it. Aborting drops the transfer mid-write, so the partial file has to
@@ -189,6 +191,15 @@ pub struct AppState {
     /// something to turn off; its presence is also the honest answer to "is
     /// the API running", which a settings row must not infer from the setting.
     pub api_server: Mutex<Option<api::ServerHandle>>,
+    /// The last rewrite, while it can still be taken back, or `None`.
+    ///
+    /// One slot, not a stack: undo puts back the sentence the user just read
+    /// and disliked, and a second step back would be aimed at text they have
+    /// long since moved on from. It expires — see
+    /// [`commands::UNDO_WINDOW`] — because the only handle it has on the
+    /// document is the text KEA wrote, and that stops being a reliable one as
+    /// the user keeps typing.
+    pub last_rewrite: Mutex<Option<UndoOffer>>,
     /// Serialises everything that fires a synthetic Cmd+C or Cmd+V at the
     /// frontmost app: the rewrite shortcut, the palette and the screen-capture
     /// shortcut.
@@ -298,6 +309,7 @@ fn main() {
             commands::has_credential,
             commands::test_provider,
             commands::list_providers,
+            commands::discover_local_llms,
             commands::add_custom_provider,
             commands::update_custom_provider,
             commands::remove_custom_provider,
@@ -401,6 +413,12 @@ fn main() {
             commands::clear_palette_history,
             commands::capture_screen_text,
             commands::get_ocr_languages,
+            commands::undo_last_rewrite_command,
+            commands::get_usage_report,
+            commands::clear_usage,
+            commands::list_llm_rates,
+            commands::upsert_llm_rate,
+            commands::delete_llm_rate,
             api::settings::get_api_settings,
             api::settings::set_api_enabled,
             api::settings::set_api_rate_limit,
@@ -599,6 +617,19 @@ fn build_engines(
         register_system_tts_engine(&mut engines, Arc::from(kea_platform::new_system_tts()));
     }
 
+    // Apple's recognizer needs nothing downloaded either, but unlike the
+    // synthesizer it is not available on every Mac: `register_apple_stt_engine`
+    // returns false and registers nothing where the OS cannot recognize on
+    // device. That refusal is the point — an engine that could only send the
+    // audio to Apple's servers (or fail after doing so) would still appear in
+    // every picker and only break at the moment of use.
+    #[cfg(all(feature = "stt-apple", target_os = "macos"))]
+    {
+        use kea_engines::register_apple_stt_engine;
+        use kea_platform::new_speech_recognition;
+        register_apple_stt_engine(&mut engines, Arc::from(new_speech_recognition()));
+    }
+
     (engines, storages)
 }
 
@@ -619,6 +650,15 @@ fn spawn_startup_maintenance(data_pool: &SqlitePool, log_dir: &Path) {
             Ok(n) if n > 0 => tracing::info!(pruned = n, "pruned old conversations"),
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "failed to prune conversation history"),
+        }
+        // The same 90 days, and deliberately the same number as the usage
+        // view's widest window: a row the view can no longer reach is a row
+        // nothing will ever read again.
+        let usage = kea_core::store::usage::UsageRepo::new(data_pool.clone());
+        match usage.prune_older_than_days(90).await {
+            Ok(n) if n > 0 => tracing::info!(pruned = n, "pruned old usage rows"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "failed to prune the usage ledger"),
         }
         let meetings = kea_core::store::meetings::MeetingRepo::new(data_pool);
         match meetings.prune_older_than_days(90).await {
@@ -705,6 +745,7 @@ fn build_state(
         preview_generation: AtomicU64::new(0),
         palette: Mutex::new(None),
         palette_counter: AtomicU64::new(0),
+        last_rewrite: Mutex::new(None),
         selection_busy: Arc::new(AtomicBool::new(false)),
         tts_busy: Arc::new(AtomicBool::new(false)),
         api_server: Mutex::new(None),

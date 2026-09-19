@@ -25,6 +25,15 @@ export type RewritePreset = {
   id: string;
   name: string;
   instruction: string;
+  /**
+   * The AI this preset asks for, or nulls to use whatever the Rewrite slot is
+   * bound to. Same three columns an app rule carries, at a different scope —
+   * and the app rule wins when both name one (see `llm_binding_over` in
+   * crates/features/src/feature.rs), which the editor says out loud.
+   */
+  llm_engine_id: string | null;
+  llm_model: string | null;
+  llm_provider_ref: string | null;
 };
 
 export type VocabularyEntry = {
@@ -202,6 +211,24 @@ export type Provider = {
 
 export const listProviders = () => invoke<Provider[]>("list_providers");
 
+/**
+ * An OpenAI-compatible LLM server found running on this Mac, mirroring
+ * `kea_engines::LocalLlmServer`. `models` may be empty — a running Ollama with
+ * nothing pulled is a real state worth reporting.
+ */
+export type LocalLlmServer = {
+  id: string;
+  display_name: string;
+  base_url: string;
+  models: string[];
+};
+
+/**
+ * Probes the well-known local ports. Never rejects for "nothing there": an
+ * empty list is the answer, and the worst case is one 2s timeout.
+ */
+export const discoverLocalLlms = () => invoke<LocalLlmServer[]>("discover_local_llms");
+
 export const addCustomProvider = (provider_ref: string, name: string) =>
   invoke<void>("add_custom_provider", { providerRef: provider_ref, name });
 
@@ -217,6 +244,90 @@ export const upsertPreset = (preset: RewritePreset) =>
   invoke<void>("upsert_preset", { preset });
 
 export const deletePreset = (id: string) => invoke<void>("delete_preset", { id });
+
+/** A preset with no AI of its own — the shape the "add a preset" row writes. */
+export const newPreset = (id: string, name: string, instruction: string): RewritePreset => ({
+  id,
+  name,
+  instruction,
+  llm_engine_id: null,
+  llm_model: null,
+  llm_provider_ref: null,
+});
+
+// ---------------------------------------------------------------------------
+// Undo the last rewrite
+// ---------------------------------------------------------------------------
+
+/** Puts back the text the last rewrite replaced. Resolves with the restored text. */
+export const undoLastRewrite = () => invoke<string>("undo_last_rewrite_command");
+
+// ---------------------------------------------------------------------------
+// Usage and cost
+// ---------------------------------------------------------------------------
+
+/**
+ * One (feature, provider, model) group's tokens, and the cost only when KEA
+ * has honest ground for one.
+ *
+ * `cost` is null when no rate has been entered for the model, and *also* when
+ * any call in the group reported no usage — the tokens are then a floor, and a
+ * price on a floor reads as a total. `unreported_calls` is how the view says
+ * so. See crates/core/src/store/rates.rs.
+ */
+export type UsageSpend = {
+  feature_id: string;
+  engine_id: string;
+  model: string | null;
+  provider_ref: string | null;
+  /** What a rate for this row would be filed under. */
+  provider_key: string;
+  calls: number;
+  unreported_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost: number | null;
+  currency: string | null;
+  rate_updated_at: string | null;
+};
+
+export type UsageDay = {
+  day: string;
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+};
+
+export type UsageReport = {
+  totals: UsageSpend[];
+  daily: UsageDay[];
+  any_rates: boolean;
+  /** The window actually measured, after the backend clamped it. */
+  days: number;
+};
+
+export const getUsageReport = (days: number) =>
+  invoke<UsageReport>("get_usage_report", { days });
+
+export const clearUsage = () => invoke<number>("clear_usage");
+
+/** A price the user typed, per million tokens. KEA ships none. */
+export type LlmRate = {
+  provider_key: string;
+  model: string;
+  input_per_mtok: number;
+  output_per_mtok: number;
+  currency: string;
+  /** Stamped by the backend on every save; never sent from here. */
+  updated_at: string;
+};
+
+export const listLlmRates = () => invoke<LlmRate[]>("list_llm_rates");
+
+export const upsertLlmRate = (rate: LlmRate) => invoke<void>("upsert_llm_rate", { rate });
+
+export const deleteLlmRate = (providerKey: string, model: string) =>
+  invoke<void>("delete_llm_rate", { providerKey, model });
 
 export const listVocabulary = () => invoke<VocabularyEntry[]>("list_vocabulary");
 
@@ -715,7 +826,8 @@ export type PermissionKind =
   | "microphone"
   | "screen_recording"
   | "accessibility"
-  | "calendar";
+  | "calendar"
+  | "speech";
 
 export const getPermissionStatus = (kind: PermissionKind) =>
   invoke<PermStatus>("get_permission_status", { kind });

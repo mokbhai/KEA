@@ -422,6 +422,23 @@ impl TextIo for MacTextIo {
             .await
             .map_err(|e| TextIoError::Other(e.to_string()))?
     }
+
+    /// Accessibility only, with **no clipboard fallback** — unlike
+    /// `replace_with_mode` above.
+    ///
+    /// The fallback there is safe because a paste goes exactly where a paste
+    /// would have gone anyway. Here it would not be: the clipboard path types
+    /// over whatever is selected, and at undo time that is either nothing or
+    /// something the user selected themselves. Refusing is the only honest
+    /// answer when the element will not hand its text back.
+    async fn swap_in_focused(&self, from: &str, to: &str) -> Result<(), TextIoError> {
+        let (from, to) = (from.to_string(), to.to_string());
+        tokio::task::spawn_blocking(move || {
+            super::macos_ax::swap_in_focused_element(&from, &to).map_err(TextIoError::Other)
+        })
+        .await
+        .map_err(|e| TextIoError::Other(e.to_string()))?
+    }
 }
 
 #[cfg(test)]

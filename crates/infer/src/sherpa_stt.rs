@@ -34,6 +34,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 
 use crate::error::InferError;
+use crate::registry::OnnxModelKind;
 #[cfg(feature = "sherpa")]
 use crate::types::{group_tokens_into_segments, TOKEN_GROUP_GAP_MS, TOKEN_GROUP_MAX_CUE_MS};
 use crate::types::{AudioPcm, SttResult};
@@ -125,16 +126,44 @@ pub struct HotwordFiles {
     pub body: String,
 }
 
+/// Whether sherpa can build a context graph for a bundle of this shape.
+///
+/// Only the transducer can. Moonshine is an encoder/decoder model with no
+/// context-graph hook in `OfflineMoonshineModelConfig`, so
+/// `modified_beam_search` there buys a slower decode and biases nothing —
+/// which is the same trade [`plan_hotwords`] already refuses for a bundle
+/// with no sentencepiece vocabulary.
+fn supports_hotwords(kind: OnnxModelKind) -> bool {
+    matches!(kind, OnnxModelKind::Parakeet)
+}
+
 /// Decides whether this bundle can honour these terms, and how.
 ///
 /// Answering "greedy, no files" is a real answer, not a failure: it is what
 /// keeps a user with no vocabulary — and a user whose model cannot encode one
 /// — from paying for a beam search that buys nothing.
-pub fn plan_hotwords(model_dir: &Path, hotwords: &SttHotwords) -> HotwordPlan {
+pub fn plan_hotwords(model_dir: &Path, kind: OnnxModelKind, hotwords: &SttHotwords) -> HotwordPlan {
     const GREEDY: &str = "greedy_search";
     const BEAM: &str = "modified_beam_search";
 
     if hotwords.is_empty() {
+        return HotwordPlan {
+            decoding_method: GREEDY,
+            hotwords: None,
+        };
+    }
+
+    if !supports_hotwords(kind) {
+        // Same reasoning as the missing-vocabulary case below: the transcript
+        // is still correct and `apply_vocabulary` still fixes the spelling
+        // afterwards, so this is a log line rather than an error — but it
+        // must not be silence about a setting the user can see.
+        tracing::debug!(
+            ?kind,
+            terms = hotwords.terms().len(),
+            "this model family has no decoder biasing; vocabulary terms are \
+             still applied to the transcript"
+        );
         return HotwordPlan {
             decoding_method: GREEDY,
             hotwords: None,
@@ -191,10 +220,17 @@ pub trait SherpaSttInference: Send + Sync {
     /// encode the terms, it changes nothing and says so in the log rather than
     /// pretending. [`plan_hotwords`] is that decision, and it is testable
     /// without a model on disk.
+    ///
+    /// `kind` says which sherpa model config the bundle in `model_dir` has to
+    /// be loaded through — a transducer triple or a Moonshine quartet. A
+    /// parameter rather than something sniffed from the directory, because
+    /// the catalog already knows it and guessing from the files present is
+    /// the heuristic `sherpa_tts` was rewritten to remove.
     async fn transcribe(
         &self,
         pcm: AudioPcm,
         model_dir: &Path,
+        kind: OnnxModelKind,
         hotwords: &SttHotwords,
     ) -> Result<SttResult, InferError>;
 }
@@ -216,10 +252,39 @@ impl Default for SherpaOnnxSttInference {
     }
 }
 
+/// The files one decode loads, already sorted into the sherpa config they
+/// belong to.
+///
+/// An enum rather than a tuple that grows a fourth path: a Moonshine bundle's
+/// four files are not "a transducer plus one more", they go into a different
+/// `OfflineModelConfig` field entirely, and a tuple would let the wrong four
+/// paths reach the wrong config with nothing in the type to stop it.
 #[cfg(feature = "sherpa")]
-fn find_parakeet_model_files(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SttModelFiles {
+    /// NeMo transducer: encoder, decoder, joiner.
+    Transducer {
+        encoder: PathBuf,
+        decoder: PathBuf,
+        joiner: PathBuf,
+        tokens: PathBuf,
+    },
+    /// Moonshine v1: preprocessor, encoder, uncached decoder, cached decoder.
+    Moonshine {
+        preprocessor: PathBuf,
+        encoder: PathBuf,
+        uncached_decoder: PathBuf,
+        cached_decoder: PathBuf,
+        tokens: PathBuf,
+    },
+}
+
+/// Locates the files for one bundle, dispatching on the catalog's own shape.
+#[cfg(feature = "sherpa")]
+pub fn find_stt_model_files(
     model_dir: &Path,
-) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), InferError> {
+    kind: OnnxModelKind,
+) -> Result<SttModelFiles, InferError> {
     let tokens = model_dir.join("tokens.txt");
     if !tokens.is_file() {
         return Err(InferError::Other(format!(
@@ -228,10 +293,42 @@ fn find_parakeet_model_files(
         )));
     }
 
-    let encoder = find_first_existing(model_dir, &["encoder.int8.onnx", "encoder.onnx"])?;
-    let decoder = find_first_existing(model_dir, &["decoder.int8.onnx", "decoder.onnx"])?;
-    let joiner = find_first_existing(model_dir, &["joiner.int8.onnx", "joiner.onnx"])?;
-    Ok((encoder, decoder, joiner, tokens))
+    match kind {
+        OnnxModelKind::Parakeet => Ok(SttModelFiles::Transducer {
+            encoder: find_first_existing(model_dir, &["encoder.int8.onnx", "encoder.onnx"])?,
+            decoder: find_first_existing(model_dir, &["decoder.int8.onnx", "decoder.onnx"])?,
+            joiner: find_first_existing(model_dir, &["joiner.int8.onnx", "joiner.onnx"])?,
+            tokens,
+        }),
+        // Explicit per-role filename lists, best first, the way
+        // `sherpa_tts::model_filenames` does it. A "first .onnx in the
+        // directory" rule cannot work here at all: there are four of them and
+        // each one goes in a different field, so picking by directory order
+        // would load the cached decoder as the encoder.
+        //
+        // The quantized bundles in the catalog ship the `.int8` spellings;
+        // the float alternatives are listed so a user who unpacked the
+        // non-quantized release into the same slot still loads.
+        OnnxModelKind::Moonshine => Ok(SttModelFiles::Moonshine {
+            preprocessor: find_first_existing(
+                model_dir,
+                &["preprocess.onnx", "preprocess.int8.onnx"],
+            )?,
+            encoder: find_first_existing(model_dir, &["encode.int8.onnx", "encode.onnx"])?,
+            uncached_decoder: find_first_existing(
+                model_dir,
+                &["uncached_decode.int8.onnx", "uncached_decode.onnx"],
+            )?,
+            cached_decoder: find_first_existing(
+                model_dir,
+                &["cached_decode.int8.onnx", "cached_decode.onnx"],
+            )?,
+            tokens,
+        }),
+        other => Err(InferError::Other(format!(
+            "{other:?} is not an offline recognizer bundle"
+        ))),
+    }
 }
 
 #[cfg(feature = "sherpa")]
@@ -257,26 +354,61 @@ fn find_first_existing(dir: &Path, names: &[&str]) -> Result<PathBuf, InferError
 /// written: sherpa aborts the process if the file named there does not exist.
 #[cfg(feature = "sherpa")]
 fn recognizer_config(
-    files: (PathBuf, PathBuf, PathBuf, PathBuf),
+    files: SttModelFiles,
     plan: &HotwordPlan,
     hotwords_file: Option<&Path>,
 ) -> sherpa_onnx::OfflineRecognizerConfig {
-    use sherpa_onnx::{OfflineRecognizerConfig, OfflineTransducerModelConfig};
+    use sherpa_onnx::{
+        OfflineMoonshineModelConfig, OfflineRecognizerConfig, OfflineTransducerModelConfig,
+    };
 
-    let (encoder, decoder, joiner, tokens) = files;
     let text = |p: &Path| p.to_string_lossy().into_owned();
 
     let mut config = OfflineRecognizerConfig {
         decoding_method: Some(plan.decoding_method.to_string()),
         ..OfflineRecognizerConfig::default()
     };
-    config.model_config.transducer = OfflineTransducerModelConfig {
-        encoder: Some(text(&encoder)),
-        decoder: Some(text(&decoder)),
-        joiner: Some(text(&joiner)),
+    let tokens = match files {
+        SttModelFiles::Transducer {
+            encoder,
+            decoder,
+            joiner,
+            tokens,
+        } => {
+            config.model_config.transducer = OfflineTransducerModelConfig {
+                encoder: Some(text(&encoder)),
+                decoder: Some(text(&decoder)),
+                joiner: Some(text(&joiner)),
+            };
+            // sherpa cannot tell a NeMo transducer from an icefall one by
+            // looking at the weights; the tag is what selects the right
+            // blank/feature handling.
+            config.model_config.model_type = Some("nemo_transducer".into());
+            tokens
+        }
+        SttModelFiles::Moonshine {
+            preprocessor,
+            encoder,
+            uncached_decoder,
+            cached_decoder,
+            tokens,
+        } => {
+            config.model_config.moonshine = OfflineMoonshineModelConfig {
+                preprocessor: Some(text(&preprocessor)),
+                encoder: Some(text(&encoder)),
+                uncached_decoder: Some(text(&uncached_decoder)),
+                cached_decoder: Some(text(&cached_decoder)),
+                // v2's single merged decoder; the v1 bundles in the catalog
+                // ship the pair above instead.
+                merged_decoder: None,
+            };
+            // No `model_type` here on purpose: sherpa infers Moonshine from
+            // the populated config, and naming a type it does not know is how
+            // the native library ends up calling `exit`.
+            tokens
+        }
     };
     config.model_config.tokens = Some(text(&tokens));
-    config.model_config.model_type = Some("nemo_transducer".into());
     config.model_config.num_threads = std::thread::available_parallelism()
         .map(|n| n.get() as i32)
         .unwrap_or(1);
@@ -302,6 +434,7 @@ impl SherpaSttInference for SherpaOnnxSttInference {
         &self,
         pcm: AudioPcm,
         model_dir: &Path,
+        kind: OnnxModelKind,
         hotwords: &SttHotwords,
     ) -> Result<SttResult, InferError> {
         let model_dir = model_dir.to_path_buf();
@@ -312,8 +445,8 @@ impl SherpaSttInference for SherpaOnnxSttInference {
         tokio::task::spawn_blocking(move || {
             use sherpa_onnx::OfflineRecognizer;
 
-            let files = find_parakeet_model_files(&model_dir)?;
-            let plan = plan_hotwords(&model_dir, &hotwords);
+            let files = find_stt_model_files(&model_dir, kind)?;
+            let plan = plan_hotwords(&model_dir, kind, &hotwords);
 
             // The file has to exist for as long as the recognizer is being
             // created — sherpa reads it there, and calls `exit` if it cannot
@@ -342,7 +475,7 @@ impl SherpaSttInference for SherpaOnnxSttInference {
 
             let result = stream
                 .get_result()
-                .ok_or_else(|| InferError::Other("sherpa parakeet returned no result".into()))?;
+                .ok_or_else(|| InferError::Other(format!("sherpa {kind:?} returned no result")))?;
 
             // sherpa reports one timestamp per *token*, so these have to be
             // grouped into cues before they are readable as subtitles — one
@@ -381,10 +514,11 @@ mod tests {
             &self,
             pcm: AudioPcm,
             _model_dir: &Path,
+            kind: OnnxModelKind,
             _hotwords: &SttHotwords,
         ) -> Result<SttResult, InferError> {
             Ok(SttResult::text_only(format!(
-                "parakeet: {} samples",
+                "{kind:?}: {} samples",
                 pcm.samples.len()
             )))
         }
@@ -405,11 +539,12 @@ mod tests {
                     sample_rate_hz: 16_000,
                 },
                 Path::new("/tmp/parakeet-model"),
+                OnnxModelKind::Parakeet,
                 &SttHotwords::default(),
             )
             .await
             .unwrap();
-        assert!(out.text.contains("parakeet"));
+        assert!(out.text.contains("Parakeet"));
         assert!(out.text.contains("1600"));
     }
 
@@ -445,7 +580,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("bpe.vocab"));
 
-        let plan = plan_hotwords(dir.path(), &SttHotwords::default());
+        let plan = plan_hotwords(dir.path(), OnnxModelKind::Parakeet, &SttHotwords::default());
         assert_eq!(plan.decoding_method, "greedy_search");
         assert_eq!(plan.hotwords, None);
     }
@@ -457,7 +592,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("bpe.vocab"));
 
-        let plan = plan_hotwords(dir.path(), &SttHotwords::new(["KittyClaw", "KEA"]));
+        let plan = plan_hotwords(
+            dir.path(),
+            OnnxModelKind::Parakeet,
+            &SttHotwords::new(["KittyClaw", "KEA"]),
+        );
         assert_eq!(plan.decoding_method, "modified_beam_search");
         let files = plan.hotwords.expect("a plan with terms carries files");
         assert_eq!(files.bpe_vocab, dir.path().join("bpe.vocab"));
@@ -474,9 +613,100 @@ mod tests {
         touch(&dir.path().join("tokens.txt"));
         touch(&dir.path().join("encoder.int8.onnx"));
 
-        let plan = plan_hotwords(dir.path(), &SttHotwords::new(["KittyClaw"]));
+        let plan = plan_hotwords(
+            dir.path(),
+            OnnxModelKind::Parakeet,
+            &SttHotwords::new(["KittyClaw"]),
+        );
         assert_eq!(plan.decoding_method, "greedy_search");
         assert_eq!(plan.hotwords, None);
+    }
+
+    /// Moonshine has no context graph to put hotwords into, so the decoder
+    /// must stay greedy even with terms *and* a vocabulary file present —
+    /// otherwise the user pays for a beam search that biases nothing.
+    #[test]
+    fn moonshine_never_switches_to_beam_search() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("bpe.vocab"));
+
+        let plan = plan_hotwords(
+            dir.path(),
+            OnnxModelKind::Moonshine,
+            &SttHotwords::new(["KittyClaw"]),
+        );
+        assert_eq!(plan.decoding_method, "greedy_search");
+        assert_eq!(plan.hotwords, None);
+    }
+
+    /// A Moonshine bundle is four files with four distinct roles. Each one
+    /// has to be found by *name*: the failure this guards against is loading
+    /// the cached decoder into the encoder slot, which no error would report.
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn a_moonshine_bundle_is_located_file_by_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "tokens.txt",
+            "preprocess.onnx",
+            "encode.int8.onnx",
+            "uncached_decode.int8.onnx",
+            "cached_decode.int8.onnx",
+        ] {
+            touch(&dir.path().join(name));
+        }
+
+        let files = find_stt_model_files(dir.path(), OnnxModelKind::Moonshine).unwrap();
+        let SttModelFiles::Moonshine {
+            preprocessor,
+            encoder,
+            uncached_decoder,
+            cached_decoder,
+            tokens,
+        } = files.clone()
+        else {
+            panic!("a moonshine bundle must locate as moonshine");
+        };
+        assert!(preprocessor.ends_with("preprocess.onnx"));
+        assert!(encoder.ends_with("encode.int8.onnx"));
+        assert!(uncached_decoder.ends_with("uncached_decode.int8.onnx"));
+        assert!(cached_decoder.ends_with("cached_decode.int8.onnx"));
+        assert!(tokens.ends_with("tokens.txt"));
+
+        // And the paths have to land in the moonshine config, not the
+        // transducer one sitting beside it in the same struct.
+        let plan = plan_hotwords(
+            dir.path(),
+            OnnxModelKind::Moonshine,
+            &SttHotwords::default(),
+        );
+        let config = recognizer_config(files, &plan, None);
+        assert_eq!(
+            config.model_config.moonshine.encoder,
+            Some(
+                dir.path()
+                    .join("encode.int8.onnx")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert_eq!(config.model_config.transducer.encoder, None);
+        // sherpa infers the family from the filled config; a `model_type` it
+        // does not recognize makes the native library exit the process.
+        assert_eq!(config.model_config.model_type, None);
+        assert_eq!(config.decoding_method.as_deref(), Some("greedy_search"));
+    }
+
+    /// An incomplete bundle names the files it wanted rather than failing
+    /// somewhere inside the native library.
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn a_half_unpacked_moonshine_bundle_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("tokens.txt"));
+        touch(&dir.path().join("preprocess.onnx"));
+        let err = find_stt_model_files(dir.path(), OnnxModelKind::Moonshine).unwrap_err();
+        assert!(err.to_string().contains("encode"), "{err}");
     }
 
     /// `bpe.model` is the other name the same vocabulary ships under.
@@ -485,7 +715,11 @@ mod tests {
         for name in ["bpe.vocab", "bpe.model"] {
             let dir = tempfile::tempdir().unwrap();
             touch(&dir.path().join(name));
-            let plan = plan_hotwords(dir.path(), &SttHotwords::new(["KEA"]));
+            let plan = plan_hotwords(
+                dir.path(),
+                OnnxModelKind::Parakeet,
+                &SttHotwords::new(["KEA"]),
+            );
             let files = plan.hotwords.expect("{name} should be accepted");
             assert_eq!(files.bpe_vocab, dir.path().join(name));
         }
@@ -504,9 +738,13 @@ mod tests {
         touch(&dir.path().join("encoder.int8.onnx"));
         touch(&dir.path().join("decoder.int8.onnx"));
         touch(&dir.path().join("joiner.int8.onnx"));
-        let files = find_parakeet_model_files(dir.path()).unwrap();
+        let files = find_stt_model_files(dir.path(), OnnxModelKind::Parakeet).unwrap();
 
-        let plan = plan_hotwords(dir.path(), &SttHotwords::new(["KittyClaw"]));
+        let plan = plan_hotwords(
+            dir.path(),
+            OnnxModelKind::Parakeet,
+            &SttHotwords::new(["KittyClaw"]),
+        );
         let hotwords_path = dir.path().join("hotwords.txt");
         std::fs::write(
             &hotwords_path,
@@ -534,7 +772,7 @@ mod tests {
 
         // With no terms, none of it is touched — and the greedy decoder the
         // engine has always used is what runs.
-        let plain = plan_hotwords(dir.path(), &SttHotwords::default());
+        let plain = plan_hotwords(dir.path(), OnnxModelKind::Parakeet, &SttHotwords::default());
         let config = recognizer_config(files, &plain, None);
         assert_eq!(config.hotwords_file, None);
         assert_eq!(config.hotwords_score, 0.0);

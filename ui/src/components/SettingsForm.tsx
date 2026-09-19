@@ -1,8 +1,23 @@
 import { useState, type ReactNode } from "react";
-import { REWRITE_MODES, TRANSLATION_TARGETS, type RewriteMode } from "../api";
+import {
+  REWRITE_MODES,
+  TRANSLATION_TARGETS,
+  type RewriteMode,
+  type RewritePreset,
+} from "../api";
+import { useLlmChoices } from "../hooks/useLlmChoices";
 import type { RewriteSettingsController } from "../hooks/useRewriteSettings";
 import LoadingBlock from "./LoadingBlock";
 import { Row, RowGroup } from "./SettingsRow";
+
+/**
+ * The `<select>` value standing for "use the Rewrite AI", stored as null.
+ * The empty string, because no engine or provider id can be empty — the same
+ * spelling the app-rule editor uses for the same idea.
+ */
+const INHERIT = "";
+
+const orNull = (value: string) => (value.trim() === "" ? null : value.trim());
 
 type Props = {
   /** The rewrite state, owned by whoever also runs the rewrites with it. */
@@ -182,7 +197,7 @@ export default function SettingsForm({ rewrite, leadingRows }: Props) {
                 {presets.length > 0 && (
                   <ul style={{ margin: 0, paddingLeft: 20 }}>
                     {presets.map((p) => (
-                      <li key={p.id} style={{ marginBottom: 4 }}>
+                      <li key={p.id} style={{ marginBottom: 12 }}>
                         <strong>{p.name}</strong> — {p.instruction.slice(0, 60)}
                         {p.instruction.length > 60 ? "…" : ""}{" "}
                         <button
@@ -194,6 +209,11 @@ export default function SettingsForm({ rewrite, leadingRows }: Props) {
                         >
                           Delete
                         </button>
+                        <PresetAi
+                          preset={p}
+                          busy={busy}
+                          onSave={(next) => void rewrite.savePreset(next)}
+                        />
                       </li>
                     ))}
                   </ul>
@@ -213,3 +233,90 @@ export default function SettingsForm({ rewrite, leadingRows }: Props) {
   );
 }
 
+type PresetAiProps = {
+  preset: RewritePreset;
+  busy: boolean;
+  onSave: (preset: RewritePreset) => void;
+};
+
+/**
+ * The AI one preset asks for.
+ *
+ * Bindings are per capability slot, so without this every preset shares one
+ * model — you cannot spend a cheap model on grammar and an expensive one on a
+ * hard rewrite. Leaving the engine on "the Rewrite AI" ignores the other two
+ * fields, exactly as an app rule does: a model with no engine names nothing
+ * KEA can resolve.
+ */
+function PresetAi({ preset, busy, onSave }: PresetAiProps) {
+  const { engines, providers } = useLlmChoices();
+  const overridden = preset.llm_engine_id !== null;
+
+  return (
+    <details style={{ marginTop: 4 }}>
+      <summary style={{ cursor: "pointer", fontSize: "0.8125rem" }}>
+        AI: {overridden ? (preset.llm_model ?? preset.llm_engine_id) : "the Rewrite AI"}
+      </summary>
+      <div style={{ display: "grid", gap: 8, padding: "8px 0 0 4px" }}>
+        <p className="kea-muted" style={{ margin: 0, fontSize: "0.8125rem" }}>
+          An app rule that names its own AI wins over this one — a rule about where
+          the text is going is a constraint, and this is a preference about the job.
+        </p>
+        <label>
+          <span className="kea-label">AI engine</span>
+          <select
+            className="kea-select"
+            aria-label={`AI engine for ${preset.name}`}
+            value={preset.llm_engine_id ?? INHERIT}
+            disabled={busy}
+            onChange={(e) =>
+              onSave({ ...preset, llm_engine_id: orNull(e.target.value) })
+            }
+          >
+            <option value={INHERIT}>The Rewrite AI</option>
+            {engines.map((id) => (
+              <option key={id} value={id}>
+                {id}
+              </option>
+            ))}
+            {/* An engine saved by a newer build still has to show as the
+                selection, or this dropdown would silently re-target it. */}
+            {preset.llm_engine_id && !engines.includes(preset.llm_engine_id) && (
+              <option value={preset.llm_engine_id}>{preset.llm_engine_id}</option>
+            )}
+          </select>
+        </label>
+        <label>
+          <span className="kea-label">Model</span>
+          <input
+            className="kea-input"
+            aria-label={`Model for ${preset.name}`}
+            value={preset.llm_model ?? ""}
+            disabled={busy || !overridden}
+            onChange={(e) => onSave({ ...preset, llm_model: orNull(e.target.value) })}
+            placeholder="gpt-4o-mini"
+          />
+        </label>
+        <label>
+          <span className="kea-label">Provider</span>
+          <select
+            className="kea-select"
+            aria-label={`Provider for ${preset.name}`}
+            value={preset.llm_provider_ref ?? INHERIT}
+            disabled={busy || !overridden}
+            onChange={(e) =>
+              onSave({ ...preset, llm_provider_ref: orNull(e.target.value) })
+            }
+          >
+            <option value={INHERIT}>The engine's own</option>
+            {providers.map((p) => (
+              <option key={p.provider_ref} value={p.provider_ref}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+    </details>
+  );
+}

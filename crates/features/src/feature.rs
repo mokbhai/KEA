@@ -47,6 +47,30 @@ impl ProfileOverrides {
         }
     }
 
+    /// Which LLM this run uses, given the preset's own override.
+    ///
+    /// **The app profile wins.** Both are overrides of the `rewrite/llm`
+    /// binding and both are things the user wrote down, so the tie has to be
+    /// broken by what each one *means*:
+    ///
+    /// * A preset is a preference about the job — "this rewrite is hard, use
+    ///   the big model" — and paying for a bigger model than intended is a
+    ///   disappointing outcome.
+    /// * A profile is a rule about where the text is going — "in Terminal,
+    ///   keep it on the local model" — and that is a constraint, not a
+    ///   preference. Losing it sends a shell buffer to a hosted provider,
+    ///   which is not a disappointing outcome but a broken promise.
+    ///
+    /// So the narrower-scoped preset yields to the profile, and the Rewrite
+    /// page says as much beside the preset's AI picker rather than leaving it
+    /// to be discovered.
+    ///
+    /// `None` from both means "use the slot binding": neither names an engine,
+    /// and neither half-applies (see [`Binding::from_parts`]).
+    pub fn llm_binding_over(&self, preset: Option<Binding>) -> Option<Binding> {
+        self.llm_binding.clone().or(preset)
+    }
+
     /// The insertion mode to use, defaulting to today's behaviour.
     pub fn replace_mode(&self) -> ReplaceMode {
         self.insertion.unwrap_or(ReplaceMode::ClipboardPaste)
@@ -187,5 +211,50 @@ impl Drop for ActionGuard<'_> {
                 "action row dropped without an outcome"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binding(engine: &str) -> Binding {
+        Binding {
+            engine_id: engine.into(),
+            model: None,
+            provider_ref: None,
+        }
+    }
+
+    #[test]
+    fn an_app_rule_outranks_a_preset_that_names_its_own_ai() {
+        // The rule this encodes: a profile is a constraint about where the
+        // text goes, a preset a preference about the job. See the doc comment
+        // — getting this backwards sends a Terminal buffer to a hosted
+        // provider the user told KEA not to use there.
+        let profile = ProfileOverrides {
+            llm_binding: Some(binding("local-llm")),
+            ..ProfileOverrides::default()
+        };
+        assert_eq!(
+            profile.llm_binding_over(Some(binding("openai"))),
+            Some(binding("local-llm"))
+        );
+    }
+
+    #[test]
+    fn a_preset_applies_when_no_rule_matched() {
+        let none = ProfileOverrides::default();
+        assert_eq!(
+            none.llm_binding_over(Some(binding("openai"))),
+            Some(binding("openai"))
+        );
+    }
+
+    #[test]
+    fn neither_means_the_slot_binding() {
+        // `None` is what sends the caller to `SlotResolver::require_llm`, so
+        // it must survive both overrides being absent.
+        assert_eq!(ProfileOverrides::default().llm_binding_over(None), None);
     }
 }

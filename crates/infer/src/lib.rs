@@ -23,6 +23,9 @@ pub use sherpa_stream::{
     find_streaming_model_files, SherpaStreamSession, SherpaStreamingInference, StreamingModelFiles,
 };
 pub use sherpa_stt::{plan_hotwords, HotwordPlan, SherpaSttInference, SttHotwords};
+
+#[cfg(feature = "sherpa")]
+pub use sherpa_stt::{find_stt_model_files, SttModelFiles};
 pub use sherpa_tts::{find_tts_bundle, SherpaTtsInference, TtsBundle, TtsModelPaths};
 pub use storage::ModelStorage;
 pub use types::{

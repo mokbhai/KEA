@@ -18,6 +18,7 @@ export type Page =
   | "profiles"
   | "general"
   | "history"
+  | "usage"
   | "logs";
 
 /**
@@ -38,6 +39,7 @@ export const PAGES: readonly Page[] = [
   "profiles",
   "general",
   "history",
+  "usage",
   "logs",
 ];
 

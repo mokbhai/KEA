@@ -27,6 +27,16 @@
 //!    everything else — including macOS 14's `WriteOnly` — → [`PermStatus::Denied`],
 //!    because reading events needs full access and nothing less will do.
 //!
+//! # Manual verification — Speech
+//! 1. Call `request(Speech)`; macOS shows a permission dialog (requires
+//!    `NSSpeechRecognitionUsageDescription` in `Info.plist`, without which
+//!    Apple's own framework calls `abort` — see `speech::SpeechRecognition`).
+//! 2. Grant or deny access in the system prompt.
+//! 3. `status(Speech)` reflects the SFSpeechRecognizerAuthorizationStatus:
+//!    `NotDetermined` → [`PermStatus::Unknown`],
+//!    `Authorized` → [`PermStatus::Granted`],
+//!    `Denied` / `Restricted` → [`PermStatus::Denied`].
+//!
 //! # Manual verification — Accessibility
 //! 1. Call `request(Accessibility)`; macOS shows the trust dialog, which offers
 //!    to open System Settings when the process is not yet trusted.
@@ -35,6 +45,7 @@
 //!    only takes effect for a process that is relaunched afterwards.
 
 use super::{PermError, PermKind, PermStatus, Permissions};
+use crate::speech::{SpeechAuth, SpeechRecognition};
 use crate::textio::macos_ax;
 use async_trait::async_trait;
 use core_graphics::access::ScreenCaptureAccess;
@@ -118,6 +129,20 @@ pub(crate) fn event_auth_status() -> i64 {
     }
 }
 
+/// Map a [`SpeechAuth`] to [`PermStatus`].
+///
+/// `Unavailable` — no Speech.framework, or a status value from a future OS —
+/// reads as `Denied` rather than `Unknown`: `Unknown` is what the UI offers a
+/// "Grant" button for, and there is nothing to grant on a system that has no
+/// recognizer. Unit-testable without TCC interaction.
+pub(crate) fn speech_auth_to_perm(auth: SpeechAuth) -> PermStatus {
+    match auth {
+        SpeechAuth::Granted => PermStatus::Granted,
+        SpeechAuth::NotDetermined => PermStatus::Unknown,
+        SpeechAuth::Denied | SpeechAuth::Unavailable => PermStatus::Denied,
+    }
+}
+
 pub struct MacPermissions;
 
 impl MacPermissions {
@@ -150,6 +175,29 @@ impl MacPermissions {
 
     fn calendar_status() -> PermStatus {
         ek_auth_status_to_perm(event_auth_status())
+    }
+
+    fn speech_status() -> PermStatus {
+        speech_auth_to_perm(crate::speech::macos::MacSpeechRecognition::new().authorization())
+    }
+
+    /// Ask for speech recognition.
+    ///
+    /// Delegated to `speech::macos` rather than messaging `SFSpeechRecognizer`
+    /// from here: that module `dlopen`s Speech.framework, which a Tauri process
+    /// does not load, so a `class!` in this file would panic before it could
+    /// ask anything.
+    ///
+    /// `request_authorization` blocks until the user answers the modal — up to
+    /// two minutes — so it runs on a blocking thread rather than stalling a
+    /// runtime worker the way the completion-handler requests above do not.
+    async fn request_speech() -> Result<PermStatus, PermError> {
+        let auth = tokio::task::spawn_blocking(|| {
+            crate::speech::macos::MacSpeechRecognition::new().request_authorization()
+        })
+        .await
+        .map_err(|e| PermError::Other(format!("speech authorization task failed: {e}")))?;
+        Ok(speech_auth_to_perm(auth))
     }
 
     /// Ask for *full* calendar access.
@@ -233,6 +281,7 @@ impl Permissions for MacPermissions {
             PermKind::Microphone => Self::microphone_status(),
             PermKind::Accessibility => Self::accessibility_status(),
             PermKind::Calendar => Self::calendar_status(),
+            PermKind::Speech => Self::speech_status(),
         }
     }
 
@@ -257,6 +306,7 @@ impl Permissions for MacPermissions {
                 Ok(Self::accessibility_status())
             }
             PermKind::Calendar => Self::request_calendar().await,
+            PermKind::Speech => Self::request_speech().await,
         }
     }
 }
@@ -264,6 +314,27 @@ impl Permissions for MacPermissions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only `NotDetermined` is actionable: it is the one state in which the
+    /// UI's Grant button can produce a dialog. `Unavailable` must not read as
+    /// `Unknown`, or a Mac with no recognizer would offer a button that can
+    /// never do anything.
+    #[test]
+    fn speech_auth_maps_only_not_determined_to_unknown() {
+        assert_eq!(
+            speech_auth_to_perm(SpeechAuth::Granted),
+            PermStatus::Granted
+        );
+        assert_eq!(speech_auth_to_perm(SpeechAuth::Denied), PermStatus::Denied);
+        assert_eq!(
+            speech_auth_to_perm(SpeechAuth::Unavailable),
+            PermStatus::Denied
+        );
+        assert_eq!(
+            speech_auth_to_perm(SpeechAuth::NotDetermined),
+            PermStatus::Unknown
+        );
+    }
 
     #[test]
     fn av_auth_status_maps_not_determined_to_unknown() {

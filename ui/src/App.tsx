@@ -15,6 +15,7 @@ import DictationPage from "./pages/DictationPage";
 import GeneralPage from "./pages/GeneralPage";
 import HistoryPage from "./pages/HistoryPage";
 import LogsPage from "./pages/LogsPage";
+import UsagePage from "./pages/UsagePage";
 import MeetingsPage from "./pages/MeetingsPage";
 import TranscribePage from "./pages/TranscribePage";
 import ModelsPage from "./pages/ModelsPage";
@@ -289,6 +290,8 @@ function AppShell() {
         return <GeneralPage onRunSetup={runSetup} />;
       case "history":
         return <HistoryPage />;
+      case "usage":
+        return <UsagePage />;
       case "logs":
         return <LogsPage />;
     }
@@ -362,6 +365,7 @@ function AppShell() {
 
             <div className="kea-drawer__group-label">Activity</div>
             {navItem("history", "History", "🕘")}
+            {navItem("usage", "Usage", "📊")}
 
             <div className="kea-drawer__group-label">Settings</div>
             {navItem("ai-providers", "AI Providers", "🤖")}

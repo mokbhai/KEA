@@ -209,11 +209,7 @@ mod tests {
         let (repo, pool) = repo().await;
         let presets = PresetRepo::new(pool.clone());
         presets
-            .upsert(&RewritePreset {
-                id: "p1".into(),
-                name: "Terse".into(),
-                instruction: "Be terse.".into(),
-            })
+            .upsert(&RewritePreset::new("p1", "Terse", "Be terse."))
             .await
             .unwrap();
 

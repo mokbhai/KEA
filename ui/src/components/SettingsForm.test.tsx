@@ -1,6 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
+import type { RewritePreset } from "../api";
 import type { RewriteSettingsController } from "../hooks/useRewriteSettings";
 import SettingsForm from "./SettingsForm";
 
@@ -39,6 +40,7 @@ function controller(
     editPromptOverride: vi.fn(),
     savePromptOverride: vi.fn(async () => {}),
     addPreset: vi.fn(async () => true),
+    savePreset: vi.fn(async () => {}),
     removePreset: vi.fn(async () => {}),
     ...overrides,
   };
@@ -91,5 +93,57 @@ describe("SettingsForm", () => {
     render(<SettingsForm rewrite={translating()} />);
 
     expect(screen.queryByLabelText("Custom instruction")).toBeNull();
+  });
+
+  const preset = (over: Partial<RewritePreset> = {}): RewritePreset => ({
+    id: "p1",
+    name: "Grammar",
+    instruction: "Fix the grammar",
+    llm_engine_id: null,
+    llm_model: null,
+    llm_provider_ref: null,
+    ...over,
+  });
+
+  it("shows a preset with no AI of its own as inheriting the Rewrite AI", async () => {
+    const rewrite = controller({ presets: [preset()] });
+    render(<SettingsForm rewrite={rewrite} />);
+
+    const select = await screen.findByLabelText<HTMLSelectElement>("AI engine for Grammar");
+    expect(select.value).toBe("");
+    // The model and provider mean nothing without an engine, so they are not
+    // offered until one is chosen.
+    expect(screen.getByLabelText<HTMLInputElement>("Model for Grammar").disabled).toBe(true);
+  });
+
+  it("writes the whole preset back when its engine changes", async () => {
+    const rewrite = controller({
+      presets: [preset({ llm_engine_id: "openai", llm_model: "gpt-4o" })],
+    });
+    render(<SettingsForm rewrite={rewrite} />);
+
+    const model = await screen.findByLabelText<HTMLInputElement>("Model for Grammar");
+    expect(model.disabled).toBe(false);
+
+    await userEvent.type(model, "-mini");
+
+    // The whole row goes back, not just the field that changed: `upsert_preset`
+    // takes the whole preset, and a partial write would drop the instruction.
+    expect(rewrite.savePreset).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "p1",
+        name: "Grammar",
+        instruction: "Fix the grammar",
+        llm_engine_id: "openai",
+      }),
+    );
+  });
+
+  it("says which override wins when an app rule also names an AI", async () => {
+    // The precedence is a decision the user cannot discover by trying it —
+    // the rule only applies in one app — so the editor states it.
+    render(<SettingsForm rewrite={controller({ presets: [preset()] })} />);
+
+    expect(await screen.findByText(/app rule that names its own AI wins/i)).toBeTruthy();
   });
 });

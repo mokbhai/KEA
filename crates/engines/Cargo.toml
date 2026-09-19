@@ -18,11 +18,16 @@ tts-local = ["kea-infer/sherpa"]
 # because it is the only thing in this crate that needs the platform layer,
 # and off macOS it would register an engine that can only refuse.
 tts-system = ["dep:kea-platform"]
+# Apple's on-device recognizer. A feature for the same reason `tts-system` is:
+# it is the platform layer, and off macOS it would register an engine that can
+# only refuse.
+stt-apple = ["dep:kea-platform"]
 
 [dependencies]
 kea-infer = { path = "../infer" }
 kea-platform = { path = "../platform", optional = true }
 reqwest = { workspace = true, features = ["multipart"] }
+futures-util.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 serde.workspace = true
@@ -33,6 +38,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 keyring.workspace = true
+# Used by the Apple speech engine to hand the OS recognizer a file, and by
+# tests. A real dependency rather than a dev one because `NamedTempFile` is
+# what guarantees a recording of the user is removed on every path, including
+# a panic.
+tempfile.workspace = true
 
 [dependencies.whisper-rs]
 version = "0.13"
@@ -41,4 +51,3 @@ optional = true
 [dev-dependencies]
 wiremock.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tempfile.workspace = true

@@ -13,6 +13,17 @@
 	<string>KEA reads the title of the calendar event you are recording, so your meeting is named after it. Your calendar is read on this Mac and is never sent to an AI provider.</string>
 	<key>NSCalendarsUsageDescription</key>
 	<string>KEA reads the title of the calendar event you are recording, so your meeting is named after it. Your calendar is read on this Mac and is never sent to an AI provider.</string>
+	<!-- Apple's on-device speech recognizer (the `apple-speech` STT engine).
+	     Apple's own SFSpeechRecognizer header: the process is KILLED on the
+	     first +requestAuthorization: when this key is missing — the same
+	     class of crash the microphone and calendar keys above guard against,
+	     and the third time this codebase has met it (EventKit needed a
+	     #[link], Vision a dlopen). `request_authorization` in
+	     crates/platform/src/speech/macos.rs is the only call that can reach
+	     it. Verify after `make install` with:
+	       plutil -p /Applications/KEA.app/Contents/Info.plist -->
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>KEA uses Apple's on-device speech recognition to turn your dictation into text. Audio is transcribed on this Mac and is never sent to a server.</string>
 	<!-- The kea:// URL scheme. LaunchServices routes `open kea://…` to this
 	     bundle as a kAEGetURL Apple Event, which Tauri surfaces as
 	     RunEvent::Opened; see src/api/mod.rs. This file is already merged into

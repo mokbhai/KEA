@@ -7,7 +7,15 @@ use crate::provider::{self, CredentialSource, Defaults, ProviderConfigSource, OP
 use crate::traits::{AudioPcm, EngineCaps, EngineError, TtsEngine, TtsOpts};
 use crate::tts::audio::bytes_to_pcm_wav;
 
-const DEFAULT_MODEL: &str = "tts-1";
+/// What a user who has chosen nothing gets.
+///
+/// `gpt-4o-mini-tts` rather than the `tts-1` this used to be: it is cheaper
+/// per character, it sounds better, and it is the only one of the three that
+/// takes voice *instructions*. Changing a default only moves users who never
+/// expressed a preference — `opts.model` and the provider's stored
+/// `default_model` both still win, so anyone who explicitly set `tts-1` keeps
+/// it, and it stays in `capabilities()` so it remains selectable.
+const DEFAULT_MODEL: &str = "gpt-4o-mini-tts";
 
 pub struct OpenAiTtsEngine {
     pub http: Arc<dyn HttpClient>,
@@ -46,6 +54,18 @@ impl TtsEngine for OpenAiTtsEngine {
         let voice = opts.voice.as_deref().unwrap_or("alloy");
         let format = opts.format.as_deref().unwrap_or("wav");
         let url = format!("{}/audio/speech", provider.base_url.trim_end_matches('/'));
+        // `speed` is not sent: the gpt-4o audio models reject it, and the
+        // app applies the user's rate at playback anyway (see
+        // `kea_infer::clamp_tts_speed`), so sending it would double the
+        // adjustment on the models that do accept it.
+        //
+        // `instructions` (a plain-English delivery note — "speak slowly, like
+        // a newsreader") is the one genuinely new capability of this model
+        // family, and it is deliberately not wired here: `TtsOpts` has no
+        // field to carry it, and every construction site of that struct is
+        // outside this crate. Adding the field without its UI would be a
+        // parameter that is accepted and dropped, which is the failure this
+        // codebase keeps writing tests against.
         let body = serde_json::json!({
             "model": model,
             "input": text,
@@ -62,6 +82,48 @@ impl TtsEngine for OpenAiTtsEngine {
             Err(EngineError::Config(format!(
                 "unsupported response format: {format}"
             )))
+        }
+    }
+}
+
+#[cfg(test)]
+mod default_model_tests {
+    use super::*;
+
+    /// The default moved, and the old value must keep working for anyone who
+    /// chose it — it is still advertised, so a picker still offers it and a
+    /// stored setting still resolves.
+    #[test]
+    fn the_default_moved_but_the_old_models_remain_selectable() {
+        assert_eq!(DEFAULT_MODEL, "gpt-4o-mini-tts");
+        let advertised = OpenAiTtsEngine {
+            http: std::sync::Arc::new(crate::http::ReqwestHttpClient::new()),
+            credentials: std::sync::Arc::new(NoCredentials),
+            configs: std::sync::Arc::new(NoConfigs),
+            provider_ref: "openai".into(),
+        }
+        .capabilities()
+        .models;
+        for model in ["tts-1", "tts-1-hd", DEFAULT_MODEL] {
+            assert!(advertised.iter().any(|m| m == model), "{model} unlisted");
+        }
+    }
+
+    struct NoCredentials;
+
+    #[async_trait]
+    impl crate::provider::CredentialSource for NoCredentials {
+        async fn api_key(&self, _provider_ref: &str) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+    }
+
+    struct NoConfigs;
+
+    #[async_trait]
+    impl crate::provider::ProviderConfigSource for NoConfigs {
+        async fn config(&self, _provider_ref: &str) -> Option<crate::provider::ProviderConfig> {
+            None
         }
     }
 }

@@ -418,6 +418,59 @@ fn insert_via_accessibility_impl(text: &str) -> Result<(), String> {
     }
 }
 
+/// Put `to` back where `from` is now, inside the focused element.
+///
+/// # Why the whole value, and not a selection
+///
+/// The undo this serves runs *after* the rewrite: nothing is selected any
+/// more, so `AXSelectedText` — the attribute
+/// [`insert_via_accessibility`] writes — has nothing to act on. What the
+/// focused element still has is `AXValue`, its entire text. So the swap reads
+/// that, finds the one occurrence of what KEA wrote (see
+/// [`super::swap_once`] for why exactly one), and writes the whole value back.
+///
+/// Two consequences worth stating rather than discovering:
+///
+/// * The caret and the app's own undo stack are not preserved. Setting
+///   `AXValue` is a whole-field write as far as the app is concerned.
+/// * Plenty of elements refuse it — anything that is not a real text field,
+///   and most web and Electron surfaces, answer `-25204` (unsupported) or
+///   `-25205` (read-only). That is an ordinary outcome here, reported as an
+///   error the user sees, not a bug: the alternative would be typing over
+///   text the app did not agree to hand back.
+///
+/// # Manual verification (macOS)
+/// 1. Rewrite a sentence in TextEdit, then press the undo shortcut: the
+///    original sentence is back, character for character.
+/// 2. Type something after the rewrite, then undo: the original comes back and
+///    what was typed afterwards is still there.
+/// 3. Delete the rewritten sentence, then undo: KEA refuses and says the text
+///    is no longer there. Nothing else in the document changes.
+/// 4. Rewrite in Slack or a browser text box: the swap is likely refused by
+///    the element; the message says so and nothing is overwritten.
+pub fn swap_in_focused_element(from: &str, to: &str) -> Result<(), String> {
+    if !is_ax_trusted() {
+        return Err("accessibility permission not granted".into());
+    }
+
+    // SAFETY: as in `insert_via_accessibility_impl` — the system-wide element
+    // and the focused element are both +1 references from AX create/copy
+    // functions, released exactly once by `AxRef`.
+    unsafe {
+        let Some(system) = system_wide_element() else {
+            return Err("AXUIElementCreateSystemWide failed".into());
+        };
+        let Some(focused) = system.copy_attr("AXFocusedUIElement") else {
+            return Err("no focused UI element".into());
+        };
+        let Some(value) = focused.copy_string_attr("AXValue") else {
+            return Err("that app will not let KEA read the text back".into());
+        };
+        let swapped = super::swap_once(&value, from, to).map_err(|e| e.to_string())?;
+        focused.set_string_attr("AXValue", &swapped)
+    }
+}
+
 const K_AX_ERROR_SUCCESS: i32 = 0;
 
 #[link(name = "ApplicationServices", kind = "framework")]

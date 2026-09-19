@@ -8,6 +8,29 @@ pub struct Binding {
     pub provider_ref: Option<String>,
 }
 
+impl Binding {
+    /// A binding from three nullable override columns, or `None` when they
+    /// name nothing resolvable.
+    ///
+    /// The rule is the engine id: a model or a provider ref with no engine
+    /// names no engine to send the request to, so the override inherits
+    /// instead of half-applying. Two tables carry exactly these three columns
+    /// for exactly this purpose — `app_profiles` and `rewrite_presets` — and
+    /// this is the one place that says what a half-filled row means, so the
+    /// two cannot come to disagree about it.
+    pub fn from_parts(
+        engine_id: Option<String>,
+        model: Option<String>,
+        provider_ref: Option<String>,
+    ) -> Option<Self> {
+        Some(Self {
+            engine_id: engine_id?,
+            model,
+            provider_ref,
+        })
+    }
+}
+
 pub struct BindingRepo {
     pool: SqlitePool,
 }
@@ -208,5 +231,24 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(repo.get("default", "llm").await.unwrap().is_some());
+    }
+
+    #[test]
+    fn from_parts_needs_an_engine_id() {
+        // A model with no engine names nothing resolvable: the override has to
+        // inherit rather than half-apply, and both override tables depend on
+        // this being the answer.
+        assert_eq!(
+            Binding::from_parts(None, Some("gpt-4o".into()), Some("work".into())),
+            None
+        );
+        assert_eq!(
+            Binding::from_parts(Some("openai".into()), None, None),
+            Some(Binding {
+                engine_id: "openai".into(),
+                model: None,
+                provider_ref: None,
+            })
+        );
     }
 }

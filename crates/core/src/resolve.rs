@@ -601,9 +601,7 @@ mod tests {
             EngineCaps { models: vec![] }
         }
         async fn complete(&self, _r: LlmRequest) -> Result<LlmResponse, EngineError> {
-            Ok(LlmResponse {
-                text: String::new(),
-            })
+            Ok(LlmResponse::untracked(String::new()))
         }
     }
 

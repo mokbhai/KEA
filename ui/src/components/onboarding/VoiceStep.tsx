@@ -7,6 +7,7 @@ import {
   buildCapabilityOptions,
   loadKeyStates,
   startOptionDownload,
+  LOCAL_STT_PREFERENCE,
   OPENAI_TTS_VOICES,
   type CapabilityOption,
 } from "../../lib/capabilityDefaults";
@@ -63,11 +64,21 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
                   (o.model ?? null) === (sttBinding.model ?? null),
               ) ?? null
             : null;
-        const local =
-          boundLocalStt ??
-          sttOpts.find((o) => o.engine === "whisper" && o.model === "whisper-base") ??
-          sttOpts.find((o) => o.engine === "whisper") ??
-          null;
+        // Cheapest first, from the shared preference table — the wizard and
+        // the Connect step must recommend the same thing. Engine *and* model
+        // both have to match: the preference for Moonshine Tiny is a
+        // preference for a 30 MB model, and matching its engine alone would
+        // recommend the 482 MB Parakeet that shares it.
+        const preferred =
+          LOCAL_STT_PREFERENCE.map((choice) =>
+            sttOpts.find(
+              (o) => o.engine === choice.engine && (o.model ?? null) === choice.model,
+            ),
+          ).find((o): o is CapabilityOption => o !== undefined) ??
+          // Nothing preferred is offerable in this build; any local option
+          // beats leaving the wizard with no offline choice at all.
+          sttOpts.find((o) => runsLocally(o.engine));
+        const local = boundLocalStt ?? preferred ?? null;
         const cloud = sttOpts.find((o) => o.engine === "openai-stt") ?? null;
         // Every voice that runs on this Mac, asked of the engine table rather
         // than named: the system synthesizer is a local voice with no catalog,
@@ -303,11 +314,13 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
                 </span>
                 <span className="kea-choice__hint">
                   Runs on this Mac, works offline.{" "}
-                  {sttLocal.installed
-                    ? "Installed ✓"
-                    : localProgress !== null
-                      ? `Downloading ${localProgress}% — you can keep going.`
-                      : `${sttLocal.model ? sizeLabel(sttLocal) : ""} download.`}
+                  {!sttLocal.downloadKind
+                    ? "Nothing to download — macOS asks for permission the first time."
+                    : sttLocal.installed
+                      ? "Installed ✓"
+                      : localProgress !== null
+                        ? `Downloading ${localProgress}% — you can keep going.`
+                        : `${sttLocal.model ? sizeLabel(sttLocal) : ""} download.`}
                 </span>
                 {savedKey === "stt" && <span className="kea-saved">Saved ✓</span>}
               </span>

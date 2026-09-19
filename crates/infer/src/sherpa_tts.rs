@@ -125,6 +125,7 @@ fn model_filenames(kind: OnnxModelKind) -> &'static [&'static str] {
         OnnxModelKind::TtsVits
         | OnnxModelKind::TtsVocoder
         | OnnxModelKind::Parakeet
+        | OnnxModelKind::Moonshine
         | OnnxModelKind::StreamingZipformer
         | OnnxModelKind::SpeakerSegmentation
         | OnnxModelKind::SpeakerEmbedding => &[],
@@ -298,6 +299,7 @@ pub fn find_tts_bundle(
         // in the TTS catalog but is half a voice, not a voice.
         OnnxModelKind::TtsVocoder
         | OnnxModelKind::Parakeet
+        | OnnxModelKind::Moonshine
         | OnnxModelKind::StreamingZipformer
         | OnnxModelKind::SpeakerSegmentation
         | OnnxModelKind::SpeakerEmbedding => {
@@ -397,6 +399,7 @@ fn model_config_for(
         },
         OnnxModelKind::TtsVocoder
         | OnnxModelKind::Parakeet
+        | OnnxModelKind::Moonshine
         | OnnxModelKind::StreamingZipformer
         | OnnxModelKind::SpeakerSegmentation
         | OnnxModelKind::SpeakerEmbedding => {
@@ -640,6 +643,7 @@ mod tests {
         for kind in [
             OnnxModelKind::TtsVocoder,
             OnnxModelKind::Parakeet,
+            OnnxModelKind::Moonshine,
             OnnxModelKind::StreamingZipformer,
             OnnxModelKind::SpeakerSegmentation,
             OnnxModelKind::SpeakerEmbedding,

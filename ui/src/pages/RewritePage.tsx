@@ -5,6 +5,7 @@ import {
   translateCommand,
   translationTargetLabel,
   triggerRewrite,
+  undoLastRewrite,
 } from "../api";
 import FeatureAiCard from "../components/FeatureAiCard";
 import FeatureBanner from "../components/FeatureBanner";
@@ -59,6 +60,28 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
     }
   };
 
+  /**
+   * The undo, from the window rather than the shortcut.
+   *
+   * It brings the app the rewrite happened in back to the front before
+   * writing, so pressing this from here is the same act the key is — and every
+   * refusal it can return names its reason, which is why the message is shown
+   * verbatim.
+   */
+  const undoSelection = async () => {
+    setBusy(true);
+    setRunStatus(null);
+    setResult(null);
+    try {
+      await undoLastRewrite();
+      setRunStatus("Put your text back.");
+    } catch (e) {
+      setRunStatus(toMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   // The real shortcut path: rewrites whatever is selected in the app you were
   // last in, and replaces it there.
   const runSelection = async () => {
@@ -106,13 +129,22 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
         <SettingsForm
           rewrite={rewrite}
           leadingRows={
-            <HotkeyRow
-              feature="rewrite"
-              command="rewrite_selection"
-              label="Shortcut"
-              hint="Rewrites the text you have selected."
-              checkRegistration
-            />
+            <>
+              <HotkeyRow
+                feature="rewrite"
+                command="rewrite_selection"
+                label="Shortcut"
+                hint="Rewrites the text you have selected."
+                checkRegistration
+              />
+              <HotkeyRow
+                feature="rewrite"
+                command="undo_rewrite"
+                label="Put my words back"
+                hint="Restores the text the last rewrite replaced, for about two minutes afterwards. It refuses rather than guessing if what KEA wrote is no longer there. Try your app's own Undo first — this is for when that does not reach it."
+                checkRegistration
+              />
+            </>
           }
         />
       </section>
@@ -227,6 +259,14 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
               disabled={busy}
             >
               Rewrite my selection
+            </button>
+            <button
+              type="button"
+              className="kea-btn"
+              onClick={() => void undoSelection()}
+              disabled={busy}
+            >
+              Put my words back
             </button>
           </div>
           <p className="kea-muted" style={{ margin: "8px 0 0", fontSize: "0.8125rem" }}>

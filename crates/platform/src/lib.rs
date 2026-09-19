@@ -9,6 +9,7 @@ pub mod hotkeys;
 pub mod macos_services;
 pub mod permissions;
 pub mod screen;
+pub mod speech;
 pub mod textio;
 pub mod tts;
 
@@ -30,6 +31,10 @@ pub use screen::{
     new_screen_capture, new_text_recognizer, observations_to_text, reading_order, CaptureOutcome,
     CaptureSlot, CaptureVerdict, CapturedImage, NormalizedRect, Observation, OcrOptions,
     ScreenCapture, ScreenError, TextBox, TextRecognizer,
+};
+pub use speech::{
+    new_speech_recognition, SpeechAuth, SpeechError, SpeechOpts, SpeechRecognition, SpeechSegment,
+    SpeechTranscript,
 };
 pub use textio::{
     new_app_context_probe, AppContext, AppContextProbe, CaptureOpts, ClipboardPlan, ReplaceMode,
@@ -89,6 +94,9 @@ mod tests {
     /// when the framework is not linked. Nothing else in a Tauri app pulls
     /// EventKit in, so without the `#[link]` in `calendar::macos` this test —
     /// and the Permissions panel — crashes instead of reporting a status.
+    /// `Speech` is the same shape of hazard with a different framework: a
+    /// Tauri process does not load Speech either, which is why `speech::macos`
+    /// `dlopen`s it rather than reaching for `class!`.
     #[test]
     fn every_permission_status_can_be_read_without_panicking() {
         let permissions = new_permissions();
@@ -97,6 +105,7 @@ mod tests {
             PermKind::ScreenRecording,
             PermKind::Accessibility,
             PermKind::Calendar,
+            PermKind::Speech,
         ] {
             let _status = permissions.status(kind);
         }

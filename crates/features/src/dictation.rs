@@ -15,7 +15,7 @@ use kea_platform::TextIo;
 use kea_platform::{AudioIo, PcmFrame};
 
 use crate::feature::{ActionGuard, CapKind, CapSlot, Command, Feature, ProfileOverrides};
-use crate::rewrite::{maybe_record_conversation, ContentStorageOpts};
+use crate::rewrite::{record_llm_call, ContentStorageOpts};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -431,7 +431,7 @@ async fn run_dictation_inner(
 
         let resp = llm.complete(llm_req).await.map_err(|e| e.to_string())?;
 
-        maybe_record_conversation(
+        record_llm_call(
             storage,
             action_id,
             "dictation",
@@ -440,6 +440,7 @@ async fn run_dictation_inner(
             llm_binding.provider_ref.clone(),
             &transcript_text,
             &resp.text,
+            resp.usage,
         )
         .await?;
 

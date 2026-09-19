@@ -51,6 +51,25 @@ fn map_status(status: u16, body: &str) -> Result<(), EngineError> {
     })
 }
 
+/// Provider-specific request headers, beyond the credential.
+///
+/// A separate parameter rather than a new [`Auth`] variant: `Auth` is matched
+/// exhaustively by fake clients in other crates, and a third variant would
+/// break every one of them for the sake of one provider. Anthropic is that
+/// provider — `/v1/messages` carries its key in `x-api-key` and *requires*
+/// an `anthropic-version` on every call, neither of which a bearer can
+/// express.
+pub type HeaderPairs<'a> = &'a [(&'a str, &'a str)];
+
+/// One streamed chunk of a response body.
+///
+/// Bytes rather than parsed events: the two wire formats that matter here
+/// (OpenAI's `data:` SSE and Anthropic's named SSE) frame differently, and
+/// the port has no business knowing which one it is carrying.
+pub type ByteStream = std::pin::Pin<
+    Box<dyn futures_util::Stream<Item = Result<Vec<u8>, EngineError>> + Send + 'static>,
+>;
+
 #[async_trait]
 pub trait HttpClient: Send + Sync {
     async fn post_json(
@@ -60,12 +79,93 @@ pub trait HttpClient: Send + Sync {
         body: serde_json::Value,
     ) -> Result<String, EngineError>;
 
+    /// POST JSON with extra headers.
+    ///
+    /// Defaulted rather than required so the fake clients that already
+    /// implement this port keep compiling. The default forwards a header-less
+    /// call and *refuses* one with headers rather than dropping them
+    /// silently: a client that cannot send `anthropic-version` cannot talk to
+    /// Anthropic, and saying so is better than a 400 from the far end.
+    async fn post_json_with_headers(
+        &self,
+        url: &str,
+        auth: Auth<'_>,
+        headers: HeaderPairs<'_>,
+        body: serde_json::Value,
+    ) -> Result<String, EngineError> {
+        if headers.is_empty() {
+            return self.post_json(url, auth, body).await;
+        }
+        Err(EngineError::Other(
+            "this HTTP client cannot send provider headers".into(),
+        ))
+    }
+
+    /// POST JSON and read the response body as it arrives.
+    ///
+    /// Defaulted to "the whole body, as one chunk", which is a correct
+    /// stream and not a pretend one: a consumer that renders each chunk as it
+    /// lands renders the finished answer once. That keeps the four engines
+    /// already on this port untouched while [`ReqwestHttpClient`] does the
+    /// real incremental read.
+    async fn post_json_stream(
+        &self,
+        url: &str,
+        auth: Auth<'_>,
+        headers: HeaderPairs<'_>,
+        body: serde_json::Value,
+    ) -> Result<ByteStream, EngineError> {
+        let whole = self
+            .post_json_with_headers(url, auth, headers, body)
+            .await?;
+        Ok(Box::pin(futures_util::stream::once(async move {
+            Ok(whole.into_bytes())
+        })))
+    }
+
     async fn post_multipart(
         &self,
         url: &str,
         auth: Auth<'_>,
         parts: Vec<MultipartPart>,
     ) -> Result<String, EngineError>;
+
+    /// POST a multipart form with extra headers. See
+    /// [`HttpClient::post_json_with_headers`] for why it is defaulted and why
+    /// the default refuses rather than dropping the headers.
+    async fn post_multipart_with_headers(
+        &self,
+        url: &str,
+        auth: Auth<'_>,
+        headers: HeaderPairs<'_>,
+        parts: Vec<MultipartPart>,
+    ) -> Result<String, EngineError> {
+        if headers.is_empty() {
+            return self.post_multipart(url, auth, parts).await;
+        }
+        Err(EngineError::Other(
+            "this HTTP client cannot send provider headers".into(),
+        ))
+    }
+
+    /// POST a raw body of `content_type`; response body is text.
+    ///
+    /// Deepgram takes the audio file as the request body itself — not JSON
+    /// around it and not a multipart field — so none of the other three
+    /// methods can express the call.
+    async fn post_bytes(
+        &self,
+        url: &str,
+        auth: Auth<'_>,
+        headers: HeaderPairs<'_>,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<String, EngineError> {
+        let _ = (url, auth, headers, content_type, body);
+        Err(EngineError::Other(
+            "this HTTP client cannot send a raw body".into(),
+        ))
+    }
 
     /// POST JSON body; response body is raw bytes (e.g. TTS audio).
     async fn post_binary(
@@ -93,6 +193,35 @@ impl ReqwestHttpClient {
             Auth::None => req,
             Auth::Bearer(key) => req.bearer_auth(key),
         }
+    }
+
+    /// The single place a multipart body is assembled.
+    fn build_form(parts: Vec<MultipartPart>) -> Result<reqwest::multipart::Form, EngineError> {
+        let mut form = reqwest::multipart::Form::new();
+        for part in parts {
+            let mut builder = reqwest::multipart::Part::bytes(part.data);
+            if let Some(filename) = part.filename {
+                builder = builder.file_name(filename);
+            }
+            if let Some(content_type) = part.content_type {
+                builder = builder
+                    .mime_str(&content_type)
+                    .map_err(|e| EngineError::Other(e.to_string()))?;
+            }
+            form = form.part(part.name, builder);
+        }
+        Ok(form)
+    }
+
+    /// And the single place provider headers are.
+    fn with_headers(
+        mut req: reqwest::RequestBuilder,
+        headers: HeaderPairs<'_>,
+    ) -> reqwest::RequestBuilder {
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        req
     }
 }
 
@@ -124,27 +253,117 @@ impl HttpClient for ReqwestHttpClient {
         Ok(text)
     }
 
+    async fn post_json_with_headers(
+        &self,
+        url: &str,
+        auth: Auth<'_>,
+        headers: HeaderPairs<'_>,
+        body: serde_json::Value,
+    ) -> Result<String, EngineError> {
+        let resp = Self::with_headers(Self::authenticate(self.client.post(url), auth), headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        map_status(status, &text)?;
+        Ok(text)
+    }
+
+    async fn post_json_stream(
+        &self,
+        url: &str,
+        auth: Auth<'_>,
+        headers: HeaderPairs<'_>,
+        body: serde_json::Value,
+    ) -> Result<ByteStream, EngineError> {
+        use futures_util::StreamExt;
+
+        let resp = Self::with_headers(Self::authenticate(self.client.post(url), auth), headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let status = resp.status().as_u16();
+        // A failed stream still has an error body, and it is short — read it
+        // whole so the user gets the provider's own message rather than
+        // "stream ended". `map_status` classifies it exactly as it does for
+        // every other method here, and it always returns `Err` for a non-2xx,
+        // so the `unwrap_or_else` can only produce a defensive fallback.
+        if !(200..300).contains(&status) {
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| EngineError::Other(e.to_string()))?;
+            return Err(map_status(status, &text)
+                .err()
+                .unwrap_or_else(|| EngineError::http(status, text)));
+        }
+        Ok(Box::pin(resp.bytes_stream().map(|chunk| {
+            chunk
+                .map(|bytes| bytes.to_vec())
+                .map_err(|e| EngineError::Other(e.to_string()))
+        })))
+    }
+
     async fn post_multipart(
         &self,
         url: &str,
         auth: Auth<'_>,
         parts: Vec<MultipartPart>,
     ) -> Result<String, EngineError> {
-        let mut form = reqwest::multipart::Form::new();
-        for part in parts {
-            let mut builder = reqwest::multipart::Part::bytes(part.data);
-            if let Some(filename) = part.filename {
-                builder = builder.file_name(filename);
-            }
-            if let Some(content_type) = part.content_type {
-                builder = builder
-                    .mime_str(&content_type)
-                    .map_err(|e| EngineError::Other(e.to_string()))?;
-            }
-            form = form.part(part.name, builder);
-        }
+        let form = Self::build_form(parts)?;
         let resp = Self::authenticate(self.client.post(url), auth)
             .multipart(form)
+            .send()
+            .await
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        map_status(status, &text)?;
+        Ok(text)
+    }
+
+    async fn post_multipart_with_headers(
+        &self,
+        url: &str,
+        auth: Auth<'_>,
+        headers: HeaderPairs<'_>,
+        parts: Vec<MultipartPart>,
+    ) -> Result<String, EngineError> {
+        let form = Self::build_form(parts)?;
+        let resp = Self::with_headers(Self::authenticate(self.client.post(url), auth), headers)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        map_status(status, &text)?;
+        Ok(text)
+    }
+
+    async fn post_bytes(
+        &self,
+        url: &str,
+        auth: Auth<'_>,
+        headers: HeaderPairs<'_>,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<String, EngineError> {
+        let resp = Self::with_headers(Self::authenticate(self.client.post(url), auth), headers)
+            .header("content-type", content_type)
+            .body(body)
             .send()
             .await
             .map_err(|e| EngineError::Other(e.to_string()))?;

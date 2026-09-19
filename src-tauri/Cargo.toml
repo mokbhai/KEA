@@ -7,7 +7,7 @@ edition = "2021"
 # The local engines ship by default: the picker offers Whisper/Parakeet/local
 # voices and downloads their models, so a build without them registered lets a
 # user fetch a gigabyte and then hit "unknown engine id" when it is selected.
-default = ["whisper", "parakeet", "streaming", "tts-local", "tts-system"]
+default = ["whisper", "parakeet", "streaming", "tts-local", "tts-system", "stt-apple"]
 updater = ["tauri-plugin-updater"]
 whisper = ["kea-engines/whisper", "kea-infer/whisper"]
 # macOS-only; selected by host in the Makefile and per-runner in release.yml,
@@ -23,6 +23,10 @@ tts-local = ["kea-engines/tts-local"]
 # Registered only on macOS (see `build_engines`); the feature itself builds
 # everywhere so the workspace has one feature set.
 tts-system = ["kea-engines/tts-system"]
+# Apple's on-device recognizer. Registered only on macOS and only where the OS
+# reports on-device recognition (see `register_apple_stt_engine`); the feature
+# builds everywhere so the workspace has one feature set.
+stt-apple = ["kea-engines/stt-apple"]
 sherpa = ["kea-infer/sherpa"]
 
 # macOS only, and only for the dictation overlay: tao exposes

@@ -3,7 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::http::HttpClient;
-use crate::llm::post_chat_completion;
+use crate::llm::stream::{LlmStream, StreamingLlmEngine};
+use crate::llm::{post_chat_completion, stream_chat_completion};
 use crate::provider::{self, CredentialSource, ProviderConfigSource};
 use crate::traits::{EngineCaps, EngineError, LlmEngine, LlmRequest, LlmResponse};
 
@@ -12,6 +13,36 @@ pub struct OpenAiCompatibleLlmEngine {
     pub credentials: Arc<dyn CredentialSource>,
     pub configs: Arc<dyn ProviderConfigSource>,
     pub provider_ref: String,
+}
+
+impl OpenAiCompatibleLlmEngine {
+    /// The provider and model one call ends up using.
+    ///
+    /// One registered instance serves every OpenAI-compatible provider the
+    /// user added, so the request's provider_ref (from the resolved binding)
+    /// decides whose key and base URL to use. `self.provider_ref` is only the
+    /// fallback for a binding that names no provider. There is no "the"
+    /// compatible endpoint, so no defaults: an unconfigured provider fails
+    /// closed — unless it is one of the well-known ones, which
+    /// [`provider::resolve`] fills in from its own table.
+    async fn resolve(
+        &self,
+        req: &LlmRequest,
+    ) -> Result<(provider::ResolvedProvider, String), EngineError> {
+        let provider = provider::resolve(
+            self.credentials.as_ref(),
+            self.configs.as_ref(),
+            req.provider_ref.as_deref(),
+            &self.provider_ref,
+            None,
+        )
+        .await?;
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| provider.default_model.clone());
+        Ok((provider, model))
+    }
 }
 
 #[async_trait]
@@ -27,27 +58,32 @@ impl LlmEngine for OpenAiCompatibleLlmEngine {
     }
 
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, EngineError> {
-        // One registered instance serves every OpenAI-compatible provider the
-        // user added, so the request's provider_ref (from the resolved
-        // binding) decides whose key and base URL to use. `self.provider_ref`
-        // is only the fallback for a binding that names no provider. There is
-        // no "the" compatible endpoint, so no defaults: an unconfigured
-        // provider fails closed.
-        let provider = provider::resolve(
-            self.credentials.as_ref(),
-            self.configs.as_ref(),
-            req.provider_ref.as_deref(),
-            &self.provider_ref,
-            None,
-        )
-        .await?;
-        let model = req.model.as_deref().unwrap_or(&provider.default_model);
+        let (provider, model) = self.resolve(&req).await?;
         // No key is a supported setup here: Ollama, LM Studio and llama.cpp
         // all serve unauthenticated, and the provider UI says "No key needed".
         post_chat_completion(
             self.http.as_ref(),
             &provider.base_url,
-            model,
+            &model,
+            provider.auth(),
+            &req.prompt,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl StreamingLlmEngine for OpenAiCompatibleLlmEngine {
+    fn id(&self) -> &str {
+        "openai-compatible"
+    }
+
+    async fn stream(&self, req: LlmRequest) -> Result<LlmStream, EngineError> {
+        let (provider, model) = self.resolve(&req).await?;
+        stream_chat_completion(
+            self.http.as_ref(),
+            &provider.base_url,
+            &model,
             provider.auth(),
             &req.prompt,
         )

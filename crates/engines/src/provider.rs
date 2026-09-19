@@ -8,6 +8,54 @@ use crate::traits::EngineError;
 /// from here rather than spelling the URL out again.
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
+/// Providers the app knows the endpoint of, so the user only supplies a key.
+///
+/// This is the answer to "does this provider earn its code?". Groq serves
+/// OpenAI's own wire format for both chat and transcription, so supporting it
+/// is not an engine at all — it is a base URL and a default model, and a row
+/// here is the entire implementation. The same is true of any other
+/// OpenAI-compatible host.
+///
+/// It is consulted by [`resolve`] *after* the user's stored configuration and
+/// *before* the engine's own defaults, which makes it a starting point rather
+/// than a policy: anyone who edits the base URL of one of these providers
+/// keeps their edit.
+///
+/// Deepgram and ElevenLabs appear here too even though their engines are
+/// bespoke — the table is "where does this provider live", not "which wire
+/// format does it speak".
+pub static WELL_KNOWN_PROVIDERS: &[(&str, &str, &str)] = &[
+    // (provider_ref, base_url, default_model)
+    ("openai", OPENAI_BASE_URL, "gpt-4o-mini"),
+    (
+        "anthropic",
+        "https://api.anthropic.com/v1",
+        "claude-sonnet-4-5",
+    ),
+    // Groq's OpenAI-compatible surface. `whisper-large-v3-turbo` is the
+    // transcription model; a Groq provider bound to the *chat* slot supplies
+    // its own model id, which is why the default here names the one that
+    // makes this provider worth having.
+    (
+        "groq",
+        "https://api.groq.com/openai/v1",
+        "whisper-large-v3-turbo",
+    ),
+    ("deepgram", "https://api.deepgram.com/v1", "nova-3"),
+    ("elevenlabs", "https://api.elevenlabs.io/v1", "scribe_v1"),
+];
+
+/// The published endpoint for a provider the app ships knowledge of.
+pub fn well_known(provider_ref: &str) -> Option<ProviderConfig> {
+    WELL_KNOWN_PROVIDERS
+        .iter()
+        .find(|(id, _, _)| *id == provider_ref)
+        .map(|(_, base_url, model)| ProviderConfig {
+            base_url: (*base_url).to_string(),
+            default_model: (*model).to_string(),
+        })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub base_url: String,
@@ -88,15 +136,24 @@ pub async fn resolve(
         .map_err(|e| EngineError::Auth(format!("keychain access failed: {e}")))?;
     let cfg = match configs.config(provider_ref).await {
         Some(cfg) => cfg,
-        None => {
-            let defaults = defaults.ok_or_else(|| {
-                EngineError::Config(format!("missing provider config for {provider_ref}"))
-            })?;
-            ProviderConfig {
-                base_url: defaults.base_url.into(),
-                default_model: defaults.model.into(),
+        // The user has configured nothing for this ref. If the app knows
+        // where the provider lives, that is a far better answer than "missing
+        // provider config" — it is the difference between pasting a key and
+        // also having to know that Groq's compatible surface hangs off
+        // `/openai/v1`. Stored config still wins, so this never overrides an
+        // edit.
+        None => match well_known(provider_ref) {
+            Some(cfg) => cfg,
+            None => {
+                let defaults = defaults.ok_or_else(|| {
+                    EngineError::Config(format!("missing provider config for {provider_ref}"))
+                })?;
+                ProviderConfig {
+                    base_url: defaults.base_url.into(),
+                    default_model: defaults.model.into(),
+                }
             }
-        }
+        },
     };
     Ok(ResolvedProvider {
         provider_ref: provider_ref.to_string(),
@@ -221,6 +278,57 @@ mod tests {
         assert_eq!(resolved.api_key, None);
         assert_eq!(resolved.auth(), Auth::None);
         assert!(resolved.require_key().is_err());
+    }
+
+    /// The point of the table: a provider the app knows resolves with nothing
+    /// stored and no engine defaults — a key is all the user supplies.
+    #[tokio::test]
+    async fn a_well_known_provider_needs_no_stored_config() {
+        let creds = MapCredentials(HashMap::from([("groq".into(), "gsk-test".into())]));
+        let resolved = resolve(&creds, &empty_configs(), Some("groq"), "openai", None)
+            .await
+            .unwrap();
+        assert_eq!(resolved.base_url, "https://api.groq.com/openai/v1");
+        assert_eq!(resolved.default_model, "whisper-large-v3-turbo");
+        assert_eq!(resolved.api_key.as_deref(), Some("gsk-test"));
+    }
+
+    /// And it is a starting point, not a policy: an edited base URL survives.
+    #[tokio::test]
+    async fn a_stored_config_still_beats_the_well_known_table() {
+        let configs = MapConfigs(HashMap::from([(
+            "groq".to_string(),
+            ProviderConfig {
+                base_url: "https://gateway.internal/v1".into(),
+                default_model: "whisper-large-v3".into(),
+            },
+        )]));
+        let resolved = resolve(&empty_creds(), &configs, Some("groq"), "openai", None)
+            .await
+            .unwrap();
+        assert_eq!(resolved.base_url, "https://gateway.internal/v1");
+    }
+
+    /// A ref nobody knows still fails closed when the engine has no default.
+    #[tokio::test]
+    async fn an_unknown_ref_is_unaffected_by_the_table() {
+        let err = resolve(&empty_creds(), &empty_configs(), Some("nowhere"), "x", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("missing provider config"));
+    }
+
+    /// Every row has to be usable as-is: a typo'd URL here is a provider that
+    /// fails for everyone who selects it, with nothing in the UI to explain.
+    #[test]
+    fn every_well_known_row_is_a_complete_https_endpoint() {
+        let mut seen = std::collections::HashSet::new();
+        for (id, base_url, model) in WELL_KNOWN_PROVIDERS {
+            assert!(seen.insert(*id), "duplicate provider ref {id}");
+            assert!(base_url.starts_with("https://"), "{id}: {base_url}");
+            assert!(!base_url.ends_with('/'), "{id}: {base_url}");
+            assert!(!model.is_empty(), "{id}");
+        }
     }
 
     #[tokio::test]

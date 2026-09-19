@@ -6,5 +6,7 @@ pub mod db;
 pub mod hotkeys;
 pub mod meetings;
 pub mod presets;
+pub mod rates;
 pub mod settings;
+pub mod usage;
 pub mod vocabulary;

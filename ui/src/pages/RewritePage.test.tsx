@@ -256,4 +256,37 @@ describe("RewritePage", () => {
       customInstruction: null,
     });
   });
+
+  it("offers to put the user's words back, and shows the refusal verbatim", async () => {
+    // Every refusal `undo_last_rewrite` can return names its reason — "too
+    // old", "not there any more", "could not bring that app back" — and a
+    // generic "undo failed" would throw away the only thing the user can act
+    // on.
+    mockWorld({
+      extra: {
+        undo_last_rewrite_command: () => {
+          throw "that rewrite is too old to undo safely";
+        },
+      },
+    });
+    render(<RewritePage />);
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Put my words back" }),
+    );
+
+    await waitFor(() => expect(invokeCalls("undo_last_rewrite_command")).toHaveLength(1));
+    expect(await screen.findByText("that rewrite is too old to undo safely")).toBeTruthy();
+  });
+
+  it("confirms when the text went back", async () => {
+    mockWorld({ extra: { undo_last_rewrite_command: () => "my original sentence" } });
+    render(<RewritePage />);
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Put my words back" }),
+    );
+
+    expect(await screen.findByText("Put your text back.")).toBeTruthy();
+  });
 });
