@@ -1,6 +1,7 @@
 //! Platform providers: OS integration behind traits (hotkeys, text I/O, audio,
 //! permissions, screen capture/OCR, calendar).
 
+pub mod appnap;
 pub mod audio;
 pub mod calendar;
 pub mod hotkeys;
@@ -11,6 +12,7 @@ pub mod screen;
 pub mod textio;
 pub mod tts;
 
+pub use appnap::disable_app_nap;
 pub use audio::{
     accumulate_frames, chunk_pcm_by_duration, cue_pcm, mix_frames, new_audio_io, resample_linear,
     rms_level, AudioIo, AudioIoError, Cue, DictationState, MeetingState, PcmBuffer, PcmFrame,

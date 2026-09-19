@@ -858,6 +858,23 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
     let guard = kea_core::log::init_logging(&log_dir, "info");
     app.manage(guard);
 
+    // Before anything else that matters: ask macOS not to nap this process.
+    //
+    // KEA spends almost all of its life with no visible window, which is
+    // exactly what App Nap targets — and a napped process cannot service a
+    // CGEventTap's callback inside its deadline, so the system disables the
+    // tap and the ⌥⇧ hold chord stops working while another app is focused.
+    // The activity token is leaked inside `disable_app_nap` on purpose; see
+    // its doc comment for why a guard would be a liability here.
+    if kea_platform::disable_app_nap() {
+        tracing::info!("app nap suppressed for this process");
+    } else {
+        tracing::warn!(
+            "could not suppress app nap; the hold-to-talk tap may be disabled \
+             by the system while KEA is in the background"
+        );
+    }
+
     let (config_pool, data_pool) = open_databases(app, &dir);
 
     let credential_store: Arc<dyn kea_core::secrets::CredentialStore> =

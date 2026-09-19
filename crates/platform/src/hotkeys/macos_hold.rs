@@ -158,6 +158,21 @@ Grant it in System Settings → Privacy & Security → Accessibility, then try a
         .expect("spawning the hold-to-talk listener thread");
 }
 
+/// Why the system disabled the tap, or `None` for an ordinary event.
+///
+/// Extracted from the callback purely so it can be tested: the callback itself
+/// needs a live `CGEvent`, which a unit test has no way to make. The mapping is
+/// the part that was wrong — both reasons shared one message, so a log could
+/// not say whether the process had been throttled or something had switched
+/// the tap off.
+fn disable_reason(event_type: CGEventType) -> Option<&'static str> {
+    match event_type {
+        CGEventType::TapDisabledByTimeout => Some("timeout"),
+        CGEventType::TapDisabledByUserInput => Some("user input"),
+        _ => None,
+    }
+}
+
 fn on_event(
     machine: &Mutex<HoldToTalk>,
     enabled: &AtomicBool,
@@ -166,14 +181,42 @@ fn on_event(
     event_type: CGEventType,
     event: &core_graphics::event::CGEvent,
 ) {
-    if let CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput = event_type {
+    if let Some(reason) = disable_reason(event_type) {
         TAP_PORT.with(|slot| {
             let port = slot.get();
             if !port.is_null() {
                 unsafe { CGEventTapEnable(port, true) };
             }
         });
-        tracing::warn!("hold-to-talk: the system disabled the event tap; re-enabled it");
+
+        // Name the reason. They are different faults with different fixes and
+        // the old message covered both, which cost a debugging session:
+        //
+        // * Timeout   — our callback missed its deadline. Almost always the
+        //   process being throttled rather than the callback being slow; see
+        //   `kea_platform::appnap`.
+        // * UserInput — something called `CGEventTapEnable(false)`. Nothing in
+        //   KEA ever does, so this means another process or the system did.
+        tracing::warn!(
+            reason,
+            "hold-to-talk: the system disabled the event tap; re-enabled it"
+        );
+
+        // Drop any half-finished chord. The tap was deaf for an unknown
+        // interval, so a press whose release happened while it was disabled
+        // would otherwise sit in the machine waiting for a release that has
+        // already been and gone — and the deadline thread would eventually
+        // fire a recording the user did not ask for.
+        //
+        // Safe to do unconditionally: `reset` on an idle machine is a no-op,
+        // and the next FlagsChanged carries the absolute modifier state, so
+        // there is nothing to rebuild by hand.
+        let mut machine = machine.lock().unwrap_or_else(|p| p.into_inner());
+        let armed = machine.is_armed();
+        send(events, machine.reset());
+        if armed {
+            let _ = events.send(HoldAction::Disarm);
+        }
         return;
     }
 
@@ -261,4 +304,39 @@ fn spawn_deadline_thread(
             }
         })
         .expect("spawning the hold-to-talk deadline thread");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two disable reasons are different faults with different fixes, and
+    /// the log has to say which. A timeout means this process was too slow to
+    /// answer — in practice, throttled; see `kea_platform::appnap`. "User
+    /// input" means something called `CGEventTapEnable(false)`, and since
+    /// nothing in KEA ever passes `false`, that something is not us.
+    #[test]
+    fn each_disable_reason_is_named_separately() {
+        assert_eq!(
+            disable_reason(CGEventType::TapDisabledByTimeout),
+            Some("timeout")
+        );
+        assert_eq!(
+            disable_reason(CGEventType::TapDisabledByUserInput),
+            Some("user input")
+        );
+        assert_ne!(
+            disable_reason(CGEventType::TapDisabledByTimeout),
+            disable_reason(CGEventType::TapDisabledByUserInput),
+            "one message for both is what made the real failure unreadable"
+        );
+    }
+
+    /// The events the tap is actually subscribed to must not be mistaken for a
+    /// disable, or every chord would reset the machine instead of driving it.
+    #[test]
+    fn an_ordinary_event_is_not_a_disable() {
+        assert_eq!(disable_reason(CGEventType::FlagsChanged), None);
+        assert_eq!(disable_reason(CGEventType::KeyDown), None);
+    }
 }
