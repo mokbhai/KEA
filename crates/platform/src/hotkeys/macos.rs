@@ -23,6 +23,12 @@ pub struct MacHotkeys {
     _listener: Option<JoinHandle<()>>,
 }
 
+impl Default for MacHotkeys {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MacHotkeys {
     pub fn new() -> Self {
         let (action_tx, action_rx) = mpsc::channel(32);
@@ -36,7 +42,9 @@ impl MacHotkeys {
             }
         };
 
-        let listener = manager.as_ref().map(|_| spawn_listener(by_id.clone(), action_tx.clone()));
+        let listener = manager
+            .as_ref()
+            .map(|_| spawn_listener(by_id.clone(), action_tx.clone()));
 
         Self {
             manager,
@@ -57,7 +65,12 @@ fn spawn_listener(
         loop {
             match receiver.recv() {
                 Ok(event) if event.state == HotKeyState::Pressed => {
-                    if let Some(action) = by_id.lock().unwrap_or_else(|p| p.into_inner()).get(&event.id()).cloned() {
+                    if let Some(action) = by_id
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&event.id())
+                        .cloned()
+                    {
                         if action_tx.blocking_send(action).is_err() {
                             break;
                         }
@@ -83,17 +96,17 @@ impl Hotkeys for MacHotkeys {
             manager
                 .unregister(*previous)
                 .map_err(|e| HotkeyError::Other(e.to_string()))?;
-            self.by_id.lock().unwrap_or_else(|p| p.into_inner()).remove(&previous.id());
+            self.by_id
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&previous.id());
         }
 
         manager
             .register(hotkey)
             .map_err(|e| HotkeyError::Other(e.to_string()))?;
 
-        self.by_id
-            .lock()
-            .unwrap()
-            .insert(hotkey.id(), action);
+        self.by_id.lock().unwrap().insert(hotkey.id(), action);
         self.by_accel.insert(binding.accelerator, hotkey);
         Ok(())
     }
@@ -110,7 +123,10 @@ impl Hotkeys for MacHotkeys {
                 .map_err(|e| HotkeyError::Other(e.to_string()))?;
         }
 
-        self.by_id.lock().unwrap_or_else(|p| p.into_inner()).remove(&hotkey.id());
+        self.by_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&hotkey.id());
         Ok(())
     }
 

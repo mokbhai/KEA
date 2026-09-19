@@ -3,17 +3,7 @@ use std::path::Path;
 use async_trait::async_trait;
 
 use crate::error::InferError;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct AudioPcm {
-    pub samples: Vec<f32>,
-    pub sample_rate_hz: u32,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct WhisperOpts {
-    pub language: Option<String>,
-}
+pub use crate::types::{AudioPcm, WhisperOpts};
 
 #[async_trait]
 pub trait WhisperInference: Send + Sync {
@@ -56,7 +46,9 @@ impl WhisperInference for WhisperRsInference {
         let language = opts.language;
 
         tokio::task::spawn_blocking(move || {
-            use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+            use whisper_rs::{
+                FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters,
+            };
 
             let ctx = WhisperContext::new_with_params(
                 model_path.to_string_lossy().as_ref(),

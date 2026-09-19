@@ -16,11 +16,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use kea_infer::{ModelRegistry, ModelStorage, SherpaSttInference, WhisperOpts};
+use kea_infer::{ModelRegistry, ModelStorage, SherpaSttInference};
 
+use crate::stt::audio::{resample_to_rate, STT_SAMPLE_RATE_HZ};
 use crate::traits::{AudioPcm, EngineCaps, EngineError, SttEngine, SttOpts, Transcript};
-
-const PARAKEET_SAMPLE_RATE_HZ: u32 = 16_000;
 
 pub struct ParakeetSttEngine {
     inference: Arc<dyn SherpaSttInference>,
@@ -29,10 +28,7 @@ pub struct ParakeetSttEngine {
 
 impl ParakeetSttEngine {
     pub fn new(inference: Arc<dyn SherpaSttInference>, storage: Arc<ModelStorage>) -> Self {
-        Self {
-            inference,
-            storage,
-        }
+        Self { inference, storage }
     }
 }
 
@@ -64,45 +60,22 @@ impl SttEngine for ParakeetSttEngine {
         }
 
         let model_dir = self.storage.onnx_dir_for(model_id);
-        let samples = resample_to_rate(&audio.samples, audio.sample_rate_hz, PARAKEET_SAMPLE_RATE_HZ);
+        let samples = resample_to_rate(&audio.samples, audio.sample_rate_hz, STT_SAMPLE_RATE_HZ);
         let pcm = kea_infer::AudioPcm {
             samples,
-            sample_rate_hz: PARAKEET_SAMPLE_RATE_HZ,
+            sample_rate_hz: STT_SAMPLE_RATE_HZ,
         };
 
-        let whisper_opts = WhisperOpts {
-            language: opts.language,
-        };
-
+        // No language is passed on: the NeMo transducer behind this trait has
+        // no language setting, so `opts.language` could only be dropped.
         let text = self
             .inference
-            .transcribe_parakeet(pcm, &model_dir, whisper_opts)
+            .transcribe(pcm, &model_dir)
             .await
             .map_err(|e| EngineError::Other(e.to_string()))?;
 
         Ok(Transcript { text })
     }
-}
-
-fn resample_to_rate(samples: &[f32], src_rate_hz: u32, dst_rate_hz: u32) -> Vec<f32> {
-    if src_rate_hz == dst_rate_hz || samples.is_empty() {
-        return samples.to_vec();
-    }
-
-    let ratio = src_rate_hz as f64 / dst_rate_hz as f64;
-    let out_len = ((samples.len() as f64) / ratio).ceil() as usize;
-    let mut out = Vec::with_capacity(out_len);
-
-    for i in 0..out_len {
-        let src_pos = i as f64 * ratio;
-        let idx = src_pos as usize;
-        let frac = (src_pos - idx as f64) as f32;
-        let s0 = samples.get(idx).copied().unwrap_or(0.0);
-        let s1 = samples.get(idx + 1).copied().unwrap_or(s0);
-        out.push(s0 + (s1 - s0) * frac);
-    }
-
-    out
 }
 
 #[cfg(feature = "parakeet")]
@@ -118,18 +91,17 @@ pub fn register_parakeet_stt_engine(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use kea_infer::{AudioPcm as InferAudioPcm, SherpaSttInference, WhisperOpts};
+    use kea_infer::{AudioPcm as InferAudioPcm, SherpaSttInference};
     use std::path::Path;
 
     struct FakeSherpaSttInference;
 
     #[async_trait]
     impl SherpaSttInference for FakeSherpaSttInference {
-        async fn transcribe_parakeet(
+        async fn transcribe(
             &self,
             pcm: InferAudioPcm,
             _model_dir: &Path,
-            _opts: WhisperOpts,
         ) -> Result<String, kea_infer::InferError> {
             Ok(format!("parakeet: {} samples", pcm.samples.len()))
         }

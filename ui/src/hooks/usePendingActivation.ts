@@ -8,6 +8,7 @@ import {
   type Capability,
   type CapabilityOption,
 } from "../lib/capabilityDefaults";
+import { toMessage } from "../lib/format";
 import { useModelDownloads } from "./useModelDownloads";
 
 /** One "make this the default" request, including where it writes. */
@@ -85,7 +86,7 @@ export function usePendingActivation(onApplied?: () => void): PendingActivation 
         onAppliedRef.current?.();
       } catch (e) {
         forget();
-        setError(e instanceof Error ? e.message : String(e));
+        setError(toMessage(e));
       }
     },
     [forget],
@@ -122,7 +123,7 @@ export function usePendingActivation(onApplied?: () => void): PendingActivation 
           await startOptionDownload(option);
         } catch (e) {
           forget();
-          setError(e instanceof Error ? e.message : String(e));
+          setError(toMessage(e));
         }
         return;
       }
@@ -148,7 +149,7 @@ export function usePendingActivation(onApplied?: () => void): PendingActivation 
     try {
       await cancelOptionDownload(request.option);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toMessage(e));
     }
   }, [forget]);
 

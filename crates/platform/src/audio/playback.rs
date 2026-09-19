@@ -49,7 +49,9 @@ pub fn play_pcm_blocking(pcm: &PcmFrame) -> Result<(), AudioIoError> {
 #[cfg(not(target_os = "macos"))]
 pub fn play_pcm_blocking(pcm: &PcmFrame) -> Result<(), AudioIoError> {
     let _ = pcm;
-    Err(AudioIoError::Other("playback not supported on this platform".into()))
+    Err(AudioIoError::Other(
+        "playback not supported on this platform".into(),
+    ))
 }
 
 #[cfg(test)]

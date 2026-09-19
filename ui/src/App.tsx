@@ -19,18 +19,8 @@ import MeetingsPage from "./pages/MeetingsPage";
 import ModelsPage from "./pages/ModelsPage";
 import ReadAloudPage from "./pages/ReadAloudPage";
 import RewritePage from "./pages/RewritePage";
+import type { Page } from "./lib/nav";
 import { ThemeProvider, useTheme } from "./theme";
-
-type Page =
-  | "rewrite"
-  | "dictation"
-  | "meetings"
-  | "read-aloud"
-  | "ai-providers"
-  | "models"
-  | "general"
-  | "history"
-  | "logs";
 
 const MOBILE_BREAKPOINT = 768;
 

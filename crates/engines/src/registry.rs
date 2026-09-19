@@ -1,6 +1,6 @@
+use crate::traits::{LlmEngine, SttEngine, TtsEngine};
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::traits::{LlmEngine, SttEngine, TtsEngine};
 
 #[derive(Default)]
 pub struct EngineRegistry {

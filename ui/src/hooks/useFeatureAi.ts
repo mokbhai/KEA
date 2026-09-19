@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { loadSlotStatuses, type SlotSpec, type SlotStatus } from "../lib/featureSlot";
+import { toMessage } from "../lib/format";
 
 export type FeatureAi = {
   /** null while the first load is in flight. */
@@ -40,7 +41,7 @@ export function useFeatureAi(specs: SlotSpec[]): FeatureAi {
       .catch((e) => {
         if (cancelled) return;
         setStatuses([]);
-        setError(e instanceof Error ? e.message : String(e));
+        setError(toMessage(e));
       });
     return () => {
       cancelled = true;

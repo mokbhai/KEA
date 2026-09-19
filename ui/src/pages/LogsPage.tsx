@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { openLogFolder, tailLogs } from "../api";
 import Banner from "../components/Banner";
 import LogsViewer from "../components/LogsViewer";
+import { toMessage } from "../lib/format";
 
 const DEFAULT_MAX_BYTES = 64 * 1024;
 
@@ -32,7 +33,7 @@ export default function LogsPage() {
       const tail = await tailLogs(DEFAULT_MAX_BYTES);
       setContent(tail);
     } catch (e) {
-      setStatus(e instanceof Error ? e.message : String(e));
+      setStatus(toMessage(e));
     } finally {
       setLoading(false);
     }
@@ -58,7 +59,7 @@ export default function LogsPage() {
     try {
       await openLogFolder();
     } catch (e) {
-      setStatus(e instanceof Error ? e.message : String(e));
+      setStatus(toMessage(e));
     }
   };
 

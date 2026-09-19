@@ -5,9 +5,7 @@ use cpal::{Device, Host};
 
 /// Returns true when `name` matches a known system-audio loopback / monitor device.
 pub fn is_loopback_device_name(name: &str) -> bool {
-    name.contains("BlackHole")
-        || name.contains("Loopback")
-        || name.contains("Monitor")
+    name.contains("BlackHole") || name.contains("Loopback") || name.contains("Monitor")
 }
 
 /// Human-readable device name from cpal, when available.

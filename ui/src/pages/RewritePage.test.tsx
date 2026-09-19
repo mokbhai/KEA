@@ -119,6 +119,26 @@ describe("RewritePage", () => {
     });
   });
 
+  it("rewrites with the style just chosen in the form", async () => {
+    // The page and the form read one state: a style picked here reaches the
+    // run without a second copy being pushed back up.
+    mockWorld({
+      engines: { llm: ["openai"] },
+      bindings: { "default/llm": openAiBinding("openai", "gpt-4o-mini") },
+      extra: { preview_rewrite: () => "Ship it Friday." },
+    });
+    render(<RewritePage />);
+
+    await userEvent.selectOptions(
+      await screen.findByLabelText("Rewrite style"),
+      "concise",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Rewrite this" }));
+
+    await waitFor(() => expect(invokeCalls("preview_rewrite")).toHaveLength(1));
+    expect(invokeCalls("preview_rewrite")[0]).toMatchObject({ mode: "concise" });
+  });
+
   it("rewrites the sample text without pasting it anywhere", async () => {
     mockWorld({
       engines: { llm: ["openai"] },

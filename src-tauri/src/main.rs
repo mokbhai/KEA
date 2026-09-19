@@ -2,14 +2,14 @@
 
 mod commands;
 mod events;
+mod hotkeys;
 mod overlay;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 
-use kea_core::dictation::DictationSettingsRepo;
 use kea_core::rewrite::{CredentialSourceAdapter, ProviderConfigRepo};
 use kea_core::secrets::KeyringCredentialStore;
 use kea_core::store::db::{open_pool, run_config_migrations, run_data_migrations};
@@ -17,12 +17,9 @@ use kea_core::store::meetings::MeetingRepo;
 use kea_core::store::settings::SettingsRepo;
 use kea_engines::{
     register_phase1_engines, register_phase2_stt_engines, register_phase4_tts_engines,
-    ReqwestHttpClient, EngineRegistry,
+    EngineRegistry, ReqwestHttpClient,
 };
-use kea_features::{
-    demo::DemoFeature,
-    DictationFeature, FeatureRegistry, MeetingFeature, RewriteFeature, TtsFeature,
-};
+use kea_features::FeatureRegistry;
 use kea_infer::ModelStorage;
 use kea_platform::{new_audio_io, new_hotkeys, new_permissions};
 use sqlx::SqlitePool;
@@ -32,17 +29,7 @@ use tauri::{Manager, Wry};
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
-use crate::commands::{
-    default_rewrite_input, dictation_hotkey_action, execute_rewrite,
-    meeting_hotkey_action, register_dictation_hotkey, register_meeting_hotkey,
-    register_rewrite_hotkey, register_tts_hotkey, resolve_dictation_accelerator,
-    resolve_meeting_accelerator, resolve_rewrite_accelerator, resolve_tts_accelerator,
-    start_dictation_inner, start_meeting_inner, stop_dictation_inner, stop_meeting_inner,
-    trigger_tts_inner, ActiveMeetingSession, DictationHotkeyAction, MeetingHotkeyAction,
-    DICTATION_ACTION_ID, MEETINGS_ACTION_ID, REWRITE_ACTION_ID,
-    TTS_ACTION_ID, HotkeyRegStatus, record_hotkey_reg_status,
-};
-use crate::events::{emit_dictation_error, emit_meeting_error, emit_rewrite_error, emit_rewrite_progress, emit_tts_error};
+use crate::commands::{feature_registry, ActiveMeetingSession, HotkeyRegStatus};
 
 /// A download in flight: what the UI is waiting on, plus everything needed to
 /// stop it. Aborting drops the transfer mid-write, so the partial file has to
@@ -55,7 +42,10 @@ pub struct ActiveDownload {
 
 pub struct AppState {
     pub engines: EngineRegistry,
-    pub features: FeatureRegistry,
+    /// The registered features, shared with [`commands::feature_registry`]:
+    /// immutable after startup, and the hotkey defaults are read off it from
+    /// pure helpers that never see this state.
+    pub features: &'static FeatureRegistry,
     pub config_pool: SqlitePool,
     pub data_pool: SqlitePool,
     pub meeting_repo: MeetingRepo,
@@ -245,60 +235,77 @@ fn main() {
         });
 }
 
-fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
-    let dir = app.path().app_data_dir().expect("app data dir");
-    std::fs::create_dir_all(&dir).ok();
-    let log_dir = app.path().app_log_dir().unwrap_or(dir.clone());
-    std::fs::create_dir_all(&log_dir).ok();
-    let guard = kea_core::log::init_logging(&log_dir, "info");
-    app.manage(guard);
+/// The model directories the engines read from.
+struct ModelStorages {
+    whisper: ModelStorage,
+    parakeet: ModelStorage,
+    tts: ModelStorage,
+}
 
-    let config_url = format!("sqlite://{}?mode=rwc", dir.join("config.db").display());
-    let data_url = format!("sqlite://{}?mode=rwc", dir.join("data.db").display());
-
-    let (config_pool, data_pool) = tauri::async_runtime::block_on(async {
-        let c = match open_pool(&config_url).await {
-            Ok(p) => p,
-            Err(e) => {
-                handle_migration_error(
-                    &format!("failed to open config DB at {}: {e}", dir.join("config.db").display()),
-                    app,
-                );
-            }
-        };
-        if let Err(e) = run_config_migrations(&c).await {
-            handle_migration_error(
-                &format!(
-                    "config DB migration failed for {}: {e}",
-                    dir.join("config.db").display()
-                ),
-                app,
-            );
-        }
-        let d = match open_pool(&data_url).await {
-            Ok(p) => p,
-            Err(e) => {
-                handle_migration_error(
-                    &format!("failed to open data DB at {}: {e}", dir.join("data.db").display()),
-                    app,
-                );
-            }
-        };
-        if let Err(e) = run_data_migrations(&d).await {
-            handle_migration_error(
-                &format!(
-                    "data DB migration failed for {}: {e}",
-                    dir.join("data.db").display()
-                ),
-                app,
-            );
-        }
-        (c, d)
+/// A model directory, created up front so a download does not have to. A
+/// failure here is not fatal: the directory is created again on first use, and
+/// the warning is what tells us why a download later failed.
+fn ensure_storage(root: PathBuf, what: &str) -> ModelStorage {
+    let storage = ModelStorage::new(root);
+    storage.ensure_root().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, path = %storage.root.display(), "failed to create {what} model directory at startup");
     });
+    storage
+}
 
-    let credential_store: Arc<dyn kea_core::secrets::CredentialStore> =
-        Arc::new(KeyringCredentialStore::new("ai.kea.desktop"));
-    let creds = Arc::new(CredentialSourceAdapter::new(credential_store.clone()));
+/// Unwrap, or take the app down the way a broken DB has to — see
+/// [`handle_migration_error`].
+fn or_abort<T, E: std::fmt::Display>(result: Result<T, E>, app: &tauri::App<Wry>, what: &str) -> T {
+    match result {
+        Ok(value) => value,
+        Err(e) => handle_migration_error(&format!("{what}: {e}"), app),
+    }
+}
+
+/// Open both databases and bring them up to date. Config first: it holds the
+/// settings every other subsystem reads.
+fn open_databases(app: &tauri::App<Wry>, dir: &Path) -> (SqlitePool, SqlitePool) {
+    let config_path = dir.join("config.db");
+    let data_path = dir.join("data.db");
+    let config_url = format!("sqlite://{}?mode=rwc", config_path.display());
+    let data_url = format!("sqlite://{}?mode=rwc", data_path.display());
+
+    tauri::async_runtime::block_on(async {
+        let config = or_abort(
+            open_pool(&config_url).await,
+            app,
+            &format!("failed to open config DB at {}", config_path.display()),
+        );
+        or_abort(
+            run_config_migrations(&config).await,
+            app,
+            &format!("config DB migration failed for {}", config_path.display()),
+        );
+        let data = or_abort(
+            open_pool(&data_url).await,
+            app,
+            &format!("failed to open data DB at {}", data_path.display()),
+        );
+        or_abort(
+            run_data_migrations(&data).await,
+            app,
+            &format!("data DB migration failed for {}", data_path.display()),
+        );
+        (config, data)
+    })
+}
+
+/// Build the engine registry and the model directories it reads from.
+///
+/// The `#[cfg(feature = ...)]` blocks are not interchangeable: each registers a
+/// differently-shaped local engine behind a real cargo feature split, so they
+/// stay written out.
+fn build_engines(
+    dir: &Path,
+    config_pool: &SqlitePool,
+    credentials: &Arc<dyn kea_core::secrets::CredentialStore>,
+) -> (EngineRegistry, ModelStorages) {
+    let creds = Arc::new(CredentialSourceAdapter::new(credentials.clone()));
     let provider_configs = Arc::new(ProviderConfigRepo::new(SettingsRepo::new(
         config_pool.clone(),
     )));
@@ -312,32 +319,25 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
         creds.clone(),
         provider_configs.clone(),
     );
-    register_phase2_stt_engines(&mut engines, http.clone(), creds.clone(), provider_configs.clone());
-    register_phase4_tts_engines(
+    register_phase2_stt_engines(
         &mut engines,
-        http,
+        http.clone(),
         creds.clone(),
-        provider_configs,
+        provider_configs.clone(),
     );
+    register_phase4_tts_engines(&mut engines, http, creds.clone(), provider_configs);
 
-    let model_storage = ModelStorage::new(ModelStorage::default_whisper_root(&dir));
-    model_storage.ensure_root().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, path = %model_storage.root.display(), "failed to create whisper model directory at startup");
-    });
-    let parakeet_storage = ModelStorage::new(ModelStorage::default_parakeet_root(&dir));
-    parakeet_storage.ensure_root().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, path = %parakeet_storage.root.display(), "failed to create parakeet model directory at startup");
-    });
-    let tts_storage = ModelStorage::new(ModelStorage::default_tts_root(&dir));
-    tts_storage.ensure_root().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, path = %tts_storage.root.display(), "failed to create tts model directory at startup");
-    });
+    let storages = ModelStorages {
+        whisper: ensure_storage(ModelStorage::default_whisper_root(dir), "whisper"),
+        parakeet: ensure_storage(ModelStorage::default_parakeet_root(dir), "parakeet"),
+        tts: ensure_storage(ModelStorage::default_tts_root(dir), "tts"),
+    };
 
     #[cfg(feature = "whisper")]
     {
         use kea_engines::register_whisper_stt_engine;
         use kea_infer::WhisperRsInference;
-        let whisper_storage = Arc::new(ModelStorage::new(model_storage.root.clone()));
+        let whisper_storage = Arc::new(ModelStorage::new(storages.whisper.root.clone()));
         register_whisper_stt_engine(
             &mut engines,
             Arc::new(WhisperRsInference::new()),
@@ -349,7 +349,7 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
     {
         use kea_engines::register_parakeet_stt_engine;
         use kea_infer::SherpaOnnxSttInference;
-        let storage = Arc::new(ModelStorage::new(parakeet_storage.root.clone()));
+        let storage = Arc::new(ModelStorage::new(storages.parakeet.root.clone()));
         register_parakeet_stt_engine(
             &mut engines,
             Arc::new(SherpaOnnxSttInference::new()),
@@ -361,7 +361,7 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
     {
         use kea_engines::register_sherpa_tts_engine;
         use kea_infer::SherpaOnnxTtsInference;
-        let storage = Arc::new(ModelStorage::new(tts_storage.root.clone()));
+        let storage = Arc::new(ModelStorage::new(storages.tts.root.clone()));
         register_sherpa_tts_engine(
             &mut engines,
             Arc::new(SherpaOnnxTtsInference::new()),
@@ -369,63 +369,67 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let mut features = FeatureRegistry::default();
-    features.register(Arc::new(DemoFeature));
-    features.register(Arc::new(RewriteFeature));
-    features.register(Arc::new(DictationFeature));
-    features.register(Arc::new(MeetingFeature));
-    features.register(Arc::new(TtsFeature));
+    (engines, storages)
+}
 
-    let hotkeys = Mutex::new(new_hotkeys());
-    let audio = AsyncMutex::new(new_audio_io());
-    let permissions = new_permissions();
+/// Startup cleanup: prune history tables and old log files older than 90 days.
+fn spawn_startup_maintenance(data_pool: &SqlitePool, log_dir: &Path) {
+    let data_pool = data_pool.clone();
+    let log_dir = log_dir.to_path_buf();
+    tauri::async_runtime::spawn(async move {
+        let actions = kea_core::store::actions::ActionRepo::new(data_pool.clone());
+        match actions.prune_older_than_days(90).await {
+            Ok(n) if n > 0 => tracing::info!(pruned = n, "pruned old action rows"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "failed to prune action history"),
+        }
+        let conversations =
+            kea_core::store::conversations::ConversationRepo::new(data_pool.clone());
+        match conversations.prune_older_than_days(90).await {
+            Ok(n) if n > 0 => tracing::info!(pruned = n, "pruned old conversations"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "failed to prune conversation history"),
+        }
+        let meetings = kea_core::store::meetings::MeetingRepo::new(data_pool);
+        match meetings.prune_older_than_days(90).await {
+            Ok(n) if n > 0 => tracing::info!(pruned = n, "pruned old meetings"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "failed to prune meeting history"),
+        }
+        match kea_core::log::prune_old_logs(&log_dir, 90) {
+            Ok(n) if n > 0 => tracing::info!(pruned = n, "pruned old log files"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "failed to prune old log files"),
+        }
+    });
+}
+
+/// Assemble the shared application state. The platform handles (hotkeys, audio,
+/// permissions) are constructed here so the composition root does not hold
+/// half-built state.
+fn build_state(
+    engines: EngineRegistry,
+    storages: ModelStorages,
+    config_pool: SqlitePool,
+    data_pool: SqlitePool,
+    credentials: Arc<dyn kea_core::secrets::CredentialStore>,
+    log_dir: PathBuf,
+) -> Arc<AppState> {
     let meeting_repo = MeetingRepo::new(data_pool.clone());
-
-    // Startup cleanup: prune history tables and old log files older than 90 days.
-    {
-        let data_pool = data_pool.clone();
-        let log_dir = log_dir.clone();
-        tauri::async_runtime::spawn(async move {
-            let actions = kea_core::store::actions::ActionRepo::new(data_pool.clone());
-            match actions.prune_older_than_days(90).await {
-                Ok(n) if n > 0 => tracing::info!(pruned = n, "pruned old action rows"),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "failed to prune action history"),
-            }
-            let conversations = kea_core::store::conversations::ConversationRepo::new(data_pool.clone());
-            match conversations.prune_older_than_days(90).await {
-                Ok(n) if n > 0 => tracing::info!(pruned = n, "pruned old conversations"),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "failed to prune conversation history"),
-            }
-            let meetings = kea_core::store::meetings::MeetingRepo::new(data_pool);
-            match meetings.prune_older_than_days(90).await {
-                Ok(n) if n > 0 => tracing::info!(pruned = n, "pruned old meetings"),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "failed to prune meeting history"),
-            }
-            match kea_core::log::prune_old_logs(&log_dir, 90) {
-                Ok(n) if n > 0 => tracing::info!(pruned = n, "pruned old log files"),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "failed to prune old log files"),
-            }
-        });
-    }
-
-    let state = Arc::new(AppState {
+    Arc::new(AppState {
         engines,
-        features,
-        config_pool: config_pool.clone(),
+        features: feature_registry(),
+        config_pool,
         data_pool,
         meeting_repo,
-        credentials: credential_store,
-        permissions,
-        hotkeys,
-        model_storage,
-        parakeet_storage,
-        tts_storage,
-        log_dir: log_dir.clone(),
-        audio,
+        credentials,
+        permissions: new_permissions(),
+        hotkeys: Mutex::new(new_hotkeys()),
+        model_storage: storages.whisper,
+        parakeet_storage: storages.parakeet,
+        tts_storage: storages.tts,
+        log_dir,
+        audio: AsyncMutex::new(new_audio_io()),
         active_meeting: Mutex::new(None),
         level_poll_cancel: Mutex::new(None),
         segment_poll_cancel: Mutex::new(None),
@@ -438,347 +442,79 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
         dictation_busy: Arc::new(AtomicBool::new(false)),
         hold_to_talk_enabled: Arc::new(AtomicBool::new(false)),
         hold_to_talk_installed: Mutex::new(false),
-    });
+    })
+}
 
-    // Hotkey dispatcher: register rewrite + dictation shortcuts and spawn listener.
-    //
-    // Manual test (macOS):
-    // 1. Grant Accessibility + Microphone to KEA in System Settings > Privacy & Security.
-    // 2. Configuration → set OpenAI provider + API key; bind dictation stt slot to `openai-stt`.
-    // 3. Features → set push-to-talk hotkey (default Cmd+Shift+D).
-    // 4. Place caret in TextEdit; press hotkey once to start listening (level meter events);
-    //    press again to stop, transcribe, and insert at cursor.
-    // 5. Optional: build with `--features whisper`, download a GGUF model, bind `whisper` engine.
-    //
-    // Manual test — meetings (mic-only, macOS):
-    // 1. `cargo tauri dev`; grant Microphone when prompted.
-    // 2. Configuration → OpenAI credentials; Features → bind `meetings` `stt` + `llm` slots.
-    // 3. Meetings → Start → speak for ~30s → `meeting:segment` events with live transcript;
-    //    `meeting:level` RMS events while recording.
-    // 4. Stop → title + notes populated in `data.db`; `meeting:state` idle.
-    // 5. `capture_mode` = `mic_only` when loopback/SCK unavailable (default CI build).
-    // Screen Recording grant + system audio are manual; not asserted in unit tests.
-    // Headless CI does not assert real hotkey delivery, mic capture, or synthetic paste.
-    // Manual test — TTS read-aloud (macOS):
-    // 1. `cargo tauri dev`; grant Accessibility + Microphone.
-    // 2. Configuration → OpenAI credentials; Features → bind `tts`/`tts` slot to `openai-tts`.
-    // 3. Select text in TextEdit; hotkey (default Cmd+Shift+T) or invoke `run_read_aloud`.
-    // 4. Hear playback via rodio; History shows `feature_id = tts` action row.
-    // 5. `--features tts-local,sherpa` adds `sherpa-tts` after ONNX model download (manual).
-    //
-    // Manual test — History + Logs:
-    // 1. History page lists actions from `data.db`; conversations when rewrite stores content.
-    // 2. Logs page tails `kea.log` via `tail_logs`; `open_log_folder` opens log dir in Finder.
-    //
-    // Manual test — autostart + notifications:
-    // 1. Settings → toggle autostart (`set_autostart` / `get_autostart`).
-    // 2. `show_notification` displays a test OS notification (grant if prompted).
-    //
-    // Manual test — first-run permissions:
-    // 1. `get_all_permission_statuses` returns mic, screen recording, accessibility chips.
-    // 2. Grant each in System Settings; re-check status (not asserted in unit tests).
-    let app_handle = app.handle().clone();
-    let state_for_hotkeys = state.clone();
-    let action_rx = {
-        let rewrite_accel =
-            tauri::async_runtime::block_on(resolve_rewrite_accelerator(&config_pool));
-        let dictation_accel =
-            tauri::async_runtime::block_on(resolve_dictation_accelerator(&config_pool));
-        let tts_accel = tauri::async_runtime::block_on(resolve_tts_accelerator(&config_pool));
-        let meeting_accel =
-            tauri::async_runtime::block_on(resolve_meeting_accelerator(&config_pool));
-        let mut hk = state_for_hotkeys.hotkeys.lock().expect("hotkeys lock");
-        {
-            let mut statuses = state_for_hotkeys
-                .hotkey_reg_status
-                .lock()
-                .expect("hotkey_reg_status lock");
-            record_hotkey_reg_status(
-                &mut statuses,
-                crate::commands::REWRITE_FEATURE_ID,
-                crate::commands::REWRITE_COMMAND_ID,
-                register_rewrite_hotkey(&mut hk, &rewrite_accel),
-            );
-            record_hotkey_reg_status(
-                &mut statuses,
-                crate::commands::DICTATION_FEATURE_ID,
-                crate::commands::DICTATION_COMMAND_ID,
-                register_dictation_hotkey(&mut hk, &dictation_accel),
-            );
-            record_hotkey_reg_status(
-                &mut statuses,
-                crate::commands::TTS_FEATURE_ID,
-                crate::commands::TTS_COMMAND_ID,
-                register_tts_hotkey(&mut hk, &tts_accel),
-            );
-            record_hotkey_reg_status(
-                &mut statuses,
-                crate::commands::MEETINGS_FEATURE_ID,
-                crate::commands::MEETINGS_COMMAND_ID,
-                register_meeting_hotkey(&mut hk, &meeting_accel),
-            );
-        }
-        hk.on_action()
-    };
+/// The macOS Services entry ("Rewrite with KEA" in the Services menu): a
+/// selection arrives as text, and takes the same rewrite path a hotkey does.
+#[cfg(target_os = "macos")]
+fn spawn_macos_rewrite_service(
+    state: &Arc<AppState>,
+    app: &tauri::AppHandle,
+    config_pool: SqlitePool,
+) {
+    use crate::commands::{default_rewrite_input, execute_rewrite};
+    use crate::events::{emit_rewrite_error, emit_rewrite_progress};
 
-    let state_for_task = state.clone();
+    let (svc_tx, mut svc_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    kea_platform::macos_services::register_rewrite_service(svc_tx);
 
-    #[cfg(target_os = "macos")]
-    {
-        let (svc_tx, mut svc_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        kea_platform::macos_services::register_rewrite_service(svc_tx);
-
-        let state_for_svc = state.clone();
-        let app_handle_for_svc = app_handle.clone();
-        let config_pool_for_svc = config_pool.clone();
-        tauri::async_runtime::spawn(async move {
-            while let Some(source_text) = svc_rx.recv().await {
-                emit_rewrite_progress(&app_handle_for_svc, "Rewriting selection...");
-                let mut input = default_rewrite_input(&config_pool_for_svc).await;
-                input.source_text = source_text;
-                match execute_rewrite(&state_for_svc, input).await {
-                    Ok(_) => emit_rewrite_progress(&app_handle_for_svc, "Done"),
-                    Err(error) => emit_rewrite_error(&app_handle_for_svc, &error),
-                }
-            }
-        });
-    }
-
+    let state = state.clone();
+    let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let mut rx = action_rx;
-
-        // Per-feature busy flags: each flag serialises its own feature's
-        // handlers so presses queued during a long handler are dropped
-        // (rather than replaying as fresh starts).
-        let rewrite_busy  = Arc::new(AtomicBool::new(false));
-        // Dictation's lives on the state instead: hold-to-talk drives the same
-        // handlers from its own task, and a chord and a Cmd+Shift+D arriving
-        // together must contend for one flag, not one each.
-        let dictation_busy = state_for_task.dictation_busy.clone();
-        let tts_busy      = Arc::new(AtomicBool::new(false));
-        let meetings_busy = Arc::new(AtomicBool::new(false));
-
-        while let Some(action) = rx.recv().await {
-            if action == REWRITE_ACTION_ID {
-                match crate::commands::try_acquire_busy(&rewrite_busy) {
-                    None => {
-                        tracing::debug!("hotkey press ignored: rewrite handler in flight");
-                        continue;
-                    }
-                    Some(_guard) => {
-                        let state = state_for_task.clone();
-                        let app = app_handle.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let _busy = _guard;
-                            emit_rewrite_progress(&app, "Capturing selection...");
-                            let input = default_rewrite_input(&state.config_pool).await;
-                            match execute_rewrite(&state, input).await {
-                                Ok(_) => emit_rewrite_progress(&app, "Done"),
-                                Err(error) => emit_rewrite_error(&app, &error),
-                            }
-                        });
-                    }
-                }
-                continue;
-            }
-
-            if action == DICTATION_ACTION_ID {
-                match crate::commands::try_acquire_busy(&dictation_busy) {
-                    None => {
-                        tracing::debug!("hotkey press ignored: dictation handler in flight");
-                        continue;
-                    }
-                    Some(_guard) => {
-                        let state = state_for_task.clone();
-                        let app = app_handle.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let _busy = _guard;
-
-                            // Check meeting state BEFORE taking the audio lock:
-                            // during meeting synthesis the lock is free but a
-                            // start would be wrong, and reading the flag first
-                            // avoids any park-and-replay.
-                            let meeting_active = state
-                                .active_meeting
-                                .lock()
-                                .map(|guard| guard.is_some())
-                                .unwrap_or(false)
-                                || state.meeting_processing.load(Ordering::SeqCst);
-
-                            let in_flight = state
-                                .dictation_current_run
-                                .lock()
-                                .map(|guard| guard.is_some())
-                                .unwrap_or(false);
-
-                            let current = state.audio.lock().await.state();
-
-                            match dictation_hotkey_action(current, meeting_active, in_flight) {
-                                DictationHotkeyAction::Start => {
-                                    if let Err(error) =
-                                        start_dictation_inner(&state, &app).await
-                                    {
-                                        emit_dictation_error(&app, &error);
-                                    }
-                                }
-                                DictationHotkeyAction::Stop => {
-                                    if let Err(error) =
-                                        stop_dictation_inner(&state, &app).await
-                                    {
-                                        emit_dictation_error(&app, &error);
-                                    }
-                                }
-                                DictationHotkeyAction::Ignore => {}
-                            }
-                        });
-                    }
-                }
-                continue;
-            }
-
-            if action == TTS_ACTION_ID {
-                match crate::commands::try_acquire_busy(&tts_busy) {
-                    None => {
-                        tracing::debug!("hotkey press ignored: tts handler in flight");
-                        continue;
-                    }
-                    Some(_guard) => {
-                        let state = state_for_task.clone();
-                        let app = app_handle.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let _busy = _guard;
-                            if let Err(error) = trigger_tts_inner(&state, &app).await {
-                                emit_tts_error(&app, &error);
-                            }
-                        });
-                    }
-                }
-                continue;
-            }
-
-            if action == MEETINGS_ACTION_ID {
-                match crate::commands::try_acquire_busy(&meetings_busy) {
-                    None => {
-                        tracing::debug!("hotkey press ignored: meetings handler in flight");
-                        continue;
-                    }
-                    Some(_guard) => {
-                        let state = state_for_task.clone();
-                        let app = app_handle.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let _busy = _guard;
-
-                            let recording = {
-                                state
-                                    .active_meeting
-                                    .lock()
-                                    .map(|guard| guard.is_some())
-                                    .unwrap_or(false)
-                            };
-                            let processing =
-                                state.meeting_processing.load(Ordering::SeqCst);
-                            match meeting_hotkey_action(recording, processing) {
-                                MeetingHotkeyAction::Ignore => {
-                                    tracing::debug!(
-                                        "meeting hotkey ignored: a meeting is finishing"
-                                    );
-                                }
-                                MeetingHotkeyAction::Stop => {
-                                    if let Err(error) =
-                                        stop_meeting_inner(&state, &app).await
-                                    {
-                                        emit_meeting_error(&app, &error);
-                                    }
-                                }
-                                MeetingHotkeyAction::Start => {
-                                    if let Err(error) =
-                                        start_meeting_inner(&state, &app).await
-                                    {
-                                        emit_meeting_error(&app, &error);
-                                    }
-                                }
-                            }
-                        });
-                    }
-                }
+        while let Some(source_text) = svc_rx.recv().await {
+            emit_rewrite_progress(&app, "Rewriting selection...");
+            let mut input = default_rewrite_input(&config_pool).await;
+            input.source_text = source_text;
+            match execute_rewrite(&state, input).await {
+                Ok(_) => emit_rewrite_progress(&app, "Done"),
+                Err(error) => emit_rewrite_error(&app, &error),
             }
         }
     });
+}
 
-    // Re-arm ⌥⇧ hold-to-talk if the user left it on. Deliberately after the
-    // hotkey dispatcher is up: the listener drives the same dictation handlers,
-    // and a chord held through launch should find them ready.
-    {
-        let state_for_hold = state.clone();
-        let app_for_hold = app.handle().clone();
-        let config_pool = config_pool.clone();
-        tauri::async_runtime::spawn(async move {
-            let settings = DictationSettingsRepo::new(SettingsRepo::new(config_pool))
-                .get()
-                .await;
-            match settings {
-                Ok(settings) if settings.hold_to_talk => {
-                    crate::commands::sync_hold_to_talk(&state_for_hold, &app_for_hold, true);
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "could not read dictation settings to arm hold-to-talk")
-                }
-            }
-        });
-    }
-
-    app.manage(state);
-
-    // Launch-time update check: non-blocking, offline-safe, silent when
-    // up-to-date. Only active when the `updater` feature is enabled.
-    #[cfg(feature = "updater")]
-    {
-        use tauri_plugin_updater::UpdaterExt;
-        let app_handle = app.handle().clone();
-        let config_pool = config_pool.clone();
-        tauri::async_runtime::spawn(async move {
-            let auto_check: Option<String> = SettingsRepo::new(config_pool)
-                .get("updates.auto_check")
-                .await
-                .ok()
-                .flatten();
-            let enabled = auto_check.as_deref() != Some("false");
-            if !enabled {
+/// Launch-time update check: non-blocking, offline-safe, silent when
+/// up-to-date. Only active when the `updater` feature is enabled.
+#[cfg(feature = "updater")]
+fn spawn_launch_update_check(app: tauri::AppHandle, config_pool: SqlitePool) {
+    use tauri_plugin_updater::UpdaterExt;
+    tauri::async_runtime::spawn(async move {
+        let auto_check: Option<String> = SettingsRepo::new(config_pool)
+            .get("updates.auto_check")
+            .await
+            .ok()
+            .flatten();
+        let enabled = auto_check.as_deref() != Some("false");
+        if !enabled {
+            return;
+        }
+        let updater = match app.updater() {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!(%e, "launch-time update check: updater init failed");
                 return;
             }
-            let updater = match app_handle.updater() {
-                Ok(u) => u,
-                Err(e) => {
-                    tracing::warn!(%e, "launch-time update check: updater init failed");
-                    return;
-                }
-            };
-            match updater.check().await {
-                Ok(Some(update)) => {
-                    tracing::info!(
-                        version = %update.version,
-                        "update available"
-                    );
-                }
-                Ok(None) => {
-                    tracing::info!("app is up-to-date");
-                }
-                Err(e) => {
-                    tracing::warn!(%e, "launch-time update check failed (offline?)");
-                }
+        };
+        match updater.check().await {
+            Ok(Some(update)) => {
+                tracing::info!(
+                    version = %update.version,
+                    "update available"
+                );
             }
-        });
-    }
+            Ok(None) => {
+                tracing::info!("app is up-to-date");
+            }
+            Err(e) => {
+                tracing::warn!(%e, "launch-time update check failed (offline?)");
+            }
+        }
+    });
+}
 
-    // Built up-front and left hidden: `emit_dictation_state` only shows and
-    // hides it, so the webview is already loaded and listening when the first
-    // state arrives. A failure here must not abort startup — dictation works
-    // without the HUD.
-    if let Err(e) = overlay::create(app.handle()) {
-        tracing::warn!(error = %e, "failed to create the dictation overlay window");
-    }
-
+/// Attach the tray menu.
+fn install_tray(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
     let open = MenuItem::with_id(app, "open", "Open KEA", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit KEA", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &quit])?;
@@ -801,6 +537,102 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
         }
         builder.on_menu_event(on_tray_menu_event).build(app)?;
     }
+    Ok(())
+}
+
+/// Composition root: open the databases, build the engines and the shared
+/// state, then start the things that run for the life of the app.
+///
+/// Manual test (macOS):
+/// 1. Grant Accessibility + Microphone to KEA in System Settings > Privacy & Security.
+/// 2. Configuration → set OpenAI provider + API key; bind dictation stt slot to `openai-stt`.
+/// 3. Features → set push-to-talk hotkey (default Cmd+Shift+D).
+/// 4. Place caret in TextEdit; press hotkey once to start listening (level meter events);
+///    press again to stop, transcribe, and insert at cursor.
+/// 5. Optional: build with `--features whisper`, download a GGUF model, bind `whisper` engine.
+///
+/// Manual test — meetings (mic-only, macOS):
+/// 1. `cargo tauri dev`; grant Microphone when prompted.
+/// 2. Configuration → OpenAI credentials; Features → bind `meetings` `stt` + `llm` slots.
+/// 3. Meetings → Start → speak for ~30s → `meeting:segment` events with live transcript;
+///    `meeting:level` RMS events while recording.
+/// 4. Stop → title + notes populated in `data.db`; `meeting:state` idle.
+/// 5. `capture_mode` = `mic_only` when loopback/SCK unavailable (default CI build).
+///
+/// Screen Recording grant + system audio are manual; not asserted in unit tests.
+/// Headless CI does not assert real hotkey delivery, mic capture, or synthetic paste.
+///
+/// Manual test — TTS read-aloud (macOS):
+/// 1. `cargo tauri dev`; grant Accessibility + Microphone.
+/// 2. Configuration → OpenAI credentials; Features → bind `tts`/`tts` slot to `openai-tts`.
+/// 3. Select text in TextEdit; hotkey (default Cmd+Shift+T) or invoke `run_read_aloud`.
+/// 4. Hear playback via rodio; History shows `feature_id = tts` action row.
+/// 5. `--features tts-local,sherpa` adds `sherpa-tts` after ONNX model download (manual).
+///
+/// Manual test — History + Logs:
+/// 1. History page lists actions from `data.db`; conversations when rewrite stores content.
+/// 2. Logs page tails `kea.log` via `tail_logs`; `open_log_folder` opens log dir in Finder.
+///
+/// Manual test — autostart + notifications:
+/// 1. Settings → toggle autostart (`set_autostart` / `get_autostart`).
+/// 2. `show_notification` displays a test OS notification (grant if prompted).
+///
+/// Manual test — first-run permissions:
+/// 1. `get_all_permission_statuses` returns mic, screen recording, accessibility chips.
+/// 2. Grant each in System Settings; re-check status (not asserted in unit tests).
+fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = app.path().app_data_dir().expect("app data dir");
+    std::fs::create_dir_all(&dir).ok();
+    let log_dir = app.path().app_log_dir().unwrap_or(dir.clone());
+    std::fs::create_dir_all(&log_dir).ok();
+    let guard = kea_core::log::init_logging(&log_dir, "info");
+    app.manage(guard);
+
+    let (config_pool, data_pool) = open_databases(app, &dir);
+
+    let credential_store: Arc<dyn kea_core::secrets::CredentialStore> =
+        Arc::new(KeyringCredentialStore::new("ai.kea.desktop"));
+    let (engines, storages) = build_engines(&dir, &config_pool, &credential_store);
+
+    spawn_startup_maintenance(&data_pool, &log_dir);
+
+    let state = build_state(
+        engines,
+        storages,
+        config_pool.clone(),
+        data_pool,
+        credential_store,
+        log_dir,
+    );
+
+    // Hotkey dispatcher: register every shortcut, then spawn the listener that
+    // turns a press into a feature handler (see [`crate::hotkeys`]).
+    let app_handle = app.handle().clone();
+    let action_rx = hotkeys::register_all(&state, &config_pool);
+
+    #[cfg(target_os = "macos")]
+    spawn_macos_rewrite_service(&state, &app_handle, config_pool.clone());
+
+    hotkeys::spawn_dispatch_loop(state.clone(), app_handle.clone(), action_rx);
+
+    // Deliberately after the dispatcher is up: the hold-to-talk listener drives
+    // the same dictation handlers.
+    hotkeys::spawn_hold_to_talk_rearm(&state, &app_handle, config_pool.clone());
+
+    app.manage(state);
+
+    #[cfg(feature = "updater")]
+    spawn_launch_update_check(app_handle, config_pool);
+
+    // Built up-front and left hidden: `emit_dictation_state` only shows and
+    // hides it, so the webview is already loaded and listening when the first
+    // state arrives. A failure here must not abort startup — dictation works
+    // without the HUD.
+    if let Err(e) = overlay::create(app.handle()) {
+        tracing::warn!(error = %e, "failed to create the dictation overlay window");
+    }
+
+    install_tray(app)?;
 
     Ok(())
 }

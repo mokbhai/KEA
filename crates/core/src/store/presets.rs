@@ -7,7 +7,9 @@ mod tests {
         let pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&pool).await.unwrap();
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rewrite_presets")
-            .fetch_one(&pool).await.unwrap();
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(count, 0);
     }
 }

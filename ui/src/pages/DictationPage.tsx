@@ -8,18 +8,21 @@ import {
   setDictationSettings,
   startDictation,
   stopDictation,
+  type DictationSettings,
   type DictationState,
 } from "../api";
 import FeatureAiCard from "../components/FeatureAiCard";
-import FeatureBanner, { type FixNavigate } from "../components/FeatureBanner";
+import FeatureBanner from "../components/FeatureBanner";
 import HotkeyRow, { formatAccelerator, KeyChips } from "../components/HotkeyRow";
 import LevelMeter from "../components/LevelMeter";
+import LoadingBlock from "../components/LoadingBlock";
 import { Row, RowGroup } from "../components/SettingsRow";
-import Spinner from "../components/Spinner";
 import Toggle from "../components/Toggle";
 import { useFeatureAi } from "../hooks/useFeatureAi";
-import { useSavedFlash } from "../hooks/useSavedFlash";
+import { useOptimisticSetting } from "../hooks/useOptimisticSetting";
 import type { SlotSpec } from "../lib/featureSlot";
+import { toMessage } from "../lib/format";
+import type { Navigate } from "../lib/nav";
 
 const DICTATION_FEATURE = "dictation";
 const DICTATION_COMMAND = "push_to_talk";
@@ -51,14 +54,20 @@ const SLOTS_WITH_CLEANUP: SlotSpec[] = [
 ];
 
 type Props = {
-  onNavigate?: FixNavigate;
+  onNavigate?: Navigate;
 };
 
 export default function DictationPage({ onNavigate }: Props) {
-  const [postProcess, setPostProcess] = useState(false);
-  const [holdToTalk, setHoldToTalk] = useState(false);
+  // Saved whole, so every write re-reads first: a stale copy of the other
+  // field would quietly revert it.
+  const settings = useOptimisticSetting<DictationSettings>({
+    initial: { post_process: false, active_model: null, hold_to_talk: false },
+    persist: setDictationSettings,
+    reread: getDictationSettings,
+  });
+  const { post_process: postProcess, hold_to_talk: holdToTalk } = settings.value;
+  const { setValue: setSettingsValue, setError: setSettingsError } = settings;
   const ai = useFeatureAi(postProcess ? SLOTS_WITH_CLEANUP : SLOTS_PLAIN);
-  const [settingsStatus, setSettingsStatus] = useState<string | null>(null);
   const [settingsLoading, setSettingsLoading] = useState(true);
   const [dictationStatus, setDictationStatus] = useState<string | null>(null);
   const [transcript, setTranscript] = useState<string | null>(null);
@@ -66,16 +75,15 @@ export default function DictationPage({ onNavigate }: Props) {
   const [dictationState, setDictationState] = useState<DictationState>("idle");
   const [level, setLevel] = useState(0);
   const [accelerator, setAccelerator] = useState<string | null>(null);
-  const [savedKey, flash] = useSavedFlash();
   const listening = dictationState !== "idle";
+  // One flag for the page: a save and a run both lock the whole panel, as
+  // they did when this was a single `busy`.
+  const anyBusy = busy || settings.busy;
 
   useEffect(() => {
     getDictationSettings()
-      .then((settings) => {
-        setPostProcess(settings.post_process);
-        setHoldToTalk(settings.hold_to_talk);
-      })
-      .catch((e) => setSettingsStatus(e instanceof Error ? e.message : String(e)))
+      .then(setSettingsValue)
+      .catch((e) => setSettingsError(toMessage(e)))
       .finally(() => setSettingsLoading(false));
 
     getDictationStateApi()
@@ -101,45 +109,6 @@ export default function DictationPage({ onNavigate }: Props) {
     if (dictationState !== "listening") setLevel(0);
   }, [dictationState]);
 
-  const savePostProcess = async (enabled: boolean) => {
-    const previous = postProcess;
-    setPostProcess(enabled);
-    setBusy(true);
-    setSettingsStatus(null);
-    try {
-      const current = await getDictationSettings();
-      await setDictationSettings({ ...current, post_process: enabled });
-      flash("post_process");
-    } catch (e) {
-      setPostProcess(previous);
-      setSettingsStatus(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  /**
-   * Re-reads before writing for the same reason `savePostProcess` does: these
-   * settings are saved whole, so writing a stale copy of the other fields would
-   * quietly revert them.
-   */
-  const saveHoldToTalk = async (enabled: boolean) => {
-    const previous = holdToTalk;
-    setHoldToTalk(enabled);
-    setBusy(true);
-    setSettingsStatus(null);
-    try {
-      const current = await getDictationSettings();
-      await setDictationSettings({ ...current, hold_to_talk: enabled });
-      flash("hold_to_talk");
-    } catch (e) {
-      setHoldToTalk(previous);
-      setSettingsStatus(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const onStart = async () => {
     setBusy(true);
     setDictationStatus(null);
@@ -147,7 +116,7 @@ export default function DictationPage({ onNavigate }: Props) {
       await startDictation();
       setDictationStatus("Listening — speak now, then stop.");
     } catch (e) {
-      setDictationStatus(e instanceof Error ? e.message : String(e));
+      setDictationStatus(toMessage(e));
     } finally {
       setBusy(false);
     }
@@ -161,7 +130,7 @@ export default function DictationPage({ onNavigate }: Props) {
       setTranscript(text || null);
       setDictationStatus(text ? "Typed into the app you were last in." : "Nothing was heard.");
     } catch (e) {
-      setDictationStatus(e instanceof Error ? e.message : String(e));
+      setDictationStatus(toMessage(e));
     } finally {
       setBusy(false);
     }
@@ -181,10 +150,7 @@ export default function DictationPage({ onNavigate }: Props) {
       <section style={{ marginBottom: 24 }}>
         <h2 style={{ margin: "0 0 12px" }}>Behavior</h2>
         {settingsLoading ? (
-          <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 44 }}>
-            <Spinner size={16} />
-            <span className="kea-muted">Loading settings…</span>
-          </div>
+          <LoadingBlock label="Loading settings…" minHeight={44} />
         ) : (
           <>
             <RowGroup aria-label="Dictation behavior">
@@ -201,30 +167,34 @@ export default function DictationPage({ onNavigate }: Props) {
                 hint="Hold ⌥⇧ anywhere to record, then let go and KEA types what you said. A quick tap does nothing, and neither does holding ⌥⇧ for one of your own shortcuts."
               >
                 <KeyChips accelerator="Option+Shift" />
-                {savedKey === "hold_to_talk" && <span className="kea-saved">Saved ✓</span>}
+                {settings.savedKey === "hold_to_talk" && (
+                  <span className="kea-saved">Saved ✓</span>
+                )}
                 <Toggle
                   label="Hold to talk"
                   checked={holdToTalk}
-                  disabled={busy}
-                  onChange={(next) => void saveHoldToTalk(next)}
+                  disabled={anyBusy}
+                  onChange={(next) => void settings.save({ hold_to_talk: next }, "hold_to_talk")}
                 />
               </Row>
               <Row
                 label="Clean up text with AI"
                 hint="Removes filler words and fixes punctuation before typing. Needs the Rewrite AI — dictation fails outright without it."
               >
-                {savedKey === "post_process" && <span className="kea-saved">Saved ✓</span>}
+                {settings.savedKey === "post_process" && (
+                  <span className="kea-saved">Saved ✓</span>
+                )}
                 <Toggle
                   label="Clean up text with AI"
                   checked={postProcess}
-                  disabled={busy}
-                  onChange={(next) => void savePostProcess(next)}
+                  disabled={anyBusy}
+                  onChange={(next) => void settings.save({ post_process: next }, "post_process")}
                 />
               </Row>
             </RowGroup>
-            {settingsStatus && (
+            {settings.error && (
               <p style={{ marginTop: 8, fontSize: "0.8125rem", color: "var(--danger)" }}>
-                {settingsStatus}
+                {settings.error}
               </p>
             )}
           </>
@@ -272,7 +242,7 @@ export default function DictationPage({ onNavigate }: Props) {
               type="button"
               className="kea-btn kea-btn--primary"
               onClick={() => void onStart()}
-              disabled={busy || listening}
+              disabled={anyBusy || listening}
             >
               Start listening
             </button>
@@ -280,7 +250,7 @@ export default function DictationPage({ onNavigate }: Props) {
               type="button"
               className="kea-btn"
               onClick={() => void onStop()}
-              disabled={busy || !listening}
+              disabled={anyBusy || !listening}
             >
               Stop
             </button>

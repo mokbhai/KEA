@@ -66,10 +66,7 @@ pub fn mix_frames(mic: &PcmFrame, system: &PcmFrame) -> PcmFrame {
         resample_linear(system, rate)
     };
 
-    let len = mic_resampled
-        .samples
-        .len()
-        .max(sys_resampled.samples.len());
+    let len = mic_resampled.samples.len().max(sys_resampled.samples.len());
     let mut samples = Vec::with_capacity(len);
     for i in 0..len {
         let m = mic_resampled.samples.get(i).copied().unwrap_or(0.0);
@@ -81,6 +78,32 @@ pub fn mix_frames(mic: &PcmFrame, system: &PcmFrame) -> PcmFrame {
         samples,
         sample_rate_hz: rate,
     }
+}
+
+/// Downmix interleaved `channels`-channel audio to mono, converting each sample
+/// with `to_f32` (identity for `f32` input, scaling for integer formats).
+///
+/// A trailing partial frame is dropped, as the capture callbacks only ever hand
+/// us whole frames.
+pub fn downmix_to_mono<S: Copy>(
+    interleaved: &[S],
+    channels: usize,
+    to_f32: impl Fn(S) -> f32,
+) -> Vec<f32> {
+    if channels <= 1 {
+        return interleaved.iter().map(|s| to_f32(*s)).collect();
+    }
+    let frames = interleaved.len() / channels;
+    let mut mono = Vec::with_capacity(frames);
+    for i in 0..frames {
+        let base = i * channels;
+        let sum: f32 = interleaved[base..base + channels]
+            .iter()
+            .map(|s| to_f32(*s))
+            .sum();
+        mono.push(sum / channels as f32);
+    }
+    mono
 }
 
 /// Split PCM into fixed-duration chunks for segmented STT (last chunk may be shorter).
@@ -177,6 +200,25 @@ mod tests {
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].samples.len(), 16_000 * 30);
         assert_eq!(chunks[2].samples.len(), 16_000 * 30);
+    }
+
+    #[test]
+    fn downmix_passes_mono_through_the_converter() {
+        let mono = downmix_to_mono(&[0i16, i16::MAX], 1, |s| s as f32 / i16::MAX as f32);
+        assert_eq!(mono.len(), 2);
+        assert!((mono[1] - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn downmix_averages_interleaved_channels() {
+        let mono = downmix_to_mono(&[1.0f32, 0.0, 0.0, 1.0], 2, |s| s);
+        assert_eq!(mono, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn downmix_drops_trailing_partial_frame() {
+        let mono = downmix_to_mono(&[1.0f32, 1.0, 1.0], 2, |s| s);
+        assert_eq!(mono, vec![1.0]);
     }
 
     #[test]

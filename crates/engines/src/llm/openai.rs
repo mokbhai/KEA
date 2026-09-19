@@ -2,12 +2,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::http::HttpClient;
+use crate::http::{Auth, HttpClient};
 use crate::llm::post_chat_completion;
-use crate::provider::{CredentialSource, ProviderConfig, ProviderConfigSource};
+use crate::provider::{self, CredentialSource, Defaults, ProviderConfigSource, OPENAI_BASE_URL};
 use crate::traits::{EngineCaps, EngineError, LlmEngine, LlmRequest, LlmResponse};
 
-const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
 
 pub struct OpenAiLlmEngine {
@@ -33,27 +32,26 @@ impl LlmEngine for OpenAiLlmEngine {
         // Same seam as the compatible engine: the resolved binding names the
         // provider, `self.provider_ref` is only the fallback for a binding
         // that carries none (an auto-resolved slot).
-        let provider_ref = req.provider_ref.as_deref().unwrap_or(&self.provider_ref);
-        let api_key = self
-            .credentials
-            .api_key(provider_ref)
-            .await
-            .map_err(|e| EngineError::Auth(format!("keychain access failed: {e}")))?
-            .ok_or_else(|| EngineError::Auth("missing api key".into()))?;
-        let cfg = self
-            .configs
-            .config(provider_ref)
-            .await
-            .unwrap_or(ProviderConfig {
-                base_url: DEFAULT_BASE_URL.into(),
-                default_model: DEFAULT_MODEL.into(),
-            });
-        let model = req.model.as_deref().unwrap_or(&cfg.default_model);
+        let provider = provider::resolve(
+            self.credentials.as_ref(),
+            self.configs.as_ref(),
+            req.provider_ref.as_deref(),
+            &self.provider_ref,
+            Some(Defaults {
+                base_url: OPENAI_BASE_URL,
+                model: DEFAULT_MODEL,
+            }),
+        )
+        .await?;
+        // api.openai.com cannot serve an unauthenticated call, so say so
+        // before the round-trip rather than relaying its 401.
+        let api_key = provider.require_key()?;
+        let model = req.model.as_deref().unwrap_or(&provider.default_model);
         post_chat_completion(
             self.http.as_ref(),
-            &cfg.base_url,
+            &provider.base_url,
             model,
-            &api_key,
+            Auth::Bearer(api_key),
             &req.prompt,
         )
         .await
@@ -64,6 +62,7 @@ impl LlmEngine for OpenAiLlmEngine {
 mod tests {
     use super::*;
     use crate::http::ReqwestHttpClient;
+    use crate::provider::ProviderConfig;
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -117,9 +116,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"{"choices":[{"message":{"content":"rewritten"}}]}"#,
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"choices":[{"message":{"content":"rewritten"}}]}"#),
+            )
             .mount(&server)
             .await;
 
@@ -217,11 +217,11 @@ mod tests {
             .await
             .unwrap_err();
         match &err {
-            EngineError::Http { status, body } => {
+            EngineError::Retryable { status, body } => {
                 assert_eq!(*status, 503);
                 assert!(body.contains("service unavailable"));
             }
-            _ => panic!("expected EngineError::Http, got {:?}", err),
+            _ => panic!("expected EngineError::Retryable, got {:?}", err),
         }
     }
 
@@ -231,9 +231,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .and(body_string_contains("\"gpt-4o\""))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"{"choices":[{"message":{"content":"bound"}}]}"#,
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"choices":[{"message":{"content":"bound"}}]}"#),
+            )
             .mount(&server)
             .await;
 

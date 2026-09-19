@@ -1,14 +1,17 @@
 use kea_core::meetings::{
-    MEETING_NOTES_PROMPT_VERSION, build_meeting_notes_request, build_meeting_title_request,
-    format_transcript_for_synthesis, parse_meeting_notes_json, sanitize_meeting_title,
-    MeetingSettings,
+    build_meeting_notes_request, build_meeting_title_request, format_transcript_for_synthesis,
+    parse_meeting_notes_json, sanitize_meeting_title, MeetingSettings,
+    MEETING_NOTES_PROMPT_VERSION,
 };
-use kea_core::resolve::{Resolution, SlotResolver};
-use kea_core::store::actions::{ActionRepo, NewAction};
-use kea_core::store::bindings::{Binding, BindingRepo};
-use kea_core::store::meetings::{Meeting, MeetingDetail, MeetingNotes, MeetingRepo, NewMeeting, NewSegment};
-use kea_engines::EngineRegistry;
+use kea_core::resolve::SlotResolver;
+use kea_core::store::actions::{ActionRepo, ActionStatus, NewAction};
+use kea_core::store::bindings::BindingRepo;
+use kea_core::store::meetings::{
+    CaptureMode, Meeting, MeetingDetail, MeetingNotes, MeetingRepo, MeetingStatus, NewMeeting,
+    NewSegment,
+};
 use kea_engines::traits::{AudioPcm, SttOpts, Transcript};
+use kea_engines::EngineRegistry;
 use kea_platform::audio::util::resample_linear;
 use kea_platform::{AudioIo, PcmFrame, SystemAudioCapability};
 
@@ -81,15 +84,15 @@ fn has_min_audio(frame: &PcmFrame) -> bool {
         && frame.samples.len() >= (frame.sample_rate_hz as usize * MIN_SEGMENT_SECS as usize)
 }
 
-fn capture_mode(cap: SystemAudioCapability, prefer_system_audio: bool) -> &'static str {
+fn capture_mode(cap: SystemAudioCapability, prefer_system_audio: bool) -> CaptureMode {
     if !prefer_system_audio {
-        return "mic_only";
+        return CaptureMode::MicOnly;
     }
     match cap {
         SystemAudioCapability::ScreenCaptureKit | SystemAudioCapability::LoopbackDevice => {
-            "mic_and_system"
+            CaptureMode::MicAndSystem
         }
-        _ => "mic_only",
+        _ => CaptureMode::MicOnly,
     }
 }
 
@@ -101,45 +104,13 @@ fn new_meeting_id() -> String {
     format!("meeting-{millis}")
 }
 
-async fn resolve_stt_binding(
-    engines: &EngineRegistry,
-    bindings: &BindingRepo,
-) -> Result<Binding, String> {
-    let resolver = SlotResolver::new(engines, bindings);
-    match resolver.resolve_stt("meetings", "stt").await {
-        Ok(Resolution::Bound(b)) => Ok(b),
-        Ok(Resolution::NeedsChoice(_)) => {
-            Err("multiple stt engines available; bind the meetings stt slot".into())
-        }
-        Ok(Resolution::Unresolvable) => Err("no stt engine available".into()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-async fn resolve_llm_binding(
-    engines: &EngineRegistry,
-    bindings: &BindingRepo,
-) -> Result<Binding, String> {
-    let resolver = SlotResolver::new(engines, bindings);
-    match resolver.resolve_llm("meetings", "llm").await {
-        Ok(Resolution::Bound(b)) => Ok(b),
-        Ok(Resolution::NeedsChoice(_)) => {
-            Err("multiple llm engines available; bind the meetings llm slot".into())
-        }
-        Ok(Resolution::Unresolvable) => Err("no llm engine available".into()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
 /// Thin single-segment STT call (testable with a fake engine).
 pub async fn transcribe_pcm_segment(
     engine: &dyn kea_engines::traits::SttEngine,
     pcm: &PcmFrame,
     opts: SttOpts,
 ) -> Result<Transcript, kea_engines::traits::EngineError> {
-    engine
-        .transcribe(pcm_to_audio(pcm.clone()), opts)
-        .await
+    engine.transcribe(pcm_to_audio(pcm.clone()), opts).await
 }
 
 pub async fn transcribe_meeting_segment(
@@ -147,7 +118,10 @@ pub async fn transcribe_meeting_segment(
     bindings: &BindingRepo,
     audio: &PcmFrame,
 ) -> Result<String, String> {
-    let binding = resolve_stt_binding(engines, bindings).await?;
+    let binding = SlotResolver::new(engines, bindings)
+        .require_stt("meetings")
+        .await
+        .map_err(|e| e.to_string())?;
     let engine_id = &binding.engine_id;
 
     let engine = engines
@@ -173,7 +147,10 @@ pub async fn synthesize_meeting_notes(
     meeting: &Meeting,
     segments: &[kea_core::MeetingSegment],
 ) -> Result<MeetingNotes, String> {
-    let binding = resolve_llm_binding(engines, bindings).await?;
+    let binding = SlotResolver::new(engines, bindings)
+        .require_llm("meetings")
+        .await
+        .map_err(|e| e.to_string())?;
     let engine_id = &binding.engine_id;
 
     let engine = engines
@@ -205,7 +182,10 @@ pub async fn synthesize_meeting_title(
     bindings: &BindingRepo,
     summary: &str,
 ) -> Result<String, String> {
-    let binding = resolve_llm_binding(engines, bindings).await?;
+    let binding = SlotResolver::new(engines, bindings)
+        .require_llm("meetings")
+        .await
+        .map_err(|e| e.to_string())?;
     let engine_id = &binding.engine_id;
 
     let engine = engines
@@ -231,6 +211,61 @@ pub struct MeetingRunContext<'a> {
 pub struct ActiveMeeting {
     pub meeting_id: String,
     pub action_id: i64,
+}
+
+impl ActiveMeeting {
+    /// Closes both rows this session owns — the meeting and its ledger entry —
+    /// as `error`, and hands back the message to return. A DB failure while
+    /// doing so is logged, never propagated: the run's own error is the one the
+    /// caller asked about.
+    pub async fn fail(
+        &self,
+        meetings: &MeetingRepo,
+        actions: &ActionRepo,
+        e: impl std::fmt::Display,
+    ) -> String {
+        let msg = e.to_string();
+        if let Err(inner) = meetings
+            .complete(&self.meeting_id, MeetingStatus::Error, Some(&msg))
+            .await
+        {
+            tracing::warn!(
+                error = %inner,
+                meeting_id = %self.meeting_id,
+                "meeting: failed to mark meeting as error in DB"
+            );
+        }
+        if let Err(inner) = actions
+            .finish(self.action_id, ActionStatus::Error, Some(&msg))
+            .await
+        {
+            tracing::warn!(
+                error = %inner,
+                action_id = %self.action_id,
+                "meeting: failed to finish action as error in DB"
+            );
+        }
+        msg
+    }
+
+    /// Closes both rows as a finished run. Unlike [`ActiveMeeting::fail`] a
+    /// failure here is propagated — there is no other error to report, and the
+    /// caller is about to read the meeting back.
+    pub async fn complete(
+        &self,
+        meetings: &MeetingRepo,
+        actions: &ActionRepo,
+    ) -> Result<(), String> {
+        meetings
+            .complete(&self.meeting_id, MeetingStatus::Completed, None)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        actions
+            .finish(self.action_id, ActionStatus::Ok, None)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,10 +314,20 @@ async fn append_transcribed_segment(
 }
 
 pub async fn run_meeting_start(ctx: &mut MeetingRunContext<'_>) -> Result<ActiveMeeting, String> {
-    let stt_binding = resolve_stt_binding(ctx.engines, ctx.bindings).await?;
-    let llm_binding = resolve_llm_binding(ctx.engines, ctx.bindings).await?;
+    let resolver = SlotResolver::new(ctx.engines, ctx.bindings);
+    let stt_binding = resolver
+        .require_stt("meetings")
+        .await
+        .map_err(|e| e.to_string())?;
+    let llm_binding = resolver
+        .require_llm("meetings")
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let capture_mode = capture_mode(ctx.audio.system_audio_capability(), ctx.settings.prefer_system_audio);
+    let capture_mode = capture_mode(
+        ctx.audio.system_audio_capability(),
+        ctx.settings.prefer_system_audio,
+    );
     let meeting_id = new_meeting_id();
 
     // Acquire the capture gate FIRST. The audio layer admits exactly one
@@ -299,7 +344,7 @@ pub async fn run_meeting_start(ctx: &mut MeetingRunContext<'_>) -> Result<Active
         .create(&NewMeeting {
             id: meeting_id.clone(),
             title: "Untitled Meeting".into(),
-            capture_mode: capture_mode.into(),
+            capture_mode,
             stt_engine_id: Some(stt_binding.engine_id.clone()),
             llm_engine_id: Some(llm_binding.engine_id),
         })
@@ -324,7 +369,11 @@ pub async fn run_meeting_start(ctx: &mut MeetingRunContext<'_>) -> Result<Active
         Err(e) => {
             let err = e.to_string();
             let _ = ctx.audio.stop_meeting().await;
-            if let Err(inner) = ctx.meetings.complete(&meeting_id, "error", Some(&err)).await {
+            if let Err(inner) = ctx
+                .meetings
+                .complete(&meeting_id, MeetingStatus::Error, Some(&err))
+                .await
+            {
                 tracing::warn!(
                     error = %inner,
                     meeting_id = %meeting_id,
@@ -396,7 +445,10 @@ pub async fn run_meeting_poll_segment(
 /// or a new meeting from acquiring the audio lock. Always releases capture,
 /// even when the drain fails.
 pub async fn drain_and_stop_meeting(audio: &mut dyn AudioIo) -> Result<PcmFrame, String> {
-    let drain_result = audio.drain_meeting_buffer().await.map_err(|e| e.to_string());
+    let drain_result = audio
+        .drain_meeting_buffer()
+        .await
+        .map_err(|e| e.to_string());
     let _ = audio.stop_meeting().await.map_err(|e| e.to_string());
     drain_result
 }
@@ -415,212 +467,28 @@ pub async fn run_meeting_stop(
 ) -> Result<MeetingDetail, String> {
     let meeting_id = &session.meeting_id;
 
+    // Reading the row back is the precondition of the stop, not part of it: a
+    // meeting that is not there owns no rows to close as an error.
     let existing = meetings
         .get(meeting_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("meeting {meeting_id} not found"))?;
 
-    let sequence = existing.segments.len() as i32;
-    let elapsed_ms = existing
-        .segments
-        .last()
-        .map(|s| s.end_offset_ms)
-        .unwrap_or(0);
-
-    let final_pcm = match drain_result {
-        Ok(pcm) => pcm,
-        Err(e) => {
-            if let Err(inner) = meetings
-                
-                .complete(meeting_id, "error", Some(&e))
-                .await
-            {
-                tracing::warn!(
-                    error = %inner,
-                    meeting_id = %meeting_id,
-                    "meeting: failed to mark meeting as error in DB"
-                );
-            }
-            if let Err(inner) = actions
-                
-                .finish(session.action_id, "error", Some(&e))
-                .await
-            {
-                tracing::warn!(
-                    error = %inner,
-                    action_id = %session.action_id,
-                    "meeting: failed to finish action as error in DB"
-                );
-            }
-            return Err(e);
-        }
-    };
-
-    if has_min_audio(&final_pcm) {
-        if let Err(e) = append_transcribed_segment(
-            engines, bindings, meetings, meeting_id, final_pcm, sequence, elapsed_ms,
-        )
-        .await
-        {
-            if let Err(inner) = meetings
-                
-                .complete(meeting_id, "error", Some(&e))
-                .await
-            {
-                tracing::warn!(
-                    error = %inner,
-                    meeting_id = %meeting_id,
-                    "meeting: failed to mark meeting as error in DB"
-                );
-            }
-            if let Err(inner) = actions
-                
-                .finish(session.action_id, "error", Some(&e))
-                .await
-            {
-                tracing::warn!(
-                    error = %inner,
-                    action_id = %session.action_id,
-                    "meeting: failed to finish action as error in DB"
-                );
-            }
-            return Err(e);
-        }
-    }
-
-    let partial = meetings
-        
-        .get(meeting_id)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("meeting {meeting_id} not found"))?;
-
-    let meeting = partial.meeting;
-    let segments = partial.segments;
-
-    let notes = match synthesize_meeting_notes(engines, bindings, &meeting, &segments).await
+    if let Err(e) = finalize_meeting(
+        engines,
+        bindings,
+        meetings,
+        session,
+        &existing,
+        drain_result,
+    )
+    .await
     {
-        Ok(notes) => notes,
-        Err(e) => {
-            if let Err(inner) = meetings
-                
-                .complete(meeting_id, "error", Some(&e))
-                .await
-            {
-                tracing::warn!(
-                    error = %inner,
-                    meeting_id = %meeting_id,
-                    "meeting: failed to mark meeting as error in DB"
-                );
-            }
-            if let Err(inner) = actions
-                
-                .finish(session.action_id, "error", Some(&e))
-                .await
-            {
-                tracing::warn!(
-                    error = %inner,
-                    action_id = %session.action_id,
-                    "meeting: failed to finish action as error in DB"
-                );
-            }
-            return Err(e);
-        }
-    };
-
-    if let Err(e) = meetings.upsert_notes(&notes).await {
-        let msg = e.to_string();
-        if let Err(inner) = meetings
-            
-            .complete(meeting_id, "error", Some(&msg))
-            .await
-        {
-            tracing::warn!(
-                error = %inner,
-                meeting_id = %meeting_id,
-                "meeting: failed to mark meeting as error in DB"
-            );
-        }
-        if let Err(inner) = actions
-            
-            .finish(session.action_id, "error", Some(&msg))
-            .await
-        {
-            tracing::warn!(
-                error = %inner,
-                action_id = %session.action_id,
-                "meeting: failed to finish action as error in DB"
-            );
-        }
-        return Err(msg);
+        return Err(session.fail(meetings, actions, e).await);
     }
 
-    let title = match synthesize_meeting_title(engines, bindings, &notes.summary).await {
-        Ok(title) => title,
-        Err(e) => {
-            if let Err(inner) = meetings
-                
-                .complete(meeting_id, "error", Some(&e))
-                .await
-            {
-                tracing::warn!(
-                    error = %inner,
-                    meeting_id = %meeting_id,
-                    "meeting: failed to mark meeting as error in DB"
-                );
-            }
-            if let Err(inner) = actions
-                
-                .finish(session.action_id, "error", Some(&e))
-                .await
-            {
-                tracing::warn!(
-                    error = %inner,
-                    action_id = %session.action_id,
-                    "meeting: failed to finish action as error in DB"
-                );
-            }
-            return Err(e);
-        }
-    };
-
-    if let Err(e) = meetings.set_title(meeting_id, &title).await {
-        let msg = e.to_string();
-        if let Err(inner) = meetings
-            
-            .complete(meeting_id, "error", Some(&msg))
-            .await
-        {
-            tracing::warn!(
-                error = %inner,
-                meeting_id = %meeting_id,
-                "meeting: failed to mark meeting as error in DB"
-            );
-        }
-        if let Err(inner) = actions
-            
-            .finish(session.action_id, "error", Some(&msg))
-            .await
-        {
-            tracing::warn!(
-                error = %inner,
-                action_id = %session.action_id,
-                "meeting: failed to finish action as error in DB"
-            );
-        }
-        return Err(msg);
-    }
-
-    meetings
-        .complete(meeting_id, "completed", None)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    actions
-        .finish(session.action_id, "ok", None)
-        .await
-        .map_err(|e| e.to_string())?;
+    session.complete(meetings, actions).await?;
 
     meetings
         .get(meeting_id)
@@ -629,13 +497,67 @@ pub async fn run_meeting_stop(
         .ok_or_else(|| format!("meeting {meeting_id} not found"))
 }
 
+/// Everything between the drain and the final status write: transcribe the tail
+/// segment, synthesize notes and a title, and persist both. Every step here
+/// closes the meeting and the action rows as an error via the one epilogue in
+/// [`run_meeting_stop`].
+async fn finalize_meeting(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    meetings: &MeetingRepo,
+    session: &ActiveMeeting,
+    existing: &MeetingDetail,
+    drain_result: Result<PcmFrame, String>,
+) -> Result<(), String> {
+    let meeting_id = &session.meeting_id;
+
+    let sequence = existing.segments.len() as i32;
+    let elapsed_ms = existing
+        .segments
+        .last()
+        .map(|s| s.end_offset_ms)
+        .unwrap_or(0);
+
+    let final_pcm = drain_result?;
+
+    if has_min_audio(&final_pcm) {
+        append_transcribed_segment(
+            engines, bindings, meetings, meeting_id, final_pcm, sequence, elapsed_ms,
+        )
+        .await?;
+    }
+
+    let partial = meetings
+        .get(meeting_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("meeting {meeting_id} not found"))?;
+
+    let notes =
+        synthesize_meeting_notes(engines, bindings, &partial.meeting, &partial.segments).await?;
+
+    meetings
+        .upsert_notes(&notes)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let title = synthesize_meeting_title(engines, bindings, &notes.summary).await?;
+
+    meetings
+        .set_title(meeting_id, &title)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
     use kea_core::store::bindings::Binding;
     use kea_core::store::db::{open_pool, run_config_migrations, run_data_migrations};
-    use kea_engines::traits::{EngineCaps, EngineError, LlmEngine, LlmRequest, LlmResponse, SttEngine};
+    use kea_engines::traits::{
+        EngineCaps, EngineError, LlmEngine, LlmRequest, LlmResponse, SttEngine,
+    };
     use kea_platform::{AudioIoError, DictationState, MeetingState};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -859,19 +781,19 @@ mod tests {
         // prefer_system_audio=false → mic_only regardless of capability
         assert_eq!(
             capture_mode(SystemAudioCapability::ScreenCaptureKit, false),
-            "mic_only"
+            CaptureMode::MicOnly
         );
         assert_eq!(
             capture_mode(SystemAudioCapability::LoopbackDevice, false),
-            "mic_only"
+            CaptureMode::MicOnly
         );
         assert_eq!(
             capture_mode(SystemAudioCapability::MicOnly, false),
-            "mic_only"
+            CaptureMode::MicOnly
         );
         assert_eq!(
             capture_mode(SystemAudioCapability::Unavailable, false),
-            "mic_only"
+            CaptureMode::MicOnly
         );
     }
 
@@ -879,19 +801,19 @@ mod tests {
     fn capture_mode_respects_capability_when_user_prefers_system_audio() {
         assert_eq!(
             capture_mode(SystemAudioCapability::ScreenCaptureKit, true),
-            "mic_and_system"
+            CaptureMode::MicAndSystem
         );
         assert_eq!(
             capture_mode(SystemAudioCapability::LoopbackDevice, true),
-            "mic_and_system"
+            CaptureMode::MicAndSystem
         );
         assert_eq!(
             capture_mode(SystemAudioCapability::MicOnly, true),
-            "mic_only"
+            CaptureMode::MicOnly
         );
         assert_eq!(
             capture_mode(SystemAudioCapability::Unavailable, true),
-            "mic_only"
+            CaptureMode::MicOnly
         );
     }
 
@@ -916,13 +838,9 @@ mod tests {
             .await
             .unwrap();
 
-        let out = transcribe_meeting_segment(
-            &reg,
-            &bindings,
-            &one_second_pcm(),
-        )
-        .await
-        .unwrap();
+        let out = transcribe_meeting_segment(&reg, &bindings, &one_second_pcm())
+            .await
+            .unwrap();
 
         assert_eq!(out, "segment text");
     }
@@ -951,8 +869,8 @@ mod tests {
             title: "Untitled Meeting".into(),
             started_at: "2026-06-26T10:00:00Z".into(),
             ended_at: None,
-            status: "recording".into(),
-            capture_mode: "mic_only".into(),
+            status: MeetingStatus::Recording,
+            capture_mode: CaptureMode::MicOnly,
             stt_engine_id: None,
             llm_engine_id: None,
             error: None,
@@ -1065,7 +983,12 @@ mod tests {
 
         let drain_result = drain_and_stop_meeting(ctx.audio).await;
         let detail = run_meeting_stop(
-            ctx.engines, ctx.bindings, ctx.actions, ctx.meetings, &session, drain_result,
+            ctx.engines,
+            ctx.bindings,
+            ctx.actions,
+            ctx.meetings,
+            &session,
+            drain_result,
         )
         .await
         .unwrap();
@@ -1075,19 +998,16 @@ mod tests {
         assert_eq!(detail.segments[1].text, "world");
         assert_eq!(detail.meeting.title, "Sprint Planning");
         assert!(detail.notes.is_some());
-        assert_eq!(
-            detail.notes.as_ref().unwrap().summary,
-            "kickoff summary"
-        );
-        assert_eq!(detail.meeting.status, "completed");
-        assert_eq!(detail.meeting.capture_mode, "mic_only");
+        assert_eq!(detail.notes.as_ref().unwrap().summary, "kickoff summary");
+        assert_eq!(detail.meeting.status, MeetingStatus::Completed);
+        assert_eq!(detail.meeting.capture_mode, CaptureMode::MicOnly);
 
         let action_rows = actions.recent(1).await.unwrap();
         assert_eq!(action_rows.len(), 1);
         assert_eq!(action_rows[0].feature_id, "meetings");
         assert_eq!(action_rows[0].command, "toggle_meeting");
         assert_eq!(action_rows[0].engine_id, "fake-stt");
-        assert_eq!(action_rows[0].status, "ok");
+        assert_eq!(action_rows[0].status, ActionStatus::Ok);
     }
 
     #[tokio::test]
@@ -1130,9 +1050,9 @@ mod tests {
         let mut audio = FakeMeetingAudioIo {
             capability: SystemAudioCapability::MicOnly,
             pending_drains: Mutex::new(vec![
-                one_second_pcm(),  // pop() returns this last
-                one_second_pcm(),  // pop() returns second
-                one_second_pcm(),  // pop() returns this first
+                one_second_pcm(), // pop() returns this last
+                one_second_pcm(), // pop() returns second
+                one_second_pcm(), // pop() returns this first
             ]),
             ..Default::default()
         };
@@ -1165,12 +1085,21 @@ mod tests {
         // stop drain picks up one undelivered frame; stop_meeting returns empty
         let drain_result = drain_and_stop_meeting(ctx.audio).await;
         let detail = run_meeting_stop(
-            ctx.engines, ctx.bindings, ctx.actions, ctx.meetings, &session, drain_result,
+            ctx.engines,
+            ctx.bindings,
+            ctx.actions,
+            ctx.meetings,
+            &session,
+            drain_result,
         )
         .await
         .unwrap();
 
-        assert_eq!(detail.segments.len(), 2, "should have polled segment + undelivered remainder only, no tail duplication");
+        assert_eq!(
+            detail.segments.len(),
+            2,
+            "should have polled segment + undelivered remainder only, no tail duplication"
+        );
         assert_eq!(detail.segments[0].text, "polled");
         assert_eq!(detail.segments[1].text, "undelivered remainder");
     }
@@ -1255,7 +1184,12 @@ mod tests {
         let session = run_meeting_start(&mut ctx).await.unwrap();
         let drain_result = drain_and_stop_meeting(ctx.audio).await;
         let err = run_meeting_stop(
-            ctx.engines, ctx.bindings, ctx.actions, ctx.meetings, &session, drain_result,
+            ctx.engines,
+            ctx.bindings,
+            ctx.actions,
+            ctx.meetings,
+            &session,
+            drain_result,
         )
         .await
         .unwrap_err();
@@ -1266,7 +1200,7 @@ mod tests {
 
         // The action row must not be left pending.
         let detail = actions.get(session.action_id).await.unwrap().unwrap();
-        assert_eq!(detail.status, "error");
+        assert_eq!(detail.status, ActionStatus::Error);
         assert!(detail.error.is_some());
     }
 }

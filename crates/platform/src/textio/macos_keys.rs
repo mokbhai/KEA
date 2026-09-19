@@ -151,8 +151,12 @@ fn post_key(
     down: bool,
     flags: CGEventFlags,
 ) -> Result<(), String> {
-    let event = CGEvent::new_keyboard_event(source.clone(), keycode, down)
-        .map_err(|_| format!("could not create a key {} event for {keycode}", if down { "down" } else { "up" }))?;
+    let event = CGEvent::new_keyboard_event(source.clone(), keycode, down).map_err(|_| {
+        format!(
+            "could not create a key {} event for {keycode}",
+            if down { "down" } else { "up" }
+        )
+    })?;
     // The whole point of this module: override the flag word the event
     // inherited from the physical keyboard state.
     event.set_flags(flags);

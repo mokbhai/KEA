@@ -17,7 +17,8 @@ pub fn bytes_to_pcm_wav(bytes: &[u8]) -> Result<AudioPcm, EngineError> {
 
     while offset + 8 <= bytes.len() {
         let chunk_id = &bytes[offset..offset + 4];
-        let chunk_size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let chunk_size =
+            u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
         let chunk_start = offset + 8;
         let chunk_end = chunk_start.saturating_add(chunk_size);
         if chunk_end > bytes.len() {
@@ -28,11 +29,15 @@ pub fn bytes_to_pcm_wav(bytes: &[u8]) -> Result<AudioPcm, EngineError> {
             if chunk_size < 16 {
                 return Err(EngineError::Config("invalid fmt chunk".into()));
             }
-            channels = u16::from_le_bytes(bytes[chunk_start + 2..chunk_start + 4].try_into().unwrap());
+            channels =
+                u16::from_le_bytes(bytes[chunk_start + 2..chunk_start + 4].try_into().unwrap());
             sample_rate_hz =
                 u32::from_le_bytes(bytes[chunk_start + 4..chunk_start + 8].try_into().unwrap());
-            bits_per_sample =
-                u16::from_le_bytes(bytes[chunk_start + 14..chunk_start + 16].try_into().unwrap());
+            bits_per_sample = u16::from_le_bytes(
+                bytes[chunk_start + 14..chunk_start + 16]
+                    .try_into()
+                    .unwrap(),
+            );
         } else if chunk_id == b"data" {
             pcm_data = Some(&bytes[chunk_start..chunk_end]);
         }
@@ -52,7 +57,9 @@ pub fn bytes_to_pcm_wav(bytes: &[u8]) -> Result<AudioPcm, EngineError> {
     }
 
     if pcm_data.len() % 2 != 0 {
-        return Err(EngineError::Config("wav data chunk has odd length, expected 16-bit aligned".into()));
+        return Err(EngineError::Config(
+            "wav data chunk has odd length, expected 16-bit aligned".into(),
+        ));
     }
 
     let samples: Vec<f32> = pcm_data

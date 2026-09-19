@@ -32,11 +32,7 @@ impl MeetingSettingsRepo {
 
     pub async fn get(&self) -> Result<MeetingSettings, KeaError> {
         Ok(MeetingSettings {
-            segment_duration_secs: self
-                .settings
-                .get(KEY_SEGMENT_DURATION)
-                .await?
-                .unwrap_or(30),
+            segment_duration_secs: self.settings.get(KEY_SEGMENT_DURATION).await?.unwrap_or(30),
             prefer_system_audio: self
                 .settings
                 .get(KEY_PREFER_SYSTEM_AUDIO)

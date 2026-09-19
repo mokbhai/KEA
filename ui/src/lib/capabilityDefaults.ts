@@ -5,13 +5,9 @@ import {
   getDictationSettings,
   getTtsSettings,
   hasCredential,
-  listInstalledOnnxModels,
-  listInstalledWhisperModels,
   listLlmEngines,
-  listOnnxModels,
   listSttEngines,
   listTtsEngines,
-  listWhisperModels,
   setBinding,
   setDictationSettings,
   setTtsSettings,
@@ -19,19 +15,23 @@ import {
   type Provider,
   type WhisperModel,
 } from "../api";
+import {
+  CAPABILITY_LABELS,
+  cloudEngineFor,
+  engineSpec,
+  enginesFor,
+  loadCatalog,
+  needsKey,
+  ownsActiveModel,
+  type Capability,
+  type DownloadKind,
+} from "./engines";
 import { formatBytes } from "./format";
 
-export type Capability = "llm" | "stt" | "tts";
-
-export const CAPABILITY_LABELS: Record<Capability, string> = {
-  llm: "Writing & rewriting",
-  stt: "Speech to text",
-  tts: "Text to speech",
-};
+export { CAPABILITY_LABELS };
+export type { Capability, DownloadKind };
 
 export const OPENAI_TTS_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
-
-export type DownloadKind = "whisper" | "parakeet" | "tts";
 
 /** A concrete, pickable default for a capability (shared between the
  * DefaultsPicker popover and the onboarding wizard). */
@@ -49,15 +49,12 @@ export type CapabilityOption = {
   cloudVoices?: boolean;
 };
 
-/** Which providers have a saved credential ("local-llm" never needs one). */
+/** Which providers have a saved credential (a keyless provider never needs one). */
 export async function loadKeyStates(providers: Provider[]): Promise<Map<string, boolean>> {
   const keyByRef = new Map<string, boolean>();
   await Promise.all(
     providers.map(async (p) => {
-      const saved =
-        p.provider_ref === "local-llm"
-          ? true
-          : await hasCredential(p.provider_ref).catch(() => false);
+      const saved = needsKey(p) ? await hasCredential(p.provider_ref).catch(() => false) : true;
       keyByRef.set(p.provider_ref, saved);
     }),
   );
@@ -92,7 +89,6 @@ export async function buildCapabilityOptions(
   keyByRef: Map<string, boolean>,
 ): Promise<CapabilityOption[]> {
   const cloudStatus = (ref: string) => (keyByRef.get(ref) ? "key ✓" : "Key missing");
-  const hasOpenAi = providers.some((p) => p.provider_ref === "openai");
 
   // Only offer engines this build actually registered. Local engines are
   // behind cargo features, so a build without them would otherwise list
@@ -101,75 +97,66 @@ export async function buildCapabilityOptions(
   const lister =
     capability === "stt" ? listSttEngines : capability === "tts" ? listTtsEngines : listLlmEngines;
   const available = new Set((await lister()).map((e) => e.id));
+  const specs = enginesFor(capability).filter((spec) => available.has(spec.id));
 
   const opts: CapabilityOption[] = [];
-  if (capability === "stt") {
-    const [whisper, whisperInstalled, parakeet, parakeetInstalled] = await Promise.all([
-      listWhisperModels(),
-      listInstalledWhisperModels(),
-      listOnnxModels("parakeet"),
-      listInstalledOnnxModels("parakeet"),
-    ]);
-    const wInstalled = new Set(whisperInstalled);
-    const pInstalled = new Set(parakeetInstalled);
-    if (available.has("whisper")) {
-      whisper.forEach((m) => opts.push(localOption(m, "whisper", "whisper", wInstalled)));
-    }
-    if (available.has("parakeet")) {
-      parakeet.forEach((m) => opts.push(localOption(m, "parakeet", "parakeet", pInstalled)));
-    }
-    if (hasOpenAi && available.has("openai-stt")) {
-      opts.push({
-        id: "openai-stt:whisper-1",
-        label: "OpenAI whisper-1",
-        detail: "cloud",
-        status: cloudStatus("openai"),
-        ready: keyByRef.get("openai") ?? false,
-        engine: "openai-stt",
-        model: "whisper-1",
-        providerRef: "openai",
-      });
-    }
-  } else if (capability === "tts") {
-    const [voices, voicesInstalled] = await Promise.all([
-      listOnnxModels("tts"),
-      listInstalledOnnxModels("tts"),
-    ]);
-    const vInstalled = new Set(voicesInstalled);
-    if (available.has("sherpa-tts")) {
-      voices.forEach((m) => opts.push(localOption(m, "sherpa-tts", "tts", vInstalled)));
-    }
-    if (hasOpenAi && available.has("openai-tts")) {
-      opts.push({
-        id: "openai-tts",
-        label: "OpenAI voices",
-        detail: "cloud",
-        status: cloudStatus("openai"),
-        ready: keyByRef.get("openai") ?? false,
-        engine: "openai-tts",
-        model: null,
-        providerRef: "openai",
-        cloudVoices: true,
-      });
-    }
-  } else {
+  if (capability === "llm") {
+    // Text engines are picked per provider, not per catalog: one row for each
+    // provider the user has connected.
     providers.forEach((p) => {
-      const isOpenAi = p.provider_ref === "openai";
-      const isLocal = p.provider_ref === "local-llm";
-      const engine = isOpenAi ? "openai" : "openai-compatible";
+      const engine = cloudEngineFor("llm", p.provider_ref);
       if (!available.has(engine)) return;
+      const keyless = !needsKey(p);
+      // A provider with an engine of its own is a known vendor; anything on
+      // the generic engine is the user's own server.
+      const custom = engineSpec(engine)?.acceptsAnyProvider === true;
       opts.push({
         id: `llm:${p.provider_ref}`,
         label: p.name,
-        detail: isLocal ? "your server" : isOpenAi ? "cloud" : "custom server",
-        status: isLocal ? "No key needed" : cloudStatus(p.provider_ref),
-        ready: isLocal || (keyByRef.get(p.provider_ref) ?? false),
+        detail: keyless ? "your server" : custom ? "custom server" : "cloud",
+        status: keyless ? "No key needed" : cloudStatus(p.provider_ref),
+        ready: keyless || (keyByRef.get(p.provider_ref) ?? false),
         engine,
         model: null,
         providerRef: p.provider_ref,
       });
     });
+    return opts;
   }
+
+  // The catalogs the local engines need, fetched together as before.
+  const catalogs = new Map(
+    await Promise.all(
+      specs
+        .filter((spec) => spec.catalog)
+        .map(async (spec) => [spec.id, await loadCatalog(spec)] as const),
+    ),
+  );
+
+  specs.forEach((spec) => {
+    const loaded = catalogs.get(spec.id);
+    if (spec.catalog && loaded) {
+      const installed = new Set(loaded.installed);
+      const kind = spec.catalog.kind;
+      loaded.models.forEach((m) => opts.push(localOption(m, spec.id, kind, installed)));
+      return;
+    }
+    const cloud = spec.cloudOption;
+    const ref = spec.credentialRef;
+    // A cloud engine is only offerable once its provider exists.
+    if (!cloud || !ref || !providers.some((p) => p.provider_ref === ref)) return;
+    opts.push({
+      id: cloud.model ? `${spec.id}:${cloud.model}` : spec.id,
+      label: cloud.label,
+      detail: "cloud",
+      status: cloudStatus(ref),
+      ready: keyByRef.get(ref) ?? false,
+      engine: spec.id,
+      model: cloud.model,
+      providerRef: ref,
+      ...(cloud.cloudVoices ? { cloudVoices: true } : {}),
+    });
+  });
   return opts;
 }
 
@@ -239,9 +226,11 @@ export async function applyDefaultChoice(
   const to = target ?? defaultTarget(capability);
   await setBinding(to.feature, to.slot, choice.engine, choice.model, choice.providerRef);
   if (!ownsSettings(capability, to)) return;
+  // Only a pick by the engine that owns the fallback, carrying a model of its
+  // own, has anything to say here.
+  const ownsFallback = ownsActiveModel(capability, choice.engine);
   if (capability === "stt") {
-    // Only a whisper pick with a model of its own has anything to say here.
-    if (choice.engine !== "whisper" || choice.model === null) return;
+    if (!ownsFallback || choice.model === null) return;
     const settings = await getDictationSettings();
     if (settings.active_model !== choice.model) {
       await setDictationSettings({ ...settings, active_model: choice.model });
@@ -249,7 +238,7 @@ export async function applyDefaultChoice(
   } else if (capability === "tts") {
     // Same rule for the model; the voice is independent — it belongs to the
     // cloud engine and is passed only by picks that carry one.
-    const keepsModel = choice.engine !== "sherpa-tts" || choice.model === null;
+    const keepsModel = !ownsFallback || choice.model === null;
     const settings = await getTtsSettings();
     const next = {
       ...settings,

@@ -6,21 +6,12 @@ use crate::store::settings::SettingsRepo;
 const KEY_ACTIVE_VOICE: &str = "tts.active_voice";
 const KEY_ACTIVE_MODEL: &str = "tts.active_model";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TtsSettings {
     #[serde(default)]
     pub active_voice: Option<String>,
     #[serde(default)]
     pub active_model: Option<String>,
-}
-
-impl Default for TtsSettings {
-    fn default() -> Self {
-        Self {
-            active_voice: None,
-            active_model: None,
-        }
-    }
 }
 
 pub struct TtsSettingsRepo {
@@ -34,19 +25,8 @@ impl TtsSettingsRepo {
 
     pub async fn get(&self) -> Result<TtsSettings, KeaError> {
         Ok(TtsSettings {
-            // Both are stored as Options, so a cleared value is the JSON
-            // literal `null` rather than a missing row — read it back as one
-            // and flatten, or every later read of these settings would fail.
-            active_voice: self
-                .settings
-                .get::<Option<String>>(KEY_ACTIVE_VOICE)
-                .await?
-                .flatten(),
-            active_model: self
-                .settings
-                .get::<Option<String>>(KEY_ACTIVE_MODEL)
-                .await?
-                .flatten(),
+            active_voice: self.settings.get_optional(KEY_ACTIVE_VOICE).await?,
+            active_model: self.settings.get_optional(KEY_ACTIVE_MODEL).await?,
         })
     }
 

@@ -3,7 +3,45 @@ use sqlx::SqlitePool;
 
 use crate::error::KeaError;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Who spoke a logged message, as persisted in `messages.role`. Same
+/// enum-with-`as_str` shape as [`crate::store::meetings::MeetingStatus`]: the
+/// two spellings are the column's contract and the JSON History renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageRole {
+    User,
+    Assistant,
+}
+
+impl MessageRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+        }
+    }
+
+    // Not `FromStr`: the caller wants an `Option`, not a `Result`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "user" => Some(MessageRole::User),
+            "assistant" => Some(MessageRole::Assistant),
+            _ => None,
+        }
+    }
+}
+
+impl TryFrom<String> for MessageRole {
+    type Error = KeaError;
+
+    fn try_from(s: String) -> Result<Self, KeaError> {
+        MessageRole::from_str(&s)
+            .ok_or_else(|| KeaError::Other(format!("unknown message role {s:?}")))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ConversationSummary {
     pub id: i64,
     pub action_id: Option<i64>,
@@ -14,11 +52,12 @@ pub struct ConversationSummary {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Message {
     pub id: i64,
     pub conversation_id: i64,
-    pub role: String,
+    #[sqlx(try_from = "String")]
+    pub role: MessageRole,
     pub content: String,
     pub token_count: Option<i64>,
     pub created_at: String,
@@ -36,7 +75,7 @@ pub struct NewConversation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewMessage {
     pub conversation_id: i64,
-    pub role: String,
+    pub role: MessageRole,
     pub content: String,
     pub token_count: Option<i64>,
 }
@@ -71,7 +110,7 @@ impl ConversationRepo {
              VALUES(?, ?, ?, ?) RETURNING id",
         )
         .bind(msg.conversation_id)
-        .bind(&msg.role)
+        .bind(msg.role.as_str())
         .bind(&msg.content)
         .bind(msg.token_count)
         .fetch_one(&self.pool)
@@ -80,63 +119,25 @@ impl ConversationRepo {
     }
 
     pub async fn list_recent(&self, limit: i64) -> Result<Vec<ConversationSummary>, KeaError> {
-        let rows = sqlx::query_as::<
-            _,
-            (
-                i64,
-                Option<i64>,
-                String,
-                String,
-                Option<String>,
-                Option<String>,
-                String,
-            ),
-        >(
+        let rows = sqlx::query_as::<_, ConversationSummary>(
             "SELECT id, action_id, feature_id, engine_id, model, provider_ref, created_at
              FROM conversations ORDER BY created_at DESC LIMIT ?",
         )
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(id, action_id, feature_id, engine_id, model, provider_ref, created_at)| {
-                    ConversationSummary {
-                        id,
-                        action_id,
-                        feature_id,
-                        engine_id,
-                        model,
-                        provider_ref,
-                        created_at,
-                    }
-                },
-            )
-            .collect())
+        Ok(rows)
     }
 
     pub async fn list_messages(&self, conversation_id: i64) -> Result<Vec<Message>, KeaError> {
-        let rows = sqlx::query_as::<_, (i64, i64, String, String, Option<i64>, String)>(
+        let rows = sqlx::query_as::<_, Message>(
             "SELECT id, conversation_id, role, content, token_count, created_at
              FROM messages WHERE conversation_id = ? ORDER BY id",
         )
         .bind(conversation_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(id, conversation_id, role, content, token_count, created_at)| Message {
-                    id,
-                    conversation_id,
-                    role,
-                    content,
-                    token_count,
-                    created_at,
-                },
-            )
-            .collect())
+        Ok(rows)
     }
 
     pub async fn delete_conversation(&self, id: i64) -> Result<(), KeaError> {
@@ -182,6 +183,18 @@ mod tests {
         assert_eq!(msg_count, 0);
     }
 
+    #[test]
+    fn role_keeps_its_stored_spellings() {
+        for (role, text) in [
+            (MessageRole::User, "user"),
+            (MessageRole::Assistant, "assistant"),
+        ] {
+            assert_eq!(role.as_str(), text);
+            assert_eq!(MessageRole::from_str(text), Some(role));
+            assert_eq!(serde_json::to_string(&role).unwrap(), format!("\"{text}\""));
+        }
+    }
+
     #[tokio::test]
     async fn append_message_and_list_recent() {
         let pool = open_pool("sqlite::memory:").await.unwrap();
@@ -201,7 +214,7 @@ mod tests {
 
         repo.append_message(&NewMessage {
             conversation_id: conv_id,
-            role: "user".into(),
+            role: MessageRole::User,
             content: "hello".into(),
             token_count: Some(1),
         })
@@ -209,7 +222,7 @@ mod tests {
         .unwrap();
         repo.append_message(&NewMessage {
             conversation_id: conv_id,
-            role: "assistant".into(),
+            role: MessageRole::Assistant,
             content: "hi there".into(),
             token_count: Some(2),
         })
@@ -223,8 +236,8 @@ mod tests {
 
         let messages = repo.list_messages(conv_id).await.unwrap();
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, "user");
-        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[1].role, MessageRole::Assistant);
     }
 
     #[tokio::test]
@@ -246,7 +259,7 @@ mod tests {
 
         repo.append_message(&NewMessage {
             conversation_id: conv_id,
-            role: "user".into(),
+            role: MessageRole::User,
             content: "test".into(),
             token_count: None,
         })

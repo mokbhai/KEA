@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::http::HttpClient;
-use crate::provider::{CredentialSource, ProviderConfig, ProviderConfigSource};
+use crate::http::{Auth, HttpClient};
+use crate::provider::{self, CredentialSource, Defaults, ProviderConfigSource, OPENAI_BASE_URL};
 use crate::traits::{AudioPcm, EngineCaps, EngineError, TtsEngine, TtsOpts};
 use crate::tts::audio::bytes_to_pcm_wav;
+
+const DEFAULT_MODEL: &str = "tts-1";
 
 pub struct OpenAiTtsEngine {
     pub http: Arc<dyn HttpClient>,
@@ -22,48 +24,38 @@ impl TtsEngine for OpenAiTtsEngine {
 
     fn capabilities(&self) -> EngineCaps {
         EngineCaps {
-            models: vec![
-                "tts-1".into(),
-                "tts-1-hd".into(),
-                "gpt-4o-mini-tts".into(),
-            ],
+            models: vec!["tts-1".into(), "tts-1-hd".into(), "gpt-4o-mini-tts".into()],
         }
     }
 
     async fn synthesize(&self, text: &str, opts: TtsOpts) -> Result<AudioPcm, EngineError> {
-        let provider_ref = opts
-            .provider_ref
-            .as_deref()
-            .unwrap_or(&self.provider_ref);
-        let api_key = self
-            .credentials
-            .api_key(provider_ref)
-            .await
-            .map_err(|e| EngineError::Auth(format!("keychain access failed: {e}")))?
-            .ok_or_else(|| EngineError::Auth("missing api key".into()))?;
-        let cfg = self
-            .configs
-            .config(provider_ref)
-            .await
-            .unwrap_or(ProviderConfig {
-                base_url: "https://api.openai.com/v1".into(),
-                default_model: "tts-1".into(),
-            });
-        let model = opts.model.as_deref().unwrap_or(&cfg.default_model);
+        let provider = provider::resolve(
+            self.credentials.as_ref(),
+            self.configs.as_ref(),
+            opts.provider_ref.as_deref(),
+            &self.provider_ref,
+            Some(Defaults {
+                base_url: OPENAI_BASE_URL,
+                model: DEFAULT_MODEL,
+            }),
+        )
+        .await?;
+        // The hosted speech endpoint cannot serve an unauthenticated call.
+        let api_key = provider.require_key()?;
+        let model = opts.model.as_deref().unwrap_or(&provider.default_model);
         let voice = opts.voice.as_deref().unwrap_or("alloy");
         let format = opts.format.as_deref().unwrap_or("wav");
-        let url = format!("{}/audio/speech", cfg.base_url.trim_end_matches('/'));
+        let url = format!("{}/audio/speech", provider.base_url.trim_end_matches('/'));
         let body = serde_json::json!({
             "model": model,
             "input": text,
             "voice": voice,
             "response_format": format,
         });
-        let (status, bytes) = self.http.post_binary(&url, &api_key, body).await?;
-        if !(200..300).contains(&status) {
-            let preview = String::from_utf8_lossy(&bytes);
-            return Err(EngineError::http(status, preview.into_owned()));
-        }
+        let bytes = self
+            .http
+            .post_binary(&url, Auth::Bearer(api_key), body)
+            .await?;
         if format == "wav" {
             bytes_to_pcm_wav(&bytes)
         } else {
@@ -78,6 +70,7 @@ impl TtsEngine for OpenAiTtsEngine {
 mod tests {
     use super::*;
     use crate::http::ReqwestHttpClient;
+    use crate::provider::ProviderConfig;
     use crate::stt::audio::pcm_to_wav_bytes;
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -183,7 +176,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maps_non_2xx_to_error() {
+    async fn server_rejection_becomes_an_auth_error() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/speech"))
@@ -210,7 +203,10 @@ mod tests {
             .synthesize("hello", TtsOpts::default())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("401"));
+        match &err {
+            EngineError::Auth(msg) => assert!(msg.contains("401")),
+            _ => panic!("expected EngineError::Auth, got {:?}", err),
+        }
     }
 
     #[tokio::test]

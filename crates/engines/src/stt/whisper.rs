@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use kea_infer::{AudioPcm as InferAudioPcm, ModelRegistry, ModelStorage, WhisperInference, WhisperOpts};
+use kea_infer::{
+    AudioPcm as InferAudioPcm, ModelRegistry, ModelStorage, WhisperInference, WhisperOpts,
+};
 
+use crate::stt::audio::{resample_to_rate, STT_SAMPLE_RATE_HZ};
 use crate::traits::{AudioPcm, EngineCaps, EngineError, SttEngine, SttOpts, Transcript};
-
-const WHISPER_SAMPLE_RATE_HZ: u32 = 16_000;
 
 pub struct WhisperSttEngine {
     inference: Arc<dyn WhisperInference>,
@@ -14,10 +15,7 @@ pub struct WhisperSttEngine {
 
 impl WhisperSttEngine {
     pub fn new(inference: Arc<dyn WhisperInference>, storage: Arc<ModelStorage>) -> Self {
-        Self {
-            inference,
-            storage,
-        }
+        Self { inference, storage }
     }
 }
 
@@ -49,10 +47,10 @@ impl SttEngine for WhisperSttEngine {
         }
 
         let model_path = self.storage.path_for(model_id);
-        let samples = resample_to_rate(&audio.samples, audio.sample_rate_hz, WHISPER_SAMPLE_RATE_HZ);
+        let samples = resample_to_rate(&audio.samples, audio.sample_rate_hz, STT_SAMPLE_RATE_HZ);
         let pcm = InferAudioPcm {
             samples,
-            sample_rate_hz: WHISPER_SAMPLE_RATE_HZ,
+            sample_rate_hz: STT_SAMPLE_RATE_HZ,
         };
 
         let whisper_opts = WhisperOpts {
@@ -67,27 +65,6 @@ impl SttEngine for WhisperSttEngine {
 
         Ok(Transcript { text })
     }
-}
-
-fn resample_to_rate(samples: &[f32], src_rate_hz: u32, dst_rate_hz: u32) -> Vec<f32> {
-    if src_rate_hz == dst_rate_hz || samples.is_empty() {
-        return samples.to_vec();
-    }
-
-    let ratio = src_rate_hz as f64 / dst_rate_hz as f64;
-    let out_len = ((samples.len() as f64) / ratio).ceil() as usize;
-    let mut out = Vec::with_capacity(out_len);
-
-    for i in 0..out_len {
-        let src_pos = i as f64 * ratio;
-        let idx = src_pos as usize;
-        let frac = (src_pos - idx as f64) as f32;
-        let s0 = samples.get(idx).copied().unwrap_or(0.0);
-        let s1 = samples.get(idx + 1).copied().unwrap_or(s0);
-        out.push(s0 + (s1 - s0) * frac);
-    }
-
-    out
 }
 
 #[cfg(feature = "whisper")]
@@ -162,12 +139,5 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not installed"));
-    }
-
-    #[test]
-    fn resample_halves_sample_count_when_halving_rate() {
-        let samples: Vec<f32> = (0..100).map(|i| i as f32 / 100.0).collect();
-        let out = resample_to_rate(&samples, 48_000, 24_000);
-        assert_eq!(out.len(), 50);
     }
 }

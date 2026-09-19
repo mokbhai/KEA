@@ -2,21 +2,40 @@ import {
   getBinding,
   getDictationSettings,
   getTtsSettings,
-  listInstalledOnnxModels,
-  listInstalledWhisperModels,
   listLlmEngines,
-  listOnnxModels,
   listSttEngines,
   listTtsEngines,
   listProviders,
-  listWhisperModels,
   type Binding,
   type Provider,
 } from "../api";
-import { loadKeyStates, type Capability } from "./capabilityDefaults";
+import { loadKeyStates } from "./capabilityDefaults";
+import {
+  catalogEngines,
+  credentialRefFor,
+  describeBinding,
+  runsLocally,
+  type Capability,
+  type LocalModel,
+} from "./engines";
+import { toMessage } from "./format";
 
-/** Where the "fix this" action on a blocked feature sends the user. */
-export type FixTarget = "ai-providers" | "models" | "picker";
+export { describeBinding };
+
+/**
+ * Why a feature cannot run, in the resolver's terms. Which screen (or picker)
+ * clears it, and what the button says, is the banner's business — this module
+ * mirrors the backend resolver and must not know the UI's routes.
+ */
+export type BlockedCause =
+  /** No binding at all: the user has never chosen. */
+  | "unset"
+  /** The saved binding names an engine this build does not register. */
+  | "unavailable"
+  /** A local engine whose model is not downloaded. */
+  | "model"
+  /** A remote provider with no API key stored. */
+  | "credentials";
 
 /** One AI slot a feature page depends on, in plain language. */
 export type SlotSpec = {
@@ -31,8 +50,7 @@ export type SlotSpec = {
 
 export type BlockedReason = {
   message: string;
-  actionLabel: string;
-  fix: FixTarget;
+  cause: BlockedCause;
 };
 
 export type SlotSource = "override" | "default" | "auto" | "none";
@@ -71,7 +89,7 @@ function createGuard() {
       try {
         return await work;
       } catch (e) {
-        message ??= e instanceof Error ? e.message : String(e);
+        message ??= toMessage(e);
         return fallback;
       }
     },
@@ -80,40 +98,6 @@ function createGuard() {
 }
 
 type Guard = ReturnType<typeof createGuard>;
-
-/** Engines that run on this Mac and therefore need a downloaded model. */
-const LOCAL_ENGINES = new Set(["whisper", "parakeet", "sherpa-tts"]);
-
-/** Turns a binding into the sentence a non-technical user reads. */
-export function describeBinding(
-  binding: Binding | null,
-  ctx: { providers: Provider[]; modelNames: Map<string, string> },
-): string | null {
-  if (!binding) return null;
-  const providerName = (ref: string | null) =>
-    ctx.providers.find((p) => p.provider_ref === ref)?.name ?? null;
-
-  switch (binding.engine_id) {
-    case "openai":
-    case "openai-stt":
-    case "openai-tts":
-      return `OpenAI${binding.model ? ` · ${binding.model}` : ""}`;
-    case "openai-compatible":
-      return `${providerName(binding.provider_ref) ?? "Custom server"}${
-        binding.model ? ` · ${binding.model}` : ""
-      }`;
-    case "whisper":
-    case "parakeet":
-    case "sherpa-tts": {
-      const name = binding.model
-        ? ctx.modelNames.get(binding.model) ?? binding.model
-        : binding.engine_id;
-      return `${name} — on this Mac`;
-    }
-    default:
-      return binding.model ?? binding.engine_id;
-  }
-}
 
 type Env = {
   providers: Provider[];
@@ -158,34 +142,32 @@ async function loadEnv(capabilities: Set<Capability>, guard: Guard): Promise<Env
 
   const needsStt = capabilities.has("stt");
   const needsTts = capabilities.has("tts");
-  const [
-    whisper,
-    whisperInstalled,
-    parakeet,
-    parakeetInstalled,
-    voices,
-    voicesInstalled,
-    dictationSettings,
-    ttsSettings,
-  ] = await Promise.all([
-    needsStt ? guard.run(listWhisperModels(), []) : [],
-    needsStt ? guard.run(listInstalledWhisperModels(), []) : [],
-    needsStt ? guard.run(listOnnxModels("parakeet"), []) : [],
-    needsStt ? guard.run(listInstalledOnnxModels("parakeet"), []) : [],
-    needsTts ? guard.run(listOnnxModels("tts"), []) : [],
-    needsTts ? guard.run(listInstalledOnnxModels("tts"), []) : [],
+  // Every local engine of a needed capability: each one owns its catalog, and
+  // the two halves are guarded apart so one failing list cannot blank the rest.
+  const [catalogs, dictationSettings, ttsSettings] = await Promise.all([
+    Promise.all(
+      catalogEngines()
+        .filter((spec) => capabilities.has(spec.capability))
+        .map(async ({ catalog }) => {
+          const [models, installed] = await Promise.all([
+            guard.run(catalog.list(), [] as LocalModel[]),
+            guard.run(catalog.listInstalled(), [] as string[]),
+          ]);
+          return { models, installed };
+        }),
+    ),
     needsStt ? guard.run(getDictationSettings(), null) : null,
     needsTts ? guard.run(getTtsSettings(), null) : null,
   ]);
 
   const modelNames = new Map<string, string>();
-  [...whisper, ...parakeet, ...voices].forEach((m) => modelNames.set(m.id, m.display_name));
+  catalogs.forEach(({ models }) => models.forEach((m) => modelNames.set(m.id, m.display_name)));
 
   return {
     providers,
     keyByRef,
     engineIds,
-    installed: new Set([...whisperInstalled, ...parakeetInstalled, ...voicesInstalled]),
+    installed: new Set(catalogs.flatMap((c) => c.installed)),
     modelNames,
     activeModels: {
       llm: null,
@@ -207,15 +189,6 @@ function usesActiveModelFallback(spec: SlotSpec): boolean {
   return false;
 }
 
-/** The provider whose key a binding needs, if it needs one at all. */
-function credentialRef(binding: Binding): string | null {
-  if (LOCAL_ENGINES.has(binding.engine_id)) return null;
-  if (binding.provider_ref) return binding.provider_ref;
-  // Auto-resolved cloud bindings carry no provider_ref; the OpenAI engines
-  // fall back to the built-in "openai" provider.
-  return binding.engine_id.startsWith("openai") ? "openai" : null;
-}
-
 function blockedReason(
   spec: SlotSpec,
   effective: Binding | null,
@@ -224,20 +197,18 @@ function blockedReason(
   if (!effective) {
     return {
       message: "Nothing is set up for this yet.",
-      actionLabel: "Choose…",
-      fix: "picker",
+      cause: "unset",
     };
   }
 
   if (!env.engineIds[spec.capability].has(effective.engine_id)) {
     return {
       message: "The saved choice isn't available in this version.",
-      actionLabel: "Change…",
-      fix: "picker",
+      cause: "unavailable",
     };
   }
 
-  if (LOCAL_ENGINES.has(effective.engine_id)) {
+  if (runsLocally(effective.engine_id)) {
     // The backend uses the binding's model, or the feature's saved fallback.
     const model =
       effective.model ??
@@ -246,19 +217,17 @@ function blockedReason(
       const name = env.modelNames.get(model) ?? model;
       return {
         message: `${name} isn't downloaded yet.`,
-        actionLabel: "Open Models",
-        fix: "models",
+        cause: "model",
       };
     }
   }
 
-  const ref = credentialRef(effective);
+  const ref = credentialRefFor(effective);
   if (ref && !env.keyByRef.get(ref)) {
     const name = env.providers.find((p) => p.provider_ref === ref)?.name ?? ref;
     return {
       message: `${name} needs an API key.`,
-      actionLabel: "Open AI Providers",
-      fix: "ai-providers",
+      cause: "credentials",
     };
   }
 

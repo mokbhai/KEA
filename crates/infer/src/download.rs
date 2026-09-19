@@ -4,7 +4,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Serialize;
 
-
 use crate::error::InferError;
 use crate::registry::{ModelRegistry, OnnxModelEntry};
 use crate::storage::ModelStorage;
@@ -28,11 +27,7 @@ fn available_disk_space(_path: &Path) -> u64 {
     u64::MAX
 }
 
-fn check_disk_space(
-    storage_root: &Path,
-    model_id: &str,
-    required: u64,
-) -> Result<(), InferError> {
+fn check_disk_space(storage_root: &Path, model_id: &str, required: u64) -> Result<(), InferError> {
     let available = available_disk_space(storage_root);
     if available < required {
         return Err(InferError::InsufficientSpace {
@@ -141,19 +136,19 @@ fn install_onnx_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), Infe
     // Extract entry-by-entry with path-traversal hardening. tar's unpack()
     // only does best-effort `..` filtering; we validate each path explicitly
     // and reject entries whose canonical target would escape the staging dir.
-    for entry in archive.entries().map_err(|e| {
-        InferError::Other(format!("failed to read onnx archive entries: {e}"))
-    })? {
-        let mut entry = entry.map_err(|e| {
-            InferError::Other(format!("failed to read onnx archive entry: {e}"))
-        })?;
+    for entry in archive
+        .entries()
+        .map_err(|e| InferError::Other(format!("failed to read onnx archive entries: {e}")))?
+    {
+        let mut entry = entry
+            .map_err(|e| InferError::Other(format!("failed to read onnx archive entry: {e}")))?;
         let header = entry.header();
 
         // Reject entries whose path contains `..`, is absolute, or resolves
         // outside the staging temp dir.
-        let entry_path = entry.path().map_err(|e| {
-            InferError::Other(format!("invalid onnx archive path: {e}"))
-        })?;
+        let entry_path = entry
+            .path()
+            .map_err(|e| InferError::Other(format!("invalid onnx archive path: {e}")))?;
         if entry_path
             .components()
             .any(|c| c == std::path::Component::ParentDir)
@@ -240,6 +235,18 @@ pub fn temp_file_for(final_path: &Path) -> PathBuf {
     final_path.parent().unwrap_or(Path::new(".")).join(name)
 }
 
+/// What a transfer needs to know about a model, independent of which catalog
+/// it came from. `size_bytes` is the progress denominator when the server
+/// sends no `Content-Length`; `required_bytes` is what the space preflight
+/// demands, which is not the same number for a bundle that has to be unpacked.
+struct FetchSpec<'a> {
+    model_id: &'a str,
+    url: &'a str,
+    sha256: &'a str,
+    size_bytes: u64,
+    required_bytes: u64,
+}
+
 pub struct ModelDownloader {
     transport: Arc<dyn DownloadTransport>,
     storage: ModelStorage,
@@ -247,10 +254,7 @@ pub struct ModelDownloader {
 
 impl ModelDownloader {
     pub fn new(transport: Arc<dyn DownloadTransport>, storage: ModelStorage) -> Self {
-        Self {
-            transport,
-            storage,
-        }
+        Self { transport, storage }
     }
 
     pub async fn download_whisper(
@@ -261,29 +265,64 @@ impl ModelDownloader {
         let entry = ModelRegistry::find_whisper(model_id)
             .ok_or_else(|| InferError::ModelNotFound(model_id.to_string()))?;
 
-        self.storage.ensure_root()?;
-
-        check_disk_space(&self.storage.root, model_id, entry.size_bytes)?;
-
         let path = self.storage.path_for(model_id);
         let temp = temp_file_for(&path);
 
+        self.install_verified(
+            FetchSpec {
+                model_id,
+                url: &entry.url,
+                sha256: &entry.sha256,
+                size_bytes: entry.size_bytes,
+                required_bytes: entry.size_bytes,
+            },
+            &temp,
+            &on_progress,
+            |temp| Ok(std::fs::rename(temp, &path)?),
+        )
+        .await?;
+
+        Ok(path)
+    }
+
+    /// The install spine both families share: preflight the root and the free
+    /// space, stream to `temp`, verify the digest against the catalog and
+    /// clear the partial file if it does not match, then emit the terminal
+    /// progress event once the model is actually in place.
+    ///
+    /// Only the tail genuinely differs — whisper renames one file into place,
+    /// an ONNX bundle is unpacked out of an archive — so `finalize` is a
+    /// closure over the verified temp file rather than a trait. Keeping the
+    /// rest here is what stops a fix to one kind's verify-or-unlink from
+    /// missing the other.
+    async fn install_verified(
+        &self,
+        spec: FetchSpec<'_>,
+        temp: &Path,
+        on_progress: &(impl Fn(DownloadProgress) + Send + Sync),
+        finalize: impl FnOnce(&Path) -> Result<(), InferError>,
+    ) -> Result<(), InferError> {
+        self.storage.ensure_root()?;
+
+        check_disk_space(&self.storage.root, spec.model_id, spec.required_bytes)?;
+
         let streamed = self
-            .stream_to_temp(&entry.url, &temp, model_id, entry.size_bytes, &on_progress)
+            .stream_to_temp(spec.url, temp, spec.model_id, spec.size_bytes, on_progress)
             .await?;
-        if let Err(e) = verify_digest(model_id, &entry.sha256, &streamed.sha256) {
-            let _ = std::fs::remove_file(&temp);
+        if let Err(e) = verify_digest(spec.model_id, spec.sha256, &streamed.sha256) {
+            let _ = std::fs::remove_file(temp);
             return Err(e);
         }
-        std::fs::rename(&temp, &path)?;
+
+        finalize(temp)?;
 
         on_progress(DownloadProgress {
-            model_id: model_id.to_string(),
+            model_id: spec.model_id.to_string(),
             bytes_received: streamed.bytes,
             bytes_total: streamed.bytes,
         });
 
-        Ok(path)
+        Ok(())
     }
 
     /// Streams a URL to `temp`, forwarding byte counts as they arrive so the
@@ -321,32 +360,28 @@ impl ModelDownloader {
         entry: &OnnxModelEntry,
         on_progress: impl Fn(DownloadProgress) + Send + Sync,
     ) -> Result<(), InferError> {
-        self.storage.ensure_root()?;
-
-        check_disk_space(&self.storage.root, &entry.id, entry.size_bytes.saturating_mul(2))?;
-
         let dest = self.storage.onnx_dir_for(&entry.id);
         let temp = temp_file_for(&dest);
 
-        let streamed = self
-            .stream_to_temp(&entry.url, &temp, &entry.id, entry.size_bytes, &on_progress)
-            .await?;
-        if let Err(e) = verify_digest(&entry.id, &entry.sha256, &streamed.sha256) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(e);
-        }
-
-        let installed = install_onnx_archive(&temp, &dest);
-        let _ = std::fs::remove_file(&temp);
-        installed?;
-
-        on_progress(DownloadProgress {
-            model_id: entry.id.clone(),
-            bytes_received: streamed.bytes,
-            bytes_total: streamed.bytes,
-        });
-
-        Ok(())
+        self.install_verified(
+            FetchSpec {
+                model_id: &entry.id,
+                url: &entry.url,
+                sha256: &entry.sha256,
+                size_bytes: entry.size_bytes,
+                // The archive and the bundle it unpacks to are on disk at the
+                // same time.
+                required_bytes: entry.size_bytes.saturating_mul(2),
+            },
+            &temp,
+            &on_progress,
+            |temp| {
+                let installed = install_onnx_archive(temp, &dest);
+                let _ = std::fs::remove_file(temp);
+                installed
+            },
+        )
+        .await
     }
 }
 
@@ -414,7 +449,11 @@ mod tests {
         for (kind, path, data, link) in entries {
             let mut header = tar::Header::new_gnu();
             header.set_entry_type(*kind);
-            header.set_mode(if *kind == tar::EntryType::Directory { 0o755 } else { 0o644 });
+            header.set_mode(if *kind == tar::EntryType::Directory {
+                0o755
+            } else {
+                0o644
+            });
             header.set_size(data.len() as u64);
             if let Some(target) = link {
                 header.set_link_name(target).unwrap();
@@ -454,7 +493,12 @@ mod tests {
     #[test]
     fn installs_a_bundle_whose_entries_sit_under_a_top_level_directory() {
         let archive = build_archive(&[
-            (tar::EntryType::Directory, "vits-piper-en_US-lessac-medium/", &[], None),
+            (
+                tar::EntryType::Directory,
+                "vits-piper-en_US-lessac-medium/",
+                &[],
+                None,
+            ),
             (
                 tar::EntryType::Regular,
                 "vits-piper-en_US-lessac-medium/tokens.txt",
@@ -476,20 +520,21 @@ mod tests {
 
         // The bundle root is unwrapped, not the directory that contained it:
         // callers look for tokens.txt directly under the model dir.
-        assert_eq!(std::fs::read(dest.join("tokens.txt")).unwrap(), b"a 1\nb 2\n");
-        assert_eq!(std::fs::read(dest.join("model.onnx")).unwrap(), b"onnx-bytes");
+        assert_eq!(
+            std::fs::read(dest.join("tokens.txt")).unwrap(),
+            b"a 1\nb 2\n"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("model.onnx")).unwrap(),
+            b"onnx-bytes"
+        );
     }
 
     /// The guard has to keep failing closed. Fixing the false positive above by
     /// loosening containment would be worse than the bug it fixed.
     #[test]
     fn rejects_an_entry_that_climbs_out_of_staging() {
-        let archive = build_archive(&[(
-            tar::EntryType::Regular,
-            "../escaped.txt",
-            b"pwned",
-            None,
-        )]);
+        let archive = build_archive(&[(tar::EntryType::Regular, "../escaped.txt", b"pwned", None)]);
         let (_archive_dir, archive_path) = write_archive(&archive);
         let dest_parent = tempfile::tempdir().unwrap();
         let dest = dest_parent.path().join("model");
@@ -506,13 +551,13 @@ mod tests {
     fn rejects_a_symlink_entry() {
         let archive = build_archive(&[
             (tar::EntryType::Directory, "bundle/", &[], None),
+            (tar::EntryType::Regular, "bundle/tokens.txt", b"a 1\n", None),
             (
-                tar::EntryType::Regular,
-                "bundle/tokens.txt",
-                b"a 1\n",
-                None,
+                tar::EntryType::Symlink,
+                "bundle/link",
+                &[],
+                Some("/etc/passwd"),
             ),
-            (tar::EntryType::Symlink, "bundle/link", &[], Some("/etc/passwd")),
         ]);
         let (_archive_dir, archive_path) = write_archive(&archive);
         let dest_parent = tempfile::tempdir().unwrap();
@@ -593,10 +638,7 @@ mod tests {
             kind: crate::registry::OnnxModelKind::Parakeet,
         };
 
-        let dl = ModelDownloader::new(
-            Arc::new(FakeTransport::new(payload.clone())),
-            storage,
-        );
+        let dl = ModelDownloader::new(Arc::new(FakeTransport::new(payload.clone())), storage);
 
         let progress = Arc::new(Mutex::new(Vec::new()));
         let p2 = progress.clone();
@@ -637,10 +679,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = ModelStorage::new(dir.path().to_path_buf());
         let payload = b"tampered content".to_vec();
-        let dl = ModelDownloader::new(
-            Arc::new(FakeTransport::new(payload)),
-            storage,
-        );
+        let dl = ModelDownloader::new(Arc::new(FakeTransport::new(payload)), storage);
 
         let err = dl
             .download_whisper("ggml-base.en", |_| {})
@@ -669,10 +708,7 @@ mod tests {
             kind: crate::registry::OnnxModelKind::Parakeet,
         };
 
-        let dl = ModelDownloader::new(
-            Arc::new(FakeTransport::new(payload.clone())),
-            storage,
-        );
+        let dl = ModelDownloader::new(Arc::new(FakeTransport::new(payload.clone())), storage);
 
         let progress = Arc::new(Mutex::new(Vec::new()));
         let p2 = progress.clone();
@@ -716,10 +752,7 @@ mod tests {
             storage,
         );
 
-        let err = dl
-            .download_onnx(&entry, |_| {})
-            .await
-            .unwrap_err();
+        let err = dl.download_onnx(&entry, |_| {}).await.unwrap_err();
         assert!(matches!(err, InferError::HashMismatch { .. }));
     }
 
@@ -732,10 +765,7 @@ mod tests {
         // pre-create a "stale" file to ensure it isn't clobbered
         std::fs::write(&target, b"previous install").unwrap();
 
-        let dl = ModelDownloader::new(
-            Arc::new(FakeTransport::new(b"bad data".to_vec())),
-            storage,
-        );
+        let dl = ModelDownloader::new(Arc::new(FakeTransport::new(b"bad data".to_vec())), storage);
 
         let _ = dl.download_whisper("ggml-base.en", |_| {}).await;
 
@@ -769,10 +799,7 @@ mod tests {
             kind: crate::registry::OnnxModelKind::Parakeet,
         };
 
-        let dl = ModelDownloader::new(
-            Arc::new(FakeTransport::new(payload.clone())),
-            storage,
-        );
+        let dl = ModelDownloader::new(Arc::new(FakeTransport::new(payload.clone())), storage);
 
         // use download_onnx for the test — install_onnx_archive will fail
         // because it's not a real tar.bz2, but that proves the atomic path
@@ -805,15 +832,9 @@ mod tests {
             kind: crate::registry::OnnxModelKind::Parakeet,
         };
 
-        let dl = ModelDownloader::new(
-            Arc::new(FakeTransport::new(vec![0u8; 8])),
-            storage,
-        );
+        let dl = ModelDownloader::new(Arc::new(FakeTransport::new(vec![0u8; 8])), storage);
 
-        let err = dl
-            .download_onnx(&entry, |_| {})
-            .await
-            .unwrap_err();
+        let err = dl.download_onnx(&entry, |_| {}).await.unwrap_err();
         assert!(
             matches!(err, InferError::InsufficientSpace { .. }),
             "expected InsufficientSpace, got: {err:?}"
@@ -842,16 +863,16 @@ mod tests {
             kind: crate::registry::OnnxModelKind::Parakeet,
         };
 
-        let dl = ModelDownloader::new(
-            Arc::new(FakeTransport::new(payload.clone())),
-            storage,
-        );
+        let dl = ModelDownloader::new(Arc::new(FakeTransport::new(payload.clone())), storage);
 
         let result = dl.download_onnx(&entry, |_| {}).await;
         // Should fail at unpack (not a real tar.bz2), not at space check
         assert!(result.is_err());
         assert!(
-            !matches!(result.as_ref().unwrap_err(), InferError::InsufficientSpace { .. }),
+            !matches!(
+                result.as_ref().unwrap_err(),
+                InferError::InsufficientSpace { .. }
+            ),
             "should not trigger InsufficientSpace for 16-byte model"
         );
     }

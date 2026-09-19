@@ -32,19 +32,8 @@ impl DictationSettingsRepo {
 
     pub async fn get(&self) -> Result<DictationSettings, KeaError> {
         Ok(DictationSettings {
-            post_process: self
-                .settings
-                .get(KEY_POST_PROCESS)
-                .await?
-                .unwrap_or(false),
-            // Stored as an Option, so a cleared model is the JSON literal
-            // `null` rather than a missing row — read it back as one and
-            // flatten, or every later read of these settings would fail.
-            active_model: self
-                .settings
-                .get::<Option<String>>(KEY_ACTIVE_MODEL)
-                .await?
-                .flatten(),
+            post_process: self.settings.get(KEY_POST_PROCESS).await?.unwrap_or(false),
+            active_model: self.settings.get_optional(KEY_ACTIVE_MODEL).await?,
             hold_to_talk: self.settings.get(KEY_HOLD_TO_TALK).await?.unwrap_or(false),
         })
     }

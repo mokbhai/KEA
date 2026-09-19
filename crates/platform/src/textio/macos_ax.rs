@@ -30,10 +30,40 @@ fn test_trust_slot() -> &'static Mutex<Option<bool>> {
     TEST_AX_TRUSTED.get_or_init(|| Mutex::new(None))
 }
 
-/// Test seam: inject a fake AX inserter (or `None` to use the real AX APIs).
 #[cfg(test)]
-pub fn set_ax_insert_fn_for_test(insert: Option<AxInsertFn>) {
-    *test_ax_slot().lock().unwrap() = insert;
+static AX_INSERT_TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+/// Test seam: injects a fake AX inserter while it is alive.
+///
+/// Same reasoning as [`AxTrustOverride`] — the slot is process-global and
+/// `cargo test` runs tests in parallel in one process, so the guard serialises
+/// its users and puts the real AX APIs back on drop even if a test panics.
+///
+/// Callers that also force trust take [`AxTrustOverride`] *first*; the two
+/// locks are always acquired in that order.
+#[cfg(test)]
+pub struct AxInsertOverride {
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl AxInsertOverride {
+    pub fn force(insert: AxInsertFn) -> Self {
+        // A poisoned lock here means some other test panicked; that is no
+        // reason to fail this one on top of it.
+        let serial = AX_INSERT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *test_ax_slot().lock().unwrap_or_else(|p| p.into_inner()) = Some(insert);
+        Self { _serial: serial }
+    }
+}
+
+#[cfg(test)]
+impl Drop for AxInsertOverride {
+    fn drop(&mut self) {
+        *test_ax_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
 }
 
 #[cfg(test)]
@@ -135,13 +165,11 @@ pub fn frontmost_app_name() -> String {
         let Some(class) = objc2::runtime::AnyClass::get(c"NSWorkspace") else {
             return "<no AppKit>".into();
         };
-        let workspace: *mut objc2::runtime::AnyObject =
-            objc2::msg_send![class, sharedWorkspace];
+        let workspace: *mut objc2::runtime::AnyObject = objc2::msg_send![class, sharedWorkspace];
         if workspace.is_null() {
             return "<no workspace>".into();
         }
-        let app: *mut objc2::runtime::AnyObject =
-            objc2::msg_send![workspace, frontmostApplication];
+        let app: *mut objc2::runtime::AnyObject = objc2::msg_send![workspace, frontmostApplication];
         if app.is_null() {
             return "<no frontmost app>".into();
         }
@@ -210,7 +238,8 @@ impl AxRef {
     unsafe fn copy_string_attr(&self, attribute: &str) -> Option<String> {
         let value = self.copy_attr(attribute)?;
         let cf_type = value.0 as core_foundation_sys::base::CFTypeRef;
-        if core_foundation::base::CFGetTypeID(cf_type) != core_foundation::string::CFString::type_id()
+        if core_foundation::base::CFGetTypeID(cf_type)
+            != core_foundation::string::CFString::type_id()
         {
             return None;
         }
@@ -219,6 +248,24 @@ impl AxRef {
             value.0 as core_foundation_sys::string::CFStringRef,
         );
         Some(s.to_string())
+    }
+
+    /// Writes one AX attribute from a `&str`, naming the AX error code on
+    /// failure — `-25204` (attribute unsupported) and `-25205` (read-only) are
+    /// the ordinary answers from an element that simply cannot take text, and
+    /// they are what the caller's clipboard fallback is for.
+    unsafe fn set_string_attr(&self, attribute: &str, value: &str) -> Result<(), String> {
+        let attr = core_foundation::string::CFString::new(attribute);
+        let cf_value = core_foundation::string::CFString::new(value);
+        let err = AXUIElementSetAttributeValue(
+            self.0,
+            attr.as_concrete_TypeRef(),
+            cf_value.as_concrete_TypeRef() as *const _,
+        );
+        if err != K_AX_ERROR_SUCCESS {
+            return Err(format!("AXUIElementSetAttributeValue failed ({err})"));
+        }
+        Ok(())
     }
 }
 
@@ -243,34 +290,18 @@ fn insert_via_accessibility_impl(text: &str) -> Result<(), String> {
         return Err("accessibility permission not granted".into());
     }
 
+    // SAFETY: as in `focused_element_role` — the system-wide element and the
+    // focused element are both +1 references from AX create/copy functions,
+    // and `AxRef` releases each exactly once. This runs on every dictation, so
+    // doing it by hand here is how the references used to leak.
     unsafe {
-        let system = AXUIElementCreateSystemWide();
-        if system.is_null() {
+        let Some(system) = AxRef::new(AXUIElementCreateSystemWide()) else {
             return Err("AXUIElementCreateSystemWide failed".into());
-        }
-
-        let focused_attr = core_foundation::string::CFString::new("AXFocusedUIElement");
-        let mut focused: *const c_void = ptr::null();
-        let err = AXUIElementCopyAttributeValue(
-            system,
-            focused_attr.as_concrete_TypeRef(),
-            &mut focused,
-        );
-        if err != K_AX_ERROR_SUCCESS || focused.is_null() {
-            return Err(format!("no focused UI element (AX error {err})"));
-        }
-
-        let text_attr = core_foundation::string::CFString::new("AXSelectedText");
-        let cf_text = core_foundation::string::CFString::new(text);
-        let err = AXUIElementSetAttributeValue(
-            focused as *mut c_void,
-            text_attr.as_concrete_TypeRef(),
-            cf_text.as_concrete_TypeRef() as *const _,
-        );
-        if err != K_AX_ERROR_SUCCESS {
-            return Err(format!("AXUIElementSetAttributeValue failed ({err})"));
-        }
-        Ok(())
+        };
+        let Some(focused) = system.copy_attr("AXFocusedUIElement") else {
+            return Err("no focused UI element".into());
+        };
+        focused.set_string_attr("AXSelectedText", text)
     }
 }
 
@@ -300,15 +331,14 @@ mod tests {
 
     #[test]
     fn injectable_ax_insert_fn_is_used_when_set() {
-        set_ax_insert_fn_for_test(Some(Box::new(|text| {
+        let _insert = AxInsertOverride::force(Box::new(|text| {
             if text == "ok" {
                 Ok(())
             } else {
                 Err("boom".into())
             }
-        })));
+        }));
         assert!(insert_via_accessibility("ok").is_ok());
         assert!(insert_via_accessibility("nope").is_err());
-        set_ax_insert_fn_for_test(None);
     }
 }

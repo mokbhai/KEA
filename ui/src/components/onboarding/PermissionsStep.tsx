@@ -5,6 +5,7 @@ import {
   requestPermission,
   type PermStatus,
 } from "../../api";
+import { toMessage } from "../../lib/format";
 import { Row, RowGroup } from "../SettingsRow";
 
 type PermKind = "microphone" | "screen_recording" | "accessibility";
@@ -43,7 +44,7 @@ export default function PermissionsStep() {
         return next;
       });
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toMessage(e));
     }
   }, []);
 
@@ -63,7 +64,7 @@ export default function PermissionsStep() {
       const result = await requestPermission(kind);
       setStatuses((prev) => ({ ...prev, [kind]: result }));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toMessage(e));
     } finally {
       setBusyKind(null);
     }

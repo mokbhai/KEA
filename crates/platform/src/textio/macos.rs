@@ -148,7 +148,10 @@ pub(crate) fn require_event_injection(trusted: bool) -> Result<(), TextIoError> 
 /// * Restoring when somebody else has since written to the pasteboard silently
 ///   destroys *their* entry (a clipboard manager's, or something the user
 ///   copied in the meantime).
-pub(crate) fn should_restore_clipboard(paste_succeeded: bool, clipboard_is_still_ours: bool) -> bool {
+pub(crate) fn should_restore_clipboard(
+    paste_succeeded: bool,
+    clipboard_is_still_ours: bool,
+) -> bool {
     paste_succeeded && clipboard_is_still_ours
 }
 
@@ -271,7 +274,10 @@ fn capture_selection_sync() -> Result<String, TextIoError> {
     };
 
     if text.trim().is_empty() {
-        tracing::warn!(op = "capture_selection", "textio: the copied selection was empty");
+        tracing::warn!(
+            op = "capture_selection",
+            "textio: the copied selection was empty"
+        );
         return Err(TextIoError::Other("no selection".into()));
     }
 
@@ -326,7 +332,10 @@ fn paste_via_clipboard_sync(text: &str) -> Result<(), TextIoError> {
     // is what keeps the text reachable with a manual ⌘V instead of putting the
     // user's old clipboard back on top of it.
     let posted = if macos_keys::secure_input_enabled() {
-        tracing::warn!(op = "paste", "textio: secure input is on; the keystroke will be dropped");
+        tracing::warn!(
+            op = "paste",
+            "textio: secure input is on; the keystroke will be dropped"
+        );
         Err(SECURE_INPUT_BLOCKED.to_string())
     } else {
         match macos_keys::post_command_chord(KEY_V) {
@@ -377,29 +386,17 @@ fn replace_with_mode_sync(text: &str, mode: ReplaceMode) -> Result<(), TextIoErr
         ReplaceMode::ClipboardPaste => paste_via_clipboard_sync(text),
         ReplaceMode::Accessibility => match super::macos_ax::insert_via_accessibility(text) {
             Ok(()) => {
-                tracing::info!(op = "replace", mode = "accessibility", "textio: inserted via AX");
+                tracing::info!(
+                    op = "replace",
+                    mode = "accessibility",
+                    "textio: inserted via AX"
+                );
                 Ok(())
             }
             Err(err) => {
                 tracing::warn!("AX insertion failed, falling back to clipboard: {err}");
                 paste_via_clipboard_sync(text)
             }
-        },
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn resolve_replace_with_fallback(
-    mode: ReplaceMode,
-    ax_insert: impl FnOnce(&str) -> Result<(), String>,
-    clipboard_insert: impl FnOnce(&str) -> Result<(), TextIoError>,
-    text: &str,
-) -> Result<(), TextIoError> {
-    match mode {
-        ReplaceMode::ClipboardPaste => clipboard_insert(text),
-        ReplaceMode::Accessibility => match ax_insert(text) {
-            Ok(()) => Ok(()),
-            Err(_) => clipboard_insert(text),
         },
     }
 }
@@ -412,11 +409,7 @@ impl TextIo for MacTextIo {
             .map_err(|e| TextIoError::Other(e.to_string()))?
     }
 
-    async fn replace_with_mode(
-        &self,
-        text: &str,
-        mode: ReplaceMode,
-    ) -> Result<(), TextIoError> {
+    async fn replace_with_mode(&self, text: &str, mode: ReplaceMode) -> Result<(), TextIoError> {
         let text = text.to_string();
         tokio::task::spawn_blocking(move || replace_with_mode_sync(&text, mode))
             .await
@@ -435,31 +428,32 @@ impl TextIo for MacTextIo {
 mod tests {
     use super::*;
 
+    /// Both fallback tests drive the real `replace_with_mode_sync` through the
+    /// two existing seams, and read the clipboard path's own refusal as the
+    /// signal that it was entered: with trust forced off,
+    /// `paste_via_clipboard_sync` fails before it touches the pasteboard, so
+    /// "did we fall back?" is exactly "did the Accessibility error come back?"
+    /// — no real focus, keystrokes or window server needed.
     #[test]
     fn accessibility_mode_falls_back_to_clipboard_on_ax_failure() {
-        let out = resolve_replace_with_fallback(
-            ReplaceMode::Accessibility,
-            |_| Err("ax failed".into()),
-            |_| Ok(()),
-            "hello",
+        let _trust = super::super::macos_ax::AxTrustOverride::force(false);
+        let _insert =
+            super::super::macos_ax::AxInsertOverride::force(Box::new(|_| Err("ax failed".into())));
+        let err = replace_with_mode_sync("hello", ReplaceMode::Accessibility).unwrap_err();
+        assert_eq!(
+            err,
+            TextIoError::Other(AX_NOT_TRUSTED.into()),
+            "a failed AX insertion must hand off to the clipboard path"
         );
-        assert!(out.is_ok());
     }
 
     #[test]
     fn accessibility_mode_skips_clipboard_when_ax_succeeds() {
-        let mut clipboard_called = false;
-        let out = resolve_replace_with_fallback(
-            ReplaceMode::Accessibility,
-            |_| Ok(()),
-            |_| {
-                clipboard_called = true;
-                Ok(())
-            },
-            "hello",
-        );
-        assert!(out.is_ok());
-        assert!(!clipboard_called);
+        let _trust = super::super::macos_ax::AxTrustOverride::force(false);
+        let _insert = super::super::macos_ax::AxInsertOverride::force(Box::new(|_| Ok(())));
+        // The clipboard path cannot succeed while trust is off, so an `Ok`
+        // here is only reachable by not taking it.
+        assert!(replace_with_mode_sync("hello", ReplaceMode::Accessibility).is_ok());
     }
 
     #[test]
@@ -498,7 +492,10 @@ mod tests {
     fn the_failure_message_names_the_way_out() {
         let message = paste_failed_but_copied(SECURE_INPUT_BLOCKED);
         assert!(message.contains("secure input"));
-        assert!(message.contains("⌘V"), "the user must be told they can paste it themselves");
+        assert!(
+            message.contains("⌘V"),
+            "the user must be told they can paste it themselves"
+        );
     }
 
     /// The settle window is the thing that actually fixed the reported bug;

@@ -1,7 +1,7 @@
+use crate::error::KeaError;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use crate::error::KeaError;
 
 #[async_trait]
 pub trait CredentialStore: Send + Sync {
@@ -11,7 +11,9 @@ pub trait CredentialStore: Send + Sync {
 }
 
 #[derive(Default)]
-pub struct InMemoryCredentialStore { map: Mutex<HashMap<String, String>> }
+pub struct InMemoryCredentialStore {
+    map: Mutex<HashMap<String, String>>,
+}
 
 #[async_trait]
 impl CredentialStore for InMemoryCredentialStore {
@@ -19,17 +21,25 @@ impl CredentialStore for InMemoryCredentialStore {
         Ok(self.map.lock().unwrap().get(p).cloned())
     }
     async fn set(&self, p: &str, s: &str) -> Result<(), KeaError> {
-        self.map.lock().unwrap().insert(p.into(), s.into()); Ok(())
+        self.map.lock().unwrap().insert(p.into(), s.into());
+        Ok(())
     }
     async fn delete(&self, p: &str) -> Result<(), KeaError> {
-        self.map.lock().unwrap().remove(p); Ok(())
+        self.map.lock().unwrap().remove(p);
+        Ok(())
     }
 }
 
-pub struct KeyringCredentialStore { service: String }
+pub struct KeyringCredentialStore {
+    service: String,
+}
 
 impl KeyringCredentialStore {
-    pub fn new(service: impl Into<String>) -> Self { Self { service: service.into() } }
+    pub fn new(service: impl Into<String>) -> Self {
+        Self {
+            service: service.into(),
+        }
+    }
     fn entry(&self, p: &str) -> Result<keyring::Entry, KeaError> {
         keyring::Entry::new(&self.service, p).map_err(|e| KeaError::Other(e.to_string()))
     }
@@ -45,7 +55,9 @@ impl CredentialStore for KeyringCredentialStore {
         }
     }
     async fn set(&self, p: &str, s: &str) -> Result<(), KeaError> {
-        self.entry(p)?.set_password(s).map_err(|e| KeaError::Other(e.to_string()))
+        self.entry(p)?
+            .set_password(s)
+            .map_err(|e| KeaError::Other(e.to_string()))
     }
     async fn delete(&self, p: &str) -> Result<(), KeaError> {
         match self.entry(p)?.delete_credential() {
@@ -105,6 +117,10 @@ mod keyring_backing_tests {
         store.set("probe", "sk-roundtrip").await.unwrap();
         let got = store.get("probe").await.unwrap();
         let _ = store.delete("probe").await;
-        assert_eq!(got, Some("sk-roundtrip".into()), "keyring did not persist the secret");
+        assert_eq!(
+            got,
+            Some("sk-roundtrip".into()),
+            "keyring did not persist the secret"
+        );
     }
 }

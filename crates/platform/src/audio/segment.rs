@@ -148,9 +148,7 @@ mod tests {
 
     fn tone(secs: f32, rate: u32) -> Vec<f32> {
         let n = (secs * rate as f32) as usize;
-        (0..n)
-            .map(|i| (i as f32 * 0.05).sin() * 0.3)
-            .collect()
+        (0..n).map(|i| (i as f32 * 0.05).sin() * 0.3).collect()
     }
 
     fn quiet(secs: f32, rate: u32) -> Vec<f32> {

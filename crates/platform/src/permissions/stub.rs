@@ -1,7 +1,7 @@
 //! Non-macOS permission stub — all kinds report [`PermStatus::Unknown`].
 
-use async_trait::async_trait;
 use super::{PermError, PermKind, PermStatus, Permissions};
+use async_trait::async_trait;
 
 pub struct StubPermissions;
 

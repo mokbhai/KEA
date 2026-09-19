@@ -28,7 +28,7 @@ pub fn sck_feature_enabled() -> bool {
 pub fn screen_recording_granted() -> bool {
     #[cfg(target_os = "macos")]
     {
-        core_graphics::access::ScreenCaptureAccess::default().preflight()
+        core_graphics::access::ScreenCaptureAccess.preflight()
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -56,8 +56,8 @@ impl SystemAudioCapture for UnavailableSystemAudioCapture {
 
 #[cfg(all(target_os = "macos", feature = "system-audio-sck"))]
 mod sck_impl {
-    use super::*;
     use super::super::util::accumulate_frames;
+    use super::*;
     use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
     use screencapturekit::cm::CMSampleBufferExt;
     use screencapturekit::prelude::*;
@@ -132,7 +132,10 @@ mod sck_impl {
                 ));
             }
 
-            self.buffered.lock().unwrap_or_else(|p| p.into_inner()).clear();
+            self.buffered
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
             let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(64);
             let (stop_tx, stop_rx) = std::sync::mpsc::channel();
             let buffered = Arc::clone(&self.buffered);
@@ -163,10 +166,15 @@ mod sck_impl {
                 join.join()
                     .map_err(|_| AudioIoError::Other("SCK capture thread panicked".into()))?;
             }
-            let frames = std::mem::take(&mut *self.buffered.lock().unwrap_or_else(|p| p.into_inner()));
+            let frames =
+                std::mem::take(&mut *self.buffered.lock().unwrap_or_else(|p| p.into_inner()));
             let drops = self.drops.swap(0, Ordering::Relaxed);
             if drops > 0 {
-                tracing::warn!(drops, "SCK: {} system audio frames dropped (channel full) during this session", drops);
+                tracing::warn!(
+                    drops,
+                    "SCK: {} system audio frames dropped (channel full) during this session",
+                    drops
+                );
             }
             Ok(accumulate_frames(&frames))
         }
@@ -183,9 +191,9 @@ mod sck_impl {
             .map_err(|e| AudioIoError::Other(format!("SCK shareable content: {e}")))?;
 
         let displays = content.displays();
-        let display = displays.first().ok_or_else(|| {
-            AudioIoError::Other("no display available for SCK capture".into())
-        })?;
+        let display = displays
+            .first()
+            .ok_or_else(|| AudioIoError::Other("no display available for SCK capture".into()))?;
 
         let filter = SCContentFilter::create()
             .with_display(display)
@@ -214,7 +222,10 @@ mod sck_impl {
             match stream.try_next() {
                 Some(sample) => {
                     if let Some(frame) = SckSystemAudioCapture::audio_sample_to_pcm(&sample) {
-                        buffered.lock().unwrap_or_else(|p| p.into_inner()).push(frame.clone());
+                        buffered
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(frame.clone());
                         if frame_tx.try_send(frame).is_err() {
                             let n = drops.fetch_add(1, Ordering::Relaxed) + 1;
                             if n % 100 == 0 {
@@ -258,34 +269,37 @@ pub fn new_system_audio_capture() -> Box<dyn SystemAudioCapture> {
     }
 }
 
+/// In-crate fake backend: emits one frame on `start`, then closes the channel.
+/// Lives outside `mod tests` so `audio::macos` can inject it into the meeting
+/// capture path, which otherwise has no seam without a real display.
+#[cfg(test)]
+pub(crate) struct FakeSck;
+
+#[cfg(test)]
+#[async_trait]
+impl SystemAudioCapture for FakeSck {
+    async fn start(&mut self) -> Result<tokio::sync::mpsc::Receiver<PcmFrame>, AudioIoError> {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(PcmFrame {
+            samples: vec![0.5; 100],
+            sample_rate_hz: 48_000,
+        })
+        .await
+        .ok();
+        Ok(rx)
+    }
+
+    async fn stop(&mut self) -> Result<PcmFrame, AudioIoError> {
+        Ok(PcmFrame {
+            samples: vec![0.5; 100],
+            sample_rate_hz: 48_000,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct FakeSck;
-
-    #[async_trait]
-    impl SystemAudioCapture for FakeSck {
-        async fn start(
-            &mut self,
-        ) -> Result<tokio::sync::mpsc::Receiver<PcmFrame>, AudioIoError> {
-            let (tx, rx) = tokio::sync::mpsc::channel(4);
-            tx.send(PcmFrame {
-                samples: vec![0.5; 100],
-                sample_rate_hz: 48_000,
-            })
-            .await
-            .ok();
-            Ok(rx)
-        }
-
-        async fn stop(&mut self) -> Result<PcmFrame, AudioIoError> {
-            Ok(PcmFrame {
-                samples: vec![0.5; 100],
-                sample_rate_hz: 48_000,
-            })
-        }
-    }
 
     /// Compile-only seam test — exercises `SystemAudioCapture` without the SCK feature.
     #[tokio::test]

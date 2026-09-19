@@ -1,7 +1,51 @@
-use sqlx::SqlitePool;
 use crate::error::KeaError;
+use sqlx::SqlitePool;
 
-pub struct ActionRepo { pool: SqlitePool }
+/// How an entry in the `actions` ledger ended, as persisted in
+/// `actions.status`. `Started` is the column's DEFAULT, written by the INSERT
+/// and overwritten by [`ActionRepo::finish`]. Spelled once here so callers bind
+/// a variant, not a literal — see [`crate::store::meetings::MeetingStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionStatus {
+    Started,
+    Ok,
+    Error,
+}
+
+impl ActionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ActionStatus::Started => "started",
+            ActionStatus::Ok => "ok",
+            ActionStatus::Error => "error",
+        }
+    }
+
+    // Not `FromStr`: the caller wants an `Option`, not a `Result`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "started" => Some(ActionStatus::Started),
+            "ok" => Some(ActionStatus::Ok),
+            "error" => Some(ActionStatus::Error),
+            _ => None,
+        }
+    }
+}
+
+impl TryFrom<String> for ActionStatus {
+    type Error = KeaError;
+
+    fn try_from(s: String) -> Result<Self, KeaError> {
+        ActionStatus::from_str(&s)
+            .ok_or_else(|| KeaError::Other(format!("unknown action status {s:?}")))
+    }
+}
+
+pub struct ActionRepo {
+    pool: SqlitePool,
+}
 
 pub struct NewAction {
     pub feature_id: String,
@@ -11,16 +55,17 @@ pub struct NewAction {
     pub provider_ref: Option<String>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, sqlx::FromRow)]
 pub struct ActionRow {
     pub id: i64,
     pub feature_id: String,
     pub command: String,
     pub engine_id: String,
-    pub status: String,
+    #[sqlx(try_from = "String")]
+    pub status: ActionStatus,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, sqlx::FromRow)]
 pub struct ActionDetail {
     pub id: i64,
     pub feature_id: String,
@@ -28,44 +73,54 @@ pub struct ActionDetail {
     pub engine_id: String,
     pub model: Option<String>,
     pub provider_ref: Option<String>,
-    pub status: String,
+    #[sqlx(try_from = "String")]
+    pub status: ActionStatus,
     pub error: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
 }
 
 impl ActionRepo {
-    pub fn new(pool: SqlitePool) -> Self { Self { pool } }
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
 
     pub async fn record(&self, a: NewAction) -> Result<i64, KeaError> {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO actions(feature_id, command, engine_id, model, provider_ref)
-             VALUES(?, ?, ?, ?, ?) RETURNING id")
-            .bind(a.feature_id).bind(a.command).bind(a.engine_id)
-            .bind(a.model).bind(a.provider_ref)
-            .fetch_one(&self.pool).await?;
+             VALUES(?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(a.feature_id)
+        .bind(a.command)
+        .bind(a.engine_id)
+        .bind(a.model)
+        .bind(a.provider_ref)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(id)
     }
 
     pub async fn recent(&self, limit: i64) -> Result<Vec<ActionRow>, KeaError> {
-        let rows = sqlx::query_as::<_, (i64, String, String, String, String)>(
+        let rows = sqlx::query_as::<_, ActionRow>(
             "SELECT id, feature_id, command, engine_id, status
-             FROM actions ORDER BY id DESC LIMIT ?")
-            .bind(limit).fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|(id, feature_id, command, engine_id, status)|
-            ActionRow { id, feature_id, command, engine_id, status }).collect())
+             FROM actions ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     pub async fn finish(
         &self,
         id: i64,
-        status: &str,
+        status: ActionStatus,
         error: Option<&str>,
     ) -> Result<(), KeaError> {
         sqlx::query(
             "UPDATE actions SET status = ?, error = ?, finished_at = datetime('now') WHERE id = ?",
         )
-        .bind(status)
+        .bind(status.as_str())
         .bind(error)
         .bind(id)
         .execute(&self.pool)
@@ -75,7 +130,7 @@ impl ActionRepo {
 
     pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<ActionRow>, KeaError> {
         let pattern = format!("%{query}%");
-        let rows = sqlx::query_as::<_, (i64, String, String, String, String)>(
+        let rows = sqlx::query_as::<_, ActionRow>(
             "SELECT id, feature_id, command, engine_id, status
              FROM actions
              WHERE feature_id LIKE ? OR command LIKE ? OR engine_id LIKE ?
@@ -87,34 +142,11 @@ impl ActionRepo {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, feature_id, command, engine_id, status)| ActionRow {
-                id,
-                feature_id,
-                command,
-                engine_id,
-                status,
-            })
-            .collect())
+        Ok(rows)
     }
 
     pub async fn get(&self, id: i64) -> Result<Option<ActionDetail>, KeaError> {
-        let row = sqlx::query_as::<
-            _,
-            (
-                i64,
-                String,
-                String,
-                String,
-                Option<String>,
-                Option<String>,
-                String,
-                Option<String>,
-                String,
-                Option<String>,
-            ),
-        >(
+        let row = sqlx::query_as::<_, ActionDetail>(
             "SELECT id, feature_id, command, engine_id, model, provider_ref,
                     status, error, started_at, finished_at
              FROM actions WHERE id = ?",
@@ -122,31 +154,7 @@ impl ActionRepo {
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(
-            |(
-                id,
-                feature_id,
-                command,
-                engine_id,
-                model,
-                provider_ref,
-                status,
-                error,
-                started_at,
-                finished_at,
-            )| ActionDetail {
-                id,
-                feature_id,
-                command,
-                engine_id,
-                model,
-                provider_ref,
-                status,
-                error,
-                started_at,
-                finished_at,
-            },
-        ))
+        Ok(row)
     }
 
     pub async fn prune_older_than_days(&self, days: i64) -> Result<u64, KeaError> {
@@ -166,16 +174,40 @@ mod tests {
     use super::*;
     use crate::store::db::{open_pool, run_data_migrations};
 
+    #[test]
+    fn status_keeps_its_stored_spellings() {
+        // `started` is the column's DEFAULT; `ok`/`error` are what History
+        // shows. The enum must not re-spell any of the three.
+        for (status, text) in [
+            (ActionStatus::Started, "started"),
+            (ActionStatus::Ok, "ok"),
+            (ActionStatus::Error, "error"),
+        ] {
+            assert_eq!(status.as_str(), text);
+            assert_eq!(ActionStatus::from_str(text), Some(status));
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{text}\"")
+            );
+        }
+    }
+
     #[tokio::test]
     async fn record_then_list() {
         let pool = open_pool("sqlite::memory:").await.unwrap();
         run_data_migrations(&pool).await.unwrap();
         let repo = ActionRepo::new(pool);
 
-        let id = repo.record(NewAction {
-            feature_id: "demo".into(), command: "ping".into(),
-            engine_id: "noop".into(), model: None, provider_ref: None,
-        }).await.unwrap();
+        let id = repo
+            .record(NewAction {
+                feature_id: "demo".into(),
+                command: "ping".into(),
+                engine_id: "noop".into(),
+                model: None,
+                provider_ref: None,
+            })
+            .await
+            .unwrap();
         assert!(id > 0);
 
         let rows = repo.recent(10).await.unwrap();
@@ -198,9 +230,9 @@ mod tests {
             })
             .await
             .unwrap();
-        repo.finish(id, "ok", None).await.unwrap();
+        repo.finish(id, ActionStatus::Ok, None).await.unwrap();
         let rows = repo.recent(1).await.unwrap();
-        assert_eq!(rows[0].status, "ok");
+        assert_eq!(rows[0].status, ActionStatus::Ok);
     }
 
     #[tokio::test]
@@ -248,13 +280,13 @@ mod tests {
             })
             .await
             .unwrap();
-        repo.finish(id, "ok", None).await.unwrap();
+        repo.finish(id, ActionStatus::Ok, None).await.unwrap();
 
         let detail = repo.get(id).await.unwrap().expect("action exists");
         assert_eq!(detail.feature_id, "tts");
         assert_eq!(detail.command, "read_selection");
         assert_eq!(detail.model, Some("tts-1".into()));
-        assert_eq!(detail.status, "ok");
+        assert_eq!(detail.status, ActionStatus::Ok);
         assert!(detail.finished_at.is_some());
     }
 

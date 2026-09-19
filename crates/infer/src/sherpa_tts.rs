@@ -102,7 +102,11 @@ impl SherpaTtsInference for SherpaOnnxTtsInference {
                 .ok_or_else(|| InferError::Other("failed to create sherpa OfflineTts".into()))?;
 
             let audio = tts
-                .generate_with_config(&text, &GenerationConfig::default(), None::<fn(&[f32], f32) -> bool>)
+                .generate_with_config(
+                    &text,
+                    &GenerationConfig::default(),
+                    None::<fn(&[f32], f32) -> bool>,
+                )
                 .ok_or_else(|| InferError::Other("sherpa TTS returned no audio".into()))?;
 
             Ok(AudioPcm {

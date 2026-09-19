@@ -18,9 +18,7 @@ impl StubAudioIo {
 
 #[async_trait]
 impl AudioIo for StubAudioIo {
-    async fn start_mic(
-        &mut self,
-    ) -> Result<tokio::sync::mpsc::Receiver<PcmFrame>, AudioIoError> {
+    async fn start_mic(&mut self) -> Result<tokio::sync::mpsc::Receiver<PcmFrame>, AudioIoError> {
         Err(AudioIoError::Other(
             "audio I/O is not yet implemented on this platform".into(),
         ))

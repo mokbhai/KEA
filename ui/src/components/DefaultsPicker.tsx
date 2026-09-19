@@ -18,7 +18,9 @@ import {
   type Capability,
   type CapabilityOption,
 } from "../lib/capabilityDefaults";
-import Spinner from "./Spinner";
+import { cloudEngineFor } from "../lib/engines";
+import { toMessage } from "../lib/format";
+import LoadingBlock from "./LoadingBlock";
 
 export { CAPABILITY_LABELS };
 export type { Capability };
@@ -46,12 +48,6 @@ type Props = {
   /** Heading override, e.g. "Speech to text for Dictation". */
   title?: string;
 };
-
-function defaultEngineFor(capability: Capability, providerRef: string): string {
-  if (capability === "stt") return "openai-stt";
-  if (capability === "tts") return "openai-tts";
-  return providerRef === "openai" ? "openai" : "openai-compatible";
-}
 
 function findMatch(options: PickerOption[], binding: Binding): string | null {
   const match =
@@ -119,7 +115,7 @@ export default function DefaultsPicker({
           setCurrentId(binding ? findMatch(opts, binding) : null);
         }
       } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        if (!cancelled) setError(toMessage(e));
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -181,12 +177,12 @@ export default function DefaultsPicker({
         option.providerRef,
       );
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toMessage(e));
     }
   };
 
   const applyAdvanced = async () => {
-    const engine = advEngine.trim() || defaultEngineFor(capability, advProvider);
+    const engine = advEngine.trim() || cloudEngineFor(capability, advProvider);
     await pick({
       id: `advanced:${engine}:${advModel.trim()}`,
       label: advModel.trim() || engine,
@@ -214,10 +210,7 @@ export default function DefaultsPicker({
         </button>
       </div>
       {loading ? (
-        <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 80 }}>
-          <Spinner size={16} />
-          <span className="kea-muted">Loading options…</span>
-        </div>
+        <LoadingBlock label="Loading options…" minHeight={80} />
       ) : (
         <>
           <ul className="kea-picker__options">
@@ -325,7 +318,7 @@ export default function DefaultsPicker({
                   className="kea-input"
                   value={advEngine}
                   onChange={(e) => setAdvEngine(e.target.value)}
-                  placeholder={defaultEngineFor(capability, advProvider)}
+                  placeholder={cloudEngineFor(capability, advProvider)}
                 />
               </label>
               <button type="button" className="kea-btn" onClick={() => void applyAdvanced()}>

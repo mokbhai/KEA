@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::http::{HttpClient, MultipartPart};
-use crate::provider::{CredentialSource, ProviderConfig, ProviderConfigSource};
+use crate::http::{Auth, HttpClient, MultipartPart};
+use crate::provider::{self, CredentialSource, Defaults, ProviderConfigSource, OPENAI_BASE_URL};
 use crate::stt::audio::pcm_to_wav_bytes;
 use crate::traits::{AudioPcm, EngineCaps, EngineError, SttEngine, SttOpts, Transcript};
+
+const DEFAULT_MODEL: &str = "whisper-1";
 
 pub struct OpenAiSttEngine {
     pub http: Arc<dyn HttpClient>,
@@ -27,29 +29,25 @@ impl SttEngine for OpenAiSttEngine {
     }
 
     async fn transcribe(&self, audio: AudioPcm, opts: SttOpts) -> Result<Transcript, EngineError> {
-        let provider_ref = opts
-            .provider_ref
-            .as_deref()
-            .unwrap_or(&self.provider_ref);
-        let api_key = self
-            .credentials
-            .api_key(provider_ref)
-            .await
-            .map_err(|e| EngineError::Auth(format!("keychain access failed: {e}")))?
-            .ok_or_else(|| EngineError::Auth("missing api key".into()))?;
-        let cfg = self
-            .configs
-            .config(provider_ref)
-            .await
-            .unwrap_or(ProviderConfig {
-                base_url: "https://api.openai.com/v1".into(),
-                default_model: "whisper-1".into(),
-            });
-        let model = opts.model.as_deref().unwrap_or(&cfg.default_model);
+        let provider = provider::resolve(
+            self.credentials.as_ref(),
+            self.configs.as_ref(),
+            opts.provider_ref.as_deref(),
+            &self.provider_ref,
+            Some(Defaults {
+                base_url: OPENAI_BASE_URL,
+                model: DEFAULT_MODEL,
+            }),
+        )
+        .await?;
+        // The hosted transcription endpoint cannot serve an unauthenticated
+        // call, so fail before uploading the audio.
+        let api_key = provider.require_key()?;
+        let model = opts.model.as_deref().unwrap_or(&provider.default_model);
         let wav = pcm_to_wav_bytes(&audio)?;
         let url = format!(
             "{}/audio/transcriptions",
-            cfg.base_url.trim_end_matches('/')
+            provider.base_url.trim_end_matches('/')
         );
         let parts = vec![
             MultipartPart {
@@ -65,12 +63,12 @@ impl SttEngine for OpenAiSttEngine {
                 data: model.as_bytes().to_vec(),
             },
         ];
-        let (status, text) = self.http.post_multipart(&url, &api_key, parts).await?;
-        if status != 200 {
-            return Err(EngineError::http(status, text));
-        }
-        let parsed: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let text = self
+            .http
+            .post_multipart(&url, Auth::Bearer(api_key), parts)
+            .await?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| EngineError::Other(e.to_string()))?;
         let content = parsed["text"]
             .as_str()
             .ok_or_else(|| EngineError::Other("missing text field".into()))?;
@@ -84,6 +82,7 @@ impl SttEngine for OpenAiSttEngine {
 mod tests {
     use super::*;
     use crate::http::ReqwestHttpClient;
+    use crate::provider::ProviderConfig;
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -137,9 +136,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(r#"{"text":"dictated text"}"#),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"text":"dictated text"}"#))
             .mount(&server)
             .await;
 
@@ -176,7 +173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maps_non_2xx_to_error() {
+    async fn server_rejection_becomes_an_auth_error() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
@@ -213,7 +210,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("401"));
+        match &err {
+            EngineError::Auth(msg) => assert!(msg.contains("401")),
+            _ => panic!("expected EngineError::Auth, got {:?}", err),
+        }
     }
 
     #[tokio::test]
@@ -243,17 +243,17 @@ mod tests {
             EngineError::Auth(msg) => assert!(msg.contains("missing api key")),
             _ => panic!("expected EngineError::Auth, got {:?}", err),
         }
-        assert!(err.to_string().contains("check the API key in provider settings"));
+        assert!(err
+            .to_string()
+            .contains("check the API key in provider settings"));
     }
 
     #[tokio::test]
-    async fn http_error_carries_status() {
+    async fn rate_limit_is_retryable() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
-            .respond_with(
-                ResponseTemplate::new(429).set_body_string(r#"{"error":"rate limited"}"#),
-            )
+            .respond_with(ResponseTemplate::new(429).set_body_string(r#"{"error":"rate limited"}"#))
             .mount(&server)
             .await;
 
@@ -282,8 +282,8 @@ mod tests {
             .await
             .unwrap_err();
         match &err {
-            EngineError::Http { status, .. } => assert_eq!(*status, 429),
-            _ => panic!("expected EngineError::Http, got {:?}", err),
+            EngineError::Retryable { status, .. } => assert_eq!(*status, 429),
+            _ => panic!("expected EngineError::Retryable, got {:?}", err),
         }
     }
 }
