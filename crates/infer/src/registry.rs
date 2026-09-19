@@ -14,6 +14,21 @@ pub const DIARIZATION_SEGMENTATION_ID: &str = "pyannote-segmentation-3-0";
 /// The embedding half of the diarization pair, by catalog id.
 pub const DIARIZATION_EMBEDDING_ID: &str = "campplus-sv-en-voxceleb-16k";
 
+/// The vocoder every Matcha voice loads alongside its acoustic model.
+///
+/// One row rather than a field on each Matcha voice: the vocoder is 3.7 MB of
+/// weights shared by all of them, and the installer already knows how to fetch
+/// a bare `.onnx` (see [`OnnxBundleShape::SingleFile`]). This is the
+/// diarization shape again — one family, two downloads, paired by id at load
+/// time — not a new kind of catalog entry.
+pub const MATCHA_VOCODER_ID: &str = "hifigan-v2";
+
+/// The filename the vocoder installs as, and therefore the one the loader
+/// looks for. Named once so the installer and the loader cannot disagree —
+/// the failure that would produce is a voice that downloads and then reports
+/// its vocoder missing forever.
+pub const MATCHA_VOCODER_FILE: &str = "hifigan_v2.onnx";
+
 /// The model families the app can install.
 ///
 /// The variant names are also the wire strings: the UI already sends
@@ -221,12 +236,47 @@ pub enum OnnxModelKind {
     TtsVits,
     TtsKokoro,
     TtsKitten,
+    /// A Matcha acoustic model, loaded through `OfflineTtsMatchaModelConfig`.
+    ///
+    /// The only voice family that cannot speak on its own: it predicts a
+    /// mel-spectrogram and needs [`TtsVocoder`](Self::TtsVocoder) to turn that
+    /// into audio.
+    TtsMatcha,
+    /// The HiFiGAN vocoder a Matcha voice loads beside its acoustic model.
+    ///
+    /// In the TTS catalog but never selectable as a voice — see
+    /// [`OnnxModelKind::is_voice`].
+    TtsVocoder,
     /// pyannote segmentation, loaded through
     /// `OfflineSpeakerSegmentationModelConfig`.
     SpeakerSegmentation,
     /// A speaker-embedding extractor, loaded through
     /// `SpeakerEmbeddingExtractorConfig`.
     SpeakerEmbedding,
+}
+
+impl OnnxModelKind {
+    /// Whether a bundle of this shape can be spoken with.
+    ///
+    /// "Is it in the TTS catalog" and "can the user pick it as a voice" used
+    /// to be the same question. They stopped being the same when the Matcha
+    /// vocoder joined the family: it downloads through the TTS section, lives
+    /// under the TTS storage root and is required for a Matcha voice to work,
+    /// but selecting it as *the voice* can only fail. Answering that here
+    /// rather than at each picker keeps the two from drifting.
+    pub fn is_voice(self) -> bool {
+        match self {
+            OnnxModelKind::TtsVits
+            | OnnxModelKind::TtsKokoro
+            | OnnxModelKind::TtsKitten
+            | OnnxModelKind::TtsMatcha => true,
+            OnnxModelKind::TtsVocoder
+            | OnnxModelKind::Parakeet
+            | OnnxModelKind::StreamingZipformer
+            | OnnxModelKind::SpeakerSegmentation
+            | OnnxModelKind::SpeakerEmbedding => false,
+        }
+    }
 }
 
 /// How an ONNX asset arrives, and therefore how it is installed and how its
@@ -433,6 +483,19 @@ impl ModelRegistry {
 
     pub fn find_tts(id: &str) -> Option<OnnxModelEntry> {
         Self::find(ModelKind::Tts, id).and_then(ModelEntry::into_onnx)
+    }
+
+    /// The TTS catalog minus the entries that are not voices — today, the
+    /// Matcha vocoder.
+    ///
+    /// What a voice picker and a "which voice do we fall back to" rule both
+    /// want. `tts_catalog` stays complete because the vocoder still has to be
+    /// offered for download, resolved for delete, and reported as installed.
+    pub fn tts_voices() -> Vec<OnnxModelEntry> {
+        Self::tts_catalog()
+            .into_iter()
+            .filter(|entry| entry.kind.is_voice() && !entry.deprecated)
+            .collect()
     }
 
     /// The catalog a picker should offer: everything that is not retired.
@@ -724,6 +787,42 @@ impl ModelRegistry {
                 kind: ModelKind::Tts,
                 onnx_kind: Some(OnnxModelKind::TtsKokoro),
                 bundle: OnnxBundleShape::TokensBundle,
+                deprecated: false,
+            },
+            // Matcha and its vocoder, in that order, because they read as the
+            // pair they are: neither is usable without the other. Two rows of
+            // one kind rather than one row with two URLs — the diarization
+            // shape, and the reason `OnnxBundleShape` exists.
+            ModelEntry {
+                id: "matcha-icefall-en-us-ljspeech".into(),
+                display_name: "Matcha LJSpeech (US English)".into(),
+                language: "en-US".into(),
+                url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/matcha-icefall-en_US-ljspeech.tar.bz2"
+                    .into(),
+                size_bytes: 76_741_121,
+                sha256: "ea75702da7456a8b1874728278a835220dc8a26f4e8bd93c83bf53dc27679845"
+                    .into(),
+                kind: ModelKind::Tts,
+                onnx_kind: Some(OnnxModelKind::TtsMatcha),
+                bundle: OnnxBundleShape::TokensBundle,
+                deprecated: false,
+            },
+            ModelEntry {
+                id: MATCHA_VOCODER_ID.into(),
+                display_name: "HiFiGAN v2 (required by Matcha voices)".into(),
+                language: "multilingual".into(),
+                url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/hifigan_v2.onnx"
+                    .into(),
+                size_bytes: 3_749_714,
+                sha256: "a41d404cce7924493540238da5b30a4bc14b6ddaf1a37f3c79fa4f59548c19f0"
+                    .into(),
+                kind: ModelKind::Tts,
+                onnx_kind: Some(OnnxModelKind::TtsVocoder),
+                // The vocoder release publishes bare `.onnx` files, like the
+                // speaker-embedding model does.
+                bundle: OnnxBundleShape::SingleFile {
+                    filename: MATCHA_VOCODER_FILE.into(),
+                },
                 deprecated: false,
             },
             ModelEntry {
@@ -1067,18 +1166,20 @@ mod tests {
     #[test]
     fn tts_catalog_entries_are_valid() {
         let models = ModelRegistry::tts_catalog();
-        assert_eq!(models.len(), 14);
+        assert_eq!(models.len(), 16);
         // The sherpa-tts engine falls back to the first entry it finds
         // installed, so the head of this list is the default voice a fresh
         // install gets — 26 MB rather than 67 MB, and a better voice.
         assert_eq!(models[0].id, "kitten-nano-en-v0.2");
         for entry in &models {
-            // Per-entry kind, not a constant: the TTS family now holds three
-            // bundle shapes, and asserting a constant here is exactly what
-            // would hide a Kokoro entry being loaded as VITS.
+            // Per-entry kind, not a constant: the TTS family now holds four
+            // bundle shapes plus a vocoder, and asserting a constant here is
+            // exactly what would hide a Kokoro entry being loaded as VITS.
             let expected = match entry.id.as_str() {
+                MATCHA_VOCODER_ID => OnnxModelKind::TtsVocoder,
                 id if id.starts_with("kokoro-") => OnnxModelKind::TtsKokoro,
                 id if id.starts_with("kitten-") => OnnxModelKind::TtsKitten,
+                id if id.starts_with("matcha-") => OnnxModelKind::TtsMatcha,
                 _ => OnnxModelKind::TtsVits,
             };
             assert_eq!(entry.kind, expected, "wrong bundle shape: {}", entry.id);
@@ -1305,12 +1406,17 @@ mod tests {
         assert_eq!(embedding.size_bytes, 29_596_978);
     }
 
-    /// Every existing entry must keep the shape it had before the enum
-    /// existed, or a released model becomes uninstallable on upgrade.
+    /// Every entry that shipped as a `tokens.txt`-rooted bundle must keep that
+    /// shape, or a released model becomes uninstallable on upgrade. The
+    /// vocoder is the one TTS row that was never an archive, so it is named
+    /// here rather than weakening the assertion for the other fifteen.
     #[test]
     fn every_non_diarization_entry_is_still_a_tokens_bundle() {
         for kind in [ModelKind::Parakeet, ModelKind::Tts, ModelKind::Streaming] {
             for entry in ModelRegistry::onnx_catalog(kind).unwrap() {
+                if entry.id == MATCHA_VOCODER_ID {
+                    continue;
+                }
                 assert_eq!(
                     entry.bundle,
                     OnnxBundleShape::TokensBundle,
@@ -1318,6 +1424,67 @@ mod tests {
                     entry.id
                 );
             }
+        }
+    }
+
+    /// Matcha is the diarization shape inside the TTS family: two rows, two
+    /// package shapes, paired at load time. Written as a test because the
+    /// failure mode is a voice that installs, reports itself present, and
+    /// then cannot synthesize a sound.
+    #[test]
+    fn matcha_and_its_vocoder_are_two_rows_of_one_family() {
+        let voice = ModelRegistry::find_tts("matcha-icefall-en-us-ljspeech").expect("matcha entry");
+        assert_eq!(voice.kind, OnnxModelKind::TtsMatcha);
+        assert!(voice.url.ends_with("matcha-icefall-en_US-ljspeech.tar.bz2"));
+        assert!(voice.bundle.is_archive());
+        assert_eq!(voice.size_bytes, 76_741_121);
+
+        let vocoder = ModelRegistry::find_tts(MATCHA_VOCODER_ID).expect("vocoder entry");
+        assert_eq!(vocoder.kind, OnnxModelKind::TtsVocoder);
+        assert!(
+            vocoder.url.ends_with(".onnx"),
+            "a bare file, not an archive"
+        );
+        assert!(!vocoder.bundle.is_archive());
+        assert_eq!(vocoder.size_bytes, 3_749_714);
+        // The installer writes this name and the loader looks for it; one
+        // constant so they cannot disagree.
+        assert_eq!(vocoder.bundle.marker(), MATCHA_VOCODER_FILE);
+    }
+
+    /// The vocoder has to be downloadable — so it is in the catalog — without
+    /// ever being offered as something to speak with.
+    #[test]
+    fn the_vocoder_is_offered_for_download_but_never_as_a_voice() {
+        let offered: Vec<String> = ModelRegistry::offered(ModelKind::Tts)
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert!(offered.contains(&MATCHA_VOCODER_ID.to_string()));
+
+        let voices: Vec<String> = ModelRegistry::tts_voices()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert!(!voices.contains(&MATCHA_VOCODER_ID.to_string()));
+        assert!(voices.contains(&"matcha-icefall-en-us-ljspeech".to_string()));
+        assert_eq!(voices.len(), ModelRegistry::tts_catalog().len() - 1);
+        // The head of the voice list is still the recommended download, which
+        // is what the engine falls back to.
+        assert_eq!(voices[0], "kitten-nano-en-v0.2");
+
+        for entry in ModelRegistry::tts_voices() {
+            assert!(entry.kind.is_voice(), "{} is not a voice", entry.id);
+        }
+        // Nothing outside the TTS family is a voice either.
+        for kind in [
+            OnnxModelKind::Parakeet,
+            OnnxModelKind::StreamingZipformer,
+            OnnxModelKind::SpeakerSegmentation,
+            OnnxModelKind::SpeakerEmbedding,
+            OnnxModelKind::TtsVocoder,
+        ] {
+            assert!(!kind.is_voice(), "{kind:?}");
         }
     }
 

@@ -16,13 +16,14 @@ pub use error::InferError;
 pub use registry::{
     ModelEntry, ModelKind, ModelRegistry, OnnxBundleShape, OnnxModelEntry, OnnxModelKind,
     OnnxVoice, WhisperModelEntry, DIARIZATION_EMBEDDING_ID, DIARIZATION_SEGMENTATION_ID,
+    MATCHA_VOCODER_FILE, MATCHA_VOCODER_ID,
 };
 pub use sherpa_diarize::{DiarizationModels, DiarizationOpts, SpeakerDiarization, SpeakerSpan};
 pub use sherpa_stream::{
     find_streaming_model_files, SherpaStreamSession, SherpaStreamingInference, StreamingModelFiles,
 };
-pub use sherpa_stt::SherpaSttInference;
-pub use sherpa_tts::{find_tts_bundle, SherpaTtsInference, TtsBundle};
+pub use sherpa_stt::{plan_hotwords, HotwordPlan, SherpaSttInference, SttHotwords};
+pub use sherpa_tts::{find_tts_bundle, SherpaTtsInference, TtsBundle, TtsModelPaths};
 pub use storage::ModelStorage;
 pub use types::{
     clamp_tts_speed, group_tokens_into_segments, join_segment_text, AudioPcm, StreamingCfg,

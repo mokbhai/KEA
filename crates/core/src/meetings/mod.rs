@@ -1,6 +1,7 @@
 pub mod attribution;
 pub mod export;
 pub mod interim;
+pub mod notion;
 pub mod settings;
 pub mod synthesis;
 
@@ -9,6 +10,12 @@ pub use export::{markdown_file_name, meeting_to_markdown};
 pub use interim::{
     should_run_interim, InterimCadence, MAX_CONSECUTIVE_INTERIM_FAILURES, MIN_INTERIM_GAP_SECS,
 };
+pub use notion::{
+    append_children_payload, block_children_url, chunk_children, classify, create_page_payload,
+    markdown_to_blocks, page_id, page_url, parse_page_id, NotionError, MAX_CHILDREN_PER_REQUEST,
+    NOTION_API_VERSION, NOTION_PAGES_URL,
+};
+
 pub use settings::{MeetingSettings, MeetingSettingsRepo};
 pub use synthesis::{
     build_interim_notes_request, build_meeting_notes_request, build_meeting_title_request,

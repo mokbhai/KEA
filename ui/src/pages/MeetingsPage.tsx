@@ -3,6 +3,7 @@ import {
   addMeetingActionItem,
   deleteMeeting,
   exportMeetingMarkdown,
+  exportMeetingToNotion,
   getMeeting,
   getMeetingSettings,
   getMeetingState,
@@ -30,6 +31,7 @@ import {
   type MeetingNotes,
   type MeetingSettings,
   type MeetingState,
+  type NotionStatus,
   type PermStatus,
   type SystemAudioCapability,
 } from "../api";
@@ -40,6 +42,7 @@ import HotkeyRow from "../components/HotkeyRow";
 import LevelMeter from "../components/LevelMeter";
 import LoadingBlock from "../components/LoadingBlock";
 import MeetingDetailView from "../components/MeetingDetail";
+import NotionSettings from "../components/NotionSettings";
 import { Row, RowGroup } from "../components/SettingsRow";
 import Toggle from "../components/Toggle";
 import TranscriptPanel, {
@@ -114,6 +117,9 @@ export default function MeetingsPage({ onNavigate }: Props) {
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
   const [listStatus, setListStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Fed by the Notion card below, which is the only thing that reads or writes
+  // that setup; the page only needs to know whether to offer the button.
+  const [notionStatus, setNotionStatus] = useState<NotionStatus | null>(null);
 
   const [state, setState] = useState<MeetingState>("idle");
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
@@ -352,6 +358,31 @@ export default function MeetingsPage({ onNavigate }: Props) {
       // Revealing it is what makes a fixed destination acceptable: the user
       // never has to know where Downloads is.
       await revealPath(path).catch(() => {});
+    } catch (e) {
+      setListStatus(toMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * Notion is offered only once both halves of its setup are saved.
+   *
+   * A "Send to Notion" button on an unconfigured app is a button whose only
+   * behaviour is an error, and the fix for that error is two screens away.
+   */
+  const notionReady = Boolean(
+    notionStatus?.has_token &&
+      notionStatus.parent_page.trim() &&
+      !notionStatus.parent_page_error,
+  );
+
+  const onExportNotion = async () => {
+    if (!selectedId) return;
+    setBusy(true);
+    try {
+      const url = await exportMeetingToNotion(selectedId);
+      setListStatus(`Sent to Notion — ${url}`);
     } catch (e) {
       setListStatus(toMessage(e));
     } finally {
@@ -616,6 +647,8 @@ export default function MeetingsPage({ onNavigate }: Props) {
 
       <FeatureAiCard ai={ai} featureLabel="Meetings" />
 
+      <NotionSettings onStatusChange={setNotionStatus} />
+
       <section style={{ marginBottom: 24 }}>
         <h2 style={{ margin: "0 0 12px" }}>Try it</h2>
         <div className="kea-card">
@@ -783,6 +816,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
               onAddActionItem={onAddActionItem}
               onCopyMarkdown={onCopyMarkdown}
               onSaveMarkdown={onSaveMarkdown}
+              onExportNotion={notionReady ? onExportNotion : undefined}
             />
           ) : selectedId && busy ? (
             <LoadingBlock label="Loading meeting…" />

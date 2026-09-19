@@ -46,6 +46,11 @@ type Props = {
   onCopyMarkdown?: () => void | Promise<void>;
   /** Write the meeting to a file and reveal it. */
   onSaveMarkdown?: () => void | Promise<void>;
+  /**
+   * Send the meeting to Notion as a new page. Omitted when Notion is not set
+   * up, so the button never appears as something that will just fail.
+   */
+  onExportNotion?: () => void | Promise<void>;
   busy?: boolean;
 };
 
@@ -350,11 +355,12 @@ export default function MeetingDetail({
   onAddActionItem,
   onCopyMarkdown,
   onSaveMarkdown,
+  onExportNotion,
   busy = false,
 }: Props) {
   const { meeting, segments, notes, speakers, action_items: actionItems } = detail;
 
-  const canExport = Boolean(onCopyMarkdown || onSaveMarkdown);
+  const canExport = Boolean(onCopyMarkdown || onSaveMarkdown || onExportNotion);
 
   return (
     <div>
@@ -439,6 +445,16 @@ export default function MeetingDetail({
                 disabled={busy}
               >
                 Save as Markdown
+              </button>
+            )}
+            {onExportNotion && (
+              <button
+                type="button"
+                className="kea-btn"
+                onClick={() => void onExportNotion()}
+                disabled={busy}
+              >
+                Send to Notion
               </button>
             )}
           </div>

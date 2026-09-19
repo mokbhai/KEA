@@ -334,6 +334,17 @@ export const setHotkey = (feature: string, command: string, accelerator: string)
   invoke<void>("set_hotkey", { feature, command, accelerator });
 
 /**
+ * Unbind a shortcut entirely.
+ *
+ * {@link setHotkey} can only move a binding, so this is the only way back to
+ * "not set". It exists for the translate shortcuts: dropping a language has to
+ * take its combo with it, or the key stays booked for a language no screen
+ * shows any more.
+ */
+export const clearHotkey = (feature: string, command: string) =>
+  invoke<void>("clear_hotkey", { feature, command });
+
+/**
  * Rewrites the current selection in the frontmost app and replaces it there.
  *
  * `parameter` is whatever the mode needs (see {@link MODE_PARAMETER}): Ask
@@ -765,6 +776,35 @@ export const meetingMarkdown = (meetingId: string) =>
 /** Writes the Markdown to `~/Downloads` and returns the path it wrote. */
 export const exportMeetingMarkdown = (meetingId: string) =>
   invoke<string>("export_meeting_markdown", { meetingId });
+
+/**
+ * Writes the meeting to Notion as a new page and returns its URL.
+ *
+ * Pressed from the meeting's own screen, never on stop: an export that cannot
+ * run while a meeting is ending cannot delay one.
+ */
+export const exportMeetingToNotion = (meetingId: string) =>
+  invoke<string>("export_meeting_to_notion", { meetingId });
+
+/** Whether the Notion export is set up, and what is wrong if it is not. */
+export type NotionStatus = {
+  has_token: boolean;
+  /** The destination link as it was pasted; "" when unset. */
+  parent_page: string;
+  /** Why the saved link is unusable, if it is. */
+  parent_page_error: string | null;
+};
+
+export const getNotionStatus = () => invoke<NotionStatus>("get_notion_status");
+
+/** Saves the integration secret in the keychain. */
+export const setNotionToken = (token: string) =>
+  invoke<void>("set_notion_token", { token });
+
+export const clearNotionToken = () => invoke<void>("clear_notion_token");
+
+/** The settings key holding the Notion page exports become children of. */
+export const NOTION_PARENT_PAGE_SETTING = "meetings.notion.parent_page";
 
 export const setMeetingActionItemStatus = (id: number, status: ActionItemStatus) =>
   invoke<void>("set_meeting_action_item_status", { id, status });

@@ -1,16 +1,22 @@
 //! Local TTS engine backed by injectable [`SherpaTtsInference`].
 //!
-//! One engine for three bundle shapes (Piper/VITS, Kokoro, Kitten): they share
-//! a storage root, a download path and a picker section, and differ only in
-//! which sherpa model config loads them — which the catalog already records,
-//! so the engine dispatches on the entry rather than sniffing the directory.
+//! One engine for four bundle shapes (Piper/VITS, Kokoro, Kitten, Matcha):
+//! they share a storage root, a download path and a picker section, and differ
+//! only in which sherpa model config loads them — which the catalog already
+//! records, so the engine dispatches on the entry rather than sniffing the
+//! directory.
+//!
+//! Matcha is the one voice whose files are two downloads: an acoustic model
+//! and the shared HiFiGAN vocoder, which is its own catalog row. Pairing them
+//! is this engine's job, because it is the layer that has the storage root —
+//! the same split as `DiarizationModels::locate`.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use kea_infer::{
-    clamp_tts_speed, ModelKind, ModelRegistry, ModelStorage, OnnxModelKind, SherpaTtsInference,
-    TtsSynthOpts,
+    clamp_tts_speed, ModelRegistry, ModelStorage, OnnxModelKind, SherpaTtsInference, TtsModelPaths,
+    TtsSynthOpts, MATCHA_VOCODER_FILE, MATCHA_VOCODER_ID,
 };
 
 use crate::traits::{AudioPcm, EngineCaps, EngineError, TtsEngine, TtsOpts};
@@ -32,13 +38,37 @@ impl LocalTtsEngine {
     /// predates it would otherwise fall back to a model that is not on disk
     /// and fail with "not installed" for a voice the user never chose.
     fn default_model(&self) -> String {
-        let catalog = ModelRegistry::offered(ModelKind::Tts);
+        // Voices, not the whole TTS catalog: the Matcha vocoder installs into
+        // the same root and would otherwise be picked as "the first installed
+        // entry" and then refuse to speak.
+        let catalog = ModelRegistry::tts_voices();
         catalog
             .iter()
             .find(|entry| self.storage.is_onnx_installed(&entry.id))
             .or_else(|| catalog.first())
             .map(|entry| entry.id.clone())
             .unwrap_or_else(|| "vits-piper-en-us-lessac-medium".into())
+    }
+
+    /// Where the files for this voice live, pairing in the vocoder when the
+    /// voice needs one.
+    ///
+    /// A Matcha voice with no vocoder on disk is refused here rather than
+    /// allowed to reach sherpa: `ModelNotInstalled` is the variant whose
+    /// message tells the user to download something, and the something is
+    /// named.
+    fn paths_for(&self, model_id: &str, kind: OnnxModelKind) -> Result<TtsModelPaths, EngineError> {
+        let paths = TtsModelPaths::new(self.storage.onnx_dir_for(model_id));
+        if kind != OnnxModelKind::TtsMatcha {
+            return Ok(paths);
+        }
+        let vocoder_dir = self.storage.onnx_dir_for(MATCHA_VOCODER_ID);
+        if !vocoder_dir.join(MATCHA_VOCODER_FILE).is_file() {
+            return Err(EngineError::ModelNotInstalled(format!(
+                "the voice '{model_id}' also needs the vocoder '{MATCHA_VOCODER_ID}'"
+            )));
+        }
+        Ok(paths.with_vocoder(vocoder_dir))
     }
 }
 
@@ -50,7 +80,9 @@ impl TtsEngine for LocalTtsEngine {
 
     fn capabilities(&self) -> EngineCaps {
         EngineCaps {
-            models: ModelRegistry::offered(ModelKind::Tts)
+            // What this engine can be asked to *speak with*. The vocoder is
+            // offered for download elsewhere; binding to it could only fail.
+            models: ModelRegistry::tts_voices()
                 .into_iter()
                 .map(|m| m.id)
                 .collect(),
@@ -90,10 +122,10 @@ impl TtsEngine for LocalTtsEngine {
             speed: clamp_tts_speed(opts.speed.unwrap_or(1.0)),
         };
 
-        let model_dir = self.storage.onnx_dir_for(model_id);
+        let paths = self.paths_for(model_id, kind)?;
         let pcm = self
             .inference
-            .synthesize(text, &model_dir, kind, synth_opts)
+            .synthesize(text, &paths, kind, synth_opts)
             .await
             .map_err(|e| EngineError::Other(e.to_string()))?;
 
@@ -118,7 +150,6 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use kea_infer::{AudioPcm as InferAudioPcm, SherpaTtsInference};
-    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     /// Records what the engine resolved, which is the whole contract here —
@@ -126,7 +157,7 @@ mod tests {
     /// the speaker id and the rate can be observed.
     #[derive(Default)]
     struct FakeSherpaTtsInference {
-        seen: Mutex<Vec<(PathBuf, OnnxModelKind, TtsSynthOpts)>>,
+        seen: Mutex<Vec<(TtsModelPaths, OnnxModelKind, TtsSynthOpts)>>,
     }
 
     #[async_trait]
@@ -134,14 +165,11 @@ mod tests {
         async fn synthesize(
             &self,
             text: &str,
-            model_dir: &Path,
+            paths: &TtsModelPaths,
             kind: OnnxModelKind,
             opts: TtsSynthOpts,
         ) -> Result<InferAudioPcm, kea_infer::InferError> {
-            self.seen
-                .lock()
-                .unwrap()
-                .push((model_dir.to_path_buf(), kind, opts));
+            self.seen.lock().unwrap().push((paths.clone(), kind, opts));
             Ok(InferAudioPcm {
                 samples: vec![0.0; text.len() * 100],
                 sample_rate_hz: 22_050,
@@ -154,6 +182,13 @@ mod tests {
         let dir = storage.onnx_dir_for(model_id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("tokens.txt"), b"tok").unwrap();
+    }
+
+    /// The vocoder is a bare `.onnx`, so its marker is the file itself.
+    fn install_vocoder(storage: &ModelStorage) {
+        let dir = storage.onnx_dir_for(MATCHA_VOCODER_ID);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MATCHA_VOCODER_FILE), b"w").unwrap();
     }
 
     #[tokio::test]
@@ -215,9 +250,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let (dir, kind, _) = inference.seen.lock().unwrap().last().unwrap().clone();
+            let (paths, kind, _) = inference.seen.lock().unwrap().last().unwrap().clone();
             assert_eq!(kind, expected, "wrong bundle shape for {model_id}");
-            assert_eq!(dir, storage.onnx_dir_for(model_id));
+            assert_eq!(paths.model_dir, storage.onnx_dir_for(model_id));
         }
     }
 
@@ -301,7 +336,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            inference.seen.lock().unwrap()[0].0,
+            inference.seen.lock().unwrap()[0].0.model_dir,
             storage.onnx_dir_for("vits-piper-en-us-lessac-medium")
         );
 
@@ -312,7 +347,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            inference.seen.lock().unwrap().last().unwrap().0,
+            inference.seen.lock().unwrap().last().unwrap().0.model_dir,
+            storage.onnx_dir_for("kitten-nano-en-v0.2")
+        );
+    }
+
+    /// Matcha is two downloads. The engine is the layer that owns the storage
+    /// root, so pairing them is its job — and the acoustic model's directory
+    /// must not be mistaken for the vocoder's.
+    #[tokio::test]
+    async fn a_matcha_voice_is_handed_both_of_its_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(ModelStorage::new(dir.path().to_path_buf()));
+        install(&storage, "matcha-icefall-en-us-ljspeech");
+        install_vocoder(&storage);
+        let inference = Arc::new(FakeSherpaTtsInference::default());
+        let engine = LocalTtsEngine::new(inference.clone(), storage.clone());
+
+        engine
+            .synthesize(
+                "hello",
+                TtsOpts {
+                    model: Some("matcha-icefall-en-us-ljspeech".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let (paths, kind, _) = inference.seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(kind, OnnxModelKind::TtsMatcha);
+        assert_eq!(
+            paths.model_dir,
+            storage.onnx_dir_for("matcha-icefall-en-us-ljspeech")
+        );
+        assert_eq!(
+            paths.vocoder_dir,
+            Some(storage.onnx_dir_for(MATCHA_VOCODER_ID))
+        );
+    }
+
+    /// Half an install is the interesting case: the voice is on disk, so the
+    /// ordinary "not installed" check passes, and the missing piece has to be
+    /// named or the user is told a voice they just downloaded does not work.
+    #[tokio::test]
+    async fn matcha_without_its_vocoder_names_the_missing_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(ModelStorage::new(dir.path().to_path_buf()));
+        install(&storage, "matcha-icefall-en-us-ljspeech");
+        let inference = Arc::new(FakeSherpaTtsInference::default());
+        let engine = LocalTtsEngine::new(inference.clone(), storage);
+
+        let err = engine
+            .synthesize(
+                "hello",
+                TtsOpts {
+                    model: Some("matcha-icefall-en-us-ljspeech".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ModelNotInstalled(_)), "{err}");
+        assert!(err.to_string().contains(MATCHA_VOCODER_ID), "{err}");
+        // And nothing was synthesized in another voice instead.
+        assert!(inference.seen.lock().unwrap().is_empty());
+    }
+
+    /// The vocoder lives in the TTS catalog so it can be downloaded, but it
+    /// is not something to speak with: it must never be offered as a model,
+    /// and never chosen as the fallback voice just because it is on disk.
+    #[tokio::test]
+    async fn the_vocoder_is_never_treated_as_a_voice() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(ModelStorage::new(dir.path().to_path_buf()));
+        install_vocoder(&storage);
+        let inference = Arc::new(FakeSherpaTtsInference::default());
+        let engine = LocalTtsEngine::new(inference.clone(), storage.clone());
+
+        assert!(!engine
+            .capabilities()
+            .models
+            .contains(&MATCHA_VOCODER_ID.to_string()));
+
+        // With only the vocoder on disk there is no installed voice, so the
+        // fallback is the recommended download — and it is reported missing,
+        // not silently loaded as a voice.
+        let err = engine
+            .synthesize("hello", TtsOpts::default())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("kitten-nano-en-v0.2"), "{err}");
+
+        install(&storage, "kitten-nano-en-v0.2");
+        engine
+            .synthesize("hello", TtsOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            inference.seen.lock().unwrap().last().unwrap().0.model_dir,
             storage.onnx_dir_for("kitten-nano-en-v0.2")
         );
     }

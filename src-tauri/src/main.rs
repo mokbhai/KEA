@@ -5,6 +5,7 @@ mod commands;
 mod events;
 mod hotkeys;
 mod macfocus;
+mod notion;
 mod nswindow;
 mod overlay;
 mod palette;
@@ -318,6 +319,7 @@ fn main() {
             commands::get_effective_hotkey,
             commands::get_hotkey_registration_status,
             commands::set_hotkey,
+            commands::clear_hotkey,
             commands::trigger_rewrite,
             commands::preview_rewrite,
             commands::run_demo,
@@ -344,6 +346,10 @@ fn main() {
             commands::delete_meeting,
             commands::meeting_markdown,
             commands::export_meeting_markdown,
+            commands::export_meeting_to_notion,
+            commands::get_notion_status,
+            commands::set_notion_token,
+            commands::clear_notion_token,
             commands::set_meeting_action_item_status,
             commands::add_meeting_action_item,
             commands::set_meeting_title,

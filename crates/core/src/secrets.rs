@@ -12,6 +12,14 @@ use std::sync::Mutex;
 /// spelling of this string would silently mint a second token.
 pub const LOCAL_API_TOKEN_REF: &str = "local-api-token";
 
+/// The credential-store slot holding the Notion internal integration token.
+///
+/// Beside [`LOCAL_API_TOKEN_REF`] and for the same reason: a `provider_ref` is
+/// whatever this module says it is, and a second module spelling this string
+/// its own way would quietly look at an empty slot. The token is a secret the
+/// user pastes, so it belongs here and never in the settings table.
+pub const NOTION_TOKEN_REF: &str = "notion-integration-token";
+
 #[async_trait]
 pub trait CredentialStore: Send + Sync {
     async fn get(&self, provider_ref: &str) -> Result<Option<String>, KeaError>;

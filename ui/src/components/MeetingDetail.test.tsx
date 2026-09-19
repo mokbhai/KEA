@@ -268,6 +268,21 @@ describe("MeetingDetail", () => {
     expect(onCopyMarkdown).toHaveBeenCalledTimes(1);
     // Save is a separate opt-in, not a package deal with copy.
     expect(screen.queryByRole("button", { name: "Save as Markdown" })).toBeNull();
+    // And so is Notion, which the page withholds until it is set up.
+    expect(screen.queryByRole("button", { name: "Send to Notion" })).toBeNull();
+  });
+
+  it("sends to Notion when the page offers that destination", async () => {
+    const onExportNotion = vi.fn();
+    render(
+      <MeetingDetail
+        detail={detail()}
+        onDelete={() => {}}
+        onExportNotion={onExportNotion}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send to Notion" }));
+    expect(onExportNotion).toHaveBeenCalledTimes(1);
   });
 
   // --- item 17: calendar titles ---

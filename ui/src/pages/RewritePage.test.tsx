@@ -228,6 +228,12 @@ describe("RewritePage", () => {
         invokeCalls("set_setting").find((c) => c?.key === "rewrite.translate.targets"),
       ).toEqual({ key: "rewrite.translate.targets", value: '["ja"]' }),
     );
+    // And the shortcut goes with it: a combo still registered for a language
+    // the page no longer lists is a key stolen from every other app with no
+    // way left to get it back.
+    expect(invokeCalls("clear_hotkey")).toEqual([
+      { feature: "rewrite", command: "translate.fr" },
+    ]);
   });
 
   it("rewrites the sample text without pasting it anywhere", async () => {

@@ -1,31 +1,70 @@
 //! Local text-to-speech through sherpa-onnx.
 //!
-//! Three bundle shapes share one storage root, one download path and one
+//! Four bundle shapes share one storage root, one download path and one
 //! picker section but not one sherpa model config, so what this module really
 //! owns is the mapping from [`OnnxModelKind`] to "which files, into which
 //! config". The file-locating half is deliberately outside the `sherpa`
 //! feature gate: it is path logic with no native dependency, and it is the
 //! half that can be tested without a 100 MB bundle on disk.
+//!
+//! Matcha is the one family whose files do not all live in one directory: it
+//! is an acoustic model plus a separately downloaded vocoder, which is two
+//! catalog rows and therefore two model directories. [`TtsModelPaths`] is
+//! where that pairing arrives, the same way `DiarizationModels::locate` pairs
+//! the two halves of the diarizer.
 
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
 use crate::error::InferError;
-use crate::registry::OnnxModelKind;
+use crate::registry::{OnnxModelKind, MATCHA_VOCODER_FILE, MATCHA_VOCODER_ID};
 use crate::types::TtsSynthOpts;
 use crate::whisper::AudioPcm;
 
+/// The installed directories one synthesis draws its files from.
+///
+/// A struct rather than a second `&Path` parameter because only one family
+/// uses the second one, and a bare `Option<&Path>` at every call site reads as
+/// "some other directory" rather than "the vocoder this voice cannot speak
+/// without".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TtsModelPaths {
+    /// The unpacked voice bundle.
+    pub model_dir: PathBuf,
+    /// Where the Matcha vocoder is installed, when the caller resolved one.
+    ///
+    /// `None` for every other family, and for a Matcha voice whose vocoder is
+    /// not downloaded — which [`find_tts_bundle`] refuses by name rather than
+    /// synthesizing silence.
+    pub vocoder_dir: Option<PathBuf>,
+}
+
+impl TtsModelPaths {
+    /// A bundle that needs nothing beside itself.
+    pub fn new(model_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            model_dir: model_dir.into(),
+            vocoder_dir: None,
+        }
+    }
+
+    pub fn with_vocoder(mut self, vocoder_dir: impl Into<PathBuf>) -> Self {
+        self.vocoder_dir = Some(vocoder_dir.into());
+        self
+    }
+}
+
 #[async_trait]
 pub trait SherpaTtsInference: Send + Sync {
-    /// `kind` says which sherpa model config the bundle in `model_dir` has to
-    /// be loaded through. It is a parameter rather than something sniffed from
+    /// `kind` says which sherpa model config the bundle in `paths` has to be
+    /// loaded through. It is a parameter rather than something sniffed from
     /// the directory because the catalog already knows it — and guessing it
     /// from the files present is exactly the heuristic this module replaced.
     async fn synthesize(
         &self,
         text: &str,
-        model_dir: &Path,
+        paths: &TtsModelPaths,
         kind: OnnxModelKind,
         opts: TtsSynthOpts,
     ) -> Result<AudioPcm, InferError>;
@@ -46,6 +85,9 @@ pub struct TtsBundle {
     pub voices: Option<PathBuf>,
     /// jieba dictionary, only in the multilingual Kokoro bundle.
     pub dict_dir: Option<PathBuf>,
+    /// The HiFiGAN weights a Matcha voice turns its mel-spectrogram into
+    /// audio with. `Some` for exactly one family, and never `None` there.
+    pub vocoder: Option<PathBuf>,
     /// Comma-joined lexicon paths, which is the form sherpa's `lexicon` field
     /// takes when a bundle ships more than one (the multilingual Kokoro ships
     /// one per language).
@@ -64,11 +106,24 @@ fn model_filenames(kind: OnnxModelKind) -> &'static [&'static str] {
     match kind {
         OnnxModelKind::TtsKokoro => &["model.int8.onnx", "model.onnx", "model.fp16.onnx"],
         OnnxModelKind::TtsKitten => &["model.fp16.onnx", "model.int8.onnx", "model.onnx"],
+        // Matcha bundles name the acoustic model after the number of ODE
+        // solver steps it was exported with; the published ones differ only
+        // in that number, so any of them is a correct answer and the order is
+        // a preference. `model-steps-3.onnx` is what the LJSpeech bundle in
+        // the catalog ships.
+        OnnxModelKind::TtsMatcha => &[
+            "model-steps-3.onnx",
+            "model-steps-2.onnx",
+            "model-steps-4.onnx",
+            "model-steps-6.onnx",
+        ],
         // Piper names the file after the voice ("en_US-lessac-medium.onnx"),
         // so there is no list to match against — see `find_sole_onnx`. The
-        // recognizer bundles have no single model file at all: they are
+        // vocoder is not a bundle at all (one bare file, found by name), and
+        // the recognizer bundles have no single model file: they are
         // encoder/decoder/joiner triples, found by their own finders.
         OnnxModelKind::TtsVits
+        | OnnxModelKind::TtsVocoder
         | OnnxModelKind::Parakeet
         | OnnxModelKind::StreamingZipformer
         | OnnxModelKind::SpeakerSegmentation
@@ -154,10 +209,38 @@ fn joined_lexicons(dir: &Path) -> Option<String> {
     (!paths.is_empty()).then(|| paths.join(","))
 }
 
+/// The vocoder weights a Matcha voice needs, or a refusal that names them.
+///
+/// A missing vocoder is reported here rather than left to sherpa: without it
+/// `OfflineTts::create` fails with nothing in the message about which of the
+/// two downloads is absent, and the alternatives — synthesizing silence, or
+/// quietly falling back to another voice — would both hide the one fact the
+/// user can act on.
+fn require_vocoder(vocoder_dir: Option<&Path>) -> Result<PathBuf, InferError> {
+    let Some(dir) = vocoder_dir else {
+        return Err(InferError::Other(format!(
+            "a Matcha voice also needs the vocoder '{MATCHA_VOCODER_ID}', which is not installed"
+        )));
+    };
+    let path = dir.join(MATCHA_VOCODER_FILE);
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(InferError::Other(format!(
+            "the Matcha vocoder '{MATCHA_VOCODER_ID}' is not installed ({})",
+            path.display()
+        )))
+    }
+}
+
 /// Locates the files a bundle of this shape needs, or says which one is
 /// missing. Pure path logic, so it is testable against a laid-out temp dir
 /// without the native library.
-pub fn find_tts_bundle(model_dir: &Path, kind: OnnxModelKind) -> Result<TtsBundle, InferError> {
+pub fn find_tts_bundle(
+    paths: &TtsModelPaths,
+    kind: OnnxModelKind,
+) -> Result<TtsBundle, InferError> {
+    let model_dir = paths.model_dir.as_path();
     let tokens = require_file(model_dir, "tokens.txt")?;
 
     match kind {
@@ -176,8 +259,24 @@ pub fn find_tts_bundle(model_dir: &Path, kind: OnnxModelKind) -> Result<TtsBundl
                 voices: None,
                 dict_dir: None,
                 lexicon: None,
+                vocoder: None,
             })
         }
+        // Matcha is VITS-shaped on disk — one acoustic model, espeak data,
+        // an optional lexicon — plus the vocoder that lives in its own
+        // directory because it is its own download.
+        OnnxModelKind::TtsMatcha => Ok(TtsBundle {
+            model: named_model(model_dir, kind)?,
+            tokens,
+            data_dir: Some(optional_dir(model_dir, "espeak-ng-data").ok_or_else(|| {
+                InferError::Other(format!("missing espeak-ng-data in {}", model_dir.display()))
+            })?),
+            // Single-speaker, like Piper: there is no packed speaker table.
+            voices: None,
+            dict_dir: optional_dir(model_dir, "dict"),
+            lexicon: joined_lexicons(model_dir),
+            vocoder: Some(require_vocoder(paths.vocoder_dir.as_deref())?),
+        }),
         OnnxModelKind::TtsKokoro | OnnxModelKind::TtsKitten => Ok(TtsBundle {
             model: named_model(model_dir, kind)?,
             tokens,
@@ -191,11 +290,14 @@ pub fn find_tts_bundle(model_dir: &Path, kind: OnnxModelKind) -> Result<TtsBundl
             voices: Some(require_file(model_dir, "voices.bin")?),
             dict_dir: optional_dir(model_dir, "dict"),
             lexicon: joined_lexicons(model_dir),
+            vocoder: None,
         }),
         // Every non-voice shape, one arm: the reason none of them can be a
         // voice is the same, and an arm per family would have to be
-        // remembered every time one is added.
-        OnnxModelKind::Parakeet
+        // remembered every time one is added. The vocoder is here too — it is
+        // in the TTS catalog but is half a voice, not a voice.
+        OnnxModelKind::TtsVocoder
+        | OnnxModelKind::Parakeet
         | OnnxModelKind::StreamingZipformer
         | OnnxModelKind::SpeakerSegmentation
         | OnnxModelKind::SpeakerEmbedding => {
@@ -230,8 +332,8 @@ fn model_config_for(
     kind: OnnxModelKind,
 ) -> Result<sherpa_onnx::OfflineTtsModelConfig, InferError> {
     use sherpa_onnx::{
-        OfflineTtsKittenModelConfig, OfflineTtsKokoroModelConfig, OfflineTtsModelConfig,
-        OfflineTtsVitsModelConfig,
+        OfflineTtsKittenModelConfig, OfflineTtsKokoroModelConfig, OfflineTtsMatchaModelConfig,
+        OfflineTtsModelConfig, OfflineTtsVitsModelConfig,
     };
 
     let path = |p: &PathBuf| Some(p.to_string_lossy().into_owned());
@@ -250,6 +352,23 @@ fn model_config_for(
                 model: path(&bundle.model),
                 tokens: path(&bundle.tokens),
                 data_dir: maybe(&bundle.data_dir),
+                ..Default::default()
+            },
+            ..base
+        },
+        OnnxModelKind::TtsMatcha => OfflineTtsModelConfig {
+            matcha: OfflineTtsMatchaModelConfig {
+                acoustic_model: path(&bundle.model),
+                // `find_tts_bundle` refuses a Matcha bundle with no vocoder,
+                // so this is `Some` by construction — but an unwrap here
+                // would turn a future loosening of that rule into a panic
+                // inside a blocking task, which is the one failure the user
+                // could not be told anything useful about.
+                vocoder: maybe(&bundle.vocoder),
+                tokens: path(&bundle.tokens),
+                data_dir: maybe(&bundle.data_dir),
+                dict_dir: maybe(&bundle.dict_dir),
+                lexicon: bundle.lexicon.clone(),
                 ..Default::default()
             },
             ..base
@@ -276,7 +395,8 @@ fn model_config_for(
             },
             ..base
         },
-        OnnxModelKind::Parakeet
+        OnnxModelKind::TtsVocoder
+        | OnnxModelKind::Parakeet
         | OnnxModelKind::StreamingZipformer
         | OnnxModelKind::SpeakerSegmentation
         | OnnxModelKind::SpeakerEmbedding => {
@@ -291,17 +411,17 @@ impl SherpaTtsInference for SherpaOnnxTtsInference {
     async fn synthesize(
         &self,
         text: &str,
-        model_dir: &Path,
+        paths: &TtsModelPaths,
         kind: OnnxModelKind,
         opts: TtsSynthOpts,
     ) -> Result<AudioPcm, InferError> {
-        let model_dir = model_dir.to_path_buf();
+        let paths = paths.clone();
         let text = text.to_string();
 
         tokio::task::spawn_blocking(move || {
             use sherpa_onnx::{GenerationConfig, OfflineTts, OfflineTtsConfig};
 
-            let bundle = find_tts_bundle(&model_dir, kind)?;
+            let bundle = find_tts_bundle(&paths, kind)?;
             let config = OfflineTtsConfig {
                 model: model_config_for(&bundle, kind)?,
                 ..Default::default()
@@ -343,7 +463,7 @@ mod tests {
         async fn synthesize(
             &self,
             text: &str,
-            _model_dir: &Path,
+            _paths: &TtsModelPaths,
             _kind: OnnxModelKind,
             _opts: TtsSynthOpts,
         ) -> Result<AudioPcm, InferError> {
@@ -360,7 +480,7 @@ mod tests {
         let pcm = inference
             .synthesize(
                 "hello",
-                Path::new("/tmp/tts-model"),
+                &TtsModelPaths::new("/tmp/tts-model"),
                 OnnxModelKind::TtsVits,
                 TtsSynthOpts::default(),
             )
@@ -395,7 +515,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         lay_out_kokoro(dir.path(), false);
 
-        let bundle = find_tts_bundle(dir.path(), OnnxModelKind::TtsKokoro).unwrap();
+        let bundle =
+            find_tts_bundle(&TtsModelPaths::new(dir.path()), OnnxModelKind::TtsKokoro).unwrap();
         assert_eq!(bundle.model, dir.path().join("model.int8.onnx"));
         assert_eq!(bundle.tokens, dir.path().join("tokens.txt"));
         assert_eq!(bundle.voices, Some(dir.path().join("voices.bin")));
@@ -410,7 +531,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         lay_out_kokoro(dir.path(), true);
 
-        let bundle = find_tts_bundle(dir.path(), OnnxModelKind::TtsKokoro).unwrap();
+        let bundle =
+            find_tts_bundle(&TtsModelPaths::new(dir.path()), OnnxModelKind::TtsKokoro).unwrap();
         assert_eq!(bundle.dict_dir, Some(dir.path().join("dict")));
         // sherpa takes several lexicons as one comma-joined string, in a
         // stable order.
@@ -432,7 +554,7 @@ mod tests {
             lay_out_kokoro(dir.path(), false);
             std::fs::remove_file(dir.path().join(missing)).unwrap();
 
-            let err = find_tts_bundle(dir.path(), OnnxModelKind::TtsKokoro)
+            let err = find_tts_bundle(&TtsModelPaths::new(dir.path()), OnnxModelKind::TtsKokoro)
                 .expect_err("a bundle missing {missing} must not load");
             assert!(
                 err.to_string().contains(missing) || err.to_string().contains("model"),
@@ -443,7 +565,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         lay_out_kokoro(dir.path(), false);
         std::fs::remove_dir_all(dir.path().join("espeak-ng-data")).unwrap();
-        let err = find_tts_bundle(dir.path(), OnnxModelKind::TtsKokoro).unwrap_err();
+        let err =
+            find_tts_bundle(&TtsModelPaths::new(dir.path()), OnnxModelKind::TtsKokoro).unwrap_err();
         assert!(err.to_string().contains("espeak-ng-data"), "{err}");
     }
 
@@ -456,7 +579,8 @@ mod tests {
         touch(&dir.path().join("tokens.txt"));
         touch(&dir.path().join("espeak-ng-data").join("phontab"));
 
-        let bundle = find_tts_bundle(dir.path(), OnnxModelKind::TtsKitten).unwrap();
+        let bundle =
+            find_tts_bundle(&TtsModelPaths::new(dir.path()), OnnxModelKind::TtsKitten).unwrap();
         assert_eq!(bundle.model, dir.path().join("model.fp16.onnx"));
     }
 
@@ -468,7 +592,8 @@ mod tests {
         touch(&dir.path().join("tokens.txt"));
         touch(&dir.path().join("espeak-ng-data").join("phontab"));
 
-        let bundle = find_tts_bundle(dir.path(), OnnxModelKind::TtsVits).unwrap();
+        let bundle =
+            find_tts_bundle(&TtsModelPaths::new(dir.path()), OnnxModelKind::TtsVits).unwrap();
         assert_eq!(bundle.model, dir.path().join("en_US-lessac-medium.onnx"));
         assert_eq!(bundle.voices, None);
     }
@@ -485,7 +610,8 @@ mod tests {
         touch(&dir.path().join("tokens.txt"));
         touch(&dir.path().join("espeak-ng-data").join("phontab"));
 
-        let err = find_tts_bundle(dir.path(), OnnxModelKind::TtsVits).unwrap_err();
+        let err =
+            find_tts_bundle(&TtsModelPaths::new(dir.path()), OnnxModelKind::TtsVits).unwrap_err();
         assert!(err.to_string().contains("exactly one"), "{err}");
     }
 
@@ -496,9 +622,10 @@ mod tests {
         // Two Kokoro quantizations in one directory is exactly the case the
         // old "first .onnx that is not an encoder" rule got wrong.
         touch(&dir.path().join("model.onnx"));
-        assert!(find_tts_bundle(dir.path(), OnnxModelKind::TtsVits).is_err());
+        assert!(find_tts_bundle(&TtsModelPaths::new(dir.path()), OnnxModelKind::TtsVits).is_err());
         // Addressed by kind, it still resolves — to the preferred weights.
-        let bundle = find_tts_bundle(dir.path(), OnnxModelKind::TtsKokoro).unwrap();
+        let bundle =
+            find_tts_bundle(&TtsModelPaths::new(dir.path()), OnnxModelKind::TtsKokoro).unwrap();
         assert_eq!(bundle.model, dir.path().join("model.int8.onnx"));
     }
 
@@ -511,15 +638,120 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("tokens.txt"));
         for kind in [
+            OnnxModelKind::TtsVocoder,
             OnnxModelKind::Parakeet,
             OnnxModelKind::StreamingZipformer,
             OnnxModelKind::SpeakerSegmentation,
             OnnxModelKind::SpeakerEmbedding,
         ] {
-            let err = find_tts_bundle(dir.path(), kind).unwrap_err();
+            let err = find_tts_bundle(&TtsModelPaths::new(dir.path()), kind).unwrap_err();
             let message = err.to_string();
             assert!(message.contains("not a voice"), "{message}");
             assert!(message.contains(&format!("{kind:?}")), "{message}");
         }
+    }
+
+    /// A Matcha bundle as the release ships it — the vocoder is deliberately
+    /// somewhere else, because it is its own download.
+    fn lay_out_matcha(dir: &Path) {
+        touch(&dir.join("model-steps-3.onnx"));
+        touch(&dir.join("tokens.txt"));
+        touch(&dir.join("espeak-ng-data").join("phontab"));
+    }
+
+    fn install_vocoder(dir: &Path) {
+        touch(&dir.join(MATCHA_VOCODER_FILE));
+    }
+
+    #[test]
+    fn a_matcha_voice_pairs_its_acoustic_model_with_a_vocoder_from_another_directory() {
+        let voice = tempfile::tempdir().unwrap();
+        let vocoder = tempfile::tempdir().unwrap();
+        lay_out_matcha(voice.path());
+        install_vocoder(vocoder.path());
+
+        let paths = TtsModelPaths::new(voice.path()).with_vocoder(vocoder.path());
+        let bundle = find_tts_bundle(&paths, OnnxModelKind::TtsMatcha).unwrap();
+        assert_eq!(bundle.model, voice.path().join("model-steps-3.onnx"));
+        assert_eq!(bundle.tokens, voice.path().join("tokens.txt"));
+        assert_eq!(bundle.data_dir, Some(voice.path().join("espeak-ng-data")));
+        assert_eq!(
+            bundle.vocoder,
+            Some(vocoder.path().join(MATCHA_VOCODER_FILE))
+        );
+        // Single-speaker, so there is no packed speaker table to find.
+        assert_eq!(bundle.voices, None);
+    }
+
+    /// The whole point of locating the vocoder here: a Matcha voice without
+    /// one must say so by name, rather than loading and emitting silence or
+    /// falling back to some other voice the user did not choose.
+    #[test]
+    fn matcha_without_its_vocoder_refuses_and_names_it() {
+        let voice = tempfile::tempdir().unwrap();
+        lay_out_matcha(voice.path());
+
+        // Nothing resolved at all.
+        let err = find_tts_bundle(&TtsModelPaths::new(voice.path()), OnnxModelKind::TtsMatcha)
+            .unwrap_err();
+        assert!(err.to_string().contains(MATCHA_VOCODER_ID), "{err}");
+
+        // A directory that exists but holds no weights — the shape of a
+        // cancelled or half-finished download.
+        let empty = tempfile::tempdir().unwrap();
+        let paths = TtsModelPaths::new(voice.path()).with_vocoder(empty.path());
+        let err = find_tts_bundle(&paths, OnnxModelKind::TtsMatcha).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains(MATCHA_VOCODER_ID), "{message}");
+        assert!(message.contains(MATCHA_VOCODER_FILE), "{message}");
+    }
+
+    /// Every other family ignores a vocoder rather than erroring on it: the
+    /// kind decides which files are read, here as everywhere else in this
+    /// module.
+    #[test]
+    fn a_vocoder_offered_to_a_family_that_cannot_use_one_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let vocoder = tempfile::tempdir().unwrap();
+        lay_out_kokoro(dir.path(), false);
+        install_vocoder(vocoder.path());
+
+        let paths = TtsModelPaths::new(dir.path()).with_vocoder(vocoder.path());
+        let bundle = find_tts_bundle(&paths, OnnxModelKind::TtsKokoro).unwrap();
+        assert_eq!(bundle.vocoder, None);
+    }
+
+    /// The step count in a Matcha filename is an export parameter, not a
+    /// different model, so any published one loads — and a bundle with none
+    /// of them says which names it looked for instead of failing inside
+    /// sherpa.
+    #[test]
+    fn matcha_accepts_any_published_step_count_and_names_the_list_when_there_is_none() {
+        for name in [
+            "model-steps-2.onnx",
+            "model-steps-3.onnx",
+            "model-steps-4.onnx",
+            "model-steps-6.onnx",
+        ] {
+            let voice = tempfile::tempdir().unwrap();
+            let vocoder = tempfile::tempdir().unwrap();
+            touch(&voice.path().join(name));
+            touch(&voice.path().join("tokens.txt"));
+            touch(&voice.path().join("espeak-ng-data").join("phontab"));
+            install_vocoder(vocoder.path());
+
+            let paths = TtsModelPaths::new(voice.path()).with_vocoder(vocoder.path());
+            let bundle = find_tts_bundle(&paths, OnnxModelKind::TtsMatcha).unwrap();
+            assert_eq!(bundle.model, voice.path().join(name));
+        }
+
+        let voice = tempfile::tempdir().unwrap();
+        let vocoder = tempfile::tempdir().unwrap();
+        touch(&voice.path().join("tokens.txt"));
+        touch(&voice.path().join("espeak-ng-data").join("phontab"));
+        install_vocoder(vocoder.path());
+        let paths = TtsModelPaths::new(voice.path()).with_vocoder(vocoder.path());
+        let err = find_tts_bundle(&paths, OnnxModelKind::TtsMatcha).unwrap_err();
+        assert!(err.to_string().contains("model-steps-3.onnx"), "{err}");
     }
 }

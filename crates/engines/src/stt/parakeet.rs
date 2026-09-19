@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use kea_infer::{ModelRegistry, ModelStorage, SherpaSttInference};
+use kea_infer::{ModelRegistry, ModelStorage, SherpaSttInference, SttHotwords};
 
 use crate::stt::audio::{resample_to_rate, STT_SAMPLE_RATE_HZ};
 use crate::stt::segments::from_infer;
@@ -69,9 +69,16 @@ impl SttEngine for ParakeetSttEngine {
 
         // No language is passed on: the NeMo transducer behind this trait has
         // no language setting, so `opts.language` could only be dropped.
+        //
+        // The vocabulary is a different case and does go down: it reaches
+        // sherpa's `hotwords_file` when the bundle can encode it, and the
+        // inference layer logs why when it cannot (see `plan_hotwords`).
+        // Normalized here, once, so an empty or whitespace-only list arrives
+        // as "no hotwords" rather than as a reason to switch decoders.
+        let hotwords = SttHotwords::new(opts.vocabulary);
         let result = self
             .inference
-            .transcribe(pcm, &model_dir)
+            .transcribe(pcm, &model_dir, &hotwords)
             .await
             .map_err(|e| EngineError::Other(e.to_string()))?;
 
@@ -94,8 +101,15 @@ mod tests {
     use async_trait::async_trait;
     use kea_infer::{AudioPcm as InferAudioPcm, SherpaSttInference};
     use std::path::Path;
+    use std::sync::Mutex;
 
-    struct FakeSherpaSttInference;
+    /// Records the hotwords it was handed: the only place the vocabulary can
+    /// be observed reaching the inference layer rather than stopping at the
+    /// engine boundary.
+    #[derive(Default)]
+    struct FakeSherpaSttInference {
+        seen: Mutex<Vec<SttHotwords>>,
+    }
 
     #[async_trait]
     impl SherpaSttInference for FakeSherpaSttInference {
@@ -103,7 +117,9 @@ mod tests {
             &self,
             pcm: InferAudioPcm,
             _model_dir: &Path,
+            hotwords: &SttHotwords,
         ) -> Result<kea_infer::SttResult, kea_infer::InferError> {
+            self.seen.lock().unwrap().push(hotwords.clone());
             Ok(kea_infer::SttResult::text_only(format!(
                 "parakeet: {} samples",
                 pcm.samples.len()
@@ -119,7 +135,7 @@ mod tests {
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(model_dir.join("tokens.txt"), b"tok").unwrap();
 
-        let engine = ParakeetSttEngine::new(Arc::new(FakeSherpaSttInference), storage);
+        let engine = ParakeetSttEngine::new(Arc::new(FakeSherpaSttInference::default()), storage);
         let out = engine
             .transcribe(
                 AudioPcm {
@@ -137,11 +153,56 @@ mod tests {
         assert!(out.text.contains("1600"));
     }
 
+    /// `SttOpts::vocabulary` is filled from the user's enabled terms and used
+    /// to be dropped at this boundary. It has to arrive normalized at the
+    /// inference layer, which is where it becomes sherpa's `hotwords_file`.
+    #[tokio::test]
+    async fn the_vocabulary_reaches_the_inference_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(ModelStorage::new(dir.path().to_path_buf()));
+        let model_dir = storage.onnx_dir_for("parakeet-tdt-0.6b-v2");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("tokens.txt"), b"tok").unwrap();
+
+        let inference = Arc::new(FakeSherpaSttInference::default());
+        let engine = ParakeetSttEngine::new(inference.clone(), storage);
+
+        for (vocabulary, expected) in [
+            (
+                vec!["KittyClaw".to_string(), "KEA".to_string()],
+                vec!["KittyClaw", "KEA"],
+            ),
+            // Trimmed, de-duplicated and emptied out before it travels.
+            (
+                vec![" KEA ".to_string(), "KEA".to_string(), "  ".to_string()],
+                vec!["KEA"],
+            ),
+            (Vec::new(), Vec::new()),
+        ] {
+            engine
+                .transcribe(
+                    AudioPcm {
+                        samples: vec![0.0; 160],
+                        sample_rate_hz: 16_000,
+                    },
+                    SttOpts {
+                        model: Some("parakeet-tdt-0.6b-v2".into()),
+                        vocabulary,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let seen = inference.seen.lock().unwrap().last().unwrap().clone();
+            assert_eq!(seen.terms(), expected.as_slice());
+        }
+    }
+
     #[tokio::test]
     async fn parakeet_engine_errors_when_model_missing() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Arc::new(ModelStorage::new(dir.path().to_path_buf()));
-        let engine = ParakeetSttEngine::new(Arc::new(FakeSherpaSttInference), storage);
+        let engine = ParakeetSttEngine::new(Arc::new(FakeSherpaSttInference::default()), storage);
         let err = engine
             .transcribe(
                 AudioPcm {

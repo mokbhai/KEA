@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -10,13 +11,16 @@ use async_trait::async_trait;
 use kea_core::app_context::{resolve_profile, AppProfile, ProfileQuery};
 use kea_core::dictation::{apply_vocabulary, hint_terms, DictationSettings, DictationSettingsRepo};
 use kea_core::log::{current_log_path, tail_log_file};
+use kea_core::meetings::notion::{parse_page_id, NotionError};
 use kea_core::meetings::{MeetingSettings, MeetingSettingsRepo};
 use kea_core::resolve::Resolution;
 use kea_core::resolve::SlotResolver;
+use kea_core::rewrite::language::is_well_formed_tag;
 use kea_core::rewrite::{
     build_llm_request, PaletteHistoryRepo, PresetRepo, PromptOverrideRepo, ProviderConfig,
     ProviderConfigRepo, RewriteInput, RewriteMode, RewritePreset, STORE_HISTORY_SETTING,
 };
+use kea_core::secrets::NOTION_TOKEN_REF;
 use kea_core::store::actions::{ActionDetail, ActionRepo, ActionRow, NewAction};
 use kea_core::store::app_profiles::AppProfileRepo;
 use kea_core::store::bindings::{Binding, BindingRepo};
@@ -106,16 +110,48 @@ pub const MEETINGS_FEATURE_ID: &str = "meetings";
 pub const MEETINGS_COMMAND_ID: &str = "toggle_meeting";
 
 /// One global hotkey: the `(feature, command)` pair the DB rows and the UI
-/// address it by, plus the action id the dispatch loop matches on.
+/// address it by.
 ///
 /// No accelerator here on purpose — the default belongs to the feature that
 /// declares the command ([`kea_features::Command::default_accelerator`]) and is
 /// read back through [`compiled_default_accelerator`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `command` is a [`Cow`] for exactly one reason: the per-language translate
+/// shortcuts (`translate.fr`, `translate.pt-BR`) are a command *family* whose
+/// members exist only once a user has picked a language, so they cannot be
+/// `&'static str`. `feature` stays static because a hotkey always belongs to a
+/// compiled-in feature, and the action id is derived rather than stored — see
+/// [`HotkeyAction::action_id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotkeyAction {
     pub feature: &'static str,
-    pub command: &'static str,
-    pub action_id: &'static str,
+    pub command: Cow<'static, str>,
+}
+
+impl HotkeyAction {
+    /// A row of the fixed table.
+    const fn fixed(feature: &'static str, command: &'static str) -> Self {
+        Self {
+            feature,
+            command: Cow::Borrowed(command),
+        }
+    }
+
+    /// The id the platform layer routes a press by.
+    ///
+    /// Derived, not stored. As a third field it was a second spelling of a
+    /// fact the other two already carry — one a row could get wrong, and one a
+    /// synthesized row would have had to invent. Every id the table ever had
+    /// was `feature:command`; now that is a rule rather than a coincidence.
+    pub fn action_id(&self) -> String {
+        format!("{}:{}", self.feature, self.command)
+    }
+
+    /// The BCP-47 tag this shortcut translates into, when it is one of the
+    /// per-language translate rows.
+    pub fn translate_target(&self) -> Option<&str> {
+        self.command.strip_prefix(TRANSLATE_COMMAND_PREFIX)
+    }
 }
 
 /// Every command that owns a global hotkey.
@@ -125,37 +161,24 @@ pub struct HotkeyAction {
 /// effective-hotkey lookup — so adding a feature hotkey is a row here rather
 /// than another arm in five matches.
 pub const HOTKEY_ACTIONS: [HotkeyAction; 6] = [
-    HotkeyAction {
-        feature: REWRITE_FEATURE_ID,
-        command: REWRITE_COMMAND_ID,
-        action_id: REWRITE_ACTION_ID,
-    },
-    HotkeyAction {
-        feature: DICTATION_FEATURE_ID,
-        command: DICTATION_COMMAND_ID,
-        action_id: DICTATION_ACTION_ID,
-    },
-    HotkeyAction {
-        feature: TTS_FEATURE_ID,
-        command: TTS_COMMAND_ID,
-        action_id: TTS_ACTION_ID,
-    },
-    HotkeyAction {
-        feature: MEETINGS_FEATURE_ID,
-        command: MEETINGS_COMMAND_ID,
-        action_id: MEETINGS_ACTION_ID,
-    },
-    HotkeyAction {
-        feature: REWRITE_FEATURE_ID,
-        command: PALETTE_COMMAND,
-        action_id: PALETTE_ACTION_ID,
-    },
-    HotkeyAction {
-        feature: REWRITE_FEATURE_ID,
-        command: OCR_COMMAND,
-        action_id: OCR_ACTION_ID,
-    },
+    HotkeyAction::fixed(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID),
+    HotkeyAction::fixed(DICTATION_FEATURE_ID, DICTATION_COMMAND_ID),
+    HotkeyAction::fixed(TTS_FEATURE_ID, TTS_COMMAND_ID),
+    HotkeyAction::fixed(MEETINGS_FEATURE_ID, MEETINGS_COMMAND_ID),
+    HotkeyAction::fixed(REWRITE_FEATURE_ID, PALETTE_COMMAND),
+    HotkeyAction::fixed(REWRITE_FEATURE_ID, OCR_COMMAND),
 ];
+
+/// The command-id prefix of the per-language translate shortcuts.
+///
+/// A hotkey row is keyed `(feature_id, command)`, so `("rewrite",
+/// "translate.fr")` is a storable, listable binding with no schema change —
+/// and the tag after the prefix is the shortcut's whole configuration.
+///
+/// The ids are *built* only in the UI (`translateCommand` in `ui/src/api.ts`),
+/// which is what decides a language has a shortcut at all; everything here
+/// reads them.
+pub const TRANSLATE_COMMAND_PREFIX: &str = "translate.";
 
 /// Escape, while — and only while — a locked recording is running.
 ///
@@ -176,10 +199,67 @@ const LOCK_CANCEL_ACCELERATOR: &str = "Escape";
 /// The descriptor for a `(feature, command)` pair, or `None` when the pair is
 /// not a global hotkey — a binding persisted for some other command, say.
 pub fn hotkey_action(feature: &str, command: &str) -> Option<HotkeyAction> {
-    HOTKEY_ACTIONS
+    // The fixed table is consulted first, always: a synthesized row must never
+    // be able to shadow a real one, whatever a future command is named.
+    if let Some(found) = HOTKEY_ACTIONS
         .iter()
-        .copied()
         .find(|a| a.feature == feature && a.command == command)
+    {
+        return Some(found.clone());
+    }
+    translate_hotkey_action(feature, command)
+}
+
+/// The synthesized descriptor for one per-language translate shortcut.
+///
+/// Translate is the one open-ended hotkey family — a shortcut per language the
+/// user enabled — so [`HOTKEY_ACTIONS`] cannot list its members. Admitting
+/// them *here*, inside the one lookup, is what makes startup registration,
+/// `set_hotkey`, its rebind cleanup, collision detection and the
+/// effective-hotkey lookup all work for them without a second branch each.
+///
+/// The tag is validated rather than merely prefix-matched: the command id is
+/// what reaches the Translate prompt as its target language, so
+/// `translate.<a sentence>` must not be a bindable hotkey.
+fn translate_hotkey_action(feature: &str, command: &str) -> Option<HotkeyAction> {
+    if feature != REWRITE_FEATURE_ID {
+        return None;
+    }
+    let tag = command.strip_prefix(TRANSLATE_COMMAND_PREFIX)?;
+    is_well_formed_tag(tag).then(|| HotkeyAction {
+        feature: REWRITE_FEATURE_ID,
+        command: Cow::Owned(command.to_string()),
+    })
+}
+
+/// The descriptor behind a dispatched action id.
+///
+/// The press stream speaks action ids while the table is keyed by
+/// `(feature, command)`; this is the one place that turns one into the other,
+/// so the dispatch loop admits exactly what every other hotkey path does.
+pub fn hotkey_action_for_id(action_id: &str) -> Option<HotkeyAction> {
+    let (feature, command) = action_id.split_once(':')?;
+    hotkey_action(feature, command)
+}
+
+/// Every `(feature, command)` that owns a global hotkey right now: the fixed
+/// table plus the persisted rows it cannot list — today, the per-language
+/// translate shortcuts.
+///
+/// Startup registration and collision detection both need "all of them", and
+/// they have to agree: a check that only saw the fixed table would happily
+/// hand French a combo Spanish already holds.
+pub fn hotkey_owners(bindings: &[HotkeyBindingRow]) -> Vec<HotkeyAction> {
+    let mut owners: Vec<HotkeyAction> = HOTKEY_ACTIONS.to_vec();
+    for row in bindings {
+        let Some(action) = hotkey_action(&row.feature_id, &row.command) else {
+            continue;
+        };
+        if !owners.contains(&action) {
+            owners.push(action);
+        }
+    }
+    owners
 }
 
 /// The registered features, built once.
@@ -780,12 +860,12 @@ pub fn validate_engine_for_slot(
 /// one, otherwise the feature's compiled-in default.
 pub async fn resolve_accelerator(config_pool: &SqlitePool, action: &HotkeyAction) -> String {
     let repo = HotkeyBindingRepo::new(config_pool.clone());
-    match repo.get(action.feature, action.command).await {
+    match repo.get(action.feature, &action.command).await {
         Ok(Some(row)) => row.accelerator,
         // Every row in HOTKEY_ACTIONS names a command whose feature declares a
         // default; falling back to empty keeps this total rather than panicking
         // if one is ever dropped, and registration then fails visibly.
-        _ => compiled_default_accelerator(action.feature, action.command).unwrap_or_default(),
+        _ => compiled_default_accelerator(action.feature, &action.command).unwrap_or_default(),
     }
 }
 
@@ -851,6 +931,11 @@ pub async fn set_rewrite_mode(
     mode: RewriteMode,
     config_pool: &SqlitePool,
 ) {
+    // Naming a mode means asking for that mode's template, and a preset
+    // replaces the template outright (`build_llm_request`). Leaving the saved
+    // preset in place would quietly run it instead — which for a translate
+    // shortcut means the key does not translate at all.
+    input.preset_id = None;
     if mode == input.mode {
         return;
     }
@@ -1184,7 +1269,7 @@ pub fn register_hotkey(
             HotkeyBinding {
                 accelerator: accelerator.to_string(),
             },
-            action.action_id.into(),
+            action.action_id(),
         )
         .map_err(|e| e.to_string())
 }
@@ -3308,7 +3393,7 @@ fn same_accelerator(a: &str, b: &str) -> bool {
 fn compiled_default_accelerator(feature: &str, command: &str) -> Option<String> {
     let action = hotkey_action(feature, command)?;
     feature_registry()
-        .find_command(action.feature, action.command)
+        .find_command(action.feature, &action.command)
         .and_then(|c| c.default_accelerator)
 }
 
@@ -3321,7 +3406,9 @@ fn check_hotkey_collision(
     accelerator: &str,
     bindings: &[HotkeyBindingRow],
 ) -> Option<String> {
-    for other in HOTKEY_ACTIONS {
+    // Not `HOTKEY_ACTIONS`: the persisted translate rows own hotkeys too, and
+    // a check that could not see them would let two languages claim one combo.
+    for other in hotkey_owners(bindings) {
         if other.feature == feature && other.command == command {
             continue;
         }
@@ -3329,7 +3416,7 @@ fn check_hotkey_collision(
             .iter()
             .find(|b| b.feature_id == other.feature && b.command == other.command)
             .map(|b| b.accelerator.clone())
-            .or_else(|| compiled_default_accelerator(other.feature, other.command));
+            .or_else(|| compiled_default_accelerator(other.feature, &other.command));
 
         if let Some(other_accel) = other_effective {
             if same_accelerator(accelerator, &other_accel) {
@@ -3510,6 +3597,66 @@ pub async fn set_hotkey(
         clear_hotkey_reg_status(&mut statuses, &feature, &command);
     }
 
+    Ok(())
+}
+
+/// Unbind one hotkey: drop its row and put the OS registration back to what
+/// the row was hiding.
+///
+/// `set_hotkey` can only ever *move* a binding, so this is the only writer of
+/// the empty state. It exists for the translate family, where removing a
+/// language has to take its shortcut with it — a row left behind would keep a
+/// global combo booked for a language the user can no longer see, and no
+/// screen would offer a way to get it back.
+///
+/// "Back to what the row was hiding" matters for the fixed commands: clearing
+/// a custom rewrite shortcut must restore the compiled-in default, not leave
+/// the feature with no shortcut at all until the next launch.
+#[tauri::command]
+pub async fn clear_hotkey(
+    state: State<'_, Arc<AppState>>,
+    feature: String,
+    command: String,
+) -> Result<(), String> {
+    let repo = HotkeyBindingRepo::new(state.config_pool.clone());
+    let Some(row) = repo
+        .get(&feature, &command)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        // Nothing persisted: the compiled default (if any) is already what is
+        // registered, so there is nothing to undo.
+        return Ok(());
+    };
+    repo.delete(&feature, &command)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // The DB is authoritative and already updated: a failure below leaves a
+    // stale registration that dies with the process, which is strictly better
+    // than a row the user cannot delete.
+    {
+        let mut hotkeys = state.hotkeys.lock().map_err(|e| e.to_string())?;
+        let fallback = compiled_default_accelerator(&feature, &command);
+        let outcome = match (&fallback, hotkey_action(&feature, &command)) {
+            (Some(default), Some(action)) => register_hotkey(&mut hotkeys, &action, default),
+            _ => hotkeys
+                .unregister(&HotkeyBinding {
+                    accelerator: row.accelerator.clone(),
+                })
+                .map_err(|e| e.to_string()),
+        };
+        if let Err(err) = outcome {
+            tracing::warn!(
+                feature = %feature, command = %command,
+                accelerator = %row.accelerator, %err,
+                "clearing a hotkey left the old registration in place (non-fatal)"
+            );
+        }
+    }
+
+    let mut statuses = state.hotkey_reg_status.lock().map_err(|e| e.to_string())?;
+    clear_hotkey_reg_status(&mut statuses, &feature, &command);
     Ok(())
 }
 
@@ -3998,6 +4145,122 @@ pub async fn export_meeting_markdown(
     std::fs::write(&target, body)
         .map_err(|e| format!("could not write {}: {e}", target.display()))?;
     Ok(target.to_string_lossy().into_owned())
+}
+
+/// The settings key holding the Notion page every export becomes a child of.
+///
+/// The link is stored exactly as the user pasted it, not as a parsed id: the
+/// field shows back what they typed, and the id is re-derived on every use so
+/// a bad link is re-diagnosed rather than remembered as garbage.
+pub const NOTION_PARENT_PAGE_SETTING: &str = "meetings.notion.parent_page";
+
+/// Whether the Notion export is set up, and what is wrong if it is not.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NotionStatus {
+    pub has_token: bool,
+    /// The destination link as the user pasted it, "" when unset.
+    pub parent_page: String,
+    /// Why the saved link cannot be used. Checked on read so a typo surfaces
+    /// on the settings screen rather than at the end of a meeting.
+    pub parent_page_error: Option<String>,
+}
+
+/// The saved setup, judged by the same parser the export runs.
+///
+/// Pure, so the verdict this screen shows and the one the export acts on
+/// cannot disagree. An unset link is not an error — it is the state a fresh
+/// install is in — so only a link that was typed and cannot be used reports
+/// one.
+pub fn notion_status(has_token: bool, parent_page: String) -> NotionStatus {
+    let parent_page_error = (!parent_page.trim().is_empty())
+        .then(|| parse_page_id(&parent_page).err())
+        .flatten()
+        .map(|e| e.to_string());
+    NotionStatus {
+        has_token,
+        parent_page,
+        parent_page_error,
+    }
+}
+
+#[tauri::command]
+pub async fn get_notion_status(state: State<'_, Arc<AppState>>) -> Result<NotionStatus, String> {
+    let has_token = credential_exists(state.credentials.as_ref(), NOTION_TOKEN_REF).await?;
+    let parent_page = SettingsRepo::new(state.config_pool.clone())
+        .get_optional::<String>(NOTION_PARENT_PAGE_SETTING)
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    Ok(notion_status(has_token, parent_page))
+}
+
+/// Save the internal integration secret.
+///
+/// The keychain, never the settings table: this is a bearer credential for the
+/// user's whole Notion workspace, and `secrets.rs` is where such a thing goes.
+#[tauri::command]
+pub async fn set_notion_token(
+    state: State<'_, Arc<AppState>>,
+    token: String,
+) -> Result<(), String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("paste the integration secret, or use Forget to remove it".into());
+    }
+    state
+        .credentials
+        .set(NOTION_TOKEN_REF, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn clear_notion_token(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state
+        .credentials
+        .delete(NOTION_TOKEN_REF)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Write one meeting to Notion as a new page, and return where it landed.
+///
+/// Manual, from the meeting's own screen — there is no export-on-stop. That is
+/// the simplest way to honour the rule that an export must never hold up the
+/// end of a meeting: a button pressed after the fact cannot, by construction.
+#[tauri::command]
+pub async fn export_meeting_to_notion(
+    state: State<'_, Arc<AppState>>,
+    meeting_id: String,
+) -> Result<String, String> {
+    let token = state
+        .credentials
+        .get(NOTION_TOKEN_REF)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| NotionError::NoToken.to_string())?;
+    let parent = SettingsRepo::new(state.config_pool.clone())
+        .get_optional::<String>(NOTION_PARENT_PAGE_SETTING)
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+
+    let detail = meeting_detail(&state, &meeting_id).await?;
+    // The same renderer the file and clipboard exports use: Notion is a
+    // destination, not a second way of saying what a meeting is.
+    let body =
+        kea_core::meetings::meeting_to_markdown(&detail, &detail.speakers, &detail.action_items);
+
+    let page = crate::notion::export_markdown(
+        &crate::notion::ReqwestNotionApi::new(),
+        &token,
+        &parent,
+        detail.meeting.title.trim(),
+        &body,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(page.url.unwrap_or(page.id))
 }
 
 /// Tick an action item off, or put it back.
@@ -6652,12 +6915,12 @@ mod tests {
     #[test]
     fn every_compiled_default_accelerator_parses() {
         for action in HOTKEY_ACTIONS {
-            let accel = compiled_default_accelerator(action.feature, action.command)
-                .unwrap_or_else(|| panic!("{} declares no default", action.action_id));
+            let accel = compiled_default_accelerator(action.feature, &action.command)
+                .unwrap_or_else(|| panic!("{} declares no default", action.action_id()));
             assert!(
                 validate_accelerator(&accel).is_ok(),
                 "{} default {accel:?} does not parse",
-                action.action_id
+                action.action_id()
             );
         }
     }
@@ -6669,18 +6932,18 @@ mod tests {
     fn no_two_hotkey_actions_share_a_default() {
         for a in HOTKEY_ACTIONS {
             for b in HOTKEY_ACTIONS {
-                if a.action_id == b.action_id {
+                if a.action_id() == b.action_id() {
                     continue;
                 }
                 let (x, y) = (
-                    compiled_default_accelerator(a.feature, a.command).unwrap_or_default(),
-                    compiled_default_accelerator(b.feature, b.command).unwrap_or_default(),
+                    compiled_default_accelerator(a.feature, &a.command).unwrap_or_default(),
+                    compiled_default_accelerator(b.feature, &b.command).unwrap_or_default(),
                 );
                 assert!(
                     !same_accelerator(&x, &y),
                     "{} and {} both default to {x}",
-                    a.action_id,
-                    b.action_id
+                    a.action_id(),
+                    b.action_id()
                 );
             }
         }
@@ -6768,7 +7031,7 @@ mod tests {
         for action in HOTKEY_ACTIONS {
             assert_eq!(
                 resolve_accelerator(&pool, &action).await,
-                compiled_default_accelerator(action.feature, action.command).unwrap()
+                compiled_default_accelerator(action.feature, &action.command).unwrap()
             );
         }
     }
@@ -6831,6 +7094,60 @@ mod tests {
             capture_opts(&pool).await.url,
             "the toggle the UI actually writes has to turn the flag on"
         );
+    }
+
+    /// A preset replaces the prompt template outright, so a caller that names
+    /// a mode and gets the saved preset anyway did not get the mode. For a
+    /// translate shortcut that is the difference between translating and not.
+    #[tokio::test]
+    async fn forcing_a_mode_drops_the_saved_preset() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        SettingsRepo::new(pool.clone())
+            .set("rewrite.translate.target", &"de".to_string())
+            .await
+            .unwrap();
+
+        let mut input = RewriteInput {
+            source_text: "hello".into(),
+            mode: RewriteMode::Improve,
+            preset_id: Some("preset-1".into()),
+            custom_instruction: None,
+        };
+        set_rewrite_mode(&mut input, RewriteMode::Translate, &pool).await;
+        assert_eq!(input.mode, RewriteMode::Translate);
+        assert_eq!(input.preset_id, None);
+        // And the parameter comes from the key the new mode reads, not the
+        // one the old mode did.
+        assert_eq!(input.custom_instruction.as_deref(), Some("de"));
+    }
+
+    /// The whole path a translate shortcut takes: the override names the mode
+    /// and carries the tag, and neither the saved preset nor the saved style
+    /// survives it.
+    #[tokio::test]
+    async fn a_translate_override_wins_over_the_saved_style_and_preset() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let settings = SettingsRepo::new(pool.clone());
+        settings
+            .set("rewrite.active_mode", &"friendly".to_string())
+            .await
+            .unwrap();
+
+        let mut input = default_rewrite_input(&pool).await;
+        input.preset_id = Some("preset-1".into());
+        RewriteOverride {
+            mode: Some(RewriteMode::Translate),
+            instruction: Some("pt-BR".into()),
+            ..RewriteOverride::default()
+        }
+        .apply(&mut input, &pool)
+        .await;
+
+        assert_eq!(input.mode, RewriteMode::Translate);
+        assert_eq!(input.preset_id, None);
+        assert_eq!(input.custom_instruction.as_deref(), Some("pt-BR"));
     }
 
     #[tokio::test]
@@ -6911,20 +7228,36 @@ mod tests {
         for action in HOTKEY_ACTIONS {
             assert!(
                 feature_registry()
-                    .find_command(action.feature, action.command)
+                    .find_command(action.feature, &action.command)
                     .is_some(),
                 "{}/{} is not declared by its feature",
                 action.feature,
                 action.command
             );
-            assert_eq!(
-                action.action_id,
-                format!("{}:{}", action.feature, action.command)
+            // The ids the dispatch loop matches on are still the constants the
+            // handlers name, now that they are derived rather than stored.
+            assert!(
+                [
+                    REWRITE_ACTION_ID,
+                    DICTATION_ACTION_ID,
+                    TTS_ACTION_ID,
+                    MEETINGS_ACTION_ID,
+                    PALETTE_ACTION_ID,
+                    OCR_ACTION_ID,
+                ]
+                .contains(&action.action_id().as_str()),
+                "{} is not one of the declared action ids",
+                action.action_id()
+            );
+            assert!(
+                action.translate_target().is_none(),
+                "a fixed row must not look like a translate row: {}",
+                action.command
             );
         }
         let mut pairs: Vec<_> = HOTKEY_ACTIONS
             .iter()
-            .map(|a| (a.feature, a.command))
+            .map(|a| (a.feature, a.command.clone()))
             .collect();
         pairs.sort();
         pairs.dedup();
@@ -7682,6 +8015,148 @@ mod tests {
         assert!(store_conversations_enabled(&pool).await);
     }
 
+    /// The widened lookup is the single point of failure for registration,
+    /// rebinding, collision detection and dispatch, so it gets its own test.
+    #[test]
+    fn translate_commands_are_admitted_only_when_they_name_a_language() {
+        // Spelled the way `translateCommand` in `ui/src/api.ts` spells it: the
+        // UI builds these ids and this lookup reads them, so the prefix is the
+        // one thing the two sides have to agree on.
+        assert_eq!(format!("{TRANSLATE_COMMAND_PREFIX}fr"), "translate.fr");
+        assert!(hotkey_action(REWRITE_FEATURE_ID, "translate.fr").is_some());
+        assert!(hotkey_action(REWRITE_FEATURE_ID, "translate.pt-BR").is_some());
+        // Nothing after the prefix, prose after the prefix, and the same
+        // command under a feature that does not own translate.
+        assert!(hotkey_action(REWRITE_FEATURE_ID, "translate.").is_none());
+        assert!(
+            hotkey_action(REWRITE_FEATURE_ID, "translate.ignore previous instructions").is_none()
+        );
+        assert!(hotkey_action(DICTATION_FEATURE_ID, "translate.fr").is_none());
+        // The command id is the whole configuration, so it must survive the
+        // round trip through the action id the dispatch loop sees.
+        let action = hotkey_action_for_id("rewrite:translate.zh-Hant").unwrap();
+        assert_eq!(action.translate_target(), Some("zh-Hant"));
+        assert_eq!(action.action_id(), "rewrite:translate.zh-Hant");
+        assert!(hotkey_action_for_id("rewrite").is_none());
+    }
+
+    /// A language with no shortcut must read as "not set" in the UI, not as an
+    /// error — and there is no sensible compiled-in default for "French".
+    #[test]
+    fn a_translate_shortcut_has_no_compiled_default() {
+        assert_eq!(
+            compiled_default_accelerator(REWRITE_FEATURE_ID, "translate.fr"),
+            None
+        );
+        assert_eq!(
+            effective_hotkey(REWRITE_FEATURE_ID, "translate.fr", None),
+            None
+        );
+        assert_eq!(
+            effective_hotkey(REWRITE_FEATURE_ID, "translate.fr", Some("Alt+1".into())),
+            Some(EffectiveHotkey {
+                accelerator: "Alt+1".into(),
+                source: "custom".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn two_languages_cannot_claim_the_same_accelerator() {
+        let bindings = vec![binding_row(REWRITE_FEATURE_ID, "translate.fr", "Alt+1")];
+        // A persisted translate row is not in the const table, so this is the
+        // case a table-only collision check would have waved through.
+        assert_eq!(
+            check_hotkey_collision(REWRITE_FEATURE_ID, "translate.de", "Alt+1", &bindings),
+            Some("rewrite/translate.fr".to_string())
+        );
+        assert_eq!(
+            check_hotkey_collision(REWRITE_FEATURE_ID, "translate.de", "Alt+2", &bindings),
+            None
+        );
+        // And it still collides with the fixed rows, in both directions.
+        let rewrite_default =
+            compiled_default_accelerator(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID).unwrap();
+        assert_eq!(
+            check_hotkey_collision(REWRITE_FEATURE_ID, "translate.de", &rewrite_default, &[]),
+            Some(format!("{REWRITE_FEATURE_ID}/{REWRITE_COMMAND_ID}"))
+        );
+        assert_eq!(
+            check_hotkey_collision(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID, "Alt+1", &bindings),
+            Some("rewrite/translate.fr".to_string())
+        );
+    }
+
+    /// A rebind must hand the old combo back to the translate row that still
+    /// owns it, exactly as it does for a fixed row — otherwise the language
+    /// keeps a DB row and loses its registration.
+    #[test]
+    fn old_hotkey_action_reassigns_to_a_persisted_translate_owner() {
+        let bindings = vec![
+            binding_row(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID, "Alt+K"),
+            binding_row(REWRITE_FEATURE_ID, "translate.fr", "Cmd+Shift+R"),
+        ];
+        assert_eq!(
+            old_hotkey_action(
+                REWRITE_FEATURE_ID,
+                REWRITE_COMMAND_ID,
+                Some("Cmd+Shift+R".into()),
+                "Alt+K",
+                &bindings,
+            ),
+            OldHotkeyAction::Reassign {
+                accelerator: "Cmd+Shift+R".into(),
+                feature_id: REWRITE_FEATURE_ID.into(),
+                command: "translate.fr".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn hotkey_owners_adds_persisted_rows_without_duplicating_the_table() {
+        let bindings = vec![
+            // Already in the table: must not appear twice.
+            binding_row(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID, "Alt+K"),
+            binding_row(REWRITE_FEATURE_ID, "translate.fr", "Alt+1"),
+            // Not a hotkey at all: a row persisted for some other command.
+            binding_row("somewhere", "else", "Alt+9"),
+        ];
+        let owners = hotkey_owners(&bindings);
+        assert_eq!(owners.len(), HOTKEY_ACTIONS.len() + 1);
+        assert_eq!(
+            owners
+                .iter()
+                .filter(|a| a.command == REWRITE_COMMAND_ID)
+                .count(),
+            1
+        );
+        assert!(owners.iter().any(|a| a.translate_target() == Some("fr")));
+    }
+
+    #[test]
+    fn notion_setup_reports_a_bad_link_but_not_a_missing_one() {
+        // Nothing typed yet is the state a fresh install is in, not a fault.
+        let fresh = notion_status(false, String::new());
+        assert!(!fresh.has_token);
+        assert_eq!(fresh.parent_page_error, None);
+
+        let good = notion_status(
+            true,
+            "https://www.notion.so/Notes-0123456789abcdef0123456789abcdef".into(),
+        );
+        assert_eq!(good.parent_page_error, None);
+
+        // The same parser the export uses, so the screen cannot approve a link
+        // the export would refuse.
+        let bad = notion_status(true, "my notion page".into());
+        assert!(bad
+            .parent_page_error
+            .unwrap()
+            .contains("does not look like a Notion page link"));
+        // Whitespace only is still "unset", not a typo to be told off about.
+        assert_eq!(notion_status(true, "   ".into()).parent_page_error, None);
+    }
+
     #[test]
     fn effective_hotkey_returns_custom_when_db_row_exists() {
         let result = effective_hotkey(
@@ -8309,12 +8784,12 @@ mod tests {
         // so a palette registered under some other feature id would register
         // an empty accelerator and the key would silently be dead.
         for action in HOTKEY_ACTIONS {
-            if action.action_id == PALETTE_ACTION_ID || action.action_id == OCR_ACTION_ID {
+            let action_id = action.action_id();
+            if action_id == PALETTE_ACTION_ID || action_id == OCR_ACTION_ID {
                 assert_eq!(action.feature, REWRITE_FEATURE_ID);
                 assert!(
-                    compiled_default_accelerator(action.feature, action.command).is_some(),
-                    "{} has no compiled default",
-                    action.action_id
+                    compiled_default_accelerator(action.feature, &action.command).is_some(),
+                    "{action_id} has no compiled default"
                 );
             }
         }

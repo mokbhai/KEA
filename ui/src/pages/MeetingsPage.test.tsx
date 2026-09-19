@@ -31,6 +31,12 @@ const meetingHandlers = {
     calendar_titles: false,
   }),
   set_meeting_settings: () => undefined,
+  // Not set up, which is the default a fresh install is in.
+  get_notion_status: () => ({
+    has_token: false,
+    parent_page: "",
+    parent_page_error: null,
+  }),
   get_system_audio_capability: () => "mic_only",
   get_permission_status: () => "Granted",
   start_meeting: () => "meeting-1",
@@ -87,8 +93,61 @@ function mockWorld(options: Parameters<typeof featureHandlers>[0] = {}) {
   );
 }
 
+const meetingRow = {
+  id: "meeting-1",
+  title: "Test capture",
+  started_at: "2026-07-17T10:00:00Z",
+  ended_at: "2026-07-17T10:00:10Z",
+  status: "completed",
+  capture_mode: "mic_only",
+  stt_engine_id: "whisper",
+  llm_engine_id: "openai",
+  error: null,
+  title_source: "llm",
+};
+
+const notionReady = {
+  has_token: true,
+  parent_page: "https://www.notion.so/Notes-0123456789abcdef0123456789abcdef",
+  parent_page_error: null,
+};
+
 describe("MeetingsPage", () => {
   beforeEach(() => resetTauriMocks());
+
+  /// A button whose only behaviour is an error is worse than no button, and
+  /// the fix for that error is elsewhere on this same page.
+  it("hides the Notion export until Notion is set up", async () => {
+    mockWorld({ bindings: readyBindings, extra: { list_meetings: () => [meetingRow] } });
+    render(<MeetingsPage />);
+
+    await userEvent.click(await screen.findByRole("button", { name: /Test capture/ }));
+    await screen.findByRole("button", { name: "Copy Markdown" });
+    expect(screen.queryByRole("button", { name: "Send to Notion" })).toBeNull();
+  });
+
+  it("sends a meeting to Notion and shows where it landed", async () => {
+    mockWorld({
+      bindings: readyBindings,
+      extra: {
+        list_meetings: () => [meetingRow],
+        get_notion_status: () => notionReady,
+        export_meeting_to_notion: () => "https://www.notion.so/Test-capture-abc",
+      },
+    });
+    render(<MeetingsPage />);
+
+    await userEvent.click(await screen.findByRole("button", { name: /Test capture/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "Send to Notion" }));
+
+    await waitFor(() =>
+      expect(invokeCalls("export_meeting_to_notion")).toEqual([{ meetingId: "meeting-1" }]),
+    );
+    // The link is what makes the export verifiable without leaving the app.
+    expect(
+      await screen.findByText(/Sent to Notion — https:\/\/www\.notion\.so\/Test-capture-abc/),
+    ).toBeTruthy();
+  });
 
   it("titles the page with the only h1", async () => {
     mockWorld({ bindings: readyBindings });

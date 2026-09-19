@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   MODE_PARAMETER,
   REWRITE_MODES,
+  clearHotkey,
   deletePreset,
   getPromptOverride,
   getSetting,
@@ -9,6 +10,7 @@ import {
   setPromptOverride,
   setSetting,
   systemTranslationTarget,
+  translateCommand,
   upsertPreset,
   type RewriteMode,
   type RewritePreset,
@@ -211,11 +213,25 @@ export function useRewriteSettings(): RewriteSettingsController {
     await saveTargets([...translateTargets, tag], "Language added.");
   };
 
-  const removeTranslateTarget = (tag: string) =>
-    saveTargets(
+  /**
+   * Drop a language, and its shortcut with it.
+   *
+   * The unbind comes first and is awaited: a combo left registered for a
+   * language that no longer appears anywhere would keep stealing that key from
+   * every other app, with no screen offering a way to get it back.
+   */
+  const removeTranslateTarget = async (tag: string) => {
+    try {
+      await clearHotkey("rewrite", translateCommand(tag));
+    } catch (e) {
+      setStatus(toMessage(e));
+      return;
+    }
+    await saveTargets(
       translateTargets.filter((t) => t !== tag),
       "Language removed.",
     );
+  };
 
   const editCustomInstruction = (text: string) => {
     // Typing counts as interaction so a slow mount fetch can't clobber text

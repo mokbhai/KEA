@@ -92,3 +92,8 @@ url = "2"
 # transitively; named here because minting a bearer token from anything less
 # than the platform entropy source is the kind of shortcut that ages badly.
 getrandom = "0.3"
+
+[dev-dependencies]
+# A real HTTP server for the Notion client's tests: the headers Notion demands
+# (`Notion-Version`) and the bodies it rejects can only be asserted against one.
+wiremock.workspace = true

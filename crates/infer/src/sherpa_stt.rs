@@ -1,3 +1,32 @@
+//! Offline recognition through sherpa-onnx, and the decoder biasing that goes
+//! with it.
+//!
+//! ## What "hotwords" cost, and when they are worth paying
+//!
+//! sherpa only consults `hotwords_file` under `modified_beam_search`; under
+//! the greedy decoder the field is read and ignored. So biasing is never free:
+//! it swaps a one-best decode for a beam search over `max_active_paths`
+//! hypotheses. An empty term list must therefore leave the decoder alone
+//! rather than "turn the feature on and pass nothing", which is why
+//! [`plan_hotwords`] answers greedy for an empty list.
+//!
+//! The second constraint is encoding. sherpa maps each hotword into the
+//! model's own modelling units before building the context graph. For a
+//! subword (BPE) model that needs the sentencepiece vocabulary the units came
+//! from — sherpa's `bpe_vocab` — and without it the terms are looked up whole
+//! in `tokens.txt`, fail, and are skipped one by one with a warning from the
+//! native library. Verified against the shipped 1.13.3 static library: an
+//! unencodable hotword is skipped ("Some hotwords failed to encode and were
+//! skipped"), not fatal — but it is also not honoured, and paying for a beam
+//! search to get nothing is worse than not biasing at all. So the plan below
+//! requires a BPE vocabulary in the bundle.
+//!
+//! NOTE, measured: the Parakeet TDT bundles in the catalog ship
+//! `encoder/decoder/joiner.int8.onnx`, `tokens.txt` and `test_wavs/` — and no
+//! `bpe.vocab`. On those bundles as published, [`plan_hotwords`] answers
+//! greedy and says so in the log. No accuracy claim is made here either way:
+//! the benefit was never measured, and nothing in this module pretends it was.
+
 use std::path::Path;
 #[cfg(feature = "sherpa")]
 use std::path::PathBuf;
@@ -9,9 +38,145 @@ use crate::error::InferError;
 use crate::types::{group_tokens_into_segments, TOKEN_GROUP_GAP_MS, TOKEN_GROUP_MAX_CUE_MS};
 use crate::types::{AudioPcm, SttResult};
 
+/// How strongly a matched hotword is boosted. sherpa's own CLI default; the
+/// scale is "bonus per token of the phrase", so a much larger value starts
+/// inventing the term out of silence.
+pub const HOTWORDS_SCORE: f32 = 1.5;
+
+/// The sentencepiece vocabulary sherpa needs to encode a hotword into the
+/// subword units a transducer actually decodes in. Two columns — token and
+/// log probability — which is why `tokens.txt` cannot stand in for it.
+const BPE_VOCAB_FILENAMES: &[&str] = &["bpe.vocab", "bpe.model"];
+
+/// Canonical spellings to bias decoding toward, normalized once.
+///
+/// A type rather than a bare `&[String]` so the normalization — trim, drop
+/// empties, drop duplicates, drop anything with a newline in it — happens in
+/// one place. The newline rule is not cosmetic: sherpa's hotwords file is one
+/// phrase per line, so a term containing a line break would silently become
+/// two different hotwords.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SttHotwords {
+    terms: Vec<String>,
+}
+
+impl SttHotwords {
+    pub fn new<I, S>(terms: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut out: Vec<String> = Vec::new();
+        for term in terms {
+            let term = term.as_ref().trim();
+            if term.is_empty() || term.contains(['\n', '\r']) {
+                continue;
+            }
+            if !out.iter().any(|existing| existing == term) {
+                out.push(term.to_string());
+            }
+        }
+        Self { terms: out }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+
+    pub fn terms(&self) -> &[String] {
+        &self.terms
+    }
+
+    /// The body of the file sherpa's `hotwords_file` points at: one phrase per
+    /// line, trailing newline included so the last line is a line.
+    pub fn file_body(&self) -> String {
+        let mut body = self.terms.join("\n");
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body
+    }
+}
+
+/// What one decode does about hotwords: the decoding method to run, and the
+/// files to run it with.
+///
+/// Decided in one place, outside the `sherpa` feature gate, because the
+/// decision is pure path-and-list logic and because the alternative — a chain
+/// of `if`s inside the blocking task — is where a parameter quietly stops
+/// being honoured. See the module note for why an empty list has to mean
+/// "change nothing".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotwordPlan {
+    /// `greedy_search` unless hotwords are actually in play; sherpa reads
+    /// `hotwords_file` only under `modified_beam_search`.
+    pub decoding_method: &'static str,
+    /// The sentencepiece vocabulary to encode the terms with, and the file
+    /// body to write. `None` means no biasing at all.
+    pub hotwords: Option<HotwordFiles>,
+}
+
+/// The two things a biased decode needs beyond the model itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotwordFiles {
+    /// sherpa's `bpe_vocab`, found in the bundle.
+    pub bpe_vocab: std::path::PathBuf,
+    /// What to write into the file `hotwords_file` will point at.
+    pub body: String,
+}
+
+/// Decides whether this bundle can honour these terms, and how.
+///
+/// Answering "greedy, no files" is a real answer, not a failure: it is what
+/// keeps a user with no vocabulary — and a user whose model cannot encode one
+/// — from paying for a beam search that buys nothing.
+pub fn plan_hotwords(model_dir: &Path, hotwords: &SttHotwords) -> HotwordPlan {
+    const GREEDY: &str = "greedy_search";
+    const BEAM: &str = "modified_beam_search";
+
+    if hotwords.is_empty() {
+        return HotwordPlan {
+            decoding_method: GREEDY,
+            hotwords: None,
+        };
+    }
+
+    let Some(bpe_vocab) = BPE_VOCAB_FILENAMES
+        .iter()
+        .map(|name| model_dir.join(name))
+        .find(|path| path.is_file())
+    else {
+        // Deliberately loud, and deliberately not an error: the transcript is
+        // still correct, and the replacement pass
+        // (`kea_core::dictation::apply_vocabulary`) still fixes the spelling
+        // afterwards. What must not happen is silence about a setting the
+        // user can see in the UI and this decode cannot use.
+        tracing::warn!(
+            model_dir = %model_dir.display(),
+            terms = hotwords.terms().len(),
+            expected = ?BPE_VOCAB_FILENAMES,
+            "this model ships no sentencepiece vocabulary, so decoder biasing \
+             is skipped; vocabulary terms are still applied to the transcript"
+        );
+        return HotwordPlan {
+            decoding_method: GREEDY,
+            hotwords: None,
+        };
+    };
+
+    HotwordPlan {
+        decoding_method: BEAM,
+        hotwords: Some(HotwordFiles {
+            bpe_vocab,
+            body: hotwords.file_body(),
+        }),
+    }
+}
+
 #[async_trait]
 pub trait SherpaSttInference: Send + Sync {
-    /// Transcribes mono PCM with the ONNX bundle in `model_dir`.
+    /// Transcribes mono PCM with the ONNX bundle in `model_dir`, biased toward
+    /// `hotwords`.
     ///
     /// There is deliberately no language parameter. The NeMo transducer this
     /// drives has no language setting — sherpa's `OfflineTransducerModelConfig`
@@ -19,7 +184,19 @@ pub trait SherpaSttInference: Send + Sync {
     /// could only ever be accepted and dropped, which is what this signature
     /// used to do. A parameter that looks honoured all the way down from the
     /// STT setting is worse than one that was never plumbed.
-    async fn transcribe(&self, pcm: AudioPcm, model_dir: &Path) -> Result<SttResult, InferError>;
+    ///
+    /// `hotwords` is here under exactly that rule, not against it. It reaches
+    /// `OfflineRecognizerConfig::hotwords_file` together with the
+    /// `modified_beam_search` the field requires — or, when the bundle cannot
+    /// encode the terms, it changes nothing and says so in the log rather than
+    /// pretending. [`plan_hotwords`] is that decision, and it is testable
+    /// without a model on disk.
+    async fn transcribe(
+        &self,
+        pcm: AudioPcm,
+        model_dir: &Path,
+        hotwords: &SttHotwords,
+    ) -> Result<SttResult, InferError>;
 }
 
 #[cfg(feature = "sherpa")]
@@ -71,36 +248,93 @@ fn find_first_existing(dir: &Path, names: &[&str]) -> Result<PathBuf, InferError
     )))
 }
 
+/// Builds the recognizer config for one decode.
+///
+/// Factored out of `transcribe` so a test can assert that a plan carrying
+/// hotwords arrives in the config as `hotwords_file`, `modified_beam_search`
+/// and a `bpe` modelling unit together, rather than being accepted and
+/// dropped on the way. `hotwords_file` is a path the caller has already
+/// written: sherpa aborts the process if the file named there does not exist.
+#[cfg(feature = "sherpa")]
+fn recognizer_config(
+    files: (PathBuf, PathBuf, PathBuf, PathBuf),
+    plan: &HotwordPlan,
+    hotwords_file: Option<&Path>,
+) -> sherpa_onnx::OfflineRecognizerConfig {
+    use sherpa_onnx::{OfflineRecognizerConfig, OfflineTransducerModelConfig};
+
+    let (encoder, decoder, joiner, tokens) = files;
+    let text = |p: &Path| p.to_string_lossy().into_owned();
+
+    let mut config = OfflineRecognizerConfig {
+        decoding_method: Some(plan.decoding_method.to_string()),
+        ..OfflineRecognizerConfig::default()
+    };
+    config.model_config.transducer = OfflineTransducerModelConfig {
+        encoder: Some(text(&encoder)),
+        decoder: Some(text(&decoder)),
+        joiner: Some(text(&joiner)),
+    };
+    config.model_config.tokens = Some(text(&tokens));
+    config.model_config.model_type = Some("nemo_transducer".into());
+    config.model_config.num_threads = std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(1);
+
+    // Both halves or neither: sherpa's default modelling unit is `cjkchar`,
+    // which looks an English phrase up whole in `tokens.txt` and skips it, so
+    // naming the vocabulary without naming the unit would be biasing that
+    // never fires.
+    if let (Some(hotwords), Some(path)) = (plan.hotwords.as_ref(), hotwords_file) {
+        config.model_config.modeling_unit = Some("bpe".into());
+        config.model_config.bpe_vocab = Some(text(&hotwords.bpe_vocab));
+        config.hotwords_file = Some(text(path));
+        config.hotwords_score = HOTWORDS_SCORE;
+    }
+
+    config
+}
+
 #[cfg(feature = "sherpa")]
 #[async_trait]
 impl SherpaSttInference for SherpaOnnxSttInference {
-    async fn transcribe(&self, pcm: AudioPcm, model_dir: &Path) -> Result<SttResult, InferError> {
+    async fn transcribe(
+        &self,
+        pcm: AudioPcm,
+        model_dir: &Path,
+        hotwords: &SttHotwords,
+    ) -> Result<SttResult, InferError> {
         let model_dir = model_dir.to_path_buf();
+        let hotwords = hotwords.clone();
         let samples = pcm.samples;
         let sample_rate = pcm.sample_rate_hz;
 
         tokio::task::spawn_blocking(move || {
-            use sherpa_onnx::{
-                OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
-            };
+            use sherpa_onnx::OfflineRecognizer;
 
-            let (encoder, decoder, joiner, tokens) = find_parakeet_model_files(&model_dir)?;
+            let files = find_parakeet_model_files(&model_dir)?;
+            let plan = plan_hotwords(&model_dir, &hotwords);
 
-            let mut config = OfflineRecognizerConfig::default();
-            config.model_config.transducer = OfflineTransducerModelConfig {
-                encoder: Some(encoder.to_string_lossy().into_owned()),
-                decoder: Some(decoder.to_string_lossy().into_owned()),
-                joiner: Some(joiner.to_string_lossy().into_owned()),
+            // The file has to exist for as long as the recognizer is being
+            // created — sherpa reads it there, and calls `exit` if it cannot
+            // be opened. The guard therefore stays alive past `create`; the
+            // terms are the user's vocabulary, so it is a temp file rather
+            // than something left beside the model.
+            let hotwords_file = match plan.hotwords.as_ref() {
+                Some(files) => {
+                    let temp = tempfile::NamedTempFile::new()?;
+                    std::fs::write(temp.path(), files.body.as_bytes())?;
+                    Some(temp)
+                }
+                None => None,
             };
-            config.model_config.tokens = Some(tokens.to_string_lossy().into_owned());
-            config.model_config.model_type = Some("nemo_transducer".into());
-            config.model_config.num_threads = std::thread::available_parallelism()
-                .map(|n| n.get() as i32)
-                .unwrap_or(1);
+            let config =
+                recognizer_config(files, &plan, hotwords_file.as_ref().map(|temp| temp.path()));
 
             let recognizer = OfflineRecognizer::create(&config).ok_or_else(|| {
                 InferError::Other("failed to create sherpa OfflineRecognizer".into())
             })?;
+            drop(hotwords_file);
 
             let stream = recognizer.create_stream();
             stream.accept_waveform(sample_rate as i32, &samples);
@@ -147,6 +381,7 @@ mod tests {
             &self,
             pcm: AudioPcm,
             _model_dir: &Path,
+            _hotwords: &SttHotwords,
         ) -> Result<SttResult, InferError> {
             Ok(SttResult::text_only(format!(
                 "parakeet: {} samples",
@@ -170,10 +405,141 @@ mod tests {
                     sample_rate_hz: 16_000,
                 },
                 Path::new("/tmp/parakeet-model"),
+                &SttHotwords::default(),
             )
             .await
             .unwrap();
         assert!(out.text.contains("parakeet"));
         assert!(out.text.contains("1600"));
+    }
+
+    /// The file sherpa reads is one phrase per line, so anything that could
+    /// split or merge a line has to be handled before it is written.
+    #[test]
+    fn hotwords_are_normalized_once_on_the_way_in() {
+        let hotwords = SttHotwords::new([
+            "  KittyClaw ",
+            "KEA",
+            // A duplicate after trimming, and an empty entry.
+            "KittyClaw",
+            "   ",
+            // A term with a line break would become two hotwords.
+            "two\nlines",
+        ]);
+        assert_eq!(hotwords.terms(), ["KittyClaw", "KEA"]);
+        assert_eq!(hotwords.file_body(), "KittyClaw\nKEA\n");
+
+        assert!(SttHotwords::default().is_empty());
+        assert_eq!(SttHotwords::new(Vec::<String>::new()).file_body(), "");
+    }
+
+    fn touch(path: &Path) {
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    /// An empty list must leave the decoder exactly as it was: hotwords only
+    /// work under `modified_beam_search`, and that is a real cost to pay for
+    /// a user who has no vocabulary at all.
+    #[test]
+    fn no_terms_means_no_beam_search() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("bpe.vocab"));
+
+        let plan = plan_hotwords(dir.path(), &SttHotwords::default());
+        assert_eq!(plan.decoding_method, "greedy_search");
+        assert_eq!(plan.hotwords, None);
+    }
+
+    /// With terms *and* a vocabulary to encode them with, the plan switches
+    /// the decoder and carries both files.
+    #[test]
+    fn terms_plus_a_bpe_vocabulary_switch_the_decoder() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("bpe.vocab"));
+
+        let plan = plan_hotwords(dir.path(), &SttHotwords::new(["KittyClaw", "KEA"]));
+        assert_eq!(plan.decoding_method, "modified_beam_search");
+        let files = plan.hotwords.expect("a plan with terms carries files");
+        assert_eq!(files.bpe_vocab, dir.path().join("bpe.vocab"));
+        assert_eq!(files.body, "KittyClaw\nKEA\n");
+    }
+
+    /// The measured case for the shipped Parakeet bundles: no sentencepiece
+    /// vocabulary, so sherpa would skip every term one by one *after* the
+    /// beam search had already been paid for. Staying greedy is the honest
+    /// answer, and the warning is where the user can find out why.
+    #[test]
+    fn a_bundle_with_no_sentencepiece_vocabulary_stays_greedy() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("tokens.txt"));
+        touch(&dir.path().join("encoder.int8.onnx"));
+
+        let plan = plan_hotwords(dir.path(), &SttHotwords::new(["KittyClaw"]));
+        assert_eq!(plan.decoding_method, "greedy_search");
+        assert_eq!(plan.hotwords, None);
+    }
+
+    /// `bpe.model` is the other name the same vocabulary ships under.
+    #[test]
+    fn either_published_vocabulary_filename_is_accepted() {
+        for name in ["bpe.vocab", "bpe.model"] {
+            let dir = tempfile::tempdir().unwrap();
+            touch(&dir.path().join(name));
+            let plan = plan_hotwords(dir.path(), &SttHotwords::new(["KEA"]));
+            let files = plan.hotwords.expect("{name} should be accepted");
+            assert_eq!(files.bpe_vocab, dir.path().join(name));
+        }
+    }
+
+    /// The point of the whole exercise: the terms must reach the recognizer
+    /// config, not merely be accepted by the signature. This asserts against
+    /// the real `OfflineRecognizerConfig`, so it only builds where sherpa
+    /// does.
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn the_terms_reach_the_recognizer_config() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("bpe.vocab"));
+        touch(&dir.path().join("tokens.txt"));
+        touch(&dir.path().join("encoder.int8.onnx"));
+        touch(&dir.path().join("decoder.int8.onnx"));
+        touch(&dir.path().join("joiner.int8.onnx"));
+        let files = find_parakeet_model_files(dir.path()).unwrap();
+
+        let plan = plan_hotwords(dir.path(), &SttHotwords::new(["KittyClaw"]));
+        let hotwords_path = dir.path().join("hotwords.txt");
+        std::fs::write(
+            &hotwords_path,
+            plan.hotwords.as_ref().unwrap().body.as_bytes(),
+        )
+        .unwrap();
+
+        let config = recognizer_config(files.clone(), &plan, Some(&hotwords_path));
+        assert_eq!(
+            config.hotwords_file,
+            Some(hotwords_path.to_string_lossy().into_owned())
+        );
+        assert_eq!(config.hotwords_score, HOTWORDS_SCORE);
+        // sherpa reads `hotwords_file` only under this decoder.
+        assert_eq!(
+            config.decoding_method.as_deref(),
+            Some("modified_beam_search")
+        );
+        // And it can only encode the terms with the model's own subword units.
+        assert_eq!(config.model_config.modeling_unit.as_deref(), Some("bpe"));
+        assert_eq!(
+            config.model_config.bpe_vocab,
+            Some(dir.path().join("bpe.vocab").to_string_lossy().into_owned())
+        );
+
+        // With no terms, none of it is touched — and the greedy decoder the
+        // engine has always used is what runs.
+        let plain = plan_hotwords(dir.path(), &SttHotwords::default());
+        let config = recognizer_config(files, &plain, None);
+        assert_eq!(config.hotwords_file, None);
+        assert_eq!(config.hotwords_score, 0.0);
+        assert_eq!(config.decoding_method.as_deref(), Some("greedy_search"));
+        assert_eq!(config.model_config.modeling_unit, None);
+        assert_eq!(config.model_config.bpe_vocab, None);
     }
 }

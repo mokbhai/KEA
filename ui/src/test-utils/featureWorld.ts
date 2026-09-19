@@ -76,6 +76,8 @@ export function featureHandlers({
       source: "default",
     }),
     get_hotkey_registration_status: () => [],
+    set_hotkey: () => undefined,
+    clear_hotkey: () => undefined,
     get_dictation_settings: () => ({
       post_process: false,
       active_model: null,

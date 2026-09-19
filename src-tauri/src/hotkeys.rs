@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use kea_core::dictation::DictationSettingsRepo;
+use kea_core::rewrite::language::describe;
+use kea_core::rewrite::RewriteMode;
+use kea_core::store::hotkeys::HotkeyBindingRepo;
 use kea_core::store::settings::SettingsRepo;
 use kea_platform::ActionId;
 use sqlx::SqlitePool;
@@ -21,12 +24,13 @@ use tokio::sync::mpsc;
 use crate::commands::trigger_tts_inner;
 use crate::commands::{
     apply_dictation_settings, capture_screen_text_inner, close_palette_for, dictation_gate,
-    dictation_hotkey_action, hold_dictation_action, lock_cancel_action, meeting_hotkey_action,
-    notify_user, open_palette_session, palette_is_open, record_hotkey_reg_status, register_hotkey,
-    resolve_accelerator, run_dictation_action, run_selection_rewrite, start_meeting_inner,
-    stop_meeting_inner, try_acquire_busy, BusyGuard, HotkeyAction, MeetingHotkeyAction,
-    RewriteOverride, DICTATION_ACTION_ID, HOTKEY_ACTIONS, LOCK_CANCEL_ACTION_ID,
-    MEETINGS_ACTION_ID, OCR_ACTION_ID, PALETTE_ACTION_ID, REWRITE_ACTION_ID, TTS_ACTION_ID,
+    dictation_hotkey_action, hold_dictation_action, hotkey_action_for_id, hotkey_owners,
+    lock_cancel_action, meeting_hotkey_action, notify_user, open_palette_session, palette_is_open,
+    record_hotkey_reg_status, register_hotkey, resolve_accelerator, run_dictation_action,
+    run_selection_rewrite, start_meeting_inner, stop_meeting_inner, try_acquire_busy, BusyGuard,
+    HotkeyAction, MeetingHotkeyAction, RewriteOverride, DICTATION_ACTION_ID, HOTKEY_ACTIONS,
+    LOCK_CANCEL_ACTION_ID, MEETINGS_ACTION_ID, OCR_ACTION_ID, PALETTE_ACTION_ID, REWRITE_ACTION_ID,
+    TTS_ACTION_ID,
 };
 use crate::events::{
     emit_meeting_error, emit_rewrite_error, emit_rewrite_progress, emit_tts_error,
@@ -41,10 +45,17 @@ type HandlerFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 /// loop: most handlers bind it and let it drop when they return, but the
 /// palette moves it into its session, because its busy window runs from open
 /// to dismissal rather than for the length of its open handler.
-type Handler = for<'a> fn(&'a Arc<AppState>, &'a AppHandle, BusyGuard) -> HandlerFuture<'a>;
+///
+/// The [`HotkeyAction`] comes along because one handler can serve a whole
+/// command family: every per-language translate shortcut runs
+/// [`handle_translate`], and the row is where it reads its language from. The
+/// six single-command handlers ignore it.
+type Handler =
+    for<'a> fn(&'a Arc<AppState>, &'a AppHandle, &'a HotkeyAction, BusyGuard) -> HandlerFuture<'a>;
 
-/// One dispatchable hotkey: the [`HOTKEY_ACTIONS`] row, the flag that keeps a
-/// second press out while the first is still running, and the handler.
+/// One dispatchable hotkey: the row, the flag that keeps a second press out
+/// while the first is still running, and the handler.
+#[derive(Clone)]
 struct Dispatch {
     action: HotkeyAction,
     busy: Arc<AtomicBool>,
@@ -65,8 +76,17 @@ fn handler_for(action_id: &str) -> Option<Handler> {
         MEETINGS_ACTION_ID => Some(handle_meetings),
         PALETTE_ACTION_ID => Some(handle_palette),
         OCR_ACTION_ID => Some(handle_ocr_capture),
-        _ => None,
+        // The per-language translate shortcuts are one family rather than a
+        // row each, so whether an id names one is asked of the hotkey table's
+        // own lookup instead of pattern-matched on a prefix here — same
+        // validation, one place.
+        other => is_translate_action(other).then_some(handle_translate as Handler),
     }
+}
+
+/// Whether `action_id` names one of the per-language translate shortcuts.
+fn is_translate_action(action_id: &str) -> bool {
+    hotkey_action_for_id(action_id).is_some_and(|a| a.translate_target().is_some())
 }
 
 /// The busy flag an action serialises on.
@@ -90,6 +110,11 @@ fn busy_flag(action_id: &str, state: &Arc<AppState>) -> Arc<AtomicBool> {
         // and a flag minted inside this table would be invisible to them —
         // two reads at once is two voices over each other.
         TTS_ACTION_ID => state.tts_busy.clone(),
+        // Fourth, and the reason the translate family shares one flag rather
+        // than one per language: a translate shortcut is a selection rewrite
+        // too, so two of them mashed together would fire two ⌘C/⌘V pairs at
+        // the same document.
+        id if is_translate_action(id) => state.selection_busy.clone(),
         _ => Arc::new(AtomicBool::new(false)),
     }
 }
@@ -98,28 +123,68 @@ fn dispatch_table(state: &Arc<AppState>) -> Vec<Dispatch> {
     HOTKEY_ACTIONS
         .iter()
         .filter_map(|action| {
-            handler_for(action.action_id).map(|handle| Dispatch {
-                action: *action,
-                busy: busy_flag(action.action_id, state),
+            let action_id = action.action_id();
+            handler_for(&action_id).map(|handle| Dispatch {
+                action: action.clone(),
+                busy: busy_flag(&action_id, state),
                 handle,
             })
         })
         .collect()
 }
 
-/// Register every hotkey in [`HOTKEY_ACTIONS`] and hand back the press stream.
+/// The dispatch entry for one press: the prebuilt row, or a translate row
+/// built on the spot.
+///
+/// The table is built once at startup, but a translate shortcut recorded
+/// *after* that is registered immediately by `set_hotkey` and its press
+/// arrives here — with no row. Rebuilding is deliberately limited to the
+/// translate family, because that family's busy flag is the shared
+/// `selection_busy`: anything else would mint a fresh flag per press, which is
+/// no gate at all.
+fn dispatch_for(table: &[Dispatch], action_id: &str, state: &Arc<AppState>) -> Option<Dispatch> {
+    if let Some(found) = table.iter().find(|e| e.action.action_id() == action_id) {
+        return Some(found.clone());
+    }
+    let action = hotkey_action_for_id(action_id).filter(|a| a.translate_target().is_some())?;
+    Some(Dispatch {
+        busy: busy_flag(action_id, state),
+        handle: handler_for(action_id)?,
+        action,
+    })
+}
+
+/// Register every global hotkey and hand back the press stream.
+///
+/// "Every" is the fixed table *plus* the persisted rows it cannot list — the
+/// per-language translate shortcuts — which is why the bindings are read here
+/// rather than only inside `resolve_accelerator`.
 ///
 /// Registration outcomes are recorded per feature so the UI can show which
 /// shortcut the OS refused.
 pub fn register_all(state: &Arc<AppState>, config_pool: &SqlitePool) -> mpsc::Receiver<ActionId> {
+    let bindings = tauri::async_runtime::block_on(
+        HotkeyBindingRepo::new(config_pool.clone()).list(),
+    )
+    .unwrap_or_else(|error| {
+        // The fixed table still registers from its compiled defaults; only the
+        // user's own rows are lost, and they come back on the next launch.
+        tracing::warn!(%error, "could not read saved hotkeys; registering the defaults only");
+        Vec::new()
+    });
+
     // Resolve every accelerator before taking the hotkeys lock: each one
     // hits the DB, and the lock is a std Mutex.
-    let accelerators: Vec<(HotkeyAction, String)> = HOTKEY_ACTIONS
-        .iter()
+    let accelerators: Vec<(HotkeyAction, String)> = hotkey_owners(&bindings)
+        .into_iter()
         .map(|action| {
-            let accel = tauri::async_runtime::block_on(resolve_accelerator(config_pool, action));
-            (*action, accel)
+            let accel = tauri::async_runtime::block_on(resolve_accelerator(config_pool, &action));
+            (action, accel)
         })
+        // A translate row has no compiled default, so an empty accelerator
+        // means its binding vanished between the two reads. Registering "" is
+        // a guaranteed failure booked against a shortcut the user never set.
+        .filter(|(_, accel)| !accel.is_empty())
         .collect();
     let mut hk = state.hotkeys.lock().expect("hotkeys lock");
     {
@@ -131,7 +196,7 @@ pub fn register_all(state: &Arc<AppState>, config_pool: &SqlitePool) -> mpsc::Re
             record_hotkey_reg_status(
                 &mut statuses,
                 action.feature,
-                action.command,
+                &action.command,
                 register_hotkey(&mut hk, action, accel),
             );
         }
@@ -191,7 +256,7 @@ pub fn spawn_dispatch_loop(state: Arc<AppState>, app: AppHandle, mut rx: mpsc::R
                 continue;
             }
 
-            let Some(entry) = table.iter().find(|e| e.action.action_id == action_id) else {
+            let Some(entry) = dispatch_for(&table, &action_id, &state) else {
                 continue;
             };
             let Some(guard) = try_acquire_busy(&entry.busy) else {
@@ -203,9 +268,8 @@ pub fn spawn_dispatch_loop(state: Arc<AppState>, app: AppHandle, mut rx: mpsc::R
             };
             let state = state.clone();
             let app = app.clone();
-            let handle = entry.handle;
             tauri::async_runtime::spawn(async move {
-                handle(&state, &app, guard).await;
+                (entry.handle)(&state, &app, &entry.action, guard).await;
             });
         }
     });
@@ -240,6 +304,7 @@ pub fn spawn_saved_dictation_settings(
 fn handle_rewrite<'a>(
     state: &'a Arc<AppState>,
     app: &'a AppHandle,
+    _action: &'a HotkeyAction,
     busy: BusyGuard,
 ) -> HandlerFuture<'a> {
     Box::pin(async move {
@@ -255,9 +320,46 @@ fn handle_rewrite<'a>(
     })
 }
 
+/// Translate the selection into this shortcut's language.
+///
+/// The rewrite shortcut's body with the mode and its parameter forced: a
+/// translate key does not ask what the saved style is, and clearing the active
+/// preset is part of forcing the mode (see `set_rewrite_mode`) — a preset
+/// replaces the prompt template outright.
+fn handle_translate<'a>(
+    state: &'a Arc<AppState>,
+    app: &'a AppHandle,
+    action: &'a HotkeyAction,
+    busy: BusyGuard,
+) -> HandlerFuture<'a> {
+    Box::pin(async move {
+        let _busy = busy;
+        // Unreachable: only `dispatch_for`/`handler_for` reach this handler,
+        // and both ask the same lookup for the tag first.
+        let Some(tag) = action.translate_target() else {
+            return;
+        };
+        // Naming the language out loud is the mitigation for this feature's
+        // quiet failure mode — "it translated into the wrong language" is
+        // otherwise unfalsifiable from outside the app.
+        let language = describe(tag).unwrap_or_else(|_| tag.to_string());
+        emit_rewrite_progress(app, &format!("Translating to {language}..."));
+        let over = RewriteOverride {
+            mode: Some(RewriteMode::Translate),
+            instruction: Some(tag.to_string()),
+            ..RewriteOverride::default()
+        };
+        match run_selection_rewrite(state, &over).await {
+            Ok(_) => emit_rewrite_progress(app, "Done"),
+            Err(error) => emit_rewrite_error(app, &error),
+        }
+    })
+}
+
 fn handle_dictation<'a>(
     state: &'a Arc<AppState>,
     app: &'a AppHandle,
+    _action: &'a HotkeyAction,
     busy: BusyGuard,
 ) -> HandlerFuture<'a> {
     Box::pin(async move {
@@ -271,6 +373,7 @@ fn handle_dictation<'a>(
 fn handle_tts<'a>(
     state: &'a Arc<AppState>,
     app: &'a AppHandle,
+    _action: &'a HotkeyAction,
     busy: BusyGuard,
 ) -> HandlerFuture<'a> {
     Box::pin(async move {
@@ -284,6 +387,7 @@ fn handle_tts<'a>(
 fn handle_meetings<'a>(
     state: &'a Arc<AppState>,
     app: &'a AppHandle,
+    _action: &'a HotkeyAction,
     busy: BusyGuard,
 ) -> HandlerFuture<'a> {
     Box::pin(async move {
@@ -320,6 +424,7 @@ fn handle_meetings<'a>(
 fn handle_palette<'a>(
     state: &'a Arc<AppState>,
     app: &'a AppHandle,
+    _action: &'a HotkeyAction,
     busy: BusyGuard,
 ) -> HandlerFuture<'a> {
     Box::pin(async move {
@@ -333,6 +438,7 @@ fn handle_palette<'a>(
 fn handle_ocr_capture<'a>(
     state: &'a Arc<AppState>,
     app: &'a AppHandle,
+    _action: &'a HotkeyAction,
     busy: BusyGuard,
 ) -> HandlerFuture<'a> {
     Box::pin(async move {
@@ -354,11 +460,22 @@ mod tests {
     fn every_hotkey_action_has_a_handler() {
         for action in HOTKEY_ACTIONS {
             assert!(
-                handler_for(action.action_id).is_some(),
+                handler_for(&action.action_id()).is_some(),
                 "no dispatch handler for {}",
-                action.action_id
+                action.action_id()
             );
         }
+    }
+
+    /// The family reaches the same three table-driven answers a fixed row
+    /// does: a handler, the *shared* selection flag, and nothing for a command
+    /// that only looks like one.
+    #[test]
+    fn translate_shortcuts_dispatch_as_one_family() {
+        assert!(handler_for("rewrite:translate.pt-BR").is_some());
+        assert!(handler_for("rewrite:translate.").is_none());
+        assert!(handler_for("rewrite:translate.not a tag").is_none());
+        assert!(handler_for("dictation:translate.fr").is_none());
     }
 
     #[test]
@@ -374,7 +491,7 @@ mod tests {
         assert!(
             HOTKEY_ACTIONS
                 .iter()
-                .all(|a| a.action_id != LOCK_CANCEL_ACTION_ID),
+                .all(|a| a.action_id() != LOCK_CANCEL_ACTION_ID),
             "Escape must not become a rebindable hotkey"
         );
         assert!(handler_for(LOCK_CANCEL_ACTION_ID).is_none());
