@@ -1,10 +1,12 @@
-//! Platform providers: OS integration behind traits (hotkeys, text I/O, audio, permissions).
+//! Platform providers: OS integration behind traits (hotkeys, text I/O, audio,
+//! permissions, screen capture/OCR).
 
 pub mod audio;
 pub mod hotkeys;
 #[cfg(target_os = "macos")]
 pub mod macos_services;
 pub mod permissions;
+pub mod screen;
 pub mod textio;
 pub mod tts;
 
@@ -18,6 +20,11 @@ pub use hotkeys::{
     parse_accelerator, spawn_hold_to_talk, ActionId, HotkeyBinding, HotkeyError, Hotkeys,
 };
 pub use permissions::{new_permissions, PermError, PermKind, PermStatus, Permissions};
+pub use screen::{
+    new_screen_capture, new_text_recognizer, observations_to_text, reading_order, CaptureOutcome,
+    CaptureSlot, CaptureVerdict, CapturedImage, NormalizedRect, Observation, OcrOptions,
+    ScreenCapture, ScreenError, TextBox, TextRecognizer,
+};
 pub use textio::{
     new_app_context_probe, AppContext, AppContextProbe, CaptureOpts, ClipboardPlan, ReplaceMode,
     TextIo, TextIoError,
@@ -63,6 +70,10 @@ mod tests {
         let _text_io = new_text_io();
         let _audio = new_audio_io();
         let _permissions = new_permissions();
+        // Constructed, not exercised: capturing a region opens an interactive
+        // selector and OCR needs a screen, neither of which a test has.
+        let _screen = new_screen_capture();
+        let _ocr = new_text_recognizer();
     }
 
     /// Verify the non-macOS composition path constructs without panic and that
@@ -78,6 +89,8 @@ mod tests {
             let _text_io = new_text_io();
             let _audio = new_audio_io();
             let _permissions = new_permissions();
+            let _screen = new_screen_capture();
+            let _ocr = new_text_recognizer();
         }
 
         #[test]

@@ -1,5 +1,10 @@
 import { useEffect, useState } from "react";
-import { onDictationLevel, onDictationState, type DictationState } from "../api";
+import {
+  onDictationLevel,
+  onDictationPartial,
+  onDictationState,
+  type DictationState,
+} from "../api";
 import { usePrefersReducedMotion } from "../hooks/usePrefersReducedMotion";
 import {
   barScale,
@@ -42,6 +47,78 @@ const stateDots: Record<DictationState, string> = {
   locked: "kea-dot--warn",
   processing: "kea-dot--accent",
 };
+
+/**
+ * How wide the transcript line is allowed to be.
+ *
+ * **Must agree with `PARTIAL_WIDTH` in `src-tauri/src/overlay.rs`**, which is
+ * what makes the overlay window wide enough to hold it. There is no seam where
+ * Rust and CSS meet, so the cross-reference in both files is the only defence.
+ */
+const PARTIAL_WIDTH_PX = 220;
+
+type PartialState = { seq: number; text: string; stableChars: number | null };
+
+/**
+ * The live transcript, settled words in `--text` and the still-moving tail in
+ * `--text-muted`.
+ *
+ * Two things here are load bearing and easy to undo by accident:
+ *
+ * - `aria-hidden`. A live region fed a self-revising string ten times a second
+ *   is unusable and no `aria-live` politeness setting fixes it, so the head's
+ *   `role="status"` stays the only announced element. A screen-reader user
+ *   gets the transcript from the application it was typed into, which is the
+ *   authoritative copy; this line is a sighted-user affordance.
+ * - The tail is dimmed with the `--text-muted` *token*, never with `opacity`.
+ *   The contrast guard in `ui/src/palette.contrast.test.ts` composites only
+ *   declared alpha, so an `opacity` here would drop the real ratio below 4.5:1
+ *   with the test still green.
+ *
+ * Splitting is by `Array.from`, never `slice`: `stableChars` counts Unicode
+ * scalar values, and a byte or UTF-16 offset would cut an emoji or a CJK
+ * character in half and render a replacement character. Invisible in
+ * English-only testing, which is why it is spelled out.
+ */
+function PartialLine({ partial }: { partial: PartialState | null }) {
+  const scalars = partial ? Array.from(partial.text) : [];
+  // `null` means the engine does not report stability, so nothing is claimed
+  // to be still moving.
+  const stable = partial?.stableChars ?? scalars.length;
+
+  return (
+    <div
+      className="kea-hud__partial"
+      aria-hidden="true"
+      style={{
+        display: "flex",
+        // The newest words are pinned to the right, so overflow spills off the
+        // start edge and is clipped there while the text itself stays LTR.
+        // `direction: rtl` would scroll the same way and mangle trailing
+        // punctuation.
+        justifyContent: "flex-end",
+        // No partial, no space reserved: this is the item-9-is-missing state
+        // and the initial one.
+        width: partial ? PARTIAL_WIDTH_PX : 0,
+        overflow: "hidden",
+        whiteSpace: "nowrap",
+        // Exactly one width change per run, 0 → 220px when the first partial
+        // arrives, not one per partial. The global reduced-motion rule in
+        // index.css zeroes this transition.
+        transition: "width 140ms ease-out",
+        maskImage: "linear-gradient(to right, transparent 0, #000 24px)",
+        WebkitMaskImage: "linear-gradient(to right, transparent 0, #000 24px)",
+      }}
+    >
+      <span className="kea-hud__partial-stable" style={{ color: "var(--text)" }}>
+        {scalars.slice(0, stable).join("")}
+      </span>
+      <span className="kea-hud__partial-tail" style={{ color: "var(--text-muted)" }}>
+        {scalars.slice(stable).join("")}
+      </span>
+    </div>
+  );
+}
 
 function Waveform({ history }: { history: readonly number[] }) {
   const latest = history[history.length - 1] ?? 0;
@@ -96,6 +173,10 @@ function TranscribingIndicator({ reducedMotion }: { reducedMotion: boolean }) {
 export default function DictationHud() {
   const [state, setState] = useState<DictationState>("idle");
   const [history, setHistory] = useState<number[]>(() => emptyLevelHistory());
+  // `null` is the initial state *and* the whole absence path: a build with no
+  // streaming model selected, or one whose model is not installed, never
+  // receives a partial and renders exactly the HUD that shipped before them.
+  const [partial, setPartial] = useState<PartialState | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const reducedMotion = usePrefersReducedMotion();
   const recording = state === "listening" || state === "locked";
@@ -105,6 +186,23 @@ export default function DictationHud() {
       onDictationState(setState),
       onDictationLevel((level) =>
         setHistory((previous) => pushLevel(previous, level, WAVEFORM_BARS)),
+      ),
+      onDictationPartial((incoming) =>
+        setPartial((previous) =>
+          // A streaming hypothesis grows *and revises its tail*, so each
+          // payload carries the whole display string and this assigns rather
+          // than appends. Reconciling deltas would be the engine's job, not
+          // the HUD's. Ignoring a lower seq is what makes the Rust throttle's
+          // drop-and-coalesce safe and turns a straggler arriving after
+          // `processing` into a no-op rather than a flicker.
+          previous && incoming.seq <= previous.seq
+            ? previous
+            : {
+                seq: incoming.seq,
+                text: incoming.text,
+                stableChars: incoming.stable_chars,
+              },
+        ),
       ),
     ]);
 
@@ -118,6 +216,16 @@ export default function DictationHud() {
     // the next one to start from.
     if (!recording) setHistory(emptyLevelHistory());
   }, [recording]);
+
+  useEffect(() => {
+    // The partial has a different lifetime from the waveform. It must
+    // *survive* listening → processing, because that is exactly the window in
+    // which the user has stopped talking and wants to see what was heard — and
+    // in which the final partial, the text actually typed, arrives. So it is
+    // cleared on idle (the run is over) and on entry to listening (a new run
+    // must not inherit the previous one's words).
+    if (state === "idle" || state === "listening") setPartial(null);
+  }, [state]);
 
   useEffect(() => {
     // Only the locked mode counts: a held recording lasts as long as the keys
@@ -137,7 +245,9 @@ export default function DictationHud() {
   if (state === "idle") return null;
 
   return (
-    <div className={`kea-hud kea-hud--${state}`}>
+    <div
+      className={`kea-hud kea-hud--${state}${partial ? " kea-hud--has-partial" : ""}`}
+    >
       {/* Only the label sits in the live region: a meter that updates 20x a
           second inside one would be announced 20x a second. */}
       <div className="kea-hud__head" role="status">
@@ -156,6 +266,7 @@ export default function DictationHud() {
       ) : (
         <TranscribingIndicator reducedMotion={reducedMotion} />
       )}
+      <PartialLine partial={partial} />
       {state === "locked" && (
         <span
           className="kea-muted"

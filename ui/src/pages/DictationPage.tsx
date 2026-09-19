@@ -4,12 +4,16 @@ import {
   getDictationSettings,
   getDictationStateApi,
   getEffectiveHotkey,
+  getSetting,
   listInputDevices,
+  listInstalledOnnxModels,
+  listOnnxModels,
   onDeviceFallback,
   onDictationLevel,
   onDictationPreview,
   onDictationState,
   setDictationSettings,
+  setSetting,
   startDictation,
   startInputPreview,
   stopDictation,
@@ -17,6 +21,7 @@ import {
   type DictationSettings,
   type DictationState,
   type InputDevice,
+  type OnnxModel,
 } from "../api";
 import FeatureAiCard from "../components/FeatureAiCard";
 import FeatureBanner from "../components/FeatureBanner";
@@ -54,6 +59,55 @@ const AUTO_DETECT = "";
  * kind a language can be chosen for (crates/infer/src/registry.rs).
  */
 const MULTILINGUAL = "multilingual";
+
+/**
+ * The live-transcript settings, which are plain key/value rows rather than
+ * part of `DictationSettings` (src-tauri/src/commands.rs).
+ */
+const STREAMING_MODEL_KEY = "dictation.streaming_model";
+const SHOW_PARTIALS_KEY = "dictation.show_partials";
+const STREAMING_FALLBACK_KEY = "dictation.streaming_fallback";
+
+/**
+ * The `<select>` value standing for "no live transcript". Same reasoning as
+ * SYSTEM_DEFAULT — and it is also what the backend reads as off, since a
+ * blank model id means the feature is off there (`streaming_model_setting`).
+ * There is deliberately no separate enable flag: the model *is* the switch.
+ */
+const STREAMING_OFF = "";
+
+/** The catalog kind the live-preview models are listed and installed under. */
+const STREAMING_KIND = "streaming";
+
+type LiveTranscript = {
+  /** Empty means off. */
+  model: string;
+  showPartials: boolean;
+  fallback: boolean;
+};
+
+/**
+ * `set_setting` takes a string and stores the JSON *of that string*, so a
+ * boolean written from here is the JSON string "true"/"false" — which is what
+ * the Rust side's `bool_setting` reads back (it accepts a real JSON bool too,
+ * for the callers that are not this command). `String(next)` is the same
+ * encoding HistoryPage's toggle writes; anything else would be a value only
+ * one half of the wire understood.
+ */
+const readBool = (value: string | null, whenUnset: boolean) =>
+  value === "true" ? true : value === "false" ? false : whenUnset;
+
+/**
+ * All three keys go together so the stored state is never half a decision —
+ * and so choosing a model materialises the two defaults next to it instead of
+ * leaving them implicit.
+ */
+const persistLiveTranscript = (next: LiveTranscript) =>
+  Promise.all([
+    setSetting(STREAMING_MODEL_KEY, next.model),
+    setSetting(SHOW_PARTIALS_KEY, String(next.showPartials)),
+    setSetting(STREAMING_FALLBACK_KEY, String(next.fallback)),
+  ]);
 
 const STATE_LABELS: Record<DictationState, string> = {
   idle: "Idle",
@@ -115,8 +169,23 @@ export default function DictationPage({ onNavigate }: Props) {
     language,
   } = settings.value;
   const { setValue: setSettingsValue, setError: setSettingsError } = settings;
+  // Three independent settings keys, saved together. No `reread`: nothing else
+  // in this window writes them, and the one backend writer — the sweep that
+  // clears the model when its files are deleted from the Models page — is
+  // picked up by the mount read the next time this page is opened.
+  const live = useOptimisticSetting<LiveTranscript>({
+    initial: { model: STREAMING_OFF, showPartials: true, fallback: false },
+    persist: persistLiveTranscript,
+  });
+  const { model: streamingModel, showPartials, fallback: draftFallback } = live.value;
+  const { setValue: setLiveValue } = live;
   const ai = useFeatureAi(postProcess ? SLOTS_WITH_CLEANUP : SLOTS_PLAIN);
   const [settingsLoading, setSettingsLoading] = useState(true);
+  const [liveLoading, setLiveLoading] = useState(true);
+  const [streamingModels, setStreamingModels] = useState<OnnxModel[]>([]);
+  const [streamingCatalogError, setStreamingCatalogError] = useState<string | null>(
+    null,
+  );
   const [dictationStatus, setDictationStatus] = useState<string | null>(null);
   const [transcript, setTranscript] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -140,7 +209,7 @@ export default function DictationPage({ onNavigate }: Props) {
   const sttModel = stt?.model ?? settings.value.active_model;
   // One flag for the page: a save and a run both lock the whole panel, as
   // they did when this was a single `busy`.
-  const anyBusy = busy || settings.busy;
+  const anyBusy = busy || settings.busy || live.busy;
 
   useEffect(() => {
     getDictationSettings()
@@ -159,6 +228,38 @@ export default function DictationPage({ onNavigate }: Props) {
     listInputDevices()
       .then(setDevices)
       .catch(() => setDevices([])); /* the dropdown falls back to the saved name */
+
+    // Each key degrades on its own, and a failed read means off rather than
+    // broken: a model cleared by the Models page is stored as the JSON literal
+    // `null`, which `get_setting` — a plain `get::<String>` — cannot
+    // deserialize, so the read for that key rejects forever after. Off is
+    // exactly what that state means, and it is what the backend does with it.
+    Promise.all([
+      getSetting(STREAMING_MODEL_KEY).catch(() => null),
+      getSetting(SHOW_PARTIALS_KEY).catch(() => null),
+      getSetting(STREAMING_FALLBACK_KEY).catch(() => null),
+    ])
+      .then(([model, partials, draft]) =>
+        setLiveValue({
+          model: model?.trim() || STREAMING_OFF,
+          showPartials: readBool(partials, true),
+          fallback: readBool(draft, false),
+        }),
+      )
+      .finally(() => setLiveLoading(false));
+
+    // Only the installed ones are offered: a model that is not on disk would
+    // be a choice that silently does nothing, so the empty state sends the
+    // user to the Models page instead.
+    Promise.all([
+      listOnnxModels(STREAMING_KIND),
+      listInstalledOnnxModels(STREAMING_KIND),
+    ])
+      .then(([models, installed]) => {
+        const onDisk = new Set(installed);
+        setStreamingModels(models.filter((m) => onDisk.has(m.id)));
+      })
+      .catch((e) => setStreamingCatalogError(toMessage(e)));
   }, []);
 
   useEffect(() => {
@@ -224,6 +325,14 @@ export default function DictationPage({ onNavigate }: Props) {
     acceptsLanguage(stt.engine_id) &&
     !!sttModel &&
     catalogLanguages.get(sttModel)?.toLowerCase() === MULTILINGUAL;
+
+  // A selected model is the whole on/off state of the feature, so the two
+  // dependent rows follow it: showing them while nothing can produce a partial
+  // would offer settings that do nothing.
+  const streamingOn = streamingModel !== STREAMING_OFF;
+  // A saved model whose files are gone still counts as a choice — it has to
+  // stay selectable so "Off" is a thing the user can actually pick.
+  const noStreamingChoice = streamingModels.length === 0 && !streamingOn;
 
   // Stopping is best-effort on unmount: the backend also stops the preview on
   // window blur and after 30s, so a navigation cannot strand an open mic.
@@ -441,6 +550,112 @@ export default function DictationPage({ onNavigate }: Props) {
             {settings.error && (
               <p style={{ marginTop: 8, fontSize: "0.8125rem", color: "var(--danger)" }}>
                 {settings.error}
+              </p>
+            )}
+          </>
+        )}
+      </section>
+
+      <section style={{ marginBottom: 24 }}>
+        <h2 style={{ margin: "0 0 12px" }}>Live transcript</h2>
+        {liveLoading ? (
+          <LoadingBlock label="Loading settings…" minHeight={44} />
+        ) : (
+          <>
+            <RowGroup aria-label="Live transcript">
+              <Row
+                label="Live preview model"
+                hint="A small, fast model that shows words in the dictation window while you talk. It is a preview only — when you stop, your speech model transcribes the whole recording again and that second pass is what gets typed, so the preview can be visibly wrong and then correct itself."
+              >
+                {streamingCatalogError ? (
+                  <span className="kea-muted">
+                    Couldn&apos;t check which previews are downloaded.
+                  </span>
+                ) : noStreamingChoice ? (
+                  <span className="kea-muted">No preview model is downloaded yet.</span>
+                ) : (
+                  <>
+                    {live.savedKey === "model" && (
+                      <span className="kea-saved">Saved ✓</span>
+                    )}
+                    <select
+                      className="kea-select"
+                      aria-label="Live preview model"
+                      value={streamingModel}
+                      disabled={anyBusy}
+                      onChange={(e) => void live.save({ model: e.target.value }, "model")}
+                    >
+                      <option value={STREAMING_OFF}>Off</option>
+                      {streamingModels.map((model) => (
+                        <option key={model.id} value={model.id}>
+                          {model.display_name}
+                        </option>
+                      ))}
+                      {/* A saved model whose files were removed still has to
+                          show as the selection, or the dropdown would read as
+                          Off while the setting says otherwise. */}
+                      {streamingOn &&
+                        !streamingModels.some((m) => m.id === streamingModel) && (
+                          <option value={streamingModel}>
+                            {streamingModel} (not downloaded)
+                          </option>
+                        )}
+                    </select>
+                  </>
+                )}
+                {/* Only offered when there is somewhere to send the user, the
+                    same rule the blocked-slot banner uses. The label is
+                    spelled out because that banner's own "Open Models" can be
+                    on screen at the same time, for a different reason. */}
+                {(streamingCatalogError || noStreamingChoice) && onNavigate && (
+                  <button
+                    type="button"
+                    className="kea-btn"
+                    aria-label="Open Models to download a live preview"
+                    onClick={() => onNavigate("models")}
+                  >
+                    Open Models
+                  </button>
+                )}
+              </Row>
+              {streamingOn && (
+                <>
+                  <Row
+                    label="Show the preview"
+                    hint="Draws the running guess in the dictation window. Off, nothing extra is shown and the second model does all the work on its own."
+                  >
+                    {live.savedKey === "showPartials" && (
+                      <span className="kea-saved">Saved ✓</span>
+                    )}
+                    <Toggle
+                      label="Show the preview"
+                      checked={showPartials}
+                      disabled={anyBusy}
+                      onChange={(next) =>
+                        void live.save({ showPartials: next }, "showPartials")
+                      }
+                    />
+                  </Row>
+                  <Row
+                    label="Type the preview if the second pass fails"
+                    hint="Trades accuracy for not losing the recording: you get the rough live text instead of nothing, and nothing tells you it is the rough one — which is why it starts off. Needs the preview above switched on, since that is what produces the draft."
+                  >
+                    {live.savedKey === "fallback" && (
+                      <span className="kea-saved">Saved ✓</span>
+                    )}
+                    <Toggle
+                      label="Type the preview if the second pass fails"
+                      checked={draftFallback}
+                      disabled={anyBusy}
+                      onChange={(next) => void live.save({ fallback: next }, "fallback")}
+                    />
+                  </Row>
+                </>
+              )}
+            </RowGroup>
+            {(streamingCatalogError || live.error) && (
+              <p style={{ marginTop: 8, fontSize: "0.8125rem", color: "var(--danger)" }}>
+                {streamingCatalogError ?? live.error}
               </p>
             )}
           </>

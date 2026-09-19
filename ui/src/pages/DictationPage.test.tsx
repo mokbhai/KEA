@@ -54,6 +54,55 @@ function mockWorld(options: Parameters<typeof featureHandlers>[0] = {}) {
   );
 }
 
+/** Two installed live-preview models, plus one that is only in the catalog. */
+const STREAM_20M = {
+  id: "streaming-zipformer-en-20m",
+  display_name: "Zipformer English 20M",
+  language: "en-US",
+  url: "",
+  size_bytes: 80 * 1024 * 1024,
+  sha256: "",
+  deprecated: false,
+};
+
+const STREAM_80M = {
+  id: "streaming-zipformer-en-80m",
+  display_name: "Zipformer English 80M",
+  language: "en-US",
+  url: "",
+  size_bytes: 320 * 1024 * 1024,
+  sha256: "",
+  deprecated: false,
+};
+
+/**
+ * A world whose streaming catalog holds both models but has only `installed`
+ * on disk, with `settings` seeded into the generic settings table. The kind is
+ * honoured so the streaming catalog cannot leak into the speech-to-text one.
+ */
+function streamingWorld(
+  installed: string[],
+  settings: Record<string, string> = {},
+) {
+  return {
+    bindings: { "default/stt": whisperBinding },
+    extra: {
+      get_dictation_state: () => "idle",
+      list_onnx_models: (args?: Record<string, unknown>) =>
+        args?.kind === "streaming" ? [STREAM_20M, STREAM_80M] : [],
+      list_installed_onnx_models: (args?: Record<string, unknown>) =>
+        args?.kind === "streaming" ? installed : [],
+      get_setting: (args?: Record<string, unknown>) =>
+        settings[args?.key as string] ?? null,
+      set_setting: () => undefined,
+    },
+  };
+}
+
+/** The set_setting write for one key, as the backend would see it. */
+const wroteSetting = (key: string) =>
+  invokeCalls("set_setting").filter((c) => c?.key === key);
+
 describe("DictationPage", () => {
   beforeEach(() => resetTauriMocks());
 
@@ -546,5 +595,187 @@ describe("DictationPage", () => {
       name: "Dictation language",
     })) as HTMLSelectElement;
     await waitFor(() => expect(picker.value).toBe("cy"));
+  });
+  it("offers only the installed live-preview models, plus a real Off", async () => {
+    mockWorld(streamingWorld([STREAM_20M.id]));
+    render(<DictationPage />);
+
+    const picker = (await screen.findByRole("combobox", {
+      name: "Live preview model",
+    })) as HTMLSelectElement;
+    // Nothing saved yet, and Off is the empty option.
+    await waitFor(() => expect(picker.value).toBe(""));
+    expect(screen.getByRole("option", { name: "Off" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Zipformer English 20M" })).toBeTruthy();
+    // In the catalog but not on disk: choosing it could only do nothing.
+    expect(screen.queryByRole("option", { name: "Zipformer English 80M" })).toBeNull();
+  });
+
+  it("says the preview is a preview, not what gets typed", async () => {
+    mockWorld(streamingWorld([STREAM_20M.id]));
+    render(<DictationPage />);
+
+    await screen.findByRole("combobox", { name: "Live preview model" });
+    expect(
+      screen.getByText(/preview only.*transcribes the whole recording again/s),
+    ).toBeTruthy();
+  });
+
+  it("saves the picked live-preview model", async () => {
+    mockWorld(streamingWorld([STREAM_20M.id]));
+    render(<DictationPage />);
+
+    const picker = await screen.findByRole("combobox", { name: "Live preview model" });
+    await userEvent.selectOptions(picker, STREAM_20M.id);
+
+    await waitFor(() =>
+      expect(wroteSetting("dictation.streaming_model")).toHaveLength(1),
+    );
+    expect(wroteSetting("dictation.streaming_model")[0]?.value).toBe(STREAM_20M.id);
+  });
+
+  it("clears the model when Off is chosen", async () => {
+    mockWorld(
+      streamingWorld([STREAM_20M.id], { "dictation.streaming_model": STREAM_20M.id }),
+    );
+    render(<DictationPage />);
+
+    const picker = (await screen.findByRole("combobox", {
+      name: "Live preview model",
+    })) as HTMLSelectElement;
+    await waitFor(() => expect(picker.value).toBe(STREAM_20M.id));
+
+    await userEvent.selectOptions(picker, "");
+
+    await waitFor(() =>
+      expect(wroteSetting("dictation.streaming_model")).toHaveLength(1),
+    );
+    // The empty string is what the backend reads as off — see
+    // `streaming_model_setting` in src-tauri/src/commands.rs.
+    expect(wroteSetting("dictation.streaming_model")[0]?.value).toBe("");
+  });
+
+  it("hides the dependent switches until a model is chosen", async () => {
+    mockWorld(streamingWorld([STREAM_20M.id]));
+    render(<DictationPage />);
+
+    await screen.findByRole("combobox", { name: "Live preview model" });
+    expect(screen.queryByRole("switch", { name: "Show the preview" })).toBeNull();
+    expect(
+      screen.queryByRole("switch", { name: "Type the preview if the second pass fails" }),
+    ).toBeNull();
+  });
+
+  it("shows the dependent switches at their backend defaults once a model is on", async () => {
+    mockWorld(
+      streamingWorld([STREAM_20M.id], { "dictation.streaming_model": STREAM_20M.id }),
+    );
+    render(<DictationPage />);
+
+    const show = await screen.findByRole("switch", { name: "Show the preview" });
+    // Partials default on, inserting the draft after a failure defaults off.
+    expect(show.getAttribute("aria-checked")).toBe("true");
+    expect(
+      screen
+        .getByRole("switch", { name: "Type the preview if the second pass fails" })
+        .getAttribute("aria-checked"),
+    ).toBe("false");
+  });
+
+  it("writes the dependent switches as the strings the backend reads", async () => {
+    mockWorld(
+      streamingWorld([STREAM_20M.id], { "dictation.streaming_model": STREAM_20M.id }),
+    );
+    render(<DictationPage />);
+
+    await userEvent.click(
+      await screen.findByRole("switch", {
+        name: "Type the preview if the second pass fails",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(wroteSetting("dictation.streaming_fallback")).toHaveLength(1),
+    );
+    // A JSON-encoded *string*, not a bool: set_setting takes a String, and
+    // that is the shape the Rust side reads back.
+    expect(wroteSetting("dictation.streaming_fallback")[0]?.value).toBe("true");
+    expect(wroteSetting("dictation.show_partials")[0]?.value).toBe("true");
+    expect(wroteSetting("dictation.streaming_model")[0]?.value).toBe(STREAM_20M.id);
+  });
+
+  it("turns the preview display off as the string false", async () => {
+    mockWorld(
+      streamingWorld([STREAM_20M.id], { "dictation.streaming_model": STREAM_20M.id }),
+    );
+    render(<DictationPage />);
+
+    await userEvent.click(await screen.findByRole("switch", { name: "Show the preview" }));
+
+    await waitFor(() => expect(wroteSetting("dictation.show_partials")).toHaveLength(1));
+    expect(wroteSetting("dictation.show_partials")[0]?.value).toBe("false");
+  });
+
+  it("says why the fallback is off by default", async () => {
+    mockWorld(
+      streamingWorld([STREAM_20M.id], { "dictation.streaming_model": STREAM_20M.id }),
+    );
+    render(<DictationPage />);
+
+    await screen.findByRole("switch", { name: "Show the preview" });
+    expect(screen.getByText(/which is why it starts off/)).toBeTruthy();
+  });
+
+  it("sends the user to Models when no preview model is downloaded", async () => {
+    mockWorld(streamingWorld([]));
+    const onNavigate = vi.fn();
+    render(<DictationPage onNavigate={onNavigate} />);
+
+    expect(await screen.findByText(/No preview model is downloaded yet/)).toBeTruthy();
+    // Nothing to choose from, so no picker offering a model the user lacks.
+    expect(screen.queryByRole("combobox", { name: "Live preview model" })).toBeNull();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Open Models to download a live preview" }),
+    );
+    expect(onNavigate).toHaveBeenCalledWith("models");
+  });
+
+  it("keeps a saved model selectable after its files are removed", async () => {
+    mockWorld(streamingWorld([], { "dictation.streaming_model": STREAM_20M.id }));
+    render(<DictationPage />);
+
+    const picker = (await screen.findByRole("combobox", {
+      name: "Live preview model",
+    })) as HTMLSelectElement;
+    await waitFor(() => expect(picker.value).toBe(STREAM_20M.id));
+    expect(
+      screen.getByRole("option", { name: /streaming-zipformer-en-20m \(not downloaded\)/ }),
+    ).toBeTruthy();
+  });
+
+  it("reads a model the backend cleared to JSON null as Off", async () => {
+    // `clear_streaming_model_for_deleted` stores the literal `null`, which
+    // get_setting's `get::<String>` cannot deserialize — so that read rejects,
+    // and off is exactly what the state means.
+    mockWorld({
+      ...streamingWorld([STREAM_20M.id]),
+      extra: {
+        ...streamingWorld([STREAM_20M.id]).extra,
+        get_setting: (args?: Record<string, unknown>) => {
+          if (args?.key === "dictation.streaming_model") {
+            throw new Error("invalid type: null, expected a string");
+          }
+          return null;
+        },
+      },
+    });
+    render(<DictationPage />);
+
+    const picker = (await screen.findByRole("combobox", {
+      name: "Live preview model",
+    })) as HTMLSelectElement;
+    await waitFor(() => expect(picker.value).toBe(""));
+    expect(screen.queryByRole("switch", { name: "Show the preview" })).toBeNull();
   });
 });

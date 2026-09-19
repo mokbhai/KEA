@@ -55,11 +55,25 @@ pub struct AppState {
     pub model_storage: ModelStorage,
     pub parakeet_storage: ModelStorage,
     pub tts_storage: ModelStorage,
+    /// A root of its own, so the kind-to-root map stays 1:1 and listing and
+    /// delete need no new cases.
+    pub streaming_storage: ModelStorage,
     pub log_dir: PathBuf,
     /// Shared mic/meeting capture (mutually exclusive with dictation).
     pub audio: AsyncMutex<Box<dyn kea_platform::AudioIo>>,
     pub active_meeting: Mutex<Option<ActiveMeetingSession>>,
     pub level_poll_cancel: Mutex<Option<watch::Sender<bool>>>,
+    /// The streaming pass feeding live partials, while one is running.
+    ///
+    /// `None` is the normal state: no streaming model selected, none
+    /// installed, or partials turned off. It owns no ledger row and can never
+    /// fail a dictation run — see `commands::start_partials`.
+    pub dictation_partials: Mutex<Option<crate::commands::DictationPartials>>,
+    /// Bumped whenever the streaming pass starts or is taken, so a decoder
+    /// that was still loading when the run ended knows its session belongs to
+    /// nobody. Without it a slow `open` could park a finished run's session in
+    /// the slot and hand its stale draft to the *next* run.
+    pub dictation_partials_generation: AtomicU64,
     pub segment_poll_cancel: Mutex<Option<watch::Sender<bool>>>,
     /// Per-feature hotkey registration outcomes recorded at startup; updated
     /// on re-registration via `set_hotkey`.
@@ -292,6 +306,7 @@ struct ModelStorages {
     whisper: ModelStorage,
     parakeet: ModelStorage,
     tts: ModelStorage,
+    streaming: ModelStorage,
 }
 
 /// A model directory, created up front so a download does not have to. A
@@ -383,6 +398,7 @@ fn build_engines(
         whisper: ensure_storage(ModelStorage::default_whisper_root(dir), "whisper"),
         parakeet: ensure_storage(ModelStorage::default_parakeet_root(dir), "parakeet"),
         tts: ensure_storage(ModelStorage::default_tts_root(dir), "tts"),
+        streaming: ensure_storage(ModelStorage::default_streaming_root(dir), "streaming"),
     };
 
     #[cfg(feature = "whisper")]
@@ -405,6 +421,21 @@ fn build_engines(
         register_parakeet_stt_engine(
             &mut engines,
             Arc::new(SherpaOnnxSttInference::new()),
+            storage,
+        );
+    }
+
+    // Registered whenever the feature is on, whether or not a model is
+    // installed: `open` reports a missing model as `ModelNotInstalled`, which
+    // is the case the whole feature is written around.
+    #[cfg(feature = "streaming")]
+    {
+        use kea_engines::register_streaming_stt_engine;
+        use kea_infer::SherpaOnnxStreamingInference;
+        let storage = Arc::new(ModelStorage::new(storages.streaming.root.clone()));
+        register_streaming_stt_engine(
+            &mut engines,
+            Arc::new(SherpaOnnxStreamingInference::new()),
             storage,
         );
     }
@@ -490,10 +521,13 @@ fn build_state(
         model_storage: storages.whisper,
         parakeet_storage: storages.parakeet,
         tts_storage: storages.tts,
+        streaming_storage: storages.streaming,
         log_dir,
         audio: AsyncMutex::new(new_audio_io()),
         active_meeting: Mutex::new(None),
         level_poll_cancel: Mutex::new(None),
+        dictation_partials: Mutex::new(None),
+        dictation_partials_generation: AtomicU64::new(0),
         segment_poll_cancel: Mutex::new(None),
         hotkey_reg_status: Mutex::new(HashMap::new()),
         active_downloads: Mutex::new(HashMap::new()),

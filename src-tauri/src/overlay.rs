@@ -99,7 +99,33 @@ fn raise_above_fullscreen(window: &WebviewWindow) {
 #[cfg(not(target_os = "macos"))]
 fn raise_above_fullscreen(_window: &WebviewWindow) {}
 
-const WIDTH: f64 = 340.0;
+/// The pill's own width, before the live transcript line.
+const PILL_WIDTH: f64 = 340.0;
+
+/// How wide the HUD's partial-transcript line is allowed to be.
+///
+/// **Must agree with `--hud-partial-width` in
+/// `ui/src/components/DictationHud.tsx`.** There is no seam where Rust and CSS
+/// meet, so a cross-reference comment in both files is the only defence: if
+/// the line grows past what this window reserves, it is clipped by the window
+/// rather than by its own `overflow: hidden`, and the fade at its start edge
+/// stops being the thing that hides the overflow.
+const PARTIAL_WIDTH: f64 = 220.0;
+
+/// The window is wider than the pill on purpose, and the extra is *always*
+/// there rather than added when a partial arrives.
+///
+/// Resizing a visible always-on-top window mid-run is the jump this avoids.
+/// The window is `transparent(true)` and `set_ignore_cursor_events(true)`, so
+/// the added area is invisible and un-hittable and costs nothing when no
+/// partial is showing — the pill inside it is centred and simply narrower.
+const WIDTH: f64 = PILL_WIDTH + PARTIAL_WIDTH;
+
+/// Unchanged by live transcripts: the line is exactly one line at a fixed
+/// line-height, so the pill's height is the same whether the text is one word
+/// or forty. If it is ever allowed to grow vertically, change
+/// `.kea-overlay-root`'s `align-items: center` to `flex-end` first, so growth
+/// goes upward off a pinned bottom edge.
 const HEIGHT: f64 = 96.0;
 /// Gap between the HUD and the bottom of the monitor's work area.
 const BOTTOM_MARGIN: f64 = 48.0;
@@ -262,6 +288,18 @@ mod tests {
     fn window_level_is_above_floating_and_below_the_screen_saver() {
         assert!(STATUS_WINDOW_LEVEL > 3);
         assert!(STATUS_WINDOW_LEVEL < 1000);
+    }
+
+    /// The four `bottom_centre_position` tests above pass 340/96 as literals,
+    /// so they neither break nor notice when the window changes size. This is
+    /// the one that notices: the window has to hold the pill *and* the
+    /// transcript line the HUD is allowed to draw.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn the_window_reserves_room_for_the_transcript_line() {
+        assert!(WIDTH >= PILL_WIDTH + PARTIAL_WIDTH);
+        // Still one line tall. Growth here would move the bottom edge.
+        assert_eq!(HEIGHT, 96.0);
     }
 
     #[test]

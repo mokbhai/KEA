@@ -99,6 +99,14 @@ impl ModelStorage {
     pub fn default_tts_root(app_data: &Path) -> PathBuf {
         app_data.join("models").join("tts")
     }
+
+    /// A root of its own rather than a corner of the parakeet one: the app's
+    /// kind-to-root map is 1:1, and keeping it that way is what lets listing
+    /// and delete stay kind-driven instead of learning to tell two families
+    /// apart inside one directory.
+    pub fn default_streaming_root(app_data: &Path) -> PathBuf {
+        app_data.join("models").join("streaming")
+    }
 }
 
 #[cfg(test)]
@@ -133,6 +141,22 @@ mod tests {
     fn default_whisper_root_under_app_data() {
         let root = ModelStorage::default_whisper_root(Path::new("/tmp/kea"));
         assert!(root.ends_with("models/whisper"));
+    }
+
+    /// One root per kind, and no two the same — a shared root would make
+    /// `installed_models` for one family list another's.
+    #[test]
+    fn every_model_root_is_distinct() {
+        let app_data = Path::new("/tmp/kea");
+        let roots = [
+            ModelStorage::default_whisper_root(app_data),
+            ModelStorage::default_parakeet_root(app_data),
+            ModelStorage::default_tts_root(app_data),
+            ModelStorage::default_streaming_root(app_data),
+        ];
+        assert!(roots[3].ends_with("models/streaming"));
+        let unique: std::collections::HashSet<_> = roots.iter().collect();
+        assert_eq!(unique.len(), roots.len());
     }
 
     #[test]

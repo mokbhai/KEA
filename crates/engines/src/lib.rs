@@ -16,8 +16,8 @@ pub use provider::{
 };
 pub use registry::EngineRegistry;
 pub use stt::{
-    pcm_to_wav_bytes, resample_to_rate, OpenAiSttEngine, ParakeetSttEngine, WhisperSttEngine,
-    STT_SAMPLE_RATE_HZ,
+    pcm_to_wav_bytes, resample_to_rate, OpenAiSttEngine, ParakeetSttEngine,
+    StreamingZipformerEngine, WhisperSttEngine, STREAMING_STT_ENGINE_ID, STT_SAMPLE_RATE_HZ,
 };
 pub use tts::{bytes_to_pcm_wav, LocalTtsEngine, OpenAiTtsEngine};
 
@@ -26,6 +26,9 @@ pub use stt::register_whisper_stt_engine;
 
 #[cfg(feature = "parakeet")]
 pub use stt::register_parakeet_stt_engine;
+
+#[cfg(feature = "streaming")]
+pub use stt::register_streaming_stt_engine;
 
 pub use traits::*;
 #[cfg(feature = "tts-local")]

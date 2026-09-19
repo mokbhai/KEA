@@ -65,8 +65,10 @@ fn model_filenames(kind: OnnxModelKind) -> &'static [&'static str] {
         OnnxModelKind::TtsKokoro => &["model.int8.onnx", "model.onnx", "model.fp16.onnx"],
         OnnxModelKind::TtsKitten => &["model.fp16.onnx", "model.int8.onnx", "model.onnx"],
         // Piper names the file after the voice ("en_US-lessac-medium.onnx"),
-        // so there is no list to match against — see `find_sole_onnx`.
-        OnnxModelKind::TtsVits | OnnxModelKind::Parakeet => &[],
+        // so there is no list to match against — see `find_sole_onnx`. The
+        // recognizer bundles have no single model file at all: they are
+        // encoder/decoder/joiner triples, found by their own finders.
+        OnnxModelKind::TtsVits | OnnxModelKind::Parakeet | OnnxModelKind::StreamingZipformer => &[],
     }
 }
 
@@ -186,8 +188,11 @@ pub fn find_tts_bundle(model_dir: &Path, kind: OnnxModelKind) -> Result<TtsBundl
             dict_dir: optional_dir(model_dir, "dict"),
             lexicon: joined_lexicons(model_dir),
         }),
-        OnnxModelKind::Parakeet => Err(InferError::Other(
-            "parakeet is a speech-to-text bundle, not a voice".into(),
+        // Both recognizer shapes, one arm: the reason they cannot be a voice
+        // is the same, and an arm per STT family would have to be remembered
+        // every time one is added.
+        OnnxModelKind::Parakeet | OnnxModelKind::StreamingZipformer => Err(InferError::Other(
+            format!("{kind:?} is a speech-to-text bundle, not a voice"),
         )),
     }
 }
@@ -264,10 +269,10 @@ fn model_config_for(
             },
             ..base
         },
-        OnnxModelKind::Parakeet => {
-            return Err(InferError::Other(
-                "parakeet is a speech-to-text bundle, not a voice".into(),
-            ))
+        OnnxModelKind::Parakeet | OnnxModelKind::StreamingZipformer => {
+            return Err(InferError::Other(format!(
+                "{kind:?} is a speech-to-text bundle, not a voice"
+            )))
         }
     })
 }

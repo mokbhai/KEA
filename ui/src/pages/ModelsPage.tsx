@@ -5,6 +5,8 @@ import {
   downloadOnnxModel,
   downloadWhisperModel,
   getBinding,
+  listInstalledOnnxModels,
+  listOnnxModels,
   previewVoice,
   type Binding,
   type OnnxModel,
@@ -19,17 +21,71 @@ import {
   loadCatalog,
   type Capability,
   type DownloadKind,
-  type LocalEngineSpec,
+  type EngineCatalog,
 } from "../lib/engines";
 import { formatBytes, toMessage } from "../lib/format";
 
-/** One section per local engine, in the order the engine table lists them. */
-const CATALOGS = catalogEngines();
+/**
+ * One downloadable catalog and what this page may do with it.
+ *
+ * Most sections come from the engine table, but not all: the streaming
+ * recogniser is downloaded, listed and deleted like any other model while
+ * being no *bindable* engine at all. Nothing resolves to it and it has no
+ * `Binding` — it is chosen by the `dictation.streaming_model` setting — so an
+ * entry in `ENGINES` would put a phantom row in the speech-to-text picker.
+ * `capability: null` is what says "no binding to disturb when this is
+ * deleted".
+ */
+type CatalogSpec = {
+  id: string;
+  catalog: EngineCatalog;
+  capability: Capability | null;
+};
 
-const CAPABILITIES = [...new Set(CATALOGS.map((spec) => spec.capability))];
+/** Live partial transcripts. Display-only, so it binds to nothing. */
+const STREAMING_CATALOG: CatalogSpec = {
+  id: "streaming-zipformer",
+  capability: null,
+  catalog: {
+    kind: "streaming",
+    title: "Live preview — streaming",
+    list: () => listOnnxModels("streaming"),
+    listInstalled: () => listInstalledOnnxModels("streaming"),
+  },
+};
+
+const ENGINE_CATALOGS: CatalogSpec[] = catalogEngines().map((spec) => ({
+  id: spec.id,
+  catalog: spec.catalog,
+  capability: spec.capability,
+}));
+
+/**
+ * Sections in the order the engine table lists them, with the streaming
+ * catalog grouped after the other speech-to-text ones rather than orphaned at
+ * the end — it is the same kind of thing to a reader, whatever the binding
+ * layer thinks of it.
+ */
+const CATALOGS: CatalogSpec[] = (() => {
+  const afterStt =
+    ENGINE_CATALOGS.map((spec) => spec.capability).lastIndexOf("stt") + 1;
+  return [
+    ...ENGINE_CATALOGS.slice(0, afterStt),
+    STREAMING_CATALOG,
+    ...ENGINE_CATALOGS.slice(afterStt),
+  ];
+})();
+
+const CAPABILITIES = [
+  ...new Set(
+    CATALOGS.map((spec) => spec.capability).filter(
+      (capability): capability is Capability => capability !== null,
+    ),
+  ),
+];
 
 type Section = {
-  spec: LocalEngineSpec;
+  spec: CatalogSpec;
   models: (WhisperModel | OnnxModel)[];
   installed: Set<string>;
 };
@@ -103,9 +159,13 @@ export default function ModelsPage() {
   };
 
   const remove = async (section: Section, model: WhisperModel | OnnxModel) => {
-    const binding = bindings.get(section.spec.capability);
+    const capability = section.spec.capability;
+    // A catalog nothing binds to has no default to warn about — and asking
+    // "this is your speech-to-text default" about a streaming model would be a
+    // lie, since deleting it leaves the real default alone.
+    const binding = capability ? bindings.get(capability) : null;
     const isActiveDefault = binding?.model === model.id;
-    const capLabel = section.spec.capability === "stt" ? "speech-to-text" : "text-to-speech";
+    const capLabel = capability === "stt" ? "speech-to-text" : "text-to-speech";
     const message = isActiveDefault
       ? `Remove ${model.display_name}? It's your current ${capLabel} default — the default will be unset until you choose another.`
       : `Remove ${model.display_name}?`;

@@ -26,16 +26,17 @@ use kea_core::store::meetings::{Meeting, MeetingDetail};
 use kea_core::store::settings::SettingsRepo;
 use kea_core::store::vocabulary::{VocabularyEntry, VocabularyRepo};
 use kea_core::tts::{TtsSettings, TtsSettingsRepo};
+use kea_engines::traits::SttOpts;
 use kea_engines::{EngineRegistry, TtsOpts};
 use kea_features::demo::{run_ping, DemoFeature};
+use kea_features::dictation::{run_dictation_with_opts, spawn_partials, DictationRunOpts};
 use kea_features::run_rewrite_with_storage;
 use kea_features::tts::run_tts_with_player;
 use kea_features::ProfileOverrides;
 use kea_features::{
-    drain_and_stop_meeting, run_dictation_with_storage, run_meeting_poll_segment,
-    run_meeting_start, run_meeting_stop, ActiveMeeting, CapKind, ContentStorageOpts,
-    DictationFeature, FeatureRegistry, MeetingFeature, MeetingRunContext, RewriteFeature,
-    TtsFeature,
+    drain_and_stop_meeting, run_meeting_poll_segment, run_meeting_start, run_meeting_stop,
+    ActiveMeeting, CapKind, ContentStorageOpts, DictationFeature, FeatureRegistry, MeetingFeature,
+    MeetingRunContext, RewriteFeature, TtsFeature,
 };
 use kea_infer::{
     temp_file_for, DownloadTransport, InferError, ModelDownloader, ModelKind, ModelRegistry,
@@ -55,10 +56,10 @@ use tokio::sync::watch;
 
 use crate::events::{
     dictation_state_wire, emit_device_fallback, emit_dictation_error, emit_dictation_level,
-    emit_dictation_preview, emit_dictation_state, emit_meeting_error, emit_meeting_level,
-    emit_meeting_segment, emit_meeting_state, emit_model_download_complete,
+    emit_dictation_partial, emit_dictation_preview, emit_dictation_state, emit_meeting_error,
+    emit_meeting_level, emit_meeting_segment, emit_meeting_state, emit_model_download_complete,
     emit_model_download_error, emit_model_download_progress, emit_tts_state, meeting_state_wire,
-    MeetingSegmentPayload, TtsState,
+    MeetingSegmentPayload, PartialThrottle, TtsState,
 };
 use crate::{ActiveDownload, AppState};
 
@@ -888,6 +889,61 @@ async fn read_bool_setting(config_pool: &SqlitePool, key: &str, default: bool) -
     }
 }
 
+/// Names the streaming model used for live partial transcripts.
+///
+/// Absent, `null` or empty means the feature is off. There is deliberately no
+/// separate on/off toggle: a selected model *is* the toggle, which removes the
+/// state where partials are "enabled" but impossible.
+pub const STREAMING_MODEL_SETTING: &str = "dictation.streaming_model";
+
+/// Whether the HUD shows partials at all, default on. Read once at run start,
+/// so a user who turns it off pays no IPC.
+pub const SHOW_PARTIALS_SETTING: &str = "dictation.show_partials";
+
+/// Whether a failed offline decode may insert the live draft instead of
+/// nothing. Default **off** — see `DictationRunOpts::draft_fallback`.
+pub const STREAMING_FALLBACK_SETTING: &str = "dictation.streaming_fallback";
+
+/// The selected streaming model, or `None` when the feature is off.
+///
+/// Through `get_optional`: a cleared model writes the JSON literal `null`
+/// rather than removing the row, and plain `get::<String>` would fail to
+/// deserialize that forever after. The empty string is treated the same way,
+/// because the generic `set_setting` command is how a picker clears it.
+async fn streaming_model_setting(config_pool: &SqlitePool) -> Option<String> {
+    match SettingsRepo::new(config_pool.clone())
+        .get_optional::<String>(STREAMING_MODEL_SETTING)
+        .await
+    {
+        Ok(value) => value
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty()),
+        Err(e) => {
+            tracing::warn!(%e, "failed to read the streaming model setting; partials are off");
+            None
+        }
+    }
+}
+
+/// Clears the streaming model setting when it names a model that was deleted.
+///
+/// The streaming counterpart of `clear_active_model_for_deleted`: a streaming
+/// model is selected by a setting rather than a binding, so this is what
+/// dangles when its files go.
+pub async fn clear_streaming_model_for_deleted(
+    config_pool: &SqlitePool,
+    model_id: &str,
+) -> Result<bool, String> {
+    if streaming_model_setting(config_pool).await.as_deref() != Some(model_id) {
+        return Ok(false);
+    }
+    SettingsRepo::new(config_pool.clone())
+        .set(STREAMING_MODEL_SETTING, &Option::<String>::None)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 async fn store_conversations_enabled(config_pool: &SqlitePool) -> bool {
     read_bool_setting(config_pool, "history.store_conversations", true).await
 }
@@ -1583,6 +1639,7 @@ fn onnx_storage_for(state: &AppState, kind: ModelKind) -> Result<&ModelStorage, 
     match kind {
         ModelKind::Parakeet => Ok(&state.parakeet_storage),
         ModelKind::Tts => Ok(&state.tts_storage),
+        ModelKind::Streaming => Ok(&state.streaming_storage),
         ModelKind::Whisper => Err(format!("unknown onnx model kind: {kind}")),
     }
 }
@@ -2029,6 +2086,7 @@ async fn start_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(
         }
     }
 
+    let frame_rx;
     {
         let mut audio = state.audio.lock().await;
         if audio.state() == DictationState::Listening {
@@ -2037,16 +2095,151 @@ async fn start_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(
         if audio.state() == DictationState::Processing {
             return Err("dictation is processing".into());
         }
-        if let Err(e) = audio.start_mic().await {
-            emit_dictation_state(app, DictationState::Idle);
-            return Err(e.to_string());
-        }
+        // The receiver is kept, not dropped: it is the streaming tap, and
+        // dropping it is what used to close the channel and make every frame's
+        // `try_send` fail.
+        frame_rx = match audio.start_mic().await {
+            Ok(rx) => rx,
+            Err(e) => {
+                emit_dictation_state(app, DictationState::Idle);
+                return Err(e.to_string());
+            }
+        };
         report_device_fallback(app, audio.as_mut());
     }
 
     emit_dictation_state(app, listening_state(state));
     spawn_level_poll(state, app);
+    // After the state is published, so the HUD is already on screen when the
+    // first hypothesis lands. Never fails the run: with no model selected or
+    // none installed, `frame_rx` is dropped inside and dictation behaves
+    // exactly as it always has.
+    start_partials(state, app, frame_rx);
     Ok(())
+}
+
+/// Starts the display-only streaming pass, if it is configured and possible.
+///
+/// Every exit is silent by design — no error cue, no HUD change, no
+/// user-visible difference. Live partials are an enhancement to feedback, and
+/// an enhancement that reports its own absence is worse than one that is
+/// simply absent.
+///
+/// Spawned rather than awaited: loading the ONNX bundle takes long enough to
+/// matter, and the caller holds `dictation_busy` for the whole handler — so
+/// awaiting it here would mean a stop pressed during the load is *dropped*
+/// rather than queued. The recording is never waiting on this: frames go to
+/// the session buffer regardless, and the ones that arrive before the decoder
+/// is ready are dropped from the tap and counted.
+fn start_partials(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    frames: tokio::sync::mpsc::Receiver<PcmFrame>,
+) {
+    let generation = state
+        .dictation_partials_generation
+        .fetch_add(1, Ordering::SeqCst)
+        + 1;
+    let state = state.clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn(
+        async move { open_partials(&state, &app, frames, generation).await },
+    );
+}
+
+async fn open_partials(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    frames: tokio::sync::mpsc::Receiver<PcmFrame>,
+    generation: u64,
+) {
+    let Some(model) = streaming_model_setting(&state.config_pool).await else {
+        return;
+    };
+    if !read_bool_setting(&state.config_pool, SHOW_PARTIALS_SETTING, true).await {
+        return;
+    }
+    let Some(engine) = state.engines.any_streaming_stt() else {
+        tracing::debug!("a streaming model is selected but this build registers no engine for it");
+        return;
+    };
+
+    let stream = match engine
+        .open(SttOpts {
+            model: Some(model.clone()),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::debug!(model = %model, error = %e, "no live partials for this run");
+            return;
+        }
+    };
+
+    let (session, mut partials) = spawn_partials(stream, frames);
+    // Shared with the final emit in `stop_dictation_run`, so `seq` stays
+    // monotonic across the whole run and the HUD's "highest seq wins" rule
+    // cannot discard the final.
+    let throttle = Arc::new(Mutex::new(PartialThrottle::new()));
+
+    let emit_app = app.clone();
+    let emit_throttle = throttle.clone();
+    // Channel-driven, not interval-driven: `spawn_cancellable_poll` is the
+    // wrong shape here even though the cancel half would fit. The loop ends
+    // when the pump drops its sender, which `PartialsSession::finish` does.
+    tauri::async_runtime::spawn(async move {
+        while let Some(partial) = partials.recv().await {
+            let payload = emit_throttle
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .offer(&partial.text, false, std::time::Instant::now());
+            if let Some(payload) = payload {
+                emit_dictation_partial(&emit_app, &payload);
+            }
+        }
+    });
+
+    // The run may have ended — stopped, cancelled, or replaced — while the
+    // bundle was loading. Its session belongs to nobody, and parking it here
+    // would hand a stale draft to the next run. Dropping it is enough: the
+    // pump finishes on its own when the capture channel closes.
+    if state.dictation_partials_generation.load(Ordering::SeqCst) != generation {
+        tracing::debug!("the run ended before the streaming decoder was ready");
+        return;
+    }
+    if let Ok(mut slot) = state.dictation_partials.lock() {
+        *slot = Some(DictationPartials { session, throttle });
+    }
+}
+
+/// A running streaming pass and the throttle its partials go out through.
+pub struct DictationPartials {
+    session: kea_features::dictation::PartialsSession,
+    throttle: Arc<Mutex<PartialThrottle>>,
+}
+
+/// Ends the streaming pass, returning its last hypothesis and the throttle the
+/// final partial must go out through.
+async fn take_partials(
+    state: &Arc<AppState>,
+) -> (Option<String>, Option<Arc<Mutex<PartialThrottle>>>) {
+    // Invalidates any session still opening, for the same reason the input
+    // preview carries a generation: the thing being cancelled may not exist
+    // yet.
+    state
+        .dictation_partials_generation
+        .fetch_add(1, Ordering::SeqCst);
+    let taken = state
+        .dictation_partials
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    match taken {
+        Some(DictationPartials { session, throttle }) => (session.finish().await, Some(throttle)),
+        None => (None, None),
+    }
 }
 
 /// Stop a run and throw its audio away. Reached only from Escape during a
@@ -2071,6 +2264,10 @@ pub async fn cancel_dictation_inner(state: &Arc<AppState>, app: &AppHandle) -> R
     }
     let discarded = audio.stop_mic().await.map_err(|e| e.to_string());
     drop(audio);
+
+    // The streaming pass goes with the audio it was reading. Its draft is
+    // discarded along with the recording — a cancelled run inserts nothing.
+    let _ = take_partials(state).await;
 
     emit_dictation_state(app, DictationState::Idle);
     spawn_dictation_cue(state, Cue::Cancel);
@@ -2131,6 +2328,11 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
             }
         }
     };
+
+    // Before "processing" is emitted, and before the offline decode starts, so
+    // the streaming decoder's threads are gone by the time the pass that
+    // produces the inserted text wants the cores.
+    let (streaming_draft, partial_throttle) = take_partials(state).await;
 
     // Allocate a run id and mark in-flight before emitting "processing".
     let run_id = state.dictation_run_counter.fetch_add(1, Ordering::SeqCst);
@@ -2199,7 +2401,7 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
     let profile = profile_for(&state.config_pool, app_context.as_ref()).await;
     let profile = ProfileOverrides::from_profile(profile.as_ref());
 
-    let result = run_dictation_with_storage(
+    let result = run_dictation_with_opts(
         &state.engines,
         &bindings,
         &actions,
@@ -2210,9 +2412,34 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
         &settings,
         &vocabulary,
         &profile,
-        storage,
+        DictationRunOpts {
+            storage,
+            streaming_draft,
+            draft_fallback: read_bool_setting(
+                &state.config_pool,
+                STREAMING_FALLBACK_SETTING,
+                false,
+            )
+            .await,
+        },
     )
     .await;
+
+    // The last frame in which the HUD shows the text that was actually typed.
+    // Without it, the HUD's final state is a claim the app never honoured: the
+    // streaming hypothesis and the offline transcript come from two different
+    // decoders. Emitted before `_run_guard` drops and publishes "idle", which
+    // is what clears it.
+    if let (Ok(text), Some(throttle)) = (&result, partial_throttle) {
+        let payload = throttle.lock().unwrap_or_else(|p| p.into_inner()).offer(
+            text,
+            true,
+            std::time::Instant::now(),
+        );
+        if let Some(payload) = payload {
+            emit_dictation_partial(app, &payload);
+        }
+    }
 
     // Flag clearing + the terminal "idle" emit are handled by _run_guard's
     // Drop (which also covers panics and the "newer run" case).
@@ -3830,7 +4057,6 @@ pub async fn delete_model(
     model_id: String,
 ) -> Result<(), String> {
     let kind = parse_model_kind(&kind)?;
-    let default_slot = kind.default_slot();
     validate_model_id_for_delete(kind, &model_id)?;
     match kind {
         ModelKind::Whisper => state.model_storage.remove_model(&model_id),
@@ -3838,8 +4064,29 @@ pub async fn delete_model(
     }
     .map_err(|e| format!("failed to remove model files: {e}"))?;
 
-    let bindings = BindingRepo::new(state.config_pool.clone());
-    let cleared = clear_bindings_for_model(&bindings, default_slot, &model_id).await?;
+    clear_references_to_deleted_model(&state.config_pool, kind, &model_id).await
+}
+
+/// Drops everything that still points at a model whose files have just been
+/// removed. Split out of [`delete_model`] because it is the half that can be
+/// tested against a pool alone, and the half that is easy to get wrong.
+pub async fn clear_references_to_deleted_model(
+    config_pool: &SqlitePool,
+    kind: ModelKind,
+    model_id: &str,
+) -> Result<(), String> {
+    // No slot means nothing binds to this kind, so there are no bindings to
+    // sweep — and sweeping "stt" for a streaming model would clear the user's
+    // dictation engine. What dangles instead is the setting that named it.
+    let Some(default_slot) = kind.default_slot() else {
+        if clear_streaming_model_for_deleted(config_pool, model_id).await? {
+            tracing::info!(model = %model_id, "cleared the streaming model setting");
+        }
+        return Ok(());
+    };
+
+    let bindings = BindingRepo::new(config_pool.clone());
+    let cleared = clear_bindings_for_model(&bindings, default_slot, model_id).await?;
     if !cleared.is_empty() {
         tracing::info!(
             model = %model_id,
@@ -3848,7 +4095,7 @@ pub async fn delete_model(
             "cleared bindings referencing the deleted model"
         );
     }
-    if clear_active_model_for_deleted(&state.config_pool, default_slot, &model_id).await? {
+    if clear_active_model_for_deleted(config_pool, default_slot, model_id).await? {
         tracing::info!(model = %model_id, slot = %default_slot, "cleared active_model setting");
     }
     Ok(())
@@ -4209,6 +4456,120 @@ mod tests {
         }];
         save_custom_providers(&settings, &list).await.unwrap();
         assert_eq!(load_custom_providers(&settings).await.unwrap(), list);
+    }
+
+    /// Deleting a streaming model must not touch the dictation binding.
+    ///
+    /// The trap `ModelKind::default_slot` returns `Option` for: a streaming
+    /// model lives in the STT *family* but nothing binds to it, so sweeping
+    /// the "stt" slot for it would silently unset the user's actual
+    /// speech-to-text engine. What has to be cleared instead is the setting
+    /// that named it.
+    #[tokio::test]
+    async fn deleting_a_streaming_model_clears_its_setting_not_the_stt_binding() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let bindings = kea_core::store::bindings::BindingRepo::new(pool.clone());
+        let stt = Binding {
+            engine_id: "parakeet".into(),
+            model: Some("parakeet-tdt-0.6b-v2".into()),
+            provider_ref: None,
+        };
+        bindings
+            .set(DEFAULT_FEATURE_ID, "stt", stt.clone())
+            .await
+            .unwrap();
+        SettingsRepo::new(pool.clone())
+            .set(STREAMING_MODEL_SETTING, &"streaming-zipformer-en-20m")
+            .await
+            .unwrap();
+
+        clear_references_to_deleted_model(
+            &pool,
+            ModelKind::Streaming,
+            "streaming-zipformer-en-20m",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            bindings.get(DEFAULT_FEATURE_ID, "stt").await.unwrap(),
+            Some(stt),
+            "the speech-to-text default must survive a streaming delete"
+        );
+        assert_eq!(streaming_model_setting(&pool).await, None);
+    }
+
+    /// The other half: deleting a *different* streaming model leaves the
+    /// selected one alone.
+    #[tokio::test]
+    async fn deleting_another_streaming_model_leaves_the_selection_alone() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        SettingsRepo::new(pool.clone())
+            .set(STREAMING_MODEL_SETTING, &"streaming-zipformer-en-20m")
+            .await
+            .unwrap();
+
+        assert!(!clear_streaming_model_for_deleted(&pool, "something-else")
+            .await
+            .unwrap());
+        assert_eq!(
+            streaming_model_setting(&pool).await.as_deref(),
+            Some("streaming-zipformer-en-20m")
+        );
+    }
+
+    /// A cleared setting is the JSON literal `null`, not a missing row, and a
+    /// picker clearing it through the generic `set_setting` command writes an
+    /// empty string. Both mean "off", and neither may read as a model id.
+    #[tokio::test]
+    async fn an_absent_cleared_or_blank_streaming_model_all_read_as_off() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let settings = SettingsRepo::new(pool.clone());
+
+        assert_eq!(streaming_model_setting(&pool).await, None, "absent");
+        settings
+            .set(STREAMING_MODEL_SETTING, &Option::<String>::None)
+            .await
+            .unwrap();
+        assert_eq!(
+            streaming_model_setting(&pool).await,
+            None,
+            "cleared to null"
+        );
+        settings.set(STREAMING_MODEL_SETTING, &"  ").await.unwrap();
+        assert_eq!(streaming_model_setting(&pool).await, None, "blank");
+        settings
+            .set(STREAMING_MODEL_SETTING, &"streaming-zipformer-en-20m")
+            .await
+            .unwrap();
+        assert_eq!(
+            streaming_model_setting(&pool).await.as_deref(),
+            Some("streaming-zipformer-en-20m")
+        );
+    }
+
+    /// Partials default on, and the toggle has to survive both encodings —
+    /// the generic `set_setting` command JSON-encodes a `String`, so the UI's
+    /// toggles land as the JSON string `"false"` rather than a JSON bool.
+    #[tokio::test]
+    async fn the_partials_toggle_defaults_on_and_reads_both_encodings() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let settings = SettingsRepo::new(pool.clone());
+
+        assert!(read_bool_setting(&pool, SHOW_PARTIALS_SETTING, true).await);
+        settings.set(SHOW_PARTIALS_SETTING, &"false").await.unwrap();
+        assert!(!read_bool_setting(&pool, SHOW_PARTIALS_SETTING, true).await);
+        settings.set(SHOW_PARTIALS_SETTING, &false).await.unwrap();
+        assert!(!read_bool_setting(&pool, SHOW_PARTIALS_SETTING, true).await);
+
+        // The draft fallback is the opposite default: inserting knowably worse
+        // text after an invisible failure is the regression two passes exist
+        // to prevent.
+        assert!(!read_bool_setting(&pool, STREAMING_FALLBACK_SETTING, false).await);
     }
 
     #[tokio::test]
@@ -5242,6 +5603,8 @@ mod tests {
         assert!(!parakeet.is_empty());
         let tts = onnx_catalog_for_kind(ModelKind::Tts).unwrap();
         assert!(!tts.is_empty());
+        let streaming = onnx_catalog_for_kind(ModelKind::Streaming).unwrap();
+        assert_eq!(streaming.len(), 1);
         // Whisper is a single ggml file, not an ONNX bundle, and unknown kind
         // strings never get this far — they are rejected at the IPC boundary.
         assert!(onnx_catalog_for_kind(ModelKind::Whisper).is_err());

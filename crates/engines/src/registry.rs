@@ -1,4 +1,4 @@
-use crate::traits::{LlmEngine, SttEngine, TtsEngine};
+use crate::traits::{LlmEngine, StreamingSttEngine, SttEngine, TtsEngine};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -6,6 +6,11 @@ use std::sync::Arc;
 pub struct EngineRegistry {
     llm: HashMap<String, Arc<dyn LlmEngine>>,
     stt: HashMap<String, Arc<dyn SttEngine>>,
+    /// Kept apart from `stt` rather than folded into it: nothing *binds* to a
+    /// streaming engine and no slot resolves to one, so a streaming engine in
+    /// the STT map would be offered as a dictation engine the moment a picker
+    /// listed `list_stt_ids`.
+    streaming: HashMap<String, Arc<dyn StreamingSttEngine>>,
     tts: HashMap<String, Arc<dyn TtsEngine>>,
 }
 
@@ -30,6 +35,32 @@ impl EngineRegistry {
     }
     pub fn list_stt_ids(&self) -> Vec<String> {
         let mut v: Vec<_> = self.stt.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    pub fn register_streaming_stt(&mut self, e: Arc<dyn StreamingSttEngine>) {
+        self.streaming.insert(e.id().to_string(), e);
+    }
+
+    pub fn streaming_stt(&self, id: &str) -> Option<Arc<dyn StreamingSttEngine>> {
+        self.streaming.get(id).cloned()
+    }
+
+    /// The one streaming engine, whichever it is.
+    ///
+    /// The caller has no engine id to offer: a streaming model is chosen by a
+    /// setting, not by a binding, so there is nothing that names an engine.
+    /// Returns `None` in a build with none registered, which is the case the
+    /// whole feature is written around.
+    pub fn any_streaming_stt(&self) -> Option<Arc<dyn StreamingSttEngine>> {
+        let mut ids: Vec<&String> = self.streaming.keys().collect();
+        ids.sort();
+        ids.first().and_then(|id| self.streaming.get(*id)).cloned()
+    }
+
+    pub fn list_streaming_stt_ids(&self) -> Vec<String> {
+        let mut v: Vec<_> = self.streaming.keys().cloned().collect();
         v.sort();
         v
     }

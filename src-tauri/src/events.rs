@@ -80,6 +80,129 @@ pub struct DictationLevelPayload {
     pub level: f32,
 }
 
+/// One live hypothesis on its way to the HUD.
+///
+/// Its own event rather than fields on `dictation:state`, for four reasons
+/// that all point the same way. `emit_dictation_state` is not a pure emit — it
+/// calls `crate::overlay::sync_visibility`, which repositions and re-shows the
+/// overlay window, so carrying partials there would re-pin the window ten
+/// times a second for a whole run. The cardinalities differ by two orders of
+/// magnitude (three state emits per run against ten partials a second).
+/// `DictationStatePayload` derives `Eq` and is pinned by a serialization test,
+/// and every consumer of `dictation:state` — including the non-overlay UI —
+/// would re-render on text it does not display.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct DictationPartialPayload {
+    /// Monotonic within a run, incremented per *emitted* partial, so a drop is
+    /// invisible to the frontend and a late arrival is discardable by
+    /// comparison rather than by timestamp. The HUD keeps only the highest it
+    /// has seen.
+    pub seq: u64,
+    /// Display text: the tail of the hypothesis, already truncated.
+    pub text: String,
+    /// Leading **scalar values** — not bytes — the engine considers committed;
+    /// `None` when it does not report stability.
+    ///
+    /// Rust byte offsets are not usable as JavaScript string indices: a
+    /// partial containing CJK or an emoji would be split mid-surrogate and
+    /// render a replacement character. Counted here with `chars().count()`,
+    /// sliced in the HUD with `Array.from`. Invisible in English-only testing,
+    /// which is what makes it worth pinning in the payload contract.
+    pub stable_chars: Option<usize>,
+    /// The last partial of the run — the offline transcript, which is what was
+    /// actually typed.
+    pub is_final: bool,
+}
+
+pub fn emit_dictation_partial(app: &AppHandle, partial: &DictationPartialPayload) {
+    let _ = app.emit("dictation:partial", partial.clone());
+}
+
+/// The longest tail, in scalar values, a partial is allowed to carry.
+///
+/// The HUD shows one clipped line and nothing earlier is renderable. Without
+/// this, a multi-minute locked dictation ships a growing multi-kilobyte string
+/// across IPC ten times a second. The truncation is display-only: this text is
+/// never an input to insertion.
+pub const PARTIAL_TAIL_BUDGET: usize = 240;
+
+/// The shortest gap between two emitted partials.
+///
+/// Half the level poll's 50 ms. Below roughly 120 ms a self-revising line
+/// reads as strobing rather than as typing, so a faster rate buys nothing a
+/// user can perceive and costs an IPC round trip per decode chunk.
+pub const PARTIAL_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Rate-limits partials on the Rust side.
+///
+/// Throttling in React would be the wrong seam: by then the events have
+/// already crossed the IPC boundary and been deserialized, which is where the
+/// cost is. Pure — no `AppHandle`, no clock of its own — so the rules are
+/// unit-testable.
+#[derive(Debug, Default)]
+pub struct PartialThrottle {
+    seq: u64,
+    last_text: String,
+    last_emit: Option<std::time::Instant>,
+}
+
+impl PartialThrottle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The payload to emit for `text`, or `None` to say nothing.
+    ///
+    /// `is_final` always emits and bypasses the interval: otherwise the last
+    /// words spoken can land inside a throttle window and never be shown,
+    /// which is the bug a naive throttle always has.
+    pub fn offer(
+        &mut self,
+        text: &str,
+        is_final: bool,
+        now: std::time::Instant,
+    ) -> Option<DictationPartialPayload> {
+        let text = tail_of(text, PARTIAL_TAIL_BUDGET);
+
+        if !is_final {
+            // An unchanged hypothesis — what a greedy decoder emits most of
+            // the time — is dropped without consuming the interval budget, so
+            // the next genuinely new one goes out immediately rather than
+            // waiting out a tick spent on a duplicate.
+            if text == self.last_text {
+                return None;
+            }
+            // Last-wins, depth 1: a superseded hypothesis is discarded, never
+            // queued. A queue would make the HUD lag real time under load,
+            // which is the one thing this feature exists to avoid.
+            if let Some(last) = self.last_emit {
+                if now.duration_since(last) < PARTIAL_MIN_INTERVAL {
+                    return None;
+                }
+            }
+        }
+
+        self.seq += 1;
+        self.last_text = text.clone();
+        self.last_emit = Some(now);
+        Some(DictationPartialPayload {
+            seq: self.seq,
+            stable_chars: is_final.then(|| text.chars().count()),
+            text,
+            is_final,
+        })
+    }
+}
+
+/// The last `budget` scalar values of `text`, cut on a scalar boundary.
+fn tail_of(text: &str, budget: usize) -> String {
+    let count = text.chars().count();
+    if count <= budget {
+        return text.to_string();
+    }
+    text.chars().skip(count - budget).collect()
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ModelDownloadProgressPayload {
     pub model_id: String,
@@ -247,6 +370,7 @@ pub fn emit_tts_error(app: &AppHandle, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn rewrite_payload_serializes_message_field() {
@@ -261,6 +385,109 @@ mod tests {
     fn dictation_level_payload_serializes() {
         let json = serde_json::to_string(&DictationLevelPayload { level: 0.5 }).unwrap();
         assert_eq!(json, r#"{"level":0.5}"#);
+    }
+
+    /// Pins the field names the frontend types against.
+    #[test]
+    fn dictation_partial_payload_serializes() {
+        let json = serde_json::to_string(&DictationPartialPayload {
+            seq: 7,
+            text: "hello wurld".into(),
+            stable_chars: Some(5),
+            is_final: false,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"seq":7,"text":"hello wurld","stable_chars":5,"is_final":false}"#
+        );
+    }
+
+    #[test]
+    fn the_first_hypothesis_is_emitted_immediately() {
+        let mut throttle = PartialThrottle::new();
+        let now = std::time::Instant::now();
+        let payload = throttle.offer("hello", false, now).expect("emitted");
+        assert_eq!(payload.seq, 1);
+        assert_eq!(payload.text, "hello");
+        assert_eq!(payload.stable_chars, None);
+        assert!(!payload.is_final);
+    }
+
+    /// Two arrivals inside one window collapse to the later text, not to the
+    /// earlier one and not to both.
+    #[test]
+    fn arrivals_inside_the_interval_coalesce_to_the_latest() {
+        let mut throttle = PartialThrottle::new();
+        let start = std::time::Instant::now();
+        assert!(throttle.offer("hello", false, start).is_some());
+        assert!(throttle
+            .offer("hello there", false, start + Duration::from_millis(10))
+            .is_none());
+        let payload = throttle
+            .offer(
+                "hello there world",
+                false,
+                start + Duration::from_millis(150),
+            )
+            .expect("emitted after the interval");
+        assert_eq!(payload.text, "hello there world");
+        assert_eq!(payload.seq, 2, "seq counts emitted partials, not offers");
+    }
+
+    /// A duplicate must not spend the interval: the next genuinely new
+    /// hypothesis would otherwise wait out a tick that showed nothing.
+    #[test]
+    fn an_identical_repeat_is_dropped_without_spending_the_interval() {
+        let mut throttle = PartialThrottle::new();
+        let start = std::time::Instant::now();
+        assert!(throttle.offer("hello", false, start).is_some());
+        assert!(throttle
+            .offer("hello", false, start + Duration::from_millis(300))
+            .is_none());
+        // Still 300ms since the last *emit*, so this goes out at once.
+        assert!(throttle
+            .offer("hello world", false, start + Duration::from_millis(301))
+            .is_some());
+    }
+
+    /// The bug a naive throttle always has: the last words spoken land inside
+    /// a window and are never shown.
+    #[test]
+    fn the_final_partial_always_goes_out() {
+        let mut throttle = PartialThrottle::new();
+        let start = std::time::Instant::now();
+        assert!(throttle.offer("hello", false, start).is_some());
+        let payload = throttle
+            .offer("hello world", true, start + Duration::from_millis(1))
+            .expect("a final is never withheld");
+        assert!(payload.is_final);
+        assert_eq!(payload.stable_chars, Some("hello world".chars().count()));
+
+        // Even a final identical to what is already on screen: it is what says
+        // the text stopped moving.
+        let same = throttle
+            .offer("hello world", true, start + Duration::from_millis(2))
+            .expect("emitted");
+        assert!(same.is_final);
+    }
+
+    /// Truncation is by scalar value, so a multi-byte character is never cut
+    /// in half — and `stable_chars` counts the same units the HUD slices by.
+    #[test]
+    fn a_long_partial_is_truncated_to_its_tail_on_a_scalar_boundary() {
+        let mut throttle = PartialThrottle::new();
+        let text: String = std::iter::repeat_n('あ', PARTIAL_TAIL_BUDGET + 40)
+            .chain("end".chars())
+            .collect();
+        let payload = throttle
+            .offer(&text, true, std::time::Instant::now())
+            .expect("emitted");
+        assert_eq!(payload.text.chars().count(), PARTIAL_TAIL_BUDGET);
+        assert!(payload.text.ends_with("end"));
+        assert_eq!(payload.stable_chars, Some(PARTIAL_TAIL_BUDGET));
+        // The tail, not the head.
+        assert!(!payload.text.starts_with(&text[..3]) || text.starts_with('あ'));
     }
 
     #[test]

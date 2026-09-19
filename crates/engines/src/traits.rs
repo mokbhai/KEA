@@ -122,6 +122,62 @@ pub trait SttEngine: Send + Sync {
     async fn transcribe(&self, audio: AudioPcm, opts: SttOpts) -> Result<Transcript, EngineError>;
 }
 
+/// One live hypothesis from a streaming recognizer.
+///
+/// Display only. The offline engine re-decodes the complete buffer when the
+/// user stops and *that* is what gets inserted, so nothing here is ever an
+/// input to insertion — which is what allows this path to be lossy, to fall
+/// behind, and to be wrong.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Partial {
+    pub text: String,
+    /// Increments each time the engine closes a segment; lets a consumer keep
+    /// finished segments and replace only the tail.
+    pub segment: u32,
+    /// This partial closed a segment (a sherpa endpoint, or the provider
+    /// equivalent). Never a signal to stop recording — the hotkey decides
+    /// that, because a user pausing mid-sentence to think must not lose the
+    /// rest of the sentence.
+    pub endpoint: bool,
+}
+
+/// An engine that can produce live partial text while audio is still arriving.
+///
+/// Separate from [`SttEngine`] rather than an optional method on it: most
+/// engines cannot stream, and a `transcribe`-shaped engine that answers
+/// "unsupported" at run time is how a feature ends up silently inert.
+#[async_trait]
+pub trait StreamingSttEngine: Send + Sync {
+    fn id(&self) -> &str;
+    fn capabilities(&self) -> EngineCaps;
+    /// [`EngineError::ModelNotInstalled`] when the streaming model is absent —
+    /// which is the normal case, since nothing downloads it automatically.
+    async fn open(&self, opts: SttOpts) -> Result<Box<dyn SttStream>, EngineError>;
+}
+
+/// A handle on one open streaming session.
+///
+/// A handle rather than a `Receiver<Partial>` the engine pumps into. Nothing
+/// in this crate spawns tasks — every engine is a passive object the caller
+/// drives — so a task-owning engine would need a runtime handle at
+/// construction and make the fakes that carry the engine tests require live
+/// timing. Cancellation is the other half: dictation ends when a key is
+/// released, mid-utterance, arbitrarily often, and with a handle that is
+/// `drop(stream)` with the borrow checker proving nothing else holds it.
+#[async_trait]
+pub trait SttStream: Send {
+    /// Feed one capture frame. `Ok(None)` means the hypothesis did not change,
+    /// which is what a greedy decoder answers most of the time.
+    ///
+    /// Must not block the runtime: an implementation backed by a blocking
+    /// decoder hands the frame off and polls, rather than awaiting a decode.
+    async fn accept(&mut self, audio: AudioPcm) -> Result<Option<Partial>, EngineError>;
+
+    /// Flush trailing context and return the last hypothesis. Consumes the
+    /// stream, so a session cannot be finalized twice.
+    async fn finalize(self: Box<Self>) -> Result<Transcript, EngineError>;
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TtsOpts {
     pub model: Option<String>,

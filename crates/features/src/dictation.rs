@@ -5,7 +5,7 @@ use kea_core::rewrite::{PresetRepo, PromptOverrideRepo, RewriteMode};
 use kea_core::store::actions::{ActionRepo, NewAction};
 use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_core::store::vocabulary::VocabularyEntry;
-use kea_engines::traits::{AudioPcm, SttOpts};
+use kea_engines::traits::{AudioPcm, Partial, SttOpts, SttStream, Transcript};
 use kea_engines::EngineRegistry;
 use kea_platform::audio::util::resample_linear;
 use kea_platform::TextIo;
@@ -14,7 +14,18 @@ use kea_platform::{AudioIo, PcmFrame};
 use crate::feature::{ActionGuard, CapKind, CapSlot, Command, Feature, ProfileOverrides};
 use crate::rewrite::{maybe_record_conversation, ContentStorageOpts};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 const WHISPER_SAMPLE_RATE_HZ: u32 = 16_000;
+
+/// How many partials may wait for the app layer to pick them up.
+///
+/// Small and dropping on full, for the same reason the decoder's own queue is:
+/// a superseded hypothesis has no value, and a queue that grows makes the HUD
+/// lag real time — which reads as a hang, the one thing live partials exist to
+/// avoid.
+const PARTIAL_CHANNEL_DEPTH: usize = 16;
 
 pub struct DictationFeature;
 
@@ -105,6 +116,63 @@ pub async fn run_dictation_with_storage(
     profile: &ProfileOverrides,
     storage: ContentStorageOpts<'_>,
 ) -> Result<String, String> {
+    run_dictation_with_opts(
+        engines,
+        bindings,
+        actions,
+        presets,
+        overrides,
+        audio,
+        textio,
+        settings,
+        vocabulary,
+        profile,
+        DictationRunOpts {
+            storage,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// What a run needs beyond its engines and settings.
+///
+/// The streaming fields are here rather than on `DictationSettings` because
+/// neither is a setting: the draft is produced by *this* run, and whether to
+/// fall back to it is a decision the app layer makes from a setting it has
+/// already read.
+#[derive(Default)]
+pub struct DictationRunOpts<'a> {
+    pub storage: ContentStorageOpts<'a>,
+    /// The last live hypothesis from the streaming pass, if there was one.
+    ///
+    /// Never inserted on the happy path — the offline engine's transcript is —
+    /// which is the whole architecture of this feature. See `draft_fallback`.
+    pub streaming_draft: Option<String>,
+    /// Insert `streaming_draft` when the offline decode fails, instead of
+    /// losing the audio entirely.
+    ///
+    /// Default **off**, and that is the honest default: inserting knowably
+    /// worse text after a failure the user cannot see is exactly the
+    /// regression the two-pass design exists to prevent. Off, the current
+    /// behaviour is kept and the log says a draft was available.
+    pub draft_fallback: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_dictation_with_opts(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    actions: &ActionRepo,
+    presets: &PresetRepo,
+    overrides: &PromptOverrideRepo,
+    audio: &mut dyn AudioIo,
+    textio: &dyn TextIo,
+    settings: &DictationSettings,
+    vocabulary: &[VocabularyEntry],
+    profile: &ProfileOverrides,
+    opts: DictationRunOpts<'_>,
+) -> Result<String, String> {
     let _frame_rx = audio.start_mic().await.map_err(|e| e.to_string())?;
     let pcm = audio.stop_mic().await.map_err(|e| e.to_string())?;
 
@@ -128,7 +196,7 @@ pub async fn run_dictation_with_storage(
     // From here the ledger row exists, so every exit closes it.
     let guard = ActionGuard::new(actions, action_id, "dictation");
     let result = run_dictation_inner(
-        engines, &resolver, presets, overrides, textio, settings, vocabulary, profile, storage,
+        engines, &resolver, presets, overrides, textio, settings, vocabulary, profile, opts,
         &binding, action_id, pcm,
     )
     .await;
@@ -151,11 +219,16 @@ async fn run_dictation_inner(
     settings: &DictationSettings,
     vocabulary: &[VocabularyEntry],
     profile: &ProfileOverrides,
-    storage: ContentStorageOpts<'_>,
+    opts: DictationRunOpts<'_>,
     binding: &Binding,
     action_id: i64,
     pcm: PcmFrame,
 ) -> Result<String, String> {
+    let DictationRunOpts {
+        storage,
+        streaming_draft,
+        draft_fallback,
+    } = opts;
     let engine_id = &binding.engine_id;
     let engine = engines
         .stt(engine_id)
@@ -173,10 +246,39 @@ async fn run_dictation_inner(
         vocabulary: hint_terms(vocabulary),
     };
 
-    let transcript = engine
-        .transcribe(pcm_to_audio(pcm), stt_opts)
-        .await
-        .map_err(|e| e.to_string())?;
+    // The second pass, and the only one whose output is ever inserted. Any
+    // live partials the user watched came from a different decoder and are
+    // discarded here.
+    let transcript = match engine.transcribe(pcm_to_audio(pcm), stt_opts).await {
+        Ok(transcript) => transcript,
+        Err(e) => {
+            let message = e.to_string();
+            // A failed decode loses the audio entirely and inserts nothing,
+            // which is why the draft is worth mentioning even when it is not
+            // used: the log is the only place the user's words still exist.
+            match streaming_draft.filter(|draft| !draft.trim().is_empty()) {
+                Some(draft) if draft_fallback => {
+                    tracing::warn!(
+                        action_id = %action_id,
+                        error = %message,
+                        "dictation: the offline decode failed; inserting the live draft instead"
+                    );
+                    Transcript { text: draft }
+                }
+                Some(draft) => {
+                    tracing::warn!(
+                        action_id = %action_id,
+                        error = %message,
+                        draft_chars = draft.chars().count(),
+                        "dictation: the offline decode failed; a live draft was available but \
+                         the draft fallback is off"
+                    );
+                    return Err(message);
+                }
+                None => return Err(message),
+            }
+        }
+    };
 
     // Before the refinement pass so the LLM sees correct proper nouns, and
     // before `transcript_text` is snapshotted below so History shows what was
@@ -282,6 +384,115 @@ async fn run_dictation_inner(
     Ok(final_text)
 }
 
+/// A running streaming pass: the task feeding capture frames to a recognizer
+/// and forwarding its hypotheses.
+///
+/// Owns no ledger row and closes no action. It is display-only, so it must
+/// never be able to fail a dictation run — every exit here is a log line.
+pub struct PartialsSession {
+    cancel: tokio::sync::watch::Sender<bool>,
+    join: tokio::task::JoinHandle<Option<String>>,
+    dropped: Arc<AtomicU64>,
+}
+
+/// Starts the streaming pass over `frames`, returning the hypotheses.
+///
+/// A `Receiver<Partial>` rather than a callback because that is how the
+/// meeting path already inverts this dependency: `crates/features` builds the
+/// values and the app layer emits them. The features crate must not know about
+/// `AppHandle`.
+pub fn spawn_partials(
+    stream: Box<dyn SttStream>,
+    mut frames: tokio::sync::mpsc::Receiver<PcmFrame>,
+) -> (PartialsSession, tokio::sync::mpsc::Receiver<Partial>) {
+    let (partial_tx, partial_rx) = tokio::sync::mpsc::channel(PARTIAL_CHANNEL_DEPTH);
+    let (cancel, mut cancel_rx) = tokio::sync::watch::channel(false);
+    let dropped = Arc::new(AtomicU64::new(0));
+    let task_dropped = dropped.clone();
+
+    let join = tokio::spawn(async move {
+        let mut stream = stream;
+        loop {
+            tokio::select! {
+                changed = cancel_rx.changed() => {
+                    if changed.is_err() || *cancel_rx.borrow() {
+                        break;
+                    }
+                }
+                frame = frames.recv() => {
+                    // The capture side closed: the recording has ended.
+                    let Some(frame) = frame else { break };
+                    // Per-frame linear resampling puts small discontinuities
+                    // at the frame boundaries that whole-buffer resampling
+                    // does not. Acceptable here precisely because this path
+                    // never produces inserted text.
+                    match stream.accept(pcm_to_audio(frame)).await {
+                        Ok(Some(partial)) => {
+                            if partial_tx.try_send(partial).is_err() {
+                                task_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::debug!(error = %e, "dictation: streaming pass ended early");
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+
+        let dropped = task_dropped.load(Ordering::Relaxed);
+        if dropped > 0 {
+            tracing::debug!(
+                dropped,
+                "dictation: dropped {dropped} partial hypotheses nobody read in time"
+            );
+        }
+
+        match stream.finalize().await {
+            Ok(transcript) => Some(transcript.text),
+            Err(e) => {
+                tracing::debug!(error = %e, "dictation: streaming pass produced no final text");
+                None
+            }
+        }
+    });
+
+    (
+        PartialsSession {
+            cancel,
+            join,
+            dropped,
+        },
+        partial_rx,
+    )
+}
+
+impl PartialsSession {
+    /// Stops the pump and returns the last hypothesis, or `None` if the
+    /// session errored, was never fed, or its task panicked.
+    ///
+    /// A `JoinError` is tolerated rather than propagated on purpose: the
+    /// blocking decode lives outside the guard that owns the dictation run's
+    /// processing state, so a panic in it must not wedge dictation.
+    pub async fn finish(self) -> Option<String> {
+        let _ = self.cancel.send(true);
+        match self.join.await {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::warn!(error = %e, "dictation: the streaming pass panicked");
+                None
+            }
+        }
+    }
+
+    /// Hypotheses that were produced but never read. Diagnostic only.
+    pub fn dropped_partials(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,7 +502,7 @@ mod tests {
     use kea_core::store::db::{open_pool, run_config_migrations, run_data_migrations};
     use kea_core::store::vocabulary::VocabularyEntry;
     use kea_engines::noop::NoopLlmEngine;
-    use kea_engines::traits::{EngineCaps, EngineError, SttEngine, Transcript};
+    use kea_engines::traits::{EngineCaps, EngineError, SttEngine};
     use kea_platform::{AudioIoError, DictationState, ReplaceMode, TextIoError};
     use std::sync::{Arc, Mutex};
 
@@ -451,6 +662,288 @@ mod tests {
             PresetRepo::new(config_pool.clone()),
             PromptOverrideRepo::new(config_pool),
         )
+    }
+
+    /// An STT engine that always refuses, so the draft path is exercised
+    /// against the failure it exists for rather than a contrived one.
+    struct FailingStt;
+
+    #[async_trait]
+    impl SttEngine for FailingStt {
+        fn id(&self) -> &str {
+            "failing-stt"
+        }
+
+        fn capabilities(&self) -> EngineCaps {
+            EngineCaps {
+                models: vec!["fake".into()],
+            }
+        }
+
+        async fn transcribe(
+            &self,
+            _audio: AudioPcm,
+            _opts: SttOpts,
+        ) -> Result<Transcript, EngineError> {
+            Err(EngineError::Other("the model fell over".into()))
+        }
+    }
+
+    /// A scripted streaming stream: one hypothesis per frame, optionally slow,
+    /// optionally failing partway.
+    struct FakeSttStream {
+        script: Vec<&'static str>,
+        index: usize,
+        delay: std::time::Duration,
+        fail_at: Option<usize>,
+        endpoint_every: Option<usize>,
+    }
+
+    impl FakeSttStream {
+        fn new(script: Vec<&'static str>) -> Self {
+            Self {
+                script,
+                index: 0,
+                delay: std::time::Duration::ZERO,
+                fail_at: None,
+                endpoint_every: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SttStream for FakeSttStream {
+        async fn accept(&mut self, _audio: AudioPcm) -> Result<Option<Partial>, EngineError> {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            let step = self.index;
+            self.index += 1;
+            if self.fail_at == Some(step) {
+                return Err(EngineError::Other("streaming decoder died".into()));
+            }
+            let Some(text) = self.script.get(step) else {
+                return Ok(None);
+            };
+            let endpoint = self
+                .endpoint_every
+                .is_some_and(|n| n > 0 && (step + 1).is_multiple_of(n));
+            Ok(Some(Partial {
+                text: (*text).to_string(),
+                segment: self.endpoint_every.map_or(0, |n| (step / n) as u32),
+                endpoint,
+            }))
+        }
+
+        async fn finalize(self: Box<Self>) -> Result<Transcript, EngineError> {
+            if self.index == 0 {
+                return Err(EngineError::Other("nothing was ever fed".into()));
+            }
+            Ok(Transcript {
+                text: self
+                    .script
+                    .get(self.index.min(self.script.len()).saturating_sub(1))
+                    .copied()
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        }
+    }
+
+    fn test_settings() -> DictationSettings {
+        DictationSettings {
+            post_process: false,
+            active_model: None,
+            hold_to_talk: false,
+            input_device: None,
+            preroll: true,
+            language: None,
+        }
+    }
+
+    fn frame(samples: usize) -> PcmFrame {
+        PcmFrame {
+            samples: vec![0.25; samples],
+            sample_rate_hz: 16_000,
+        }
+    }
+
+    /// **The invariant the whole feature is built on.** The streaming pass is
+    /// display-only: whatever it guessed, the offline engine's transcript is
+    /// what gets inserted. This is the test that fails if anyone later
+    /// "simplifies" the two passes into one.
+    #[tokio::test]
+    async fn the_offline_transcript_wins_over_the_live_draft() {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: "hello world".into(),
+        }));
+        let textio = Arc::new(FakeTextIo::new());
+        let (bindings, actions, presets, overrides) = test_repos().await;
+        let mut audio = FakeAudioIo::with_pcm(frame(1600));
+
+        let out = run_dictation_with_opts(
+            &reg,
+            &bindings,
+            &actions,
+            &presets,
+            &overrides,
+            &mut audio,
+            textio.as_ref(),
+            &test_settings(),
+            &[],
+            &ProfileOverrides::default(),
+            DictationRunOpts {
+                streaming_draft: Some("hello wurld".into()),
+                // Even with the fallback armed: it is a *failure* path, and
+                // this run does not fail.
+                draft_fallback: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "hello world");
+        assert_eq!(
+            *textio.inserted.lock().unwrap(),
+            Some("hello world".to_string())
+        );
+    }
+
+    /// A failed decode loses the audio entirely today. The draft can stand in,
+    /// but only when asked: inserting knowably worse text after a failure the
+    /// user cannot see is the regression the two-pass design prevents.
+    #[tokio::test]
+    async fn the_draft_is_only_inserted_when_the_fallback_is_on() {
+        for (fallback, expected) in [(false, None), (true, Some("hello wurld".to_string()))] {
+            let mut reg = EngineRegistry::default();
+            reg.register_stt(Arc::new(FailingStt));
+            let textio = Arc::new(FakeTextIo::new());
+            let (bindings, actions, presets, overrides) = test_repos().await;
+            let mut audio = FakeAudioIo::with_pcm(frame(1600));
+
+            let result = run_dictation_with_opts(
+                &reg,
+                &bindings,
+                &actions,
+                &presets,
+                &overrides,
+                &mut audio,
+                textio.as_ref(),
+                &test_settings(),
+                &[],
+                &ProfileOverrides::default(),
+                DictationRunOpts {
+                    streaming_draft: Some("hello wurld".into()),
+                    draft_fallback: fallback,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+            assert_eq!(result.is_ok(), fallback, "fallback = {fallback}");
+            assert_eq!(*textio.inserted.lock().unwrap(), expected);
+        }
+    }
+
+    /// Partials come out in order, with their segments, and `finish` returns
+    /// the last hypothesis.
+    #[tokio::test]
+    async fn the_pump_forwards_hypotheses_in_order_and_finishes_with_the_last() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut stream = FakeSttStream::new(vec!["the", "the cat", "the cat sat"]);
+        stream.endpoint_every = Some(3);
+        let (session, mut partials) = spawn_partials(Box::new(stream), rx);
+
+        for _ in 0..3 {
+            tx.send(frame(160)).await.unwrap();
+        }
+        drop(tx);
+
+        let mut seen = Vec::new();
+        while let Some(partial) = partials.recv().await {
+            seen.push(partial);
+        }
+
+        let texts: Vec<&str> = seen.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, vec!["the", "the cat", "the cat sat"]);
+        // Only the last one closed a segment.
+        assert_eq!(
+            seen.iter().filter(|p| p.endpoint).count(),
+            1,
+            "segments must close on an endpoint and nowhere else"
+        );
+        assert!(seen.iter().all(|p| p.segment == 0));
+
+        assert_eq!(session.finish().await.as_deref(), Some("the cat sat"));
+    }
+
+    /// A stream that dies mid-session must not panic and must not pretend to
+    /// have produced a final hypothesis.
+    #[tokio::test]
+    async fn a_stream_that_errors_yields_no_final_text() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut stream = FakeSttStream::new(vec!["the", "the cat"]);
+        stream.fail_at = Some(1);
+        let (session, mut partials) = spawn_partials(Box::new(stream), rx);
+
+        for _ in 0..2 {
+            let _ = tx.send(frame(160)).await;
+        }
+        drop(tx);
+
+        let mut seen = Vec::new();
+        while let Some(partial) = partials.recv().await {
+            seen.push(partial);
+        }
+        assert_eq!(seen.len(), 1);
+        assert!(session.finish().await.is_none());
+    }
+
+    /// The property that makes a lossy preview acceptable: the session buffer
+    /// the second pass decodes is written unconditionally, so a starved
+    /// streaming consumer cannot cost the user a single sample of the audio
+    /// that actually gets transcribed.
+    #[tokio::test]
+    async fn a_starved_streaming_pass_costs_the_recording_nothing() {
+        // Bounded and dropping, exactly like the capture channel.
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut stream = FakeSttStream::new(vec!["falling behind"; 1000]);
+        stream.delay = std::time::Duration::from_millis(2);
+        let (session, mut partials) = spawn_partials(Box::new(stream), rx);
+
+        // What the capture thread does: offer the frame to the streaming
+        // consumer, then record it regardless of whether it landed.
+        let mut recorded: Vec<PcmFrame> = Vec::new();
+        let mut offered_and_dropped = 0u64;
+        for i in 0..1000 {
+            let frame = frame(160 + i % 3);
+            if tx.try_send(frame.clone()).is_err() {
+                offered_and_dropped += 1;
+            }
+            recorded.push(frame);
+        }
+        drop(tx);
+
+        assert!(
+            offered_and_dropped > 0,
+            "a 2ms-per-frame decoder must fall behind 1000 frames"
+        );
+        assert_eq!(recorded.len(), 1000, "the recording keeps every frame");
+        assert!(recorded
+            .iter()
+            .enumerate()
+            .all(|(i, f)| f.samples.len() == 160 + i % 3));
+
+        // Nothing reads the partials, so the pump's own channel fills too —
+        // and drops rather than growing.
+        let mut received = 0;
+        while let Some(_partial) = partials.recv().await {
+            received += 1;
+        }
+        assert!(received <= 1000);
+        let _ = session.finish().await;
     }
 
     #[test]

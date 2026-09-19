@@ -64,6 +64,10 @@ export function featureHandlers({
     list_installed_whisper_models: () => installedWhisper,
     list_onnx_models: () => [],
     list_installed_onnx_models: () => installedOnnx,
+    // Generic settings rows, which several pages read on mount. Null is
+    // "unset", so every such setting shows its own default.
+    get_setting: () => null,
+    set_setting: () => undefined,
     get_binding: (args) => bindings[`${args?.feature}/${args?.slot}`] ?? null,
     set_binding: () => undefined,
     delete_binding: () => undefined,

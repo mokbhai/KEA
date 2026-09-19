@@ -9,6 +9,10 @@ whisper = ["kea-infer/whisper", "dep:whisper-rs"]
 whisper-metal = ["whisper", "kea-infer/whisper-metal"]
 whisper-coreml = ["whisper", "kea-infer/whisper-coreml"]
 parakeet = ["kea-infer/sherpa"]
+# The streaming recognizer behind live partial transcripts. Its own feature
+# rather than a rider on `parakeet`: they are different sherpa APIs, and a
+# build can reasonably want the offline transducer without the streaming one.
+streaming = ["kea-infer/sherpa"]
 tts-local = ["kea-infer/sherpa"]
 # The OS synthesizer. A feature rather than an unconditional dependency
 # because it is the only thing in this crate that needs the platform layer,

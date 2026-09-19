@@ -505,6 +505,34 @@ export const onDictationState = (
 export const onDictationLevel = (handler: (level: number) => void): Promise<UnlistenFn> =>
   listen<{ level: number }>("dictation:level", (event) => handler(event.payload.level));
 
+/**
+ * A live hypothesis from the streaming recogniser, already throttled and
+ * truncated on the Rust side.
+ *
+ * Snake case, matching `ModelDownloadProgress` and `DictationSettings`, which
+ * both mirror the Rust field names verbatim.
+ *
+ * This is **not** what gets typed. The offline engine re-decodes the whole
+ * recording when the user stops, and that transcript is what reaches the text
+ * field — it arrives here once more as the `is_final` partial.
+ */
+export type DictationPartial = {
+  /** Monotonic within a run; the HUD keeps only the highest it has seen. */
+  seq: number;
+  text: string;
+  /**
+   * Leading **scalar values** the engine considers settled, or null when it
+   * does not report stability. Not a byte offset — slice with `Array.from`.
+   */
+  stable_chars: number | null;
+  is_final: boolean;
+};
+
+export const onDictationPartial = (
+  handler: (partial: DictationPartial) => void,
+): Promise<UnlistenFn> =>
+  listen<DictationPartial>("dictation:partial", (event) => handler(event.payload));
+
 export const onDictationPreview = (
   handler: (active: boolean) => void,
 ): Promise<UnlistenFn> =>
@@ -813,7 +841,12 @@ export type SystemVoice = {
   quality: string;
 };
 
-export type OnnxModelKindParam = "parakeet" | "tts";
+/**
+ * `"streaming"` is a catalog, not a bindable engine: nothing resolves to it
+ * and it has no `Binding`. It is here so the generic model commands —
+ * list/installed/download/cancel/delete — serve it for free.
+ */
+export type OnnxModelKindParam = "parakeet" | "streaming" | "tts";
 
 export const listTtsEngines = () => invoke<EngineInfo[]>("list_tts_engines");
 

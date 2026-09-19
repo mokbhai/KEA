@@ -26,6 +26,26 @@ async function setLevel(level: number) {
   });
 }
 
+async function setPartial(
+  partial: {
+    seq: number;
+    text: string;
+    stable_chars?: number | null;
+    is_final?: boolean;
+  },
+) {
+  await act(async () => {
+    emitTauriEvent("dictation:partial", {
+      stable_chars: null,
+      is_final: false,
+      ...partial,
+    });
+  });
+}
+
+const partialText = () =>
+  document.querySelector(".kea-hud__partial")?.textContent ?? "";
+
 const realMatchMedia = window.matchMedia;
 
 /** Makes only `(prefers-reduced-motion: reduce)` match. */
@@ -165,6 +185,129 @@ describe("DictationHud", () => {
 
     expect(screen.getByRole("meter", { name: "Microphone level" })).toBeTruthy();
     expect(document.querySelector(".kea-waveform")).toBeNull();
+  });
+
+  /**
+   * The most important assertion in the file: this is what a build with no
+   * streaming model — the default — actually renders.
+   */
+  it("shows no transcript line when no partial ever arrives", async () => {
+    await renderHud();
+    await setState("listening");
+
+    expect(partialText()).toBe("");
+    expect(document.querySelector(".kea-hud--has-partial")).toBeNull();
+  });
+
+  it("replaces the hypothesis rather than accumulating it", async () => {
+    await renderHud();
+    await setState("listening");
+    await setPartial({ seq: 1, text: "the cat sat on the mat" });
+    await setPartial({ seq: 2, text: "the cat sat on the matter" });
+
+    // A streaming recogniser revises its tail; appending deltas would show
+    // both.
+    expect(partialText()).toBe("the cat sat on the matter");
+    expect(partialText().match(/the cat sat on the/g)).toHaveLength(1);
+    expect(document.querySelector(".kea-hud--has-partial")).not.toBeNull();
+  });
+
+  it("ignores a partial that arrives out of order", async () => {
+    await renderHud();
+    await setState("listening");
+    await setPartial({ seq: 5, text: "newest" });
+    await setPartial({ seq: 4, text: "stale" });
+
+    expect(partialText()).toBe("newest");
+  });
+
+  it("keeps the transcript across processing and clears it when the run ends", async () => {
+    await renderHud();
+    await setState("listening");
+    await setPartial({ seq: 1, text: "hello wurld" });
+
+    // The window in which the user has stopped talking and wants to see what
+    // was heard — and in which the final partial arrives.
+    await setState("processing");
+    expect(partialText()).toBe("hello wurld");
+
+    await setState("idle");
+    await setState("listening");
+    expect(partialText()).toBe("");
+  });
+
+  it("does not inherit the previous run's words", async () => {
+    await renderHud();
+    await setState("listening");
+    await setPartial({ seq: 1, text: "first run" });
+    await setState("processing");
+    await setState("listening");
+
+    expect(partialText()).toBe("");
+  });
+
+  it("splits settled text from the tail the engine is still revising", async () => {
+    await renderHud();
+    await setState("listening");
+    await setPartial({ seq: 1, text: "hello wurld", stable_chars: 6 });
+
+    expect(document.querySelector(".kea-hud__partial-stable")?.textContent).toBe("hello ");
+    expect(document.querySelector(".kea-hud__partial-tail")?.textContent).toBe("wurld");
+  });
+
+  it("treats an engine that reports no stability as all settled", async () => {
+    await renderHud();
+    await setState("listening");
+    await setPartial({ seq: 1, text: "hello wurld", stable_chars: null });
+
+    expect(document.querySelector(".kea-hud__partial-stable")?.textContent).toBe("hello wurld");
+    expect(document.querySelector(".kea-hud__partial-tail")?.textContent).toBe("");
+  });
+
+  /**
+   * `stable_chars` counts Unicode scalar values. A byte or UTF-16 offset would
+   * cut these in half and render a replacement character — invisible in
+   * English-only testing, which is exactly why it is pinned here.
+   */
+  it("splits on a scalar boundary, not a byte or surrogate one", async () => {
+    await renderHud();
+    await setState("listening");
+    // Two astral emoji and a CJK character: 3 scalars, 11 UTF-8 bytes,
+    // 5 UTF-16 code units.
+    await setPartial({ seq: 1, text: "🎤🐈猫ok", stable_chars: 3 });
+
+    const stable = document.querySelector(".kea-hud__partial-stable")?.textContent ?? "";
+    const tail = document.querySelector(".kea-hud__partial-tail")?.textContent ?? "";
+    expect(stable).toBe("🎤🐈猫");
+    expect(tail).toBe("ok");
+    expect(stable + tail).not.toContain("\uFFFD");
+  });
+
+  /**
+   * A live region fed a self-revising string ten times a second is unusable,
+   * so only the state label is announced.
+   */
+  it("keeps the transcript out of the live region", async () => {
+    await renderHud();
+    await setState("listening");
+    await setPartial({ seq: 1, text: "hello wurld" });
+
+    expect(screen.getByRole("status").textContent).toContain("Listening");
+    expect(screen.getByRole("status").textContent).not.toContain("wurld");
+    expect(document.querySelector(".kea-hud__partial")?.getAttribute("aria-hidden")).toBe(
+      "true",
+    );
+  });
+
+  it("still falls back to a static meter with a partial on screen", async () => {
+    stubReducedMotion();
+    await renderHud();
+    await setState("listening");
+    await setPartial({ seq: 1, text: "hello wurld" });
+
+    expect(screen.getByRole("meter", { name: "Microphone level" })).toBeTruthy();
+    expect(document.querySelector(".kea-waveform")).toBeNull();
+    expect(partialText()).toBe("hello wurld");
   });
 
   it("stills the transcribing indicator when motion is reduced", async () => {

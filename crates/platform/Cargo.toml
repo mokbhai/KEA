@@ -18,6 +18,10 @@ tracing.workspace = true
 cpal.workspace = true
 rodio.workspace = true
 screencapturekit = { version = "7", optional = true, features = ["macos_13_0", "async"] }
+# Region captures are pictures of someone's screen. NamedTempFile/TempDir own
+# the file so Drop removes it on every path, including a panic, rather than
+# leaving cleanup to each early return in the capture flow.
+tempfile.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"

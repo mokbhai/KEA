@@ -18,6 +18,12 @@ pub enum ModelKind {
     Whisper,
     Parakeet,
     Tts,
+    /// The streaming recognizer that feeds live partial transcripts. Its own
+    /// family rather than a Parakeet variant: a different sherpa config, a
+    /// different storage root, and — unlike every other kind here — nothing
+    /// binds to it, which is what [`ModelKind::default_slot`] answers `None`
+    /// for.
+    Streaming,
 }
 
 impl ModelKind {
@@ -26,14 +32,24 @@ impl ModelKind {
             ModelKind::Whisper => "whisper",
             ModelKind::Parakeet => "parakeet",
             ModelKind::Tts => "tts",
+            ModelKind::Streaming => "streaming",
         }
     }
 
-    /// The capability slot a model of this kind is bound to by default.
-    pub fn default_slot(self) -> &'static str {
+    /// The capability slot a model of this kind is bound to by default, or
+    /// `None` for a kind nothing binds to.
+    ///
+    /// `None` is not a shrug. `delete_model` uses this to decide which
+    /// bindings to clear, and a streaming model is selected by a *setting*
+    /// rather than a binding — so answering `"stt"` here would clear the
+    /// user's Parakeet or Whisper binding when they deleted a streaming model.
+    /// A silent, user-visible regression, and the price of the enum being
+    /// genuinely exhaustive.
+    pub fn default_slot(self) -> Option<&'static str> {
         match self {
-            ModelKind::Whisper | ModelKind::Parakeet => "stt",
-            ModelKind::Tts => "tts",
+            ModelKind::Whisper | ModelKind::Parakeet => Some("stt"),
+            ModelKind::Tts => Some("tts"),
+            ModelKind::Streaming => None,
         }
     }
 
@@ -44,6 +60,7 @@ impl ModelKind {
             ModelKind::Whisper => None,
             ModelKind::Parakeet => Some(OnnxModelKind::Parakeet),
             ModelKind::Tts => Some(OnnxModelKind::TtsVits),
+            ModelKind::Streaming => Some(OnnxModelKind::StreamingZipformer),
         }
     }
 
@@ -66,6 +83,7 @@ impl FromStr for ModelKind {
             "whisper" => Ok(ModelKind::Whisper),
             "parakeet" => Ok(ModelKind::Parakeet),
             "tts" => Ok(ModelKind::Tts),
+            "streaming" => Ok(ModelKind::Streaming),
             other => Err(InferError::UnknownModelKind(other.to_string())),
         }
     }
@@ -162,6 +180,9 @@ impl ModelEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OnnxModelKind {
     Parakeet,
+    /// A streaming transducer, loaded through `OnlineRecognizerConfig` rather
+    /// than the offline one — a different sherpa API, not a different vendor.
+    StreamingZipformer,
     TtsVits,
     TtsKokoro,
     TtsKitten,
@@ -276,6 +297,7 @@ impl ModelRegistry {
             ModelKind::Whisper => Self::whisper_entries(),
             ModelKind::Parakeet => Self::parakeet_entries(),
             ModelKind::Tts => Self::tts_entries(),
+            ModelKind::Streaming => Self::streaming_entries(),
         }
     }
 
@@ -480,6 +502,28 @@ impl ModelRegistry {
                 deprecated: false,
             },
         ]
+    }
+
+    /// The streaming recognizers offered for live partials.
+    ///
+    /// The 20M model is chosen deliberately, and a bigger one would be a
+    /// mistake rather than an upgrade: partials are display-only — the offline
+    /// engine re-decodes the buffer and *that* is what gets inserted — so
+    /// accuracy here buys nothing and latency here is the entire feature.
+    fn streaming_entries() -> Vec<ModelEntry> {
+        vec![ModelEntry {
+            id: "streaming-zipformer-en-20m".into(),
+            display_name: "Streaming Zipformer 20M (English)".into(),
+            language: "en-US".into(),
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17.tar.bz2"
+                .into(),
+            size_bytes: 127_887_156,
+            sha256: "9c559283e8498d3fe95913c79ca1cb454bb26281ac2b102b41306c7d752765d9"
+                .into(),
+            kind: ModelKind::Streaming,
+            onnx_kind: None,
+            deprecated: false,
+        }]
     }
 
     fn tts_entries() -> Vec<ModelEntry> {
@@ -756,7 +800,7 @@ mod tests {
         assert!(!offered.contains(&"ggml-medium.en".to_string()));
         assert!(offered.contains(&"ggml-large-v3-turbo-q5_0".to_string()));
         // Nothing else is retired, in any family.
-        for kind in [ModelKind::Whisper, ModelKind::Parakeet, ModelKind::Tts] {
+        for kind in ALL_KINDS {
             assert_eq!(
                 ModelRegistry::catalog(kind).len() - ModelRegistry::offered(kind).len(),
                 usize::from(kind == ModelKind::Whisper),
@@ -830,9 +874,31 @@ mod tests {
 
     #[test]
     fn every_catalog_entry_is_complete() {
-        for kind in [ModelKind::Whisper, ModelKind::Parakeet, ModelKind::Tts] {
+        for kind in ALL_KINDS {
             assert_catalog_is_valid(kind);
         }
+    }
+
+    /// The streaming entry is measured, not guessed: a wrong sha256 fails the
+    /// download at the verify step and a wrong size only shows as a progress
+    /// bar that lies.
+    #[test]
+    fn the_streaming_catalog_offers_the_small_english_model() {
+        let models = ModelRegistry::onnx_catalog(ModelKind::Streaming).unwrap();
+        assert_eq!(models.len(), 1);
+        let entry = &models[0];
+        assert_eq!(entry.id, "streaming-zipformer-en-20m");
+        assert_eq!(entry.kind, OnnxModelKind::StreamingZipformer);
+        assert_eq!(entry.language, "en-US");
+        assert!(entry.url.contains("streaming-zipformer-en-20M"));
+        assert!(!entry.deprecated);
+        // Partials are display-only, so a big accurate model here would be
+        // waste rather than an upgrade. Guard the size class, not the byte.
+        assert!(
+            entry.size_bytes < 200_000_000,
+            "a streaming model this large defeats the point: {}",
+            entry.size_bytes
+        );
     }
 
     #[test]
@@ -950,9 +1016,18 @@ mod tests {
         }
     }
 
+    /// Every kind, so a variant added without a catalog, a wire string or a
+    /// slot fails here rather than in production.
+    const ALL_KINDS: [ModelKind; 4] = [
+        ModelKind::Whisper,
+        ModelKind::Parakeet,
+        ModelKind::Tts,
+        ModelKind::Streaming,
+    ];
+
     #[test]
     fn model_kind_round_trips_through_its_wire_string() {
-        for kind in [ModelKind::Whisper, ModelKind::Parakeet, ModelKind::Tts] {
+        for kind in ALL_KINDS {
             assert_eq!(ModelKind::try_from(kind.as_str()).unwrap(), kind);
             // The serde form is the same string the UI already sends.
             assert_eq!(
@@ -982,13 +1057,21 @@ mod tests {
             "onnx:parakeet:parakeet-tdt-0.6b-v2"
         );
         assert_eq!(ModelKind::Tts.download_key("v"), "onnx:tts:v");
+        assert_eq!(
+            ModelKind::Streaming.download_key("streaming-zipformer-en-20m"),
+            "onnx:streaming:streaming-zipformer-en-20m"
+        );
     }
 
     #[test]
     fn default_slot_per_kind() {
-        assert_eq!(ModelKind::Whisper.default_slot(), "stt");
-        assert_eq!(ModelKind::Parakeet.default_slot(), "stt");
-        assert_eq!(ModelKind::Tts.default_slot(), "tts");
+        assert_eq!(ModelKind::Whisper.default_slot(), Some("stt"));
+        assert_eq!(ModelKind::Parakeet.default_slot(), Some("stt"));
+        assert_eq!(ModelKind::Tts.default_slot(), Some("tts"));
+        // Nothing binds to a streaming model — it is chosen by a setting — and
+        // answering "stt" here would make deleting one clear the user's
+        // dictation binding.
+        assert_eq!(ModelKind::Streaming.default_slot(), None);
     }
 
     #[test]
@@ -1008,8 +1091,9 @@ mod tests {
         // Whisper has no bundle shape, so the ONNX view refuses rather than
         // quietly handing back an empty catalog.
         assert!(ModelRegistry::onnx_catalog(ModelKind::Whisper).is_none());
+        assert!(ModelRegistry::onnx_catalog(ModelKind::Streaming).is_some());
 
-        for kind in [ModelKind::Whisper, ModelKind::Parakeet, ModelKind::Tts] {
+        for kind in ALL_KINDS {
             for entry in ModelRegistry::catalog(kind) {
                 assert_eq!(entry.kind, kind);
                 assert_eq!(ModelRegistry::find(kind, &entry.id), Some(entry));

@@ -277,9 +277,16 @@ export const catalogEngines = (capability?: Capability): LocalEngineSpec[] =>
     (e): e is LocalEngineSpec => !!e.catalog && (!capability || e.capability === capability),
   );
 
-/** Loads a local engine's catalog and the ids already on disk. */
+/**
+ * Loads a local engine's catalog and the ids already on disk.
+ *
+ * Takes anything that *has* a catalog rather than an `EngineSpec`, because not
+ * every catalog belongs to a bindable engine: the streaming recogniser is
+ * downloaded and deleted like any other model while nothing resolves to it
+ * (see `ModelsPage`). Every `EngineSpec` still satisfies this.
+ */
 export async function loadCatalog(
-  spec: EngineSpec,
+  spec: { catalog?: EngineCatalog },
 ): Promise<{ models: LocalModel[]; installed: string[] }> {
   if (!spec.catalog) return { models: [], installed: [] };
   const [models, installed] = await Promise.all([
