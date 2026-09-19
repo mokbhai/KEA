@@ -610,6 +610,16 @@ export type MeetingSegment = {
   start_offset_ms: number;
   end_offset_ms: number;
   text: string;
+  /** Which side spoke, or null when the two could not be told apart. */
+  speaker_key: string | null;
+};
+
+export type MeetingSpeaker = {
+  meeting_id: string;
+  speaker_key: string;
+  display_name: string;
+  /** "channel" is the default KEA assigned; "user" is a name someone typed. */
+  source: "channel" | "user";
 };
 
 export type MeetingSegmentEvent = {
@@ -618,6 +628,7 @@ export type MeetingSegmentEvent = {
   start_offset_ms: number;
   end_offset_ms: number;
   text: string;
+  speaker_key: string | null;
 };
 
 export type MeetingNotes = {
@@ -636,6 +647,7 @@ export type MeetingDetail = {
   meeting: Meeting;
   segments: MeetingSegment[];
   notes: MeetingNotes | null;
+  speakers: MeetingSpeaker[];
 };
 
 export type MeetingSettings = {
@@ -683,6 +695,17 @@ export const getMeeting = (id: string) =>
 export const deleteMeeting = (id: string) =>
   invoke<void>("delete_meeting", { id });
 
+export const setMeetingSpeakerName = (
+  meetingId: string,
+  speakerKey: string,
+  displayName: string,
+) =>
+  invoke<void>("set_meeting_speaker_name", {
+    meetingId,
+    speakerKey,
+    displayName,
+  });
+
 export const startMeeting = () => invoke<string>("start_meeting");
 
 export const stopMeeting = () => invoke<MeetingDetail>("stop_meeting");
@@ -723,7 +746,7 @@ export const onMeetingError = (handler: (message: string) => void): Promise<Unli
   );
 
 /** Mirrors `kea_core::store::actions::ActionStatus`. */
-export type ActionStatus = "started" | "ok" | "error";
+export type ActionStatus = "started" | "ok" | "error" | "cancelled";
 
 export type ActionRow = {
   id: number;
@@ -1042,3 +1065,79 @@ export const onTranscribeFileError = (
 
 /** Opens the system file picker; resolves to null when the user cancelled. */
 export const pickAudioFile = () => invoke<string | null>("pick_audio_file");
+
+/**
+ * The prompt palette: a spotlight-style bar that takes one instruction against
+ * whatever was selected, and puts the answer back in the app you came from.
+ *
+ * Only the session id crosses on the event; the body is pulled with
+ * {@link getPaletteSession}, because `app.emit` reaches every window and the
+ * settings window has no business receiving whatever you had selected in
+ * Slack.
+ */
+export type PaletteOrigin = "selection" | "screen_capture";
+
+/** Where the answer goes. Picked by which key submits — see PromptPalette. */
+export type PaletteDelivery = "replace" | "insert" | "copy";
+
+export type PaletteSession = {
+  session_id: number;
+  /** What the answer is about. Empty is the "ask KEA anything" case. */
+  source_text: string;
+  origin: PaletteOrigin;
+  /** Display only; the app the palette took focus from. */
+  app_name: string | null;
+  can_replace: boolean;
+  can_insert: boolean;
+  default_delivery: PaletteDelivery;
+  /** Why there is no source text, or why only Copy is on offer. */
+  notice: string | null;
+};
+
+/**
+ * What a run actually did, which is not always what was asked: a Replace whose
+ * selection went missing becomes an Insert, and anything becomes a Copy when
+ * the target app could not be brought back.
+ */
+export type PaletteOutcome = {
+  delivered: PaletteDelivery | "cancelled";
+  message: string | null;
+};
+
+export const openPalette = () => invoke<void>("open_palette");
+
+export const getPaletteSession = (sessionId: number) =>
+  invoke<PaletteSession>("get_palette_session", { sessionId });
+
+/** Tells the backend the session is rendered, which is what shows the window. */
+export const paletteReady = (sessionId: number) =>
+  invoke<void>("palette_ready", { sessionId });
+
+export const runPalette = (
+  sessionId: number,
+  instruction: string,
+  delivery: PaletteDelivery,
+) => invoke<PaletteOutcome>("run_palette", { sessionId, instruction, delivery });
+
+export const cancelPalette = () => invoke<void>("cancel_palette");
+
+export const listPaletteHistory = () => invoke<string[]>("list_palette_history");
+
+export const clearPaletteHistory = () => invoke<void>("clear_palette_history");
+
+/** Select a screen region, OCR it, and open the palette with the result. */
+export const captureScreenText = () => invoke<void>("capture_screen_text");
+
+/** The recognition languages this macOS build supports, asked of Vision. */
+export const getOcrLanguages = () => invoke<string[]>("get_ocr_languages");
+
+export const onPaletteOpen = (
+  handler: (sessionId: number) => void,
+): Promise<UnlistenFn> =>
+  listen<{ session_id: number }>("palette:open", (event) =>
+    handler(event.payload.session_id),
+  );
+
+/** A dismissal the palette did not start: the toggle shortcut, or a delivery. */
+export const onPaletteClose = (handler: () => void): Promise<UnlistenFn> =>
+  listen<null>("palette:close", () => handler());

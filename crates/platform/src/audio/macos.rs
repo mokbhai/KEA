@@ -5,7 +5,7 @@
 //! 2. Call `start_mic()`, speak into the default input device, then `stop_mic()`.
 //! 3. Returned [`PcmFrame`] should contain non-empty mono f32 samples at the device rate.
 //! 4. `current_level()` should rise while audio is present.
-//! 5. For meetings: `start_meeting()` → speak → `drain_meeting_buffer()` / `stop_meeting()`.
+//! 5. For meetings: `start_meeting()` → speak → `drain_meeting_sources()` / `stop_meeting()`.
 //! 6. Optional loopback: install BlackHole (or similar); `system_audio_capability()` →
 //!    [`SystemAudioCapability::LoopbackDevice`]; route system audio to the virtual device.
 //! 7. Optional SCK: build with `--features system-audio-sck`, grant Screen Recording;
@@ -19,8 +19,8 @@ use super::macos_sck::{
     new_system_audio_capture, sck_feature_enabled, screen_recording_granted, SystemAudioCapture,
 };
 use super::util::{
-    accumulate_frames, choose_input_device, downmix_to_mono, mix_frames, rms_level, DeviceChoice,
-    FrameCounters, RingBuffer,
+    accumulate_frames, align_meeting_sources, choose_input_device, downmix_to_mono, rms_level,
+    DeviceChoice, FrameCounters, RingBuffer,
 };
 use super::{
     AudioIo, AudioIoError, DeviceFallback, DictationState, InputDevice, MeetingState, PcmFrame,
@@ -44,8 +44,8 @@ struct MeetingCaptureWorker {
     sck: Option<SckMeetingWorker>,
 }
 
-/// The pump thread that copies system-audio frames into the mic callback's mix
-/// slot. The capture itself is owned by [`MacAudioIo::system_audio`], so the
+/// The pump thread that appends system-audio frames to the system drain
+/// buffer. The capture itself is owned by [`MacAudioIo::system_audio`], so the
 /// backend outlives a single meeting.
 struct SckMeetingWorker {
     pump: JoinHandle<()>,
@@ -57,6 +57,15 @@ pub struct MacAudioIo {
     level: Arc<Mutex<f32>>,
     dictation_buffered: Arc<Mutex<Vec<PcmFrame>>>,
     meeting_drain_frames: Arc<Mutex<Vec<PcmFrame>>>,
+    /// System/loopback audio, buffered *beside* the mic rather than mixed into
+    /// it. The two are mixed at drain time instead, which is the only place
+    /// that can align them: a callback holds one mic frame and whatever the
+    /// loopback thread happened to have produced by then, which is zero frames
+    /// or two as often as it is one.
+    meeting_system_frames: Arc<Mutex<Vec<PcmFrame>>>,
+    /// RMS of the most recent system frame, so the meeting meter still shows
+    /// the far side now that the mic callback no longer sees it.
+    system_level: Arc<Mutex<f32>>,
     dictation_capture: Mutex<Option<CaptureWorker>>,
     meeting_capture: Mutex<Option<MeetingCaptureWorker>>,
     sample_rate_hz: Mutex<u32>,
@@ -102,6 +111,8 @@ impl MacAudioIo {
             level: Arc::new(Mutex::new(0.0)),
             dictation_buffered: Arc::new(Mutex::new(Vec::new())),
             meeting_drain_frames: Arc::new(Mutex::new(Vec::new())),
+            meeting_system_frames: Arc::new(Mutex::new(Vec::new())),
+            system_level: Arc::new(Mutex::new(0.0)),
             dictation_capture: Mutex::new(None),
             meeting_capture: Mutex::new(None),
             sample_rate_hz: Mutex::new(sample_rate_hz),
@@ -112,6 +123,49 @@ impl MacAudioIo {
             device_fallback: Mutex::new(None),
             preview_capture: Mutex::new(None),
             armed_capture: Mutex::new(None),
+        }
+    }
+
+    /// Empty both drain buffers, newest lock first.
+    ///
+    /// Taken rather than read under a held lock: everything the caller does
+    /// with the frames — aligning, mixing, searching for a cut — runs over the
+    /// whole buffered meeting, and a `cpal` callback blocked on one of these
+    /// locks for that long is a dropped frame on a live device.
+    fn take_pending_frames(&self) -> (Vec<PcmFrame>, Vec<PcmFrame>) {
+        let mic = std::mem::take(
+            &mut *self
+                .meeting_drain_frames
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        let system = std::mem::take(
+            &mut *self
+                .meeting_system_frames
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        (mic, system)
+    }
+
+    /// Put frames back at the *front* of each drain buffer.
+    ///
+    /// At the front because callbacks kept running while the caller was
+    /// looking at what it took: anything that landed in the meantime is newer
+    /// than what is being returned, and appending would play the meeting back
+    /// out of order.
+    fn restore_pending_frames(&self, mic: Vec<PcmFrame>, system: Vec<PcmFrame>) {
+        if !mic.is_empty() {
+            self.meeting_drain_frames
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .splice(0..0, mic);
+        }
+        if !system.is_empty() {
+            self.meeting_system_frames
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .splice(0..0, system);
         }
     }
 
@@ -439,20 +493,51 @@ fn push_dictation_frame(
         .push(frame);
 }
 
+/// The first `take` samples of `frame`.
+fn head(frame: &PcmFrame, take: usize) -> PcmFrame {
+    PcmFrame {
+        samples: frame.samples[..take.min(frame.samples.len())].to_vec(),
+        sample_rate_hz: frame.sample_rate_hz,
+    }
+}
+
+/// Everything after the first `take` samples of `frame`.
+fn tail(frame: &PcmFrame, take: usize) -> PcmFrame {
+    PcmFrame {
+        samples: frame.samples[take.min(frame.samples.len())..].to_vec(),
+        sample_rate_hz: frame.sample_rate_hz,
+    }
+}
+
+/// A drain buffer holding `frame`, or empty when there is nothing left — an
+/// empty buffer is how "this source is not recording" is spelled, so a
+/// zero-sample frame must never be stored.
+fn refill(frame: PcmFrame) -> Vec<PcmFrame> {
+    if frame.samples.is_empty() {
+        Vec::new()
+    } else {
+        vec![frame]
+    }
+}
+
+/// Buffer one mic frame for a meeting. Deliberately does *not* mix: mixing
+/// here is what dropped or duplicated system audio, because a mic callback can
+/// see zero or two loopback frames as easily as one.
 fn push_meeting_frame(
-    mut frame: PcmFrame,
+    frame: PcmFrame,
     level: &Arc<Mutex<f32>>,
+    system_level: &Arc<Mutex<f32>>,
     tx: &tokio::sync::mpsc::Sender<PcmFrame>,
     drain_frames: &Arc<Mutex<Vec<PcmFrame>>>,
-    latest_loopback: Option<&Arc<Mutex<Option<PcmFrame>>>>,
     counters: &FrameCounters,
 ) {
-    if let Some(lb) = latest_loopback {
-        if let Some(ref sys) = *lb.lock().unwrap_or_else(|p| p.into_inner()) {
-            frame = mix_frames(&frame, sys);
-        }
-    }
-    *level.lock().unwrap_or_else(|p| p.into_inner()) = rms_level(&frame.samples);
+    // The published level is the louder of the two sources rather than the
+    // mix's: the meter answers "is anything being heard", and averaging in a
+    // silent channel halves the needle while the other side is talking.
+    let mic_level = rms_level(&frame.samples);
+    let system_level = *system_level.lock().unwrap_or_else(|p| p.into_inner());
+    *level.lock().unwrap_or_else(|p| p.into_inner()) = mic_level.max(system_level);
+
     counters.send(tx, frame.clone(), "meeting");
     drain_frames
         .lock()
@@ -460,15 +545,17 @@ fn push_meeting_frame(
         .push(frame);
 }
 
-fn push_loopback_frame(
-    samples: Vec<f32>,
-    sample_rate_hz: u32,
-    latest: &Arc<Mutex<Option<PcmFrame>>>,
+/// Append a system frame, rather than overwrite a single latest-frame slot.
+///
+/// The slot was the bug: two loopback callbacks between two mic callbacks lost
+/// one frame outright, and zero of them mixed the previous frame in twice.
+fn push_system_frame(
+    frame: PcmFrame,
+    system_level: &Arc<Mutex<f32>>,
+    frames: &Arc<Mutex<Vec<PcmFrame>>>,
 ) {
-    *latest.lock().unwrap_or_else(|p| p.into_inner()) = Some(PcmFrame {
-        samples,
-        sample_rate_hz,
-    });
+    *system_level.lock().unwrap_or_else(|p| p.into_inner()) = rms_level(&frame.samples);
+    frames.lock().unwrap_or_else(|p| p.into_inner()).push(frame);
 }
 
 fn run_capture_on_device(
@@ -497,7 +584,7 @@ fn run_meeting_mic_capture(
     frame_tx: tokio::sync::mpsc::Sender<PcmFrame>,
     drain_frames: Arc<Mutex<Vec<PcmFrame>>>,
     level: Arc<Mutex<f32>>,
-    latest_loopback: Option<Arc<Mutex<Option<PcmFrame>>>>,
+    system_level: Arc<Mutex<f32>>,
     counters: FrameCounters,
 ) -> Result<(), AudioIoError> {
     run_input_stream(device, stop_rx, move |mono, sample_rate_hz| {
@@ -508,20 +595,21 @@ fn run_meeting_mic_capture(
         push_meeting_frame(
             frame,
             &level,
+            &system_level,
             &frame_tx,
             &drain_frames,
-            latest_loopback.as_ref(),
             &counters,
         );
     })
 }
 
-/// Start system-audio capture and pump its frames into `latest`, the slot the
-/// meeting mic callback mixes from. The capture stays owned by [`MacAudioIo`]
-/// so `stop_meeting` can stop the same instance.
+/// Start system-audio capture and append its frames to the system drain
+/// buffer. The capture stays owned by [`MacAudioIo`] so `stop_meeting` can
+/// stop the same instance.
 async fn start_system_audio(
     capture: &mut dyn SystemAudioCapture,
-    latest: Arc<Mutex<Option<PcmFrame>>>,
+    system_level: Arc<Mutex<f32>>,
+    frames: Arc<Mutex<Vec<PcmFrame>>>,
 ) -> Result<SckMeetingWorker, AudioIoError> {
     let mut frame_rx = capture.start().await?;
     let pump = thread::spawn(move || {
@@ -531,7 +619,7 @@ async fn start_system_audio(
             .expect("tokio runtime for SCK pump");
         rt.block_on(async move {
             while let Some(frame) = frame_rx.recv().await {
-                *latest.lock().unwrap_or_else(|p| p.into_inner()) = Some(frame);
+                push_system_frame(frame, &system_level, &frames);
             }
         });
     });
@@ -541,10 +629,18 @@ async fn start_system_audio(
 fn run_loopback_capture(
     device: Device,
     stop_rx: mpsc::Receiver<()>,
-    latest: Arc<Mutex<Option<PcmFrame>>>,
+    system_level: Arc<Mutex<f32>>,
+    frames: Arc<Mutex<Vec<PcmFrame>>>,
 ) -> Result<(), AudioIoError> {
     run_input_stream(device, stop_rx, move |mono, sample_rate_hz| {
-        push_loopback_frame(mono, sample_rate_hz, &latest);
+        push_system_frame(
+            PcmFrame {
+                samples: mono,
+                sample_rate_hz,
+            },
+            &system_level,
+            &frames,
+        );
     })
 }
 
@@ -775,7 +871,12 @@ impl AudioIo for MacAudioIo {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
+        self.meeting_system_frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         *self.level.lock().unwrap_or_else(|p| p.into_inner()) = 0.0;
+        *self.system_level.lock().unwrap_or_else(|p| p.into_inner()) = 0.0;
 
         let host = cpal::default_host();
         let mic_device = self.open_input_device(&host)?;
@@ -794,17 +895,11 @@ impl AudioIo for MacAudioIo {
         let use_sck =
             prefer_system_audio && matches!(capability, SystemAudioCapability::ScreenCaptureKit);
 
-        let latest_loopback = if loopback_device.is_some() || use_sck {
-            Some(Arc::new(Mutex::new(None::<PcmFrame>)))
-        } else {
-            None
-        };
-
         let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(64);
         let (mic_stop_tx, mic_stop_rx) = mpsc::channel();
         let drain_frames = Arc::clone(&self.meeting_drain_frames);
         let level = Arc::clone(&self.level);
-        let loopback_for_mic = latest_loopback.clone();
+        let system_level = Arc::clone(&self.system_level);
         let counters = self.meeting_mic_frames.clone();
         counters.reset();
 
@@ -815,34 +910,41 @@ impl AudioIo for MacAudioIo {
                 frame_tx,
                 drain_frames,
                 level,
-                loopback_for_mic,
+                system_level,
                 counters,
             ) {
                 tracing::error!("meeting mic capture failed: {err}");
             }
         });
 
-        let loopback_worker =
-            if let (Some(device), Some(latest)) = (loopback_device, latest_loopback.clone()) {
-                let (loop_stop_tx, loop_stop_rx) = mpsc::channel();
-                let join = thread::spawn(move || {
-                    if let Err(err) = run_loopback_capture(device, loop_stop_rx, latest) {
-                        tracing::error!("loopback capture failed: {err}");
-                    }
-                });
-                Some(CaptureWorker {
-                    stop_tx: loop_stop_tx,
-                    join,
-                })
-            } else {
-                None
-            };
+        let loopback_worker = if let Some(device) = loopback_device {
+            let (loop_stop_tx, loop_stop_rx) = mpsc::channel();
+            let system_level = Arc::clone(&self.system_level);
+            let system_frames = Arc::clone(&self.meeting_system_frames);
+            let join = thread::spawn(move || {
+                if let Err(err) =
+                    run_loopback_capture(device, loop_stop_rx, system_level, system_frames)
+                {
+                    tracing::error!("loopback capture failed: {err}");
+                }
+            });
+            Some(CaptureWorker {
+                stop_tx: loop_stop_tx,
+                join,
+            })
+        } else {
+            None
+        };
 
         let sck_worker = if use_sck {
-            let latest = latest_loopback
-                .clone()
-                .expect("SCK meeting capture requires loopback state");
-            Some(start_system_audio(self.system_audio.as_mut(), latest).await?)
+            Some(
+                start_system_audio(
+                    self.system_audio.as_mut(),
+                    Arc::clone(&self.system_level),
+                    Arc::clone(&self.meeting_system_frames),
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -889,8 +991,13 @@ impl AudioIo for MacAudioIo {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
+        self.meeting_system_frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         *self.meeting_state.lock().unwrap_or_else(|p| p.into_inner()) = MeetingState::Idle;
         *self.level.lock().unwrap_or_else(|p| p.into_inner()) = 0.0;
+        *self.system_level.lock().unwrap_or_else(|p| p.into_inner()) = 0.0;
 
         self.meeting_mic_frames.log_session("meeting");
 
@@ -903,50 +1010,80 @@ impl AudioIo for MacAudioIo {
         })
     }
 
-    async fn drain_meeting_buffer(&mut self) -> Result<PcmFrame, AudioIoError> {
-        let frames = std::mem::take(
-            &mut *self
-                .meeting_drain_frames
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()),
+    async fn drain_meeting_sources(&mut self) -> Result<crate::audio::SpeechSegment, AudioIoError> {
+        let (mic_frames, system_frames) = self.take_pending_frames();
+        let had_system = !system_frames.is_empty();
+        let sources = align_meeting_sources(
+            &accumulate_frames(&mic_frames),
+            &accumulate_frames(&system_frames),
         );
-        Ok(accumulate_frames(&frames))
+        Ok(crate::audio::SpeechSegment {
+            // The tail is taken because the meeting is over, not because a
+            // pause was found, so there is no cut decision to report. The
+            // caller gates it on duration instead.
+            has_speech: true,
+            pcm: sources.mixed,
+            mic: had_system.then_some(sources.mic),
+            system: had_system.then_some(sources.system),
+        })
     }
 
     async fn try_drain_meeting_segment(
         &mut self,
         cfg: crate::audio::segment::SegmentCutConfig,
     ) -> Result<Option<crate::audio::SpeechSegment>, AudioIoError> {
-        let mut guard = self
-            .meeting_drain_frames
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let pending = accumulate_frames(&guard);
-        let Some(cut) =
-            crate::audio::segment::find_segment_cut(&pending.samples, pending.sample_rate_hz, cfg)
-        else {
-            // Not at a cut point yet — leave everything buffered.
+        // Both buffers are emptied back to back, so what was taken ends at the
+        // same instant on each side — which is what `align_meeting_sources`
+        // relies on.
+        let (mic_frames, system_frames) = self.take_pending_frames();
+
+        // An empty system buffer is the liveness test for the far side: a
+        // running loopback stream delivers frames continuously, silence
+        // included, so nothing at all means no system source this meeting (or
+        // one that has stopped) rather than a quiet call.
+        let had_system = !system_frames.is_empty();
+        let sources = align_meeting_sources(
+            &accumulate_frames(&mic_frames),
+            &accumulate_frames(&system_frames),
+        );
+
+        // The cut is decided on the mix — everything that was said — and then
+        // applied to both halves at the same sample index, which is what keeps
+        // them comparable window for window downstream.
+        let Some(cut) = crate::audio::segment::find_segment_cut(
+            &sources.mixed.samples,
+            sources.mixed.sample_rate_hz,
+            cfg,
+        ) else {
+            // Not at a cut point yet. The frames go back exactly as they were
+            // taken rather than as the aligned pair: the padding above is
+            // derived, recomputed from the raw buffers on every poll, and
+            // storing it would bake one poll's skew into the rest of the
+            // meeting.
+            self.restore_pending_frames(mic_frames, system_frames);
             return Ok(None);
         };
 
         // Keep whatever follows the cut as the start of the next segment, so
-        // audio spoken after the pause is not discarded.
-        let remainder = pending.samples[cut.take..].to_vec();
-        *guard = if remainder.is_empty() {
-            Vec::new()
-        } else {
-            vec![PcmFrame {
-                samples: remainder,
-                sample_rate_hz: pending.sample_rate_hz,
-            }]
-        };
+        // audio spoken after the pause is not discarded. The remainder goes
+        // back aligned — both sides cut at one index — so the next segment
+        // starts from the same instant on each.
+        self.restore_pending_frames(
+            refill(tail(&sources.mic, cut.take)),
+            if had_system {
+                refill(tail(&sources.system, cut.take))
+            } else {
+                Vec::new()
+            },
+        );
 
         Ok(Some(crate::audio::SpeechSegment {
-            pcm: PcmFrame {
-                samples: pending.samples[..cut.take].to_vec(),
-                sample_rate_hz: pending.sample_rate_hz,
-            },
+            pcm: head(&sources.mixed, cut.take),
             has_speech: cut.has_speech,
+            // No system source means nothing to attribute against; the caller
+            // must not read silence as "the far side said nothing".
+            mic: had_system.then(|| head(&sources.mic, cut.take)),
+            system: had_system.then(|| head(&sources.system, cut.take)),
         }))
     }
 
@@ -1111,17 +1248,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn system_audio_pump_publishes_frames_for_the_mic_mix() {
+    async fn system_audio_pump_appends_frames_to_the_system_buffer() {
         let mut capture = FakeSck;
-        let latest = Arc::new(Mutex::new(None));
-        let worker = start_system_audio(&mut capture, Arc::clone(&latest))
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let level = Arc::new(Mutex::new(0.0));
+        let worker = start_system_audio(&mut capture, Arc::clone(&level), Arc::clone(&frames))
             .await
             .expect("fake backend starts");
         // The fake closes its channel after one frame, so the pump exits on its own.
         worker.pump.join().expect("pump thread");
-        let frame = latest.lock().unwrap().clone().expect("frame published");
-        assert_eq!(frame.samples.len(), 100);
-        assert_eq!(frame.sample_rate_hz, 48_000);
+        let buffered = frames.lock().unwrap();
+        assert_eq!(buffered.len(), 1);
+        assert_eq!(buffered[0].samples.len(), 100);
+        assert_eq!(buffered[0].sample_rate_hz, 48_000);
     }
 
     /// A capture worker that holds its slot and nothing else. Lets the gate
@@ -1227,11 +1366,184 @@ mod tests {
     #[tokio::test]
     async fn unavailable_system_audio_refuses_to_start() {
         let mut capture = UnavailableSystemAudioCapture;
-        let Err(AudioIoError::Other(msg)) =
-            start_system_audio(&mut capture, Arc::new(Mutex::new(None))).await
+        let Err(AudioIoError::Other(msg)) = start_system_audio(
+            &mut capture,
+            Arc::new(Mutex::new(0.0)),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await
         else {
             panic!("null object must refuse to start");
         };
         assert!(msg.contains("system-audio-sck"));
+    }
+
+    fn speech(secs: f32, rate: u32, amplitude: f32) -> PcmFrame {
+        let n = (secs * rate as f32) as usize;
+        PcmFrame {
+            samples: (0..n)
+                .map(|i| (i as f32 * 0.05).sin() * amplitude)
+                .collect(),
+            sample_rate_hz: rate,
+        }
+    }
+
+    /// A cut is decided on the mix but applied to both halves at one index, so
+    /// the two channels the attributor compares describe the same instants.
+    #[tokio::test]
+    async fn a_meeting_segment_carries_both_sources_cut_at_one_index() {
+        let mut io = MacAudioIo::new_for_test();
+        // The loopback stream opens after the mic's, so it is short by design.
+        io.meeting_drain_frames
+            .lock()
+            .unwrap()
+            .push(speech(6.0, 16_000, 0.3));
+        io.meeting_system_frames
+            .lock()
+            .unwrap()
+            .push(speech(5.0, 16_000, 0.02));
+
+        let cfg = crate::audio::segment::SegmentCutConfig {
+            max_secs: 5.0,
+            ..Default::default()
+        };
+        let segment = io
+            .try_drain_meeting_segment(cfg)
+            .await
+            .unwrap()
+            .expect("6s of audio is past the 5s cap");
+
+        let mic = segment.mic.expect("a system source was recorded");
+        let system = segment.system.expect("a system source was recorded");
+        assert_eq!(mic.samples.len(), system.samples.len());
+        assert_eq!(mic.samples.len(), segment.pcm.samples.len());
+        assert_eq!(mic.sample_rate_hz, system.sample_rate_hz);
+        // Mixed is the average of the two halves, sample for sample.
+        assert!((segment.pcm.samples[0] - (mic.samples[0] + system.samples[0]) / 2.0).abs() < 1e-6);
+        // The whole buffer was taken at the cap, so nothing is left over.
+        assert!(io.meeting_drain_frames.lock().unwrap().is_empty());
+        assert!(io.meeting_system_frames.lock().unwrap().is_empty());
+    }
+
+    /// Mic-only: there is no second channel, and inventing a silent one would
+    /// make every segment look mic-dominant rather than unattributable.
+    #[tokio::test]
+    async fn a_mic_only_meeting_segment_has_no_per_source_halves() {
+        let mut io = MacAudioIo::new_for_test();
+        io.meeting_drain_frames
+            .lock()
+            .unwrap()
+            .push(speech(6.0, 16_000, 0.3));
+
+        let cfg = crate::audio::segment::SegmentCutConfig {
+            max_secs: 5.0,
+            ..Default::default()
+        };
+        let segment = io.try_drain_meeting_segment(cfg).await.unwrap().unwrap();
+        assert!(segment.mic.is_none());
+        assert!(segment.system.is_none());
+        assert_eq!(segment.pcm.samples.len(), 6 * 16_000);
+    }
+
+    /// Before a cut point both buffers stay exactly as they were: the padding
+    /// that aligns them is derived per poll, never written back.
+    #[tokio::test]
+    async fn a_poll_that_finds_no_cut_leaves_both_buffers_untouched() {
+        let mut io = MacAudioIo::new_for_test();
+        io.meeting_drain_frames
+            .lock()
+            .unwrap()
+            .push(speech(1.0, 16_000, 0.3));
+        io.meeting_system_frames
+            .lock()
+            .unwrap()
+            .push(speech(0.5, 16_000, 0.3));
+
+        let cfg = crate::audio::segment::SegmentCutConfig::default();
+        assert!(io.try_drain_meeting_segment(cfg).await.unwrap().is_none());
+        assert_eq!(
+            io.meeting_drain_frames.lock().unwrap()[0].samples.len(),
+            16_000
+        );
+        assert_eq!(
+            io.meeting_system_frames.lock().unwrap()[0].samples.len(),
+            8_000
+        );
+    }
+
+    /// The remainder after a cut is kept on both sides and stays aligned, so
+    /// the next segment starts from one index on both channels.
+    #[tokio::test]
+    async fn the_remainder_after_a_cut_stays_aligned_on_both_sources() {
+        let mut io = MacAudioIo::new_for_test();
+        let mut mic = speech(8.0, 16_000, 0.3).samples;
+        mic.extend(std::iter::repeat_n(0.0, 4 * 16_000));
+        io.meeting_drain_frames.lock().unwrap().push(PcmFrame {
+            samples: mic,
+            sample_rate_hz: 16_000,
+        });
+        io.meeting_system_frames
+            .lock()
+            .unwrap()
+            .push(speech(12.0, 16_000, 0.001));
+
+        let cfg = crate::audio::segment::SegmentCutConfig::default();
+        let segment = io
+            .try_drain_meeting_segment(cfg)
+            .await
+            .unwrap()
+            .expect("3.5s of trailing silence is a pause");
+        assert!(
+            segment.pcm.samples.len() < 12 * 16_000,
+            "cut before the end"
+        );
+
+        let mic_left = io.meeting_drain_frames.lock().unwrap()[0].samples.len();
+        let system_left = io.meeting_system_frames.lock().unwrap()[0].samples.len();
+        assert_eq!(mic_left, system_left);
+        assert_eq!(mic_left + segment.pcm.samples.len(), 12 * 16_000);
+    }
+
+    /// The tail taken at stop is a segment like any other, so the last thing
+    /// said in a meeting is attributed rather than left blank.
+    #[tokio::test]
+    async fn the_stop_drain_returns_both_sources_too() {
+        let mut io = MacAudioIo::new_for_test();
+        io.meeting_drain_frames
+            .lock()
+            .unwrap()
+            .push(speech(2.0, 16_000, 0.3));
+        io.meeting_system_frames
+            .lock()
+            .unwrap()
+            .push(speech(2.0, 16_000, 0.3));
+
+        let tail = io.drain_meeting_sources().await.unwrap();
+        assert_eq!(tail.pcm.samples.len(), 2 * 16_000);
+        assert_eq!(tail.mic.unwrap().samples.len(), 2 * 16_000);
+        assert_eq!(tail.system.unwrap().samples.len(), 2 * 16_000);
+        assert!(io.meeting_system_frames.lock().unwrap().is_empty());
+    }
+
+    /// Two system frames between two mic callbacks used to overwrite one
+    /// another in a single-frame slot; now both survive to the drain.
+    #[test]
+    fn every_system_frame_is_kept_rather_than_overwriting_the_last() {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let level = Arc::new(Mutex::new(0.0));
+        for value in [0.1f32, 0.2, 0.3] {
+            push_system_frame(
+                PcmFrame {
+                    samples: vec![value; 4],
+                    sample_rate_hz: 16_000,
+                },
+                &level,
+                &frames,
+            );
+        }
+        let kept = accumulate_frames(&frames.lock().unwrap());
+        assert_eq!(kept.samples.len(), 12);
+        assert_eq!(kept.samples[0], 0.1);
+        assert_eq!(kept.samples[11], 0.3);
     }
 }

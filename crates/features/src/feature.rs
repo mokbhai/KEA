@@ -144,6 +144,17 @@ impl<'a> ActionGuard<'a> {
         self.finish(ActionStatus::Ok, None).await;
     }
 
+    /// Closes the row as something the user called off rather than a failure.
+    ///
+    /// Takes a reason because "cancelled" alone does not say what was dropped;
+    /// it lands in the same column as an error message, just under a status
+    /// that is not red.
+    pub async fn cancel(mut self, reason: impl Display) -> String {
+        let msg = reason.to_string();
+        self.finish(ActionStatus::Cancelled, Some(&msg)).await;
+        msg
+    }
+
     /// Hands the still-open row to the caller, which becomes responsible for
     /// closing it (see `run_tts_synthesize`, whose caller plays the audio).
     pub fn release(mut self) -> i64 {

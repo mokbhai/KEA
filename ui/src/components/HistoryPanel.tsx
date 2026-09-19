@@ -10,6 +10,9 @@ type Props = {
 export function statusClass(status: string): string {
   if (status === "ok" || status === "success") return "kea-status--ok";
   if (status === "error" || status === "failed") return "kea-status--error";
+  // Everything else, including "cancelled", reads as muted. A run the user
+  // called off is not a fault, and colouring it like one teaches people to
+  // ignore the colour that is supposed to mean something went wrong.
   return "kea-status--muted";
 }
 

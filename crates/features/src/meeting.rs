@@ -1,20 +1,21 @@
 use kea_core::dictation::{apply_vocabulary, hint_terms};
 use kea_core::meetings::{
-    build_meeting_notes_request, build_meeting_title_request, format_transcript_for_synthesis,
-    parse_meeting_notes_json, sanitize_meeting_title, MeetingSettings,
-    MEETING_NOTES_PROMPT_VERSION,
+    attribute_segment, build_meeting_notes_request, build_meeting_title_request,
+    format_transcript_for_synthesis, parse_meeting_notes_json, sanitize_meeting_title,
+    MeetingSettings, SpeakerChannel, MEETING_NOTES_PROMPT_VERSION,
 };
 use kea_core::resolve::SlotResolver;
 use kea_core::store::actions::{ActionRepo, ActionStatus, NewAction};
 use kea_core::store::bindings::BindingRepo;
 use kea_core::store::meetings::{
-    CaptureMode, Meeting, MeetingDetail, MeetingNotes, MeetingRepo, MeetingStatus, NewMeeting,
-    NewSegment,
+    CaptureMode, Meeting, MeetingDetail, MeetingNotes, MeetingRepo, MeetingSpeaker, MeetingStatus,
+    NewMeeting, NewSegment,
 };
 use kea_core::store::vocabulary::VocabularyEntry;
 use kea_engines::traits::{AudioPcm, SttOpts, Transcript};
 use kea_engines::EngineRegistry;
 use kea_platform::audio::util::resample_linear;
+use kea_platform::audio::SpeechSegment;
 use kea_platform::{AudioIo, PcmFrame, SystemAudioCapability};
 
 use crate::feature::{CapKind, CapSlot, Command, Feature};
@@ -98,6 +99,40 @@ fn capture_mode(cap: SystemAudioCapability, prefer_system_audio: bool) -> Captur
     }
 }
 
+/// Which side of the meeting a drained segment came from.
+///
+/// Deliberately reads the *segment*, not the capture mode: the capture mode is
+/// what was asked for, and the two halves are what was actually recorded. A
+/// loopback stream that never delivered a frame leaves both halves `None`, and
+/// the honest answer then is the same as for a mic-only meeting — everything
+/// on the recording reached it through the microphone.
+///
+/// Deriving it here also keeps the poll off `system_audio_capability()`, which
+/// re-probes the host's devices on every call.
+fn segment_speaker(segment: &SpeechSegment) -> Option<SpeakerChannel> {
+    match (&segment.mic, &segment.system) {
+        (Some(mic), Some(system)) => Some(attribute_segment(
+            &mic.samples,
+            &system.samples,
+            mic.sample_rate_hz,
+        )),
+        // One source: there is nothing to compare, so this is the person
+        // sitting here rather than an unknown. Saying "you" is honest;
+        // inventing a second speaker from a channel that was never recorded
+        // is not.
+        _ => Some(SpeakerChannel::Local),
+    }
+}
+
+/// The two sides a meeting can have, and what they are called before anyone
+/// renames them. A mic-only meeting has exactly one.
+fn default_speakers(mode: CaptureMode) -> &'static [SpeakerChannel] {
+    match mode {
+        CaptureMode::MicOnly => &[SpeakerChannel::Local],
+        CaptureMode::MicAndSystem => &[SpeakerChannel::Local, SpeakerChannel::Remote],
+    }
+}
+
 fn new_meeting_id() -> String {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -154,6 +189,7 @@ pub async fn synthesize_meeting_notes(
     bindings: &BindingRepo,
     meeting: &Meeting,
     segments: &[kea_core::MeetingSegment],
+    speakers: &[MeetingSpeaker],
 ) -> Result<MeetingNotes, String> {
     let binding = SlotResolver::new(engines, bindings)
         .require_llm("meetings")
@@ -165,7 +201,7 @@ pub async fn synthesize_meeting_notes(
         .llm(engine_id)
         .ok_or_else(|| format!("no llm engine '{engine_id}'"))?;
 
-    let transcript = format_transcript_for_synthesis(segments);
+    let transcript = format_transcript_for_synthesis(segments, speakers);
     let mut req = build_meeting_notes_request(&meeting.title, &meeting.started_at, &transcript);
     req.model = binding.model.clone();
     req.provider_ref = binding.provider_ref.clone();
@@ -288,6 +324,9 @@ pub struct MeetingSegmentEvent {
     pub text: String,
     pub start_offset_ms: i64,
     pub end_offset_ms: i64,
+    /// The persisted speaker key, so the live transcript can label the line
+    /// while it is still being recorded rather than only after a reload.
+    pub speaker_key: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -297,6 +336,7 @@ async fn append_transcribed_segment(
     meetings: &MeetingRepo,
     meeting_id: &str,
     pcm: PcmFrame,
+    speaker: Option<SpeakerChannel>,
     sequence: i32,
     start_offset_ms: i64,
     vocabulary: &[VocabularyEntry],
@@ -318,6 +358,7 @@ async fn append_transcribed_segment(
                 start_offset_ms,
                 end_offset_ms,
                 text: text.clone(),
+                speaker,
             },
         )
         .await
@@ -329,6 +370,7 @@ async fn append_transcribed_segment(
         text,
         start_offset_ms,
         end_offset_ms,
+        speaker_key: speaker.map(|c| c.as_str().to_string()),
     })
 }
 
@@ -371,6 +413,25 @@ pub async fn run_meeting_start(ctx: &mut MeetingRunContext<'_>) -> Result<Active
     {
         let _ = ctx.audio.stop_meeting().await;
         return Err(e.to_string());
+    }
+
+    // Seed the meeting's speaker rows now rather than on the first attributed
+    // segment, so the detail view has names to show — and to rename — from the
+    // moment recording starts. A failure here is logged, not fatal: a meeting
+    // with unnamed sides is still a meeting.
+    for channel in default_speakers(capture_mode) {
+        if let Err(e) = ctx
+            .meetings
+            .ensure_speaker(&meeting_id, *channel, channel.display_name())
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                meeting_id = %meeting_id,
+                channel = channel.as_str(),
+                "meeting: failed to seed speaker row"
+            );
+        }
     }
 
     let action_id = match ctx
@@ -436,18 +497,24 @@ pub async fn run_meeting_poll_segment(
     if !segment.has_speech {
         return Ok(None);
     }
-    let pcm = segment.pcm;
 
-    if !has_min_audio(&pcm) {
+    if !has_min_audio(&segment.pcm) {
         return Ok(None);
     }
+
+    // Decided before the STT call, off the two halves this segment carries.
+    // They are dropped with the segment either way — there is no recording on
+    // disk to go back to — so attribution has to happen while the audio is
+    // still in hand.
+    let speaker = segment_speaker(&segment);
 
     let event = append_transcribed_segment(
         ctx.engines,
         ctx.bindings,
         ctx.meetings,
         meeting_id,
-        pcm,
+        segment.pcm,
+        speaker,
         *sequence,
         *elapsed_ms,
         ctx.vocabulary,
@@ -464,9 +531,9 @@ pub async fn run_meeting_poll_segment(
 /// synthesis in `run_meeting_stop` (tens of seconds) must not block dictation
 /// or a new meeting from acquiring the audio lock. Always releases capture,
 /// even when the drain fails.
-pub async fn drain_and_stop_meeting(audio: &mut dyn AudioIo) -> Result<PcmFrame, String> {
+pub async fn drain_and_stop_meeting(audio: &mut dyn AudioIo) -> Result<SpeechSegment, String> {
     let drain_result = audio
-        .drain_meeting_buffer()
+        .drain_meeting_sources()
         .await
         .map_err(|e| e.to_string());
     let _ = audio.stop_meeting().await.map_err(|e| e.to_string());
@@ -484,7 +551,7 @@ pub async fn run_meeting_stop(
     actions: &ActionRepo,
     meetings: &MeetingRepo,
     session: &ActiveMeeting,
-    drain_result: Result<PcmFrame, String>,
+    drain_result: Result<SpeechSegment, String>,
     vocabulary: &[VocabularyEntry],
 ) -> Result<MeetingDetail, String> {
     let meeting_id = &session.meeting_id;
@@ -531,7 +598,7 @@ async fn finalize_meeting(
     meetings: &MeetingRepo,
     session: &ActiveMeeting,
     existing: &MeetingDetail,
-    drain_result: Result<PcmFrame, String>,
+    drain_result: Result<SpeechSegment, String>,
     vocabulary: &[VocabularyEntry],
 ) -> Result<(), String> {
     let meeting_id = &session.meeting_id;
@@ -543,11 +610,15 @@ async fn finalize_meeting(
         .map(|s| s.end_offset_ms)
         .unwrap_or(0);
 
-    let final_pcm = drain_result?;
+    let tail = drain_result?;
 
-    if has_min_audio(&final_pcm) {
+    if has_min_audio(&tail.pcm) {
+        // The tail is attributed like every other segment: the last thing said
+        // in a meeting is as worth labelling as the first.
+        let speaker = segment_speaker(&tail);
         append_transcribed_segment(
-            engines, bindings, meetings, meeting_id, final_pcm, sequence, elapsed_ms, vocabulary,
+            engines, bindings, meetings, meeting_id, tail.pcm, speaker, sequence, elapsed_ms,
+            vocabulary,
         )
         .await?;
     }
@@ -558,8 +629,14 @@ async fn finalize_meeting(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("meeting {meeting_id} not found"))?;
 
-    let notes =
-        synthesize_meeting_notes(engines, bindings, &partial.meeting, &partial.segments).await?;
+    let notes = synthesize_meeting_notes(
+        engines,
+        bindings,
+        &partial.meeting,
+        &partial.segments,
+        &partial.speakers,
+    )
+    .await?;
 
     meetings
         .upsert_notes(&notes)
@@ -674,7 +751,44 @@ mod tests {
         meeting_state: MeetingState,
         capability: SystemAudioCapability,
         buffered: PcmFrame,
-        pending_drains: Mutex<Vec<PcmFrame>>,
+        /// Each entry stands for one segment the cut logic released. Where the
+        /// boundary falls is covered by the cut tests in kea-platform; these
+        /// tests are about what the meeting does with a segment once it has
+        /// one, including which halves it carries.
+        pending_drains: Mutex<Vec<SpeechSegment>>,
+    }
+
+    /// A mic-only segment: one source, so no halves to compare.
+    fn mic_only_segment(pcm: PcmFrame) -> SpeechSegment {
+        SpeechSegment {
+            pcm,
+            has_speech: true,
+            mic: None,
+            system: None,
+        }
+    }
+
+    /// A two-source segment whose halves are `mic_amplitude` and
+    /// `system_amplitude` loud throughout — enough for `attribute_segment` to
+    /// reach a verdict without a real recording.
+    fn two_source_segment(mic_amplitude: f32, system_amplitude: f32) -> SpeechSegment {
+        let tone = |amplitude: f32| PcmFrame {
+            samples: (0..16_000)
+                .map(|i| {
+                    let t = i as f32 / 16_000.0;
+                    (std::f32::consts::TAU * 220.0 * t).sin() * amplitude
+                })
+                .collect(),
+            sample_rate_hz: 16_000,
+        };
+        let mic = tone(mic_amplitude);
+        let system = tone(system_amplitude);
+        SpeechSegment {
+            pcm: kea_platform::audio::mix_frames(&mic, &system),
+            has_speech: true,
+            mic: Some(mic),
+            system: Some(system),
+        }
     }
 
     impl Default for FakeMeetingAudioIo {
@@ -740,32 +854,25 @@ mod tests {
             })
         }
 
-        async fn drain_meeting_buffer(&mut self) -> Result<PcmFrame, AudioIoError> {
+        async fn drain_meeting_sources(&mut self) -> Result<SpeechSegment, AudioIoError> {
             Ok(self
                 .pending_drains
                 .lock()
                 .unwrap()
                 .pop()
-                .unwrap_or(PcmFrame {
-                    samples: vec![],
-                    sample_rate_hz: 16_000,
+                .unwrap_or_else(|| {
+                    mic_only_segment(PcmFrame {
+                        samples: vec![],
+                        sample_rate_hz: 16_000,
+                    })
                 }))
         }
 
-        /// Each queued drain stands for one segment the cut logic released.
-        /// Where the boundary falls is covered by the cut tests in
-        /// kea-platform; these tests are about what the meeting does with a
-        /// segment once it has one.
         async fn try_drain_meeting_segment(
             &mut self,
             _cfg: kea_platform::audio::segment::SegmentCutConfig,
-        ) -> Result<Option<kea_platform::audio::SpeechSegment>, AudioIoError> {
-            Ok(self.pending_drains.lock().unwrap().pop().map(|pcm| {
-                kea_platform::audio::SpeechSegment {
-                    pcm,
-                    has_speech: true,
-                }
-            }))
+        ) -> Result<Option<SpeechSegment>, AudioIoError> {
+            Ok(self.pending_drains.lock().unwrap().pop())
         }
     }
 
@@ -899,7 +1006,7 @@ mod tests {
             error: None,
         };
 
-        let notes = synthesize_meeting_notes(&reg, &bindings, &meeting, &[])
+        let notes = synthesize_meeting_notes(&reg, &bindings, &meeting, &[], &[])
             .await
             .unwrap();
 
@@ -970,7 +1077,10 @@ mod tests {
 
         let mut audio = FakeMeetingAudioIo {
             capability: SystemAudioCapability::MicOnly,
-            pending_drains: Mutex::new(vec![one_second_pcm(), one_second_pcm()]),
+            pending_drains: Mutex::new(vec![
+                mic_only_segment(one_second_pcm()),
+                mic_only_segment(one_second_pcm()),
+            ]),
             ..Default::default()
         };
 
@@ -1075,9 +1185,9 @@ mod tests {
         let mut audio = FakeMeetingAudioIo {
             capability: SystemAudioCapability::MicOnly,
             pending_drains: Mutex::new(vec![
-                one_second_pcm(), // pop() returns this last
-                one_second_pcm(), // pop() returns second
-                one_second_pcm(), // pop() returns this first
+                mic_only_segment(one_second_pcm()), // pop() returns this last
+                mic_only_segment(one_second_pcm()), // pop() returns second
+                mic_only_segment(one_second_pcm()), // pop() returns this first
             ]),
             ..Default::default()
         };
@@ -1190,7 +1300,7 @@ mod tests {
         // runs (and fails via ErroringStt).
         let mut audio = FakeMeetingAudioIo {
             capability: SystemAudioCapability::MicOnly,
-            pending_drains: Mutex::new(vec![one_second_pcm()]),
+            pending_drains: Mutex::new(vec![mic_only_segment(one_second_pcm())]),
             ..Default::default()
         };
 
@@ -1231,5 +1341,192 @@ mod tests {
         let detail = actions.get(session.action_id).await.unwrap().unwrap();
         assert_eq!(detail.status, ActionStatus::Error);
         assert!(detail.error.is_some());
+    }
+
+    /// Helper for the attribution tests: a meetings-bound registry plus repos.
+    async fn attribution_world() -> (EngineRegistry, BindingRepo, ActionRepo, MeetingRepo) {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(CountingFakeStt {
+            texts: vec!["mine".into(), "theirs".into(), "both at once".into()],
+            call: AtomicUsize::new(0),
+        }));
+        reg.register_llm(Arc::new(FakeLlm));
+
+        let (bindings, actions, meetings) = test_repos().await;
+        for slot in ["stt", "llm"] {
+            bindings
+                .set(
+                    "meetings",
+                    slot,
+                    Binding {
+                        engine_id: if slot == "stt" {
+                            "fake-stt"
+                        } else {
+                            "fake-llm"
+                        }
+                        .into(),
+                        model: None,
+                        provider_ref: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        (reg, bindings, actions, meetings)
+    }
+
+    /// End to end: two sources in, two different speaker keys out, and an
+    /// ambiguous segment left unattributed rather than forced onto a side.
+    #[tokio::test]
+    async fn a_two_source_meeting_attributes_each_segment_to_a_channel() {
+        let (reg, bindings, actions, meetings) = attribution_world().await;
+        let mut audio = FakeMeetingAudioIo {
+            capability: SystemAudioCapability::ScreenCaptureKit,
+            pending_drains: Mutex::new(vec![
+                // pop() drains from the back, so this is the third segment.
+                two_source_segment(0.4, 0.4),
+                two_source_segment(0.01, 0.5),
+                two_source_segment(0.5, 0.01),
+            ]),
+            ..Default::default()
+        };
+        let settings = MeetingSettings {
+            segment_duration_secs: 30,
+            prefer_system_audio: true,
+        };
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+
+        let session = run_meeting_start(&mut ctx).await.unwrap();
+        let mut seq = 0;
+        let mut elapsed = 0;
+        let mut keys = Vec::new();
+        for _ in 0..3 {
+            let ev =
+                run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed)
+                    .await
+                    .unwrap()
+                    .expect("a segment was queued");
+            keys.push(ev.speaker_key);
+        }
+        assert_eq!(
+            keys,
+            vec![
+                Some("local".to_string()),
+                Some("remote".to_string()),
+                Some("mixed".to_string()),
+            ]
+        );
+
+        let detail = meetings.get(&session.meeting_id).await.unwrap().unwrap();
+        assert_eq!(
+            detail
+                .segments
+                .iter()
+                .map(|s| s.speaker_key.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("local"), Some("remote"), Some("mixed")]
+        );
+        // Both sides exist to be named, and start with the honest defaults.
+        assert_eq!(
+            detail
+                .speakers
+                .iter()
+                .map(|s| (s.speaker_key.as_str(), s.display_name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("local", "You"), ("remote", "Others")]
+        );
+    }
+
+    /// A mic-only meeting has exactly one source. Every segment is the person
+    /// sitting here, and there is no second speaker to invent.
+    #[tokio::test]
+    async fn a_mic_only_meeting_has_one_speaker_and_it_is_you() {
+        let (reg, bindings, actions, meetings) = attribution_world().await;
+        let mut audio = FakeMeetingAudioIo {
+            capability: SystemAudioCapability::MicOnly,
+            pending_drains: Mutex::new(vec![mic_only_segment(one_second_pcm())]),
+            ..Default::default()
+        };
+        let settings = MeetingSettings {
+            segment_duration_secs: 30,
+            prefer_system_audio: false,
+        };
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+
+        let session = run_meeting_start(&mut ctx).await.unwrap();
+        let mut seq = 0;
+        let mut elapsed = 0;
+        let ev = run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ev.speaker_key.as_deref(), Some("local"));
+
+        let detail = meetings.get(&session.meeting_id).await.unwrap().unwrap();
+        assert_eq!(detail.speakers.len(), 1, "no second side to invent");
+        assert_eq!(detail.speakers[0].display_name, "You");
+    }
+
+    /// The transcript handed to the notes model is the whole point of the
+    /// feature: it must name both sides instead of one fictional "Speaker".
+    #[tokio::test]
+    async fn the_notes_prompt_sees_both_speakers_by_their_names() {
+        let (reg, bindings, actions, meetings) = attribution_world().await;
+        let mut audio = FakeMeetingAudioIo {
+            capability: SystemAudioCapability::ScreenCaptureKit,
+            pending_drains: Mutex::new(vec![
+                two_source_segment(0.01, 0.5),
+                two_source_segment(0.5, 0.01),
+            ]),
+            ..Default::default()
+        };
+        let settings = MeetingSettings {
+            segment_duration_secs: 30,
+            prefer_system_audio: true,
+        };
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        let session = run_meeting_start(&mut ctx).await.unwrap();
+        let mut seq = 0;
+        let mut elapsed = 0;
+        for _ in 0..2 {
+            run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed)
+                .await
+                .unwrap();
+        }
+
+        meetings
+            .set_speaker_name(&session.meeting_id, "remote", "Priya")
+            .await
+            .unwrap();
+
+        let detail = meetings.get(&session.meeting_id).await.unwrap().unwrap();
+        let transcript = format_transcript_for_synthesis(&detail.segments, &detail.speakers);
+        assert!(transcript.contains("You: mine"), "{transcript}");
+        assert!(transcript.contains("Priya: theirs"), "{transcript}");
+        assert!(!transcript.contains("Speaker:"), "{transcript}");
     }
 }

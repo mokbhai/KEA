@@ -9,6 +9,7 @@ import {
 import FeatureAiCard from "../components/FeatureAiCard";
 import FeatureBanner from "../components/FeatureBanner";
 import HotkeyRow from "../components/HotkeyRow";
+import PaletteSettings from "../components/PaletteSettings";
 import SettingsForm from "../components/SettingsForm";
 import { RowGroup } from "../components/SettingsRow";
 import Spinner from "../components/Spinner";
@@ -185,6 +186,8 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
           )}
         </div>
       </section>
+
+      <PaletteSettings />
 
       <FeatureAiCard ai={ai} featureLabel="Rewrite" />
 

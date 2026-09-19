@@ -14,8 +14,8 @@ use kea_core::meetings::{MeetingSettings, MeetingSettingsRepo};
 use kea_core::resolve::Resolution;
 use kea_core::resolve::SlotResolver;
 use kea_core::rewrite::{
-    build_llm_request, PresetRepo, PromptOverrideRepo, ProviderConfig, ProviderConfigRepo,
-    RewriteInput, RewriteMode, RewritePreset,
+    build_llm_request, PaletteHistoryRepo, PresetRepo, PromptOverrideRepo, ProviderConfig,
+    ProviderConfigRepo, RewriteInput, RewriteMode, RewritePreset, STORE_HISTORY_SETTING,
 };
 use kea_core::store::actions::{ActionDetail, ActionRepo, ActionRow, NewAction};
 use kea_core::store::app_profiles::AppProfileRepo;
@@ -35,6 +35,7 @@ use kea_engines::traits::SttOpts;
 use kea_engines::{EngineRegistry, TtsOpts};
 use kea_features::demo::{run_ping, DemoFeature};
 use kea_features::dictation::{run_dictation_with_commands, spawn_partials, DictationRunOpts};
+use kea_features::rewrite::{complete_rewrite, OCR_COMMAND, PALETTE_COMMAND};
 use kea_features::run_rewrite_with_storage;
 use kea_features::tts::run_tts_with_player;
 use kea_features::ProfileOverrides;
@@ -59,14 +60,19 @@ use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::watch;
 
+use crate::palette::{
+    palette_event, DeliveryOptions, PaletteDelivery, PaletteEvent, PaletteOrigin, PaletteReaction,
+    PaletteState,
+};
+
 use crate::events::{
     dictation_state_wire, emit_device_fallback, emit_dictation_error, emit_dictation_level,
     emit_dictation_partial, emit_dictation_preview, emit_dictation_state, emit_meeting_error,
     emit_meeting_level, emit_meeting_segment, emit_meeting_state, emit_model_download_complete,
-    emit_model_download_error, emit_model_download_progress, emit_transcribe_file_complete,
-    emit_transcribe_file_error, emit_transcribe_file_progress, emit_transcribe_file_segment,
-    emit_tts_state, meeting_state_wire, MeetingSegmentPayload, PartialThrottle,
-    TranscribeFileProgressPayload, TranscribeFileSegmentPayload, TtsState,
+    emit_model_download_error, emit_model_download_progress, emit_palette_close, emit_palette_open,
+    emit_transcribe_file_complete, emit_transcribe_file_error, emit_transcribe_file_progress,
+    emit_transcribe_file_segment, emit_tts_state, meeting_state_wire, MeetingSegmentPayload,
+    PartialThrottle, TranscribeFileProgressPayload, TranscribeFileSegmentPayload, TtsState,
 };
 use crate::{ActiveDownload, AppState};
 
@@ -81,6 +87,13 @@ pub const DICTATION_COMMAND_ID: &str = "push_to_talk";
 pub const TTS_ACTION_ID: &str = "tts:read_selection";
 pub const TTS_FEATURE_ID: &str = "tts";
 pub const TTS_COMMAND_ID: &str = "read_selection";
+
+/// The prompt palette and the screen-capture shortcut are commands of the
+/// **rewrite** feature, not features of their own: all three are a rewrite
+/// with an instruction, they share one `llm` slot binding, and they contend
+/// for the same synthetic-keystroke path. See `RewriteFeature::commands`.
+pub const PALETTE_ACTION_ID: &str = "rewrite:prompt_palette";
+pub const OCR_ACTION_ID: &str = "rewrite:ocr_capture";
 
 pub const MEETINGS_ACTION_ID: &str = "meetings:toggle_meeting";
 pub const MEETINGS_FEATURE_ID: &str = "meetings";
@@ -105,7 +118,7 @@ pub struct HotkeyAction {
 /// `set_hotkey`, its rebind cleanup, collision detection and the
 /// effective-hotkey lookup — so adding a feature hotkey is a row here rather
 /// than another arm in five matches.
-pub const HOTKEY_ACTIONS: [HotkeyAction; 4] = [
+pub const HOTKEY_ACTIONS: [HotkeyAction; 6] = [
     HotkeyAction {
         feature: REWRITE_FEATURE_ID,
         command: REWRITE_COMMAND_ID,
@@ -125,6 +138,16 @@ pub const HOTKEY_ACTIONS: [HotkeyAction; 4] = [
         feature: MEETINGS_FEATURE_ID,
         command: MEETINGS_COMMAND_ID,
         action_id: MEETINGS_ACTION_ID,
+    },
+    HotkeyAction {
+        feature: REWRITE_FEATURE_ID,
+        command: PALETTE_COMMAND,
+        action_id: PALETTE_ACTION_ID,
+    },
+    HotkeyAction {
+        feature: REWRITE_FEATURE_ID,
+        command: OCR_COMMAND,
+        action_id: OCR_ACTION_ID,
     },
 ];
 
@@ -1885,6 +1908,7 @@ fn spawn_segment_poll(
                                 text: ev.text,
                                 start_offset_ms: ev.start_offset_ms,
                                 end_offset_ms: ev.end_offset_ms,
+                                speaker_key: ev.speaker_key,
                             },
                         );
                     }
@@ -2813,6 +2837,24 @@ pub async fn profile_for(
         &profiles,
     )
     .cloned()
+}
+
+/// Renames one side of a meeting.
+///
+/// Upserts with `source = 'user'`, which is what stops the channel defaults
+/// from overwriting a name a human typed the next time a segment lands.
+#[tauri::command]
+pub async fn set_meeting_speaker_name(
+    state: State<'_, Arc<AppState>>,
+    meeting_id: String,
+    speaker_key: String,
+    display_name: String,
+) -> Result<(), String> {
+    state
+        .meeting_repo
+        .set_speaker_name(&meeting_id, &speaker_key, &display_name)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -4732,6 +4774,858 @@ pub async fn export_transcript(
     Ok(target.to_string_lossy().into_owned())
 }
 
+// ===========================================================================
+// Prompt palette (plan item 12) and screen-capture OCR (item 20)
+// ===========================================================================
+
+/// The instruction history's read limit. Arrow-up walks this list; past a few
+/// dozen it is faster to retype than to keep pressing.
+const PALETTE_HISTORY_READ: usize = 50;
+
+/// Whether a Replace re-reads the selection and compares it before writing
+/// over it. Default **on**: the palette deactivates the target app, and a
+/// handful of editors (Electron, some web canvases, some terminals) drop the
+/// selection on `resignFirstResponder`. Replacing then destroys whatever the
+/// caret happens to be near. One extra ⌘C plus `COPY_SETTLE` (~150 ms) is the
+/// price; this key is for users who would rather have it back.
+pub const PALETTE_VERIFY_SETTING: &str = "palette.verify_selection";
+
+/// Vision's spell-correction pass. Right for prose, ruinous for code,
+/// identifiers and serial numbers — which is most of what people OCR off a
+/// terminal — so the settings row says as much.
+pub const OCR_LANGUAGE_CORRECTION_SETTING: &str = "ocr.language_correction";
+
+/// BCP-47 tags, comma-separated, most preferred first. Empty leaves the choice
+/// to Vision, which is the right default: a guessed list is worse than none.
+pub const OCR_LANGUAGES_SETTING: &str = "ocr.languages";
+
+/// How long to wait for the palette webview to say it has rendered, before
+/// showing the window anyway.
+///
+/// The webview is loaded at startup and only has to paint two strings, so this
+/// never fires in practice. It exists because the alternative to a fallback is
+/// a palette that never appears — and, worse, a `BusyGuard` held until restart
+/// — if the webview is wedged.
+const PALETTE_READY_FALLBACK: Duration = Duration::from_millis(600);
+
+/// One open palette: what it captured, where it came from, and the busy flag
+/// it holds until it closes.
+///
+/// The `BusyGuard` is a field rather than a local of the hotkey handler on
+/// purpose. `spawn_dispatch_loop` drops a press's guard when the handler
+/// future returns, which is right for the other four actions and wrong for
+/// this one: the palette's busy window runs from open to dismissal. Moving the
+/// guard in here is what makes the rewrite shortcut stay blocked for exactly
+/// as long as the palette is up — no longer (a leak would wedge both features
+/// until restart) and no shorter (a ⌘C from a rewrite landing between the
+/// palette's ⌘C and its ⌘V corrupts the document).
+pub struct PaletteSession {
+    pub id: u64,
+    /// What the answer is about. Empty is the ordinary "ask KEA anything" case.
+    pub source_text: String,
+    pub origin: PaletteOrigin,
+    pub options: DeliveryOptions,
+    /// The frontmost app when the shortcut fired, for the profile lookup.
+    pub context: Option<kea_platform::AppContext>,
+    /// The pid to hand focus back to. Read before the window appeared: once
+    /// KEA is active, "frontmost" is KEA.
+    pub target_pid: Option<i32>,
+    /// A line the palette shows above the input — why there is no source text,
+    /// or why only Copy is on offer.
+    pub notice: Option<String>,
+    /// True from submit until the request finishes. A second Return while this
+    /// is set is ignored rather than spending a second provider call.
+    pub running: bool,
+    /// Whether the window has been shown for this session yet.
+    pub shown: bool,
+    _busy: BusyGuard,
+}
+
+/// The palette session as the webview sees it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PaletteSessionView {
+    pub session_id: u64,
+    pub source_text: String,
+    pub origin: String,
+    /// For the "from Slack" hint. Display only — `app_name` is localized and
+    /// is never a match key.
+    pub app_name: Option<String>,
+    pub can_replace: bool,
+    pub can_insert: bool,
+    pub default_delivery: String,
+    pub notice: Option<String>,
+}
+
+/// What a finished palette run actually did, which is not always what was
+/// asked: a Replace whose selection went missing is downgraded to an Insert,
+/// and anything at all is downgraded to Copy when the target app cannot be
+/// brought back.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PaletteOutcome {
+    /// [`PaletteDelivery::as_str`], or `"cancelled"`.
+    pub delivered: String,
+    /// One line for the user, when something is worth saying. `None` on the
+    /// ordinary path — a rewrite that worked needs no announcement.
+    pub message: Option<String>,
+}
+
+/// The state machine's view of one slot. Both readers go through it, so a
+/// submit racing a dismissal cannot be judged by two slightly different rules.
+fn palette_state_of(session: Option<&PaletteSession>) -> PaletteState {
+    match session {
+        None => PaletteState::Closed,
+        Some(session) if session.running => PaletteState::Running,
+        Some(_) => PaletteState::Open,
+    }
+}
+
+/// The palette's current state, for [`palette_event`].
+fn palette_state(state: &AppState) -> PaletteState {
+    match state.palette.lock() {
+        Ok(slot) => palette_state_of(slot.as_ref()),
+        // A poisoned lock means a panic while a session was held. Reporting
+        // "closed" lets the next press rebuild one rather than wedging the
+        // feature; `take_palette_session` recovers the guard the same way.
+        Err(_) => PaletteState::Closed,
+    }
+}
+
+/// Whether a palette session exists at all, running or not.
+///
+/// The dispatch loop asks before the busy gate: an open palette holds the
+/// shared selection flag, so a second press has to be turned into a dismissal
+/// rather than dropped as "already busy".
+pub fn palette_is_open(state: &AppState) -> bool {
+    palette_state(state) != PaletteState::Closed
+}
+
+/// Ends the session, whatever it was doing, and hands back what it held.
+///
+/// Dropping the returned value releases the shared busy flag, so callers that
+/// still need it held (delivery) bind it and callers that do not (dismissal)
+/// let it fall.
+fn take_palette_session(state: &AppState) -> Option<PaletteSession> {
+    match state.palette.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    }
+}
+
+/// Whether KEA can post synthetic keystrokes at all right now, and the line to
+/// show the user when it cannot.
+///
+/// Both blockers are checked before the window opens, because both change what
+/// the palette can offer: without them Replace and Insert are impossible and
+/// Copy is the only delivery left. Refusing to open — which the plan
+/// suggests — would be worse: the clipboard path needs neither permission, and
+/// "ask KEA a question and copy the answer" is a perfectly good use of the
+/// feature that a refusal takes away.
+fn palette_typing_ability(state: &AppState) -> (bool, Option<String>) {
+    if state.permissions.status(PermKind::Accessibility) != PermStatus::Granted {
+        return (
+            false,
+            Some(
+                "KEA needs Accessibility to read your selection and type the answer back. \
+                 Until then the answer is copied to the clipboard."
+                    .into(),
+            ),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    if kea_platform::textio::macos_keys::secure_input_enabled() {
+        // `post_command_chord` is silently dropped under secure input, so
+        // without this the palette would take the user's instruction and fail
+        // at the very last step.
+        return (
+            false,
+            Some(
+                "A password field is focused somewhere, so macOS is blocking keystrokes. \
+                 The answer will be copied to the clipboard."
+                    .into(),
+            ),
+        );
+    }
+    (true, None)
+}
+
+/// Reads the selection for a palette session, tolerating the ordinary "nothing
+/// was selected" case.
+///
+/// Every failure becomes an empty source rather than a refusal to open.
+/// `capture_selection` cannot distinguish "nothing is selected" from "the ⌘C
+/// did not reach the app": in both cases the pasteboard's change count is
+/// unmoved, and `TextIoError` is a single `Other(String)`, so telling them
+/// apart would mean matching on prose. Since the Accessibility and
+/// secure-input blockers are already ruled out by
+/// [`palette_typing_ability`], what is left is overwhelmingly "nothing
+/// selected", and the palette works fine that way. The real message is logged,
+/// not shown.
+async fn palette_capture_selection(textio: &dyn kea_platform::TextIo) -> (String, Option<String>) {
+    match textio.capture_selection().await {
+        Ok(text) => (text, None),
+        Err(e) => {
+            tracing::debug!(error = %e, "palette: no selection to work on");
+            (
+                String::new(),
+                Some("Nothing selected — ask KEA anything.".into()),
+            )
+        }
+    }
+}
+
+/// Opens a palette session, taking ownership of the press's busy guard.
+///
+/// **Everything that touches the user's app happens before the window is
+/// shown**, and the order is the feature: once KEA is active, the app context
+/// answers about KEA, the synthetic ⌘C goes to the palette's own text field,
+/// and the pid to hand focus back to is KEA's. The plan's Risks section
+/// suggests painting the window first and filling the preview in behind it;
+/// that is wrong at HEAD, and the ~150 ms of `COPY_SETTLE` spent here is what
+/// buys a selection at all.
+pub async fn open_palette_session(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    origin: PaletteOrigin,
+    prefilled: Option<String>,
+    busy: BusyGuard,
+) {
+    if palette_state(state) != PaletteState::Closed {
+        // The dispatch loop turns a press arriving while the palette is up
+        // into a dismissal before it ever gets here; this is the belt and
+        // braces for the other entry points.
+        return;
+    }
+
+    let ctx = capture_app_context_now(state).await;
+    let target_pid = tokio::task::spawn_blocking(crate::macfocus::frontmost_pid)
+        .await
+        .unwrap_or(None);
+
+    let (can_type, mut notice) = palette_typing_ability(state);
+
+    let source_text = match prefilled {
+        // A screen capture already has its text; there is no selection to read
+        // and firing a ⌘C at the user's app would be gratuitous.
+        Some(text) => {
+            if text.trim().is_empty() {
+                notice = Some("No text found in that capture.".into());
+            }
+            text
+        }
+        None if !can_type => String::new(),
+        None => {
+            let textio = new_text_io();
+            let (text, why) = palette_capture_selection(textio.as_ref()).await;
+            // A blocker message outranks "nothing selected": it explains both.
+            notice = notice.or(why);
+            text
+        }
+    };
+
+    let options = DeliveryOptions::resolve(origin, !source_text.trim().is_empty(), can_type);
+    let id = state.palette_counter.fetch_add(1, Ordering::SeqCst) + 1;
+
+    if let Ok(mut slot) = state.palette.lock() {
+        *slot = Some(PaletteSession {
+            id,
+            source_text,
+            origin,
+            options,
+            context: ctx,
+            target_pid,
+            notice,
+            running: false,
+            shown: false,
+            _busy: busy,
+        });
+    } else {
+        tracing::error!("the palette slot is poisoned; not opening");
+        return;
+    }
+
+    emit_palette_open(app, id);
+    spawn_palette_ready_fallback(state.clone(), app.clone(), id);
+}
+
+/// Shows the window even if the webview never reports back, so a wedged
+/// frontend cannot strand the session — and with it the shared busy flag.
+fn spawn_palette_ready_fallback(state: Arc<AppState>, app: AppHandle, id: u64) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(PALETTE_READY_FALLBACK).await;
+        if show_palette_once(&state, &app, id) {
+            tracing::warn!(
+                session = id,
+                "the palette webview never reported ready; showing it anyway"
+            );
+        }
+    });
+}
+
+/// Shows the palette for `id` if that session is still current and has not been
+/// shown yet. Returns whether this call was the one that showed it.
+fn show_palette_once(state: &AppState, app: &AppHandle, id: u64) -> bool {
+    let should_show = match state.palette.lock() {
+        Ok(mut slot) => match slot.as_mut() {
+            Some(session) if session.id == id && !session.shown => {
+                session.shown = true;
+                true
+            }
+            _ => false,
+        },
+        Err(_) => false,
+    };
+    if should_show {
+        crate::palette::show(app);
+    }
+    should_show
+}
+
+/// Closes the palette in response to `event`, if the rules say it should.
+///
+/// The one place a session ends. Escape, a blur, the toggle shortcut and a
+/// delivered result all come through here or through [`take_palette_session`],
+/// so "the session is over" has exactly one meaning and a cancel racing a
+/// finished request cannot both win.
+pub async fn close_palette_for(state: &Arc<AppState>, app: &AppHandle, event: PaletteEvent) {
+    let reaction = palette_event(palette_state(state), event);
+    if !matches!(reaction, PaletteReaction::Dismiss | PaletteReaction::Cancel) {
+        return;
+    }
+
+    // Taken first: a request finishing a microsecond from now must find the
+    // slot empty and discard its result rather than paste it.
+    let session = take_palette_session(state);
+    let Some(session) = session else { return };
+
+    crate::palette::hide(app);
+    emit_palette_close(app);
+
+    if event.restores_focus() {
+        let pid = session.target_pid;
+        let _ = tokio::task::spawn_blocking(move || crate::macfocus::restore_focus(pid)).await;
+    }
+    tracing::debug!(session = session.id, ?reaction, "palette closed");
+    // `session` — and with it the BusyGuard — drops here.
+}
+
+/// Where a Copy delivery puts the text.
+///
+/// A seam, not indirection for its own sake: the other two deliveries already
+/// go through `TextIo`, which tests substitute, and without a matching one
+/// here "Copy must not type anything" could only be asserted by clobbering the
+/// clipboard of whoever is running the tests.
+pub trait ClipboardSink: Send + Sync {
+    fn copy(&self, text: &str) -> Result<(), String>;
+}
+
+/// The real one.
+pub struct SystemClipboard;
+
+impl ClipboardSink for SystemClipboard {
+    fn copy(&self, text: &str) -> Result<(), String> {
+        copy_to_clipboard(text)
+    }
+}
+
+/// Puts `text` on the clipboard, confirming it stuck.
+///
+/// **This belongs in `kea_platform::textio`**, beside
+/// `set_clipboard_text_verified`, which does the same job for the paste path
+/// and for the same reason: a clipboard manager declaring ownership between
+/// the write and the read makes a bare `set_text` succeed while the clipboard
+/// holds something else. `TextIo` has no "just copy this" method today, so the
+/// palette's Copy delivery carries its own until it does.
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|e| format!("clipboard unavailable: {e}"))?;
+    let mut last = String::from("no attempt was made");
+    for _ in 0..3 {
+        let attempt: Result<String, arboard::Error> =
+            clipboard.set_text(text).and_then(|()| clipboard.get_text());
+        match attempt {
+            Ok(back) if back == text => return Ok(()),
+            Ok(_) => last = "another app took the clipboard".into(),
+            Err(e) => last = e.to_string(),
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!("could not copy to the clipboard: {last}"))
+}
+
+/// Writes the answer where the user asked, downgrading rather than guessing.
+///
+/// Two downgrades, both of which prevent a worse outcome than a disappointing
+/// one:
+///
+/// * The target app never came back — it quit, hung, or the machine slept — so
+///   any keystroke would land in whatever *is* frontmost. Everything becomes
+///   Copy.
+/// * The selection is no longer what it was when the palette opened. Replacing
+///   would destroy a span the user did not choose, so it becomes an Insert.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_palette_result(
+    textio: &dyn kea_platform::TextIo,
+    clipboard: &dyn ClipboardSink,
+    delivery: PaletteDelivery,
+    text: &str,
+    source_text: &str,
+    verify: bool,
+    reactivation: crate::macfocus::Reactivation,
+    replace_mode: kea_platform::ReplaceMode,
+) -> Result<PaletteOutcome, String> {
+    let mut message = None;
+    let mut delivery = delivery;
+
+    if delivery != PaletteDelivery::Copy && !reactivation.can_deliver() {
+        tracing::warn!(
+            ?reactivation,
+            "palette: could not bring the target app back; copying instead"
+        );
+        delivery = PaletteDelivery::Copy;
+        message = Some(
+            "KEA could not bring that app back to the front, so the answer is on your clipboard."
+                .into(),
+        );
+    }
+
+    if delivery == PaletteDelivery::Replace && verify {
+        // Costs one more ⌘C plus COPY_SETTLE. Safe to run: capture_selection
+        // saves and restores the user's clipboard around it.
+        let still_there = match textio.capture_selection().await {
+            Ok(current) => current == source_text,
+            Err(e) => {
+                tracing::debug!(error = %e, "palette: could not re-read the selection");
+                false
+            }
+        };
+        if !still_there {
+            delivery = PaletteDelivery::Insert;
+            message = Some(
+                "That app dropped the selection while the palette was open, \
+                 so the answer was inserted at the caret instead of replacing it."
+                    .into(),
+            );
+        }
+    }
+
+    match delivery {
+        PaletteDelivery::Replace => textio
+            .replace_with_mode(text, replace_mode)
+            .await
+            .map_err(|e| e.to_string())?,
+        PaletteDelivery::Insert => textio
+            .insert_at_cursor(text)
+            .await
+            .map_err(|e| e.to_string())?,
+        PaletteDelivery::Copy => {
+            clipboard.copy(text)?;
+            message = message.or(Some("Copied to the clipboard.".into()));
+        }
+    }
+
+    Ok(PaletteOutcome {
+        delivered: delivery.as_str().into(),
+        message,
+    })
+}
+
+/// Opens the palette from the UI (or a test) rather than from the shortcut.
+///
+/// Takes the shared selection flag the same way a press does, so a palette
+/// opened this way still locks out the rewrite shortcut.
+#[tauri::command]
+pub async fn open_palette(state: State<'_, Arc<AppState>>, app: AppHandle) -> Result<(), String> {
+    let state = state.inner().clone();
+    let Some(busy) = try_acquire_busy(&state.selection_busy) else {
+        return Err("KEA is already working on a selection.".into());
+    };
+    open_palette_session(&state, &app, PaletteOrigin::Selection, None, busy).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_palette_session(
+    state: State<'_, Arc<AppState>>,
+    session_id: u64,
+) -> Result<PaletteSessionView, String> {
+    let slot = state.palette.lock().map_err(|e| e.to_string())?;
+    let session = slot
+        .as_ref()
+        .filter(|s| s.id == session_id)
+        .ok_or_else(|| "that palette session is no longer open".to_string())?;
+    Ok(PaletteSessionView {
+        session_id: session.id,
+        source_text: session.source_text.clone(),
+        origin: session.origin.as_str().into(),
+        app_name: session.context.as_ref().and_then(|c| c.app_name.clone()),
+        can_replace: session.options.can_replace,
+        can_insert: session.options.can_insert,
+        default_delivery: session.options.default.as_str().into(),
+        notice: session.notice.clone(),
+    })
+}
+
+/// The webview has rendered the session; show the window.
+///
+/// The window is shown from here rather than at open so it never appears
+/// holding the previous run's text.
+#[tauri::command]
+pub fn palette_ready(state: State<'_, Arc<AppState>>, app: AppHandle, session_id: u64) {
+    show_palette_once(state.inner(), &app, session_id);
+}
+
+#[tauri::command]
+pub async fn cancel_palette(state: State<'_, Arc<AppState>>, app: AppHandle) -> Result<(), String> {
+    close_palette_for(state.inner(), &app, PaletteEvent::Escape).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_palette_history(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String> {
+    PaletteHistoryRepo::new(SettingsRepo::new(state.config_pool.clone()))
+        .recent(PALETTE_HISTORY_READ)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn clear_palette_history(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    PaletteHistoryRepo::new(SettingsRepo::new(state.config_pool.clone()))
+        .clear()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Whether to remember instructions: `palette.store_history` (default on),
+/// with `history.store_conversations = false` as a global override.
+///
+/// The override is one-directional on purpose. Turning off conversation
+/// storage is a statement about content, and an instruction is content
+/// ("rewrite this rejection letter for Bob"); turning it on says nothing about
+/// whether the user wants a shortcut list.
+async fn palette_history_enabled(config_pool: &SqlitePool) -> bool {
+    read_bool_setting(config_pool, STORE_HISTORY_SETTING, true).await
+        && store_conversations_enabled(config_pool).await
+}
+
+/// Runs one palette instruction and delivers the answer.
+///
+/// The ordering that matters is at the end: hide, reactivate, *confirm* the
+/// reactivation, then write. Step by step, and why each step is where it is,
+/// in [`crate::palette`]'s module docs.
+#[tauri::command]
+pub async fn run_palette(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+    session_id: u64,
+    instruction: String,
+    delivery: String,
+) -> Result<PaletteOutcome, String> {
+    let state = state.inner().clone();
+    let delivery = PaletteDelivery::from_str(&delivery)
+        .ok_or_else(|| format!("unknown palette delivery: {delivery}"))?;
+
+    // Claim the session: one run at a time, and only for the session the
+    // webview thinks it is looking at.
+    let (source_text, context, target_pid, options) = {
+        let mut slot = state.palette.lock().map_err(|e| e.to_string())?;
+        let reaction = palette_event(
+            palette_state_of(slot.as_ref()),
+            PaletteEvent::Submit {
+                instruction_empty: instruction.trim().is_empty(),
+            },
+        );
+        if reaction != PaletteReaction::Run {
+            // The webview applies the same rule before invoking, so getting
+            // here means a stale window or a second Return that raced the
+            // first — neither of which should spend a provider call.
+            return Err("that instruction cannot be run right now".into());
+        }
+        let session = slot
+            .as_mut()
+            .filter(|s| s.id == session_id)
+            .ok_or_else(|| "that palette session is no longer open".to_string())?;
+        if !session.options.allows(delivery) {
+            return Err(format!(
+                "this palette session cannot deliver by {}",
+                delivery.as_str()
+            ));
+        }
+        session.running = true;
+        (
+            session.source_text.clone(),
+            session.context.clone(),
+            session.target_pid,
+            session.options,
+        )
+    };
+
+    let outcome = run_palette_inner(
+        &state,
+        &app,
+        session_id,
+        &instruction,
+        delivery,
+        source_text,
+        context,
+        target_pid,
+        options,
+    )
+    .await;
+
+    if outcome.is_err() {
+        // The request failed before anything was delivered, so the palette
+        // stays up with its error showing and the user can edit and retry.
+        // Clearing `running` is what makes that retry possible.
+        if let Ok(mut slot) = state.palette.lock() {
+            if let Some(session) = slot.as_mut().filter(|s| s.id == session_id) {
+                session.running = false;
+            }
+        }
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_palette_inner(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    session_id: u64,
+    instruction: &str,
+    delivery: PaletteDelivery,
+    source_text: String,
+    context: Option<kea_platform::AppContext>,
+    target_pid: Option<i32>,
+    options: DeliveryOptions,
+) -> Result<PaletteOutcome, String> {
+    let _ = options;
+    if palette_history_enabled(&state.config_pool).await {
+        if let Err(e) = PaletteHistoryRepo::new(SettingsRepo::new(state.config_pool.clone()))
+            .record(instruction)
+            .await
+        {
+            // A history write is a convenience; it must never cost the run.
+            tracing::warn!(error = %e, "could not record the palette instruction");
+        }
+    }
+
+    // A per-app profile applies to a palette ask exactly as it does to a
+    // hotkey rewrite — same binding, same insertion mode, same post-process
+    // choice. Its `mode` and `preset_id` deliberately do not: the user typed
+    // an instruction, and that IS the mode. Forcing them into Professional
+    // because they are in Slack would answer a question they did not ask.
+    let profile = profile_for(&state.config_pool, context.as_ref()).await;
+    let overrides = ProfileOverrides::from_profile(profile.as_ref());
+
+    let input = RewriteInput {
+        source_text: source_text.clone(),
+        mode: RewriteMode::AskKea,
+        preset_id: None,
+        custom_instruction: Some(instruction.to_string()),
+    };
+
+    let bindings = BindingRepo::new(state.config_pool.clone());
+    let actions = ActionRepo::new(state.data_pool.clone());
+    let presets = PresetRepo::new(state.config_pool.clone());
+    let prompt_overrides = PromptOverrideRepo::new(state.config_pool.clone());
+    let conversations = ConversationRepo::new(state.data_pool.clone());
+    let storage = if store_conversations_enabled(&state.config_pool).await {
+        ContentStorageOpts::enabled(&conversations)
+    } else {
+        ContentStorageOpts::default()
+    };
+
+    let (text, action_id) = complete_rewrite(
+        &state.engines,
+        &bindings,
+        &actions,
+        &presets,
+        &prompt_overrides,
+        PALETTE_COMMAND,
+        &input,
+        &overrides,
+        storage,
+    )
+    .await?;
+
+    // From here a provider call has been made and the ledger row is open, so
+    // every branch below closes it.
+    let stale = match state.palette.lock() {
+        Ok(slot) => slot.as_ref().map(|s| s.id) != Some(session_id),
+        Err(_) => true,
+    };
+    if palette_event(PaletteState::Running, PaletteEvent::Completed { stale })
+        != PaletteReaction::Deliver
+    {
+        // Dismissed mid-flight. Deliver nothing — and do not quietly put the
+        // answer on the clipboard either: a cancelled request that replaces
+        // the clipboard is a surprise, and the clipboard is the one piece of
+        // state this feature borrows and has to give back. The row is still
+        // closed — the call happened and was billed — but as Cancelled rather
+        // than Error: the user ending their own request is not a fault, and
+        // colouring it like one teaches people to ignore the colour.
+        let guard = ActionGuard::new(&actions, action_id, "rewrite");
+        guard
+            .cancel("the palette was dismissed before the answer arrived")
+            .await;
+        return Ok(PaletteOutcome {
+            delivered: "cancelled".into(),
+            message: None,
+        });
+    }
+
+    // Holds the BusyGuard through delivery: the rewrite shortcut must stay
+    // blocked until the last synthetic keystroke has landed.
+    let _session = take_palette_session(state);
+
+    crate::palette::hide(app);
+    emit_palette_close(app);
+
+    let reactivation =
+        tokio::task::spawn_blocking(move || crate::macfocus::restore_focus(target_pid))
+            .await
+            .unwrap_or(crate::macfocus::Reactivation::Unknown);
+
+    let verify = read_bool_setting(&state.config_pool, PALETTE_VERIFY_SETTING, true).await;
+    let textio = new_text_io();
+    let guard = ActionGuard::new(&actions, action_id, "rewrite");
+    match deliver_palette_result(
+        textio.as_ref(),
+        &SystemClipboard,
+        delivery,
+        &text,
+        &source_text,
+        verify,
+        reactivation,
+        overrides.replace_mode(),
+    )
+    .await
+    {
+        Ok(outcome) => {
+            guard.succeed().await;
+            if let Some(message) = &outcome.message {
+                notify_palette(app, message);
+            }
+            Ok(outcome)
+        }
+        Err(e) => Err(guard.fail(e).await),
+    }
+}
+
+/// Tells the user something about a run whose window has already gone.
+///
+/// A notification rather than an in-app banner: by the time a downgrade is
+/// known the palette is hidden and the settings window is very likely closed,
+/// so a banner would be a message nobody ever sees.
+pub fn notify_palette(app: &AppHandle, message: &str) {
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title("KEA")
+        .body(message)
+        .show()
+    {
+        tracing::warn!(error = %e, message, "could not show the palette notification");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Screenshot OCR (item 20): capture a region, recognise it, open the palette
+// ---------------------------------------------------------------------------
+
+/// The OCR knobs, read from settings.
+async fn ocr_options(config_pool: &SqlitePool) -> kea_platform::OcrOptions {
+    let languages = SettingsRepo::new(config_pool.clone())
+        .get_optional::<String>(OCR_LANGUAGES_SETTING)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    kea_platform::OcrOptions {
+        languages: languages
+            .split(',')
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_string)
+            .collect(),
+        language_correction: read_bool_setting(config_pool, OCR_LANGUAGE_CORRECTION_SETTING, true)
+            .await,
+    }
+}
+
+/// The recognition languages this macOS build actually supports, asked of the
+/// framework rather than guessed, so the settings page can show a real list.
+#[tauri::command]
+pub fn get_ocr_languages() -> Result<Vec<String>, String> {
+    kea_platform::new_text_recognizer()
+        .supported_languages()
+        .map_err(|e| e.to_string())
+}
+
+/// Captures a screen region, recognises its text, and opens the palette with
+/// it. `None` when the user cancelled, which is not an error.
+///
+/// The image is owned by a `CapturedImage` that deletes its whole temp
+/// directory on drop, including on a panic. It is bound for exactly as long as
+/// `recognize` needs it and dropped on the next line — a screenshot of
+/// someone's screen left in `/tmp` is the worst bug this feature can produce,
+/// so its path never outlives the value that owns it.
+async fn recognize_screen_region(config_pool: &SqlitePool) -> Result<Option<String>, String> {
+    let capture = kea_platform::new_screen_capture();
+    capture.availability().map_err(|e| e.to_string())?;
+
+    let outcome = capture.capture_region().await.map_err(|e| e.to_string())?;
+    let image = match outcome {
+        // Escape. Open nothing, show nothing: changing one's mind is a success.
+        kea_platform::CaptureOutcome::Cancelled => return Ok(None),
+        kea_platform::CaptureOutcome::Captured(image) => image,
+    };
+
+    let opts = ocr_options(config_pool).await;
+    let observations = kea_platform::new_text_recognizer()
+        .recognize(image.path(), &opts)
+        .await
+        .map_err(|e| e.to_string());
+    drop(image);
+
+    Ok(Some(kea_platform::observations_to_text(&observations?)))
+}
+
+/// Runs the screen-capture shortcut's whole flow, taking the press's busy
+/// guard with it.
+pub async fn capture_screen_text_inner(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    busy: BusyGuard,
+) -> Result<(), String> {
+    match recognize_screen_region(&state.config_pool).await? {
+        Some(text) => {
+            open_palette_session(state, app, PaletteOrigin::ScreenCapture, Some(text), busy).await;
+        }
+        // The user pressed Escape. Open nothing, show nothing: changing one's
+        // mind is a success, and an error toast for a non-event is worse than
+        // silence. `busy` drops here.
+        None => tracing::debug!("screen capture cancelled"),
+    }
+    Ok(())
+}
+
+/// The screen-capture shortcut, from the UI rather than the hotkey.
+///
+/// The error comes back to the caller here — unlike the hotkey path, the
+/// settings page is on screen and has a line to show it on.
+#[tauri::command]
+pub async fn capture_screen_text(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let Some(busy) = try_acquire_busy(&state.selection_busy) else {
+        return Err("KEA is already working on a selection.".into());
+    };
+    capture_screen_text_inner(&state, &app, busy).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4746,6 +5640,7 @@ mod tests {
     };
     use kea_features::{DictationFeature, Feature, MeetingFeature, RewriteFeature, TtsFeature};
     use kea_platform::{DictationState, SystemAudioCapability};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
     async fn phase1_registry() -> EngineRegistry {
@@ -5373,6 +6268,48 @@ mod tests {
         assert!(validate_accelerator("Cmd+Shift+R").is_ok());
         assert!(validate_accelerator("CommandOrControl+Shift+D").is_ok());
         assert!(validate_accelerator("Ctrl+Alt+Delete").is_ok());
+    }
+
+    /// Every compiled default has to survive `normalize_accelerator` and
+    /// `HotKey::from_str`, and the palette's is the first one whose key is a
+    /// word rather than a letter — `platform_accelerator` takes a `char`, so
+    /// "Space" is spelled out and is exactly the kind of literal that would
+    /// register as a dead key instead of failing loudly.
+    #[test]
+    fn every_compiled_default_accelerator_parses() {
+        for action in HOTKEY_ACTIONS {
+            let accel = compiled_default_accelerator(action.feature, action.command)
+                .unwrap_or_else(|| panic!("{} declares no default", action.action_id));
+            assert!(
+                validate_accelerator(&accel).is_ok(),
+                "{} default {accel:?} does not parse",
+                action.action_id
+            );
+        }
+    }
+
+    /// Two features sharing a default means `set_hotkey` refuses the second
+    /// one the first time a user tries to rebind it, and startup silently
+    /// registers whichever went first.
+    #[test]
+    fn no_two_hotkey_actions_share_a_default() {
+        for a in HOTKEY_ACTIONS {
+            for b in HOTKEY_ACTIONS {
+                if a.action_id == b.action_id {
+                    continue;
+                }
+                let (x, y) = (
+                    compiled_default_accelerator(a.feature, a.command).unwrap_or_default(),
+                    compiled_default_accelerator(b.feature, b.command).unwrap_or_default(),
+                );
+                assert!(
+                    !same_accelerator(&x, &y),
+                    "{} and {} both default to {x}",
+                    a.action_id,
+                    b.action_id
+                );
+            }
+        }
     }
 
     #[test]
@@ -6673,5 +7610,359 @@ mod tests {
                 .is_err(),
             "an unreachable host must surface as an error"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Prompt palette
+    // -----------------------------------------------------------------
+
+    /// Records which delivery a run actually reached for. Nothing here touches
+    /// a window server, a clipboard or an app: the question these tests ask is
+    /// "which of the three paths ran", and that is answerable at the `TextIo`
+    /// seam, which is the same one `crates/features/src/rewrite.rs` uses.
+    struct RecordingTextIo {
+        /// Answers returned by successive `capture_selection` calls. The
+        /// verify step is a *second* read, so the two have to be separable.
+        selections: Mutex<Vec<Result<String, String>>>,
+        replaced: Mutex<Option<String>>,
+        inserted: Mutex<Option<String>>,
+        captures: AtomicUsize,
+    }
+
+    impl RecordingTextIo {
+        fn with(selections: Vec<Result<String, String>>) -> Self {
+            Self {
+                selections: Mutex::new(selections),
+                replaced: Mutex::new(None),
+                inserted: Mutex::new(None),
+                captures: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl kea_platform::TextIo for RecordingTextIo {
+        async fn capture_selection(&self) -> Result<String, kea_platform::TextIoError> {
+            self.captures.fetch_add(1, Ordering::SeqCst);
+            let mut queue = self.selections.lock().unwrap();
+            let next = if queue.is_empty() {
+                Err("no selection".to_string())
+            } else {
+                queue.remove(0)
+            };
+            next.map_err(kea_platform::TextIoError::Other)
+        }
+
+        async fn replace_with_mode(
+            &self,
+            text: &str,
+            _mode: kea_platform::ReplaceMode,
+        ) -> Result<(), kea_platform::TextIoError> {
+            *self.replaced.lock().unwrap() = Some(text.to_string());
+            Ok(())
+        }
+
+        async fn insert_at_cursor(&self, text: &str) -> Result<(), kea_platform::TextIoError> {
+            *self.inserted.lock().unwrap() = Some(text.to_string());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeClipboard {
+        contents: Mutex<Option<String>>,
+    }
+
+    impl ClipboardSink for FakeClipboard {
+        fn copy(&self, text: &str) -> Result<(), String> {
+            *self.contents.lock().unwrap() = Some(text.to_string());
+            Ok(())
+        }
+    }
+
+    async fn palette_test_pool() -> SqlitePool {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        pool
+    }
+
+    async fn deliver(
+        textio: &RecordingTextIo,
+        clipboard: &FakeClipboard,
+        delivery: PaletteDelivery,
+        source: &str,
+        verify: bool,
+        reactivation: crate::macfocus::Reactivation,
+    ) -> PaletteOutcome {
+        deliver_palette_result(
+            textio,
+            clipboard,
+            delivery,
+            "the answer",
+            source,
+            verify,
+            reactivation,
+            kea_platform::ReplaceMode::ClipboardPaste,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn copy_delivery_types_nothing_anywhere() {
+        let textio = RecordingTextIo::with(vec![]);
+        let clipboard = FakeClipboard::default();
+        let outcome = deliver(
+            &textio,
+            &clipboard,
+            PaletteDelivery::Copy,
+            "source",
+            true,
+            crate::macfocus::Reactivation::Active,
+        )
+        .await;
+
+        assert_eq!(outcome.delivered, "copy");
+        assert_eq!(
+            clipboard.contents.lock().unwrap().as_deref(),
+            Some("the answer")
+        );
+        assert!(textio.replaced.lock().unwrap().is_none());
+        assert!(textio.inserted.lock().unwrap().is_none());
+        // Not even the verify read: there is no selection involved in a copy.
+        assert_eq!(textio.captures.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn insert_delivery_goes_to_the_caret() {
+        let textio = RecordingTextIo::with(vec![]);
+        let clipboard = FakeClipboard::default();
+        let outcome = deliver(
+            &textio,
+            &clipboard,
+            PaletteDelivery::Insert,
+            "source",
+            true,
+            crate::macfocus::Reactivation::Active,
+        )
+        .await;
+
+        assert_eq!(outcome.delivered, "insert");
+        assert_eq!(
+            textio.inserted.lock().unwrap().as_deref(),
+            Some("the answer")
+        );
+        assert!(textio.replaced.lock().unwrap().is_none());
+        assert!(clipboard.contents.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn replace_writes_over_a_selection_that_is_still_there() {
+        let textio = RecordingTextIo::with(vec![Ok("the original".into())]);
+        let clipboard = FakeClipboard::default();
+        let outcome = deliver(
+            &textio,
+            &clipboard,
+            PaletteDelivery::Replace,
+            "the original",
+            true,
+            crate::macfocus::Reactivation::Active,
+        )
+        .await;
+
+        assert_eq!(outcome.delivered, "replace");
+        assert_eq!(
+            outcome.message, None,
+            "nothing to explain on the happy path"
+        );
+        assert_eq!(
+            textio.replaced.lock().unwrap().as_deref(),
+            Some("the answer")
+        );
+        assert_eq!(textio.captures.load(Ordering::SeqCst), 1);
+    }
+
+    /// The guard against the worst outcome this feature can produce: replacing
+    /// a span the user never selected, because the app dropped the selection
+    /// when the palette took focus.
+    #[tokio::test]
+    async fn replace_downgrades_to_insert_when_the_selection_moved() {
+        let textio = RecordingTextIo::with(vec![Ok("something else entirely".into())]);
+        let clipboard = FakeClipboard::default();
+        let outcome = deliver(
+            &textio,
+            &clipboard,
+            PaletteDelivery::Replace,
+            "the original",
+            true,
+            crate::macfocus::Reactivation::Active,
+        )
+        .await;
+
+        assert_eq!(outcome.delivered, "insert");
+        assert!(textio.replaced.lock().unwrap().is_none());
+        assert_eq!(
+            textio.inserted.lock().unwrap().as_deref(),
+            Some("the answer")
+        );
+        // And the user is told, because the result is not where they expected.
+        assert!(outcome.message.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_selection_that_cannot_be_reread_is_treated_as_gone() {
+        // Apps that clear the selection on resignFirstResponder answer the
+        // verify Cmd+C with a failure rather than with different text.
+        let textio = RecordingTextIo::with(vec![Err("no selection".into())]);
+        let clipboard = FakeClipboard::default();
+        let outcome = deliver(
+            &textio,
+            &clipboard,
+            PaletteDelivery::Replace,
+            "the original",
+            true,
+            crate::macfocus::Reactivation::Active,
+        )
+        .await;
+        assert_eq!(outcome.delivered, "insert");
+    }
+
+    #[tokio::test]
+    async fn verification_can_be_turned_off() {
+        let textio = RecordingTextIo::with(vec![Ok("something else".into())]);
+        let clipboard = FakeClipboard::default();
+        let outcome = deliver(
+            &textio,
+            &clipboard,
+            PaletteDelivery::Replace,
+            "the original",
+            false,
+            crate::macfocus::Reactivation::Active,
+        )
+        .await;
+
+        assert_eq!(outcome.delivered, "replace");
+        // The point of the setting: no second Cmd+C, so no extra 150 ms.
+        assert_eq!(textio.captures.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_target_that_never_came_back_gets_the_clipboard_instead() {
+        // The app quit, hung, or the machine slept while the palette was up.
+        // Typing now would land in whatever *is* frontmost.
+        for delivery in [PaletteDelivery::Replace, PaletteDelivery::Insert] {
+            let textio = RecordingTextIo::with(vec![Ok("the original".into())]);
+            let clipboard = FakeClipboard::default();
+            let outcome = deliver(
+                &textio,
+                &clipboard,
+                delivery,
+                "the original",
+                true,
+                crate::macfocus::Reactivation::Failed,
+            )
+            .await;
+
+            assert_eq!(outcome.delivered, "copy", "{delivery:?}");
+            assert!(textio.replaced.lock().unwrap().is_none());
+            assert!(textio.inserted.lock().unwrap().is_none());
+            assert_eq!(
+                clipboard.contents.lock().unwrap().as_deref(),
+                Some("the answer")
+            );
+            assert!(outcome.message.is_some(), "the user has to be told");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_reactivation_is_not_treated_as_success() {
+        // No pid was captured (no GUI session, or not macOS). Optimism here
+        // pastes into whatever the user happens to be looking at.
+        let textio = RecordingTextIo::with(vec![]);
+        let clipboard = FakeClipboard::default();
+        let outcome = deliver(
+            &textio,
+            &clipboard,
+            PaletteDelivery::Insert,
+            "",
+            true,
+            crate::macfocus::Reactivation::Unknown,
+        )
+        .await;
+        assert_eq!(outcome.delivered, "copy");
+    }
+
+    #[tokio::test]
+    async fn the_palette_is_a_rewrite_hotkey_row_not_a_feature_of_its_own() {
+        // The accelerator falls back to `RewriteFeature`'s declared default,
+        // so a palette registered under some other feature id would register
+        // an empty accelerator and the key would silently be dead.
+        for action in HOTKEY_ACTIONS {
+            if action.action_id == PALETTE_ACTION_ID || action.action_id == OCR_ACTION_ID {
+                assert_eq!(action.feature, REWRITE_FEATURE_ID);
+                assert!(
+                    compiled_default_accelerator(action.feature, action.command).is_some(),
+                    "{} has no compiled default",
+                    action.action_id
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ocr_options_default_to_vision_choosing_the_language() {
+        let pool = palette_test_pool().await;
+        let opts = ocr_options(&pool).await;
+        assert!(
+            opts.languages.is_empty(),
+            "a guessed list is worse than none"
+        );
+        assert!(opts.language_correction);
+    }
+
+    #[tokio::test]
+    async fn ocr_options_read_the_settings_rows() {
+        let pool = palette_test_pool().await;
+        let settings = SettingsRepo::new(pool.clone());
+        settings
+            .set(OCR_LANGUAGES_SETTING, &"en-US, ja ,".to_string())
+            .await
+            .unwrap();
+        // Written the way the generic `set_setting` command writes it: a JSON
+        // string, not a JSON bool. Reading this with a plain typed get is the
+        // trap that shipped two other toggles inert.
+        settings
+            .set(OCR_LANGUAGE_CORRECTION_SETTING, &"false".to_string())
+            .await
+            .unwrap();
+
+        let opts = ocr_options(&pool).await;
+        assert_eq!(opts.languages, vec!["en-US".to_string(), "ja".to_string()]);
+        assert!(!opts.language_correction);
+    }
+
+    #[tokio::test]
+    async fn instruction_history_is_on_by_default_and_follows_the_content_switch() {
+        let pool = palette_test_pool().await;
+        assert!(palette_history_enabled(&pool).await);
+
+        let settings = SettingsRepo::new(pool.clone());
+        // Turning off content storage takes instructions with it: an
+        // instruction is content ("rewrite this rejection letter for Bob").
+        settings
+            .set("history.store_conversations", &"false".to_string())
+            .await
+            .unwrap();
+        assert!(!palette_history_enabled(&pool).await);
+
+        settings
+            .set("history.store_conversations", &"true".to_string())
+            .await
+            .unwrap();
+        settings
+            .set(STORE_HISTORY_SETTING, &"false".to_string())
+            .await
+            .unwrap();
+        assert!(!palette_history_enabled(&pool).await);
     }
 }

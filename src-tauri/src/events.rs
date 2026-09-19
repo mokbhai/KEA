@@ -311,6 +311,13 @@ pub struct MeetingSegmentPayload {
     pub text: String,
     pub start_offset_ms: i64,
     pub end_offset_ms: i64,
+    /// Which side spoke, or `None` when it could not be told apart.
+    ///
+    /// Carried on the live event and not only in the row, because the
+    /// transcript is read as it is being written: without this the speaker
+    /// chips appear only after the meeting is reopened, which makes the
+    /// attribution look broken exactly while the user is watching it work.
+    pub speaker_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -620,9 +627,28 @@ mod tests {
             text: "hi".into(),
             start_offset_ms: 0,
             end_offset_ms: 30_000,
+            speaker_key: Some("local".into()),
         })
         .unwrap();
         assert!(json.contains(r#""text":"hi""#));
+        assert!(json.contains(r#""speaker_key":"local""#));
+    }
+
+    /// An unattributed segment must cross the wire as an explicit null rather
+    /// than a missing key: the transcript renders it as "unattributed", which
+    /// is a real answer, not an absent one.
+    #[test]
+    fn an_unattributed_segment_carries_an_explicit_null() {
+        let json = serde_json::to_string(&MeetingSegmentPayload {
+            meeting_id: "m1".into(),
+            sequence: 1,
+            text: "hi".into(),
+            start_offset_ms: 0,
+            end_offset_ms: 1_000,
+            speaker_key: None,
+        })
+        .unwrap();
+        assert!(json.contains(r#""speaker_key":null"#), "{json}");
     }
 
     #[test]
@@ -743,4 +769,34 @@ mod tests {
         .unwrap();
         assert_eq!(json, r#"{"state":"reading"}"#);
     }
+}
+
+/// Tells the palette webview which session to pull.
+///
+/// **Only the id travels.** `app.emit` — which every other emitter here uses —
+/// broadcasts to every window, so putting the captured selection in the
+/// payload would hand the settings window the contents of whatever the user
+/// had selected in Slack. The body is fetched with `get_palette_session`,
+/// which also removes the emit-before-show race: the window is not shown until
+/// the webview says it has rendered this session, so it never appears holding
+/// the previous run's text.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct PaletteOpenPayload {
+    pub session_id: u64,
+}
+
+pub fn emit_palette_open(app: &AppHandle, session_id: u64) {
+    if let Err(e) = app.emit_to(
+        crate::palette::LABEL,
+        "palette:open",
+        PaletteOpenPayload { session_id },
+    ) {
+        tracing::warn!(error = %e, "could not tell the palette window to open");
+    }
+}
+
+/// Tells the palette webview to clear itself, for a dismissal it did not
+/// start — the toggle shortcut, a delivery, or a blur handled in Rust.
+pub fn emit_palette_close(app: &AppHandle) {
+    let _ = app.emit_to(crate::palette::LABEL, "palette:close", ());
 }

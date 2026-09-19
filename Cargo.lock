@@ -2558,6 +2558,7 @@ dependencies = [
 name = "kea-app"
 version = "0.3.0"
 dependencies = [
+ "arboard",
  "async-trait",
  "futures-util",
  "kea-core",

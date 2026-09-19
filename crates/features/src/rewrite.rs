@@ -6,7 +6,7 @@ use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_core::store::conversations::{ConversationRepo, MessageRole, NewConversation, NewMessage};
 use kea_engines::traits::LlmRequest;
 use kea_engines::EngineRegistry;
-use kea_platform::{ReplaceMode, TextIo};
+use kea_platform::TextIo;
 
 use crate::feature::{ActionGuard, CapKind, CapSlot, Command, Feature, ProfileOverrides};
 
@@ -106,12 +106,55 @@ impl Feature for RewriteFeature {
         }]
     }
 
+    /// Three commands, one feature, one `llm` slot.
+    ///
+    /// The palette and the screen-capture shortcut are rewrites with an
+    /// instruction typed for the occasion, not a second feature: giving them a
+    /// `Feature` of their own would give them a *second* `llm` slot binding
+    /// for the user to configure, and picking a writer for "Rewrite" while the
+    /// palette silently used another is not a distinction anyone asked for.
+    /// [`crate::feature::ProfileOverrides`], the preset list and the prompt
+    /// overrides all follow the same seam for the same reason.
     fn commands(&self) -> Vec<Command> {
-        vec![Command {
-            id: "rewrite_selection".into(),
-            title: "Rewrite Selection".into(),
-            default_accelerator: Some(default_rewrite_accelerator().into()),
-        }]
+        vec![
+            Command {
+                id: "rewrite_selection".into(),
+                title: "Rewrite Selection".into(),
+                default_accelerator: Some(default_rewrite_accelerator().into()),
+            },
+            Command {
+                id: PALETTE_COMMAND.into(),
+                title: "Prompt Palette".into(),
+                default_accelerator: Some(default_palette_accelerator().into()),
+            },
+            Command {
+                id: OCR_COMMAND.into(),
+                title: "Capture Screen Text".into(),
+                default_accelerator: Some(crate::feature::platform_accelerator('O')),
+            },
+        ]
+    }
+}
+
+/// Command id of the prompt palette, shared with the app layer's hotkey table.
+pub const PALETTE_COMMAND: &str = "prompt_palette";
+
+/// Command id of the screenshot-OCR shortcut, which opens the palette
+/// prefilled with whatever text was recognised.
+pub const OCR_COMMAND: &str = "ocr_capture";
+
+/// `Cmd+Shift+R/D/T/M` and now `O` are taken by the other four, and the
+/// screenshot keys `Cmd+Shift+3..6` belong to macOS. Space is spelled out
+/// rather than going through [`crate::feature::platform_accelerator`], which
+/// takes a `char`.
+fn default_palette_accelerator() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Cmd+Shift+Space"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "CommandOrControl+Shift+Space"
     }
 }
 
@@ -170,6 +213,69 @@ pub async fn run_rewrite_with_storage(
             .map_err(|e| e.to_string())?;
     }
 
+    let (text, action_id) = complete_rewrite(
+        engines,
+        bindings,
+        actions,
+        presets,
+        overrides,
+        "rewrite_selection",
+        &input,
+        profile,
+        storage,
+    )
+    .await?;
+
+    // The ledger row is still open — `complete_rewrite` released it — because
+    // a rewrite is not done until the text is back in the user's document.
+    // Taking it back into a guard is what keeps the "every exit closes the
+    // row" rule in one type rather than two copies of `actions.finish`.
+    let guard = ActionGuard::new(actions, action_id, "rewrite");
+    match textio
+        .replace_with_mode(&text, profile.replace_mode())
+        .await
+    {
+        Ok(()) => {
+            guard.succeed().await;
+            Ok(text)
+        }
+        Err(e) => Err(guard.fail(e).await),
+    }
+}
+
+/// Everything between an input and a finished LLM response: resolve the
+/// binding, build the request, open the ledger row, call the engine, record
+/// the conversation. Returns the text and the **still-open** row id.
+///
+/// `command` says which of [`RewriteFeature`]'s commands this run is, so
+/// History can tell a palette ask from a plain rewrite; the feature id stays
+/// `rewrite` either way.
+///
+/// The seam exists because the two callers deliver differently and at
+/// different times. A hotkey rewrite writes the answer straight back over the
+/// selection; the palette hides its window, reactivates the app the user came
+/// from, and only then decides between replace, insert and the clipboard — and
+/// may find that the user dismissed it while the request was in flight, in
+/// which case the row closes without anything being delivered at all. Neither
+/// half may re-capture the selection: for the palette that would fire a second
+/// ⌘C into whatever is frontmost *now*, which is KEA's own window.
+///
+/// The row is handed over open (via [`ActionGuard::release`], as
+/// `run_tts_synthesize` does) rather than closed here and reopened: History
+/// would otherwise show a rewrite that succeeded a second before the paste
+/// that failed.
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_rewrite(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    actions: &ActionRepo,
+    presets: &PresetRepo,
+    overrides: &PromptOverrideRepo,
+    command: &str,
+    input: &RewriteInput,
+    profile: &ProfileOverrides,
+    storage: ContentStorageOpts<'_>,
+) -> Result<(String, i64), String> {
     // A profile substitutes for the resolver rather than patching its result:
     // `llm_binding()` is None unless an engine id is set, so a half-filled
     // profile inherits the global binding instead of half-applying one.
@@ -182,7 +288,7 @@ pub async fn run_rewrite_with_storage(
     };
     let engine_id = binding.engine_id.clone();
 
-    let mut llm_req = build_llm_request(&input, presets, overrides)
+    let mut llm_req = build_llm_request(input, presets, overrides)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -195,7 +301,7 @@ pub async fn run_rewrite_with_storage(
     let action_id = actions
         .record(NewAction {
             feature_id: "rewrite".into(),
-            command: "rewrite_selection".into(),
+            command: command.into(),
             engine_id: engine_id.clone(),
             model: binding.model.clone(),
             provider_ref: binding.provider_ref.clone(),
@@ -205,36 +311,23 @@ pub async fn run_rewrite_with_storage(
 
     // From here the ledger row exists, so every exit closes it.
     let guard = ActionGuard::new(actions, action_id, "rewrite");
-    let result = run_rewrite_inner(
-        engines,
-        textio,
-        storage,
-        &binding,
-        &input,
-        llm_req,
-        action_id,
-        profile.replace_mode(),
-    )
-    .await;
-    match result {
-        Ok(text) => {
-            guard.succeed().await;
-            Ok(text)
-        }
+    match run_completion(engines, storage, &binding, input, llm_req, action_id).await {
+        // Released, not closed: the caller delivers the text and owns the
+        // outcome. See this function's doc comment.
+        Ok(text) => Ok((text, guard.release())),
         Err(e) => Err(guard.fail(e).await),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_rewrite_inner(
+/// The LLM call and the optional conversation record — everything that is the
+/// same whether the answer ends up replacing a selection or on the clipboard.
+async fn run_completion(
     engines: &EngineRegistry,
-    textio: &dyn TextIo,
     storage: ContentStorageOpts<'_>,
     binding: &Binding,
     input: &RewriteInput,
     llm_req: LlmRequest,
     action_id: i64,
-    replace_mode: ReplaceMode,
 ) -> Result<String, String> {
     let engine_id = &binding.engine_id;
     let engine = engines
@@ -242,11 +335,6 @@ async fn run_rewrite_inner(
         .ok_or_else(|| format!("no llm engine '{engine_id}'"))?;
 
     let response = engine.complete(llm_req).await.map_err(|e| e.to_string())?;
-
-    textio
-        .replace_with_mode(&response.text, replace_mode)
-        .await
-        .map_err(|e| e.to_string())?;
 
     maybe_record_conversation(
         storage,
@@ -273,16 +361,32 @@ mod tests {
     use kea_core::store::db::{open_pool, run_config_migrations, run_data_migrations};
     use kea_engines::noop::NoopLlmEngine;
     use kea_platform::{ReplaceMode, TextIoError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     struct FakeTextIo {
         selection: String,
         replaced: Mutex<Option<String>>,
+        /// How many times the selection was read. The palette path must never
+        /// bump this: a second synthetic Cmd+C would go to KEA's own window,
+        /// which is frontmost while the palette is up.
+        captures: AtomicUsize,
+    }
+
+    impl FakeTextIo {
+        fn with_selection(selection: &str) -> Self {
+            Self {
+                selection: selection.into(),
+                replaced: Mutex::new(None),
+                captures: AtomicUsize::new(0),
+            }
+        }
     }
 
     #[async_trait]
     impl TextIo for FakeTextIo {
         async fn capture_selection(&self) -> Result<String, TextIoError> {
+            self.captures.fetch_add(1, Ordering::SeqCst);
             Ok(self.selection.clone())
         }
 
@@ -296,6 +400,35 @@ mod tests {
         }
     }
 
+    /// The four repos every test here builds, over two in-memory pools.
+    struct Harness {
+        engines: EngineRegistry,
+        bindings: BindingRepo,
+        actions: ActionRepo,
+        presets: PresetRepo,
+        overrides: PromptOverrideRepo,
+        conversations: ConversationRepo,
+    }
+
+    impl Harness {
+        async fn new() -> Self {
+            let mut engines = EngineRegistry::default();
+            engines.register_llm(Arc::new(NoopLlmEngine));
+            let config_pool = open_pool("sqlite::memory:").await.unwrap();
+            run_config_migrations(&config_pool).await.unwrap();
+            let data_pool = open_pool("sqlite::memory:").await.unwrap();
+            run_data_migrations(&data_pool).await.unwrap();
+            Self {
+                engines,
+                bindings: BindingRepo::new(config_pool.clone()),
+                actions: ActionRepo::new(data_pool.clone()),
+                presets: PresetRepo::new(config_pool.clone()),
+                overrides: PromptOverrideRepo::new(config_pool),
+                conversations: ConversationRepo::new(data_pool),
+            }
+        }
+    }
+
     #[test]
     fn rewrite_declares_llm_slot_and_command() {
         let f = RewriteFeature;
@@ -303,7 +436,8 @@ mod tests {
         assert_eq!(f.required_caps()[0].name, "llm");
         assert_eq!(f.required_caps()[0].kind, CapKind::Llm);
         let cmds = f.commands();
-        assert_eq!(cmds.len(), 1);
+        // The selection rewrite stays first: it is the feature's headline
+        // command and the one the Rewrite page's own hotkey row names.
         assert_eq!(cmds[0].id, "rewrite_selection");
         assert_eq!(cmds[0].title, "Rewrite Selection");
         assert!(cmds[0].default_accelerator.is_some());
@@ -314,10 +448,7 @@ mod tests {
         let mut reg = EngineRegistry::default();
         reg.register_llm(Arc::new(NoopLlmEngine));
 
-        let textio = Arc::new(FakeTextIo {
-            selection: "bad text".into(),
-            replaced: Mutex::new(None),
-        });
+        let textio = Arc::new(FakeTextIo::with_selection("bad text"));
 
         let config_pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&config_pool).await.unwrap();
@@ -370,10 +501,7 @@ mod tests {
         let mut reg = EngineRegistry::default();
         reg.register_llm(Arc::new(NoopLlmEngine));
 
-        let textio = Arc::new(FakeTextIo {
-            selection: "guten tag".into(),
-            replaced: Mutex::new(None),
-        });
+        let textio = Arc::new(FakeTextIo::with_selection("guten tag"));
 
         let config_pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&config_pool).await.unwrap();
@@ -416,10 +544,7 @@ mod tests {
         let mut reg = EngineRegistry::default();
         reg.register_llm(Arc::new(NoopLlmEngine));
 
-        let textio = Arc::new(FakeTextIo {
-            selection: "bad text".into(),
-            replaced: Mutex::new(None),
-        });
+        let textio = Arc::new(FakeTextIo::with_selection("bad text"));
 
         let config_pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&config_pool).await.unwrap();
@@ -469,10 +594,7 @@ mod tests {
         let mut reg = EngineRegistry::default();
         reg.register_llm(Arc::new(NoopLlmEngine));
 
-        let textio = Arc::new(FakeTextIo {
-            selection: "bad text".into(),
-            replaced: Mutex::new(None),
-        });
+        let textio = Arc::new(FakeTextIo::with_selection("bad text"));
 
         let config_pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&config_pool).await.unwrap();
@@ -507,15 +629,166 @@ mod tests {
         assert!(conversations.list_recent(1).await.unwrap().is_empty());
     }
 
+    /// The palette's seam: it has already captured the selection (before its
+    /// own window took focus) and passes it in. A capture here would fire a
+    /// synthetic Cmd+C into KEA's own text field.
+    #[tokio::test]
+    async fn complete_rewrite_never_reads_the_selection() {
+        let h = Harness::new().await;
+        let textio = FakeTextIo::with_selection("MUST NOT BE READ");
+
+        let (text, action_id) = complete_rewrite(
+            &h.engines,
+            &h.bindings,
+            &h.actions,
+            &h.presets,
+            &h.overrides,
+            PALETTE_COMMAND,
+            &RewriteInput {
+                source_text: "the selection the palette already had".into(),
+                mode: RewriteMode::AskKea,
+                preset_id: None,
+                custom_instruction: Some("make it shorter".into()),
+            },
+            &ProfileOverrides::default(),
+            ContentStorageOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(textio.captures.load(Ordering::SeqCst), 0);
+        assert!(text.contains("make it shorter"), "{text}");
+        assert!(
+            textio.replaced.lock().unwrap().is_none(),
+            "nothing delivered"
+        );
+
+        // The row is handed back OPEN: the caller has not delivered yet.
+        let detail = h.actions.get(action_id).await.unwrap().unwrap();
+        assert_eq!(detail.status, ActionStatus::Started);
+        assert_eq!(detail.command, PALETTE_COMMAND);
+    }
+
+    /// An empty source is the palette's "ask KEA anything" case and must reach
+    /// the engine as an instruction-only prompt, not as a rewrite of nothing.
+    #[tokio::test]
+    async fn complete_rewrite_asks_without_a_source() {
+        let h = Harness::new().await;
+        let (text, _) = complete_rewrite(
+            &h.engines,
+            &h.bindings,
+            &h.actions,
+            &h.presets,
+            &h.overrides,
+            PALETTE_COMMAND,
+            &RewriteInput {
+                source_text: String::new(),
+                mode: RewriteMode::AskKea,
+                preset_id: None,
+                custom_instruction: Some("what is 9 factorial".into()),
+            },
+            &ProfileOverrides::default(),
+            ContentStorageOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        // The noop engine echoes the prompt back, so this reads the prompt.
+        assert!(text.contains("what is 9 factorial"), "{text}");
+        assert!(!text.contains("Source text:"), "{text}");
+    }
+
+    /// A failure before delivery closes the row itself — the caller is never
+    /// handed a released id it does not know it owns.
+    #[tokio::test]
+    async fn complete_rewrite_closes_its_own_row_on_failure() {
+        let h = Harness::new().await;
+        let err = complete_rewrite(
+            &h.engines,
+            &h.bindings,
+            &h.actions,
+            &h.presets,
+            &h.overrides,
+            PALETTE_COMMAND,
+            &RewriteInput {
+                source_text: "hi".into(),
+                // Ask KEA with no instruction cannot render its template.
+                mode: RewriteMode::AskKea,
+                preset_id: None,
+                custom_instruction: None,
+            },
+            &ProfileOverrides::default(),
+            ContentStorageOpts::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("missing custom instruction"), "{err}");
+        // The row never opened (the render fails before `actions.record`), so
+        // nothing is left pending either way.
+        assert!(h.actions.recent(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn complete_rewrite_records_the_conversation_once() {
+        let h = Harness::new().await;
+        complete_rewrite(
+            &h.engines,
+            &h.bindings,
+            &h.actions,
+            &h.presets,
+            &h.overrides,
+            PALETTE_COMMAND,
+            &RewriteInput {
+                source_text: "some selected prose".into(),
+                mode: RewriteMode::AskKea,
+                preset_id: None,
+                custom_instruction: Some("shorten".into()),
+            },
+            &ProfileOverrides::default(),
+            ContentStorageOpts::enabled(&h.conversations),
+        )
+        .await
+        .unwrap();
+
+        let recent = h.conversations.list_recent(2).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        let messages = h.conversations.list_messages(recent[0].id).await.unwrap();
+        assert_eq!(messages[0].content, "some selected prose");
+    }
+
+    #[test]
+    fn the_palette_and_ocr_commands_declare_defaults() {
+        let cmds = RewriteFeature.commands();
+        let ids: Vec<&str> = cmds.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&PALETTE_COMMAND));
+        assert!(ids.contains(&OCR_COMMAND));
+        // `resolve_accelerator` falls back to these, so a None here would
+        // register an empty accelerator and the key would silently be dead.
+        for cmd in &cmds {
+            assert!(
+                cmd.default_accelerator.is_some(),
+                "{} has no default accelerator",
+                cmd.id
+            );
+        }
+        // Distinct, or `check_hotkey_collision` refuses the second one.
+        let mut accels: Vec<&str> = cmds
+            .iter()
+            .filter_map(|c| c.default_accelerator.as_deref())
+            .collect();
+        accels.sort_unstable();
+        let count = accels.len();
+        accels.dedup();
+        assert_eq!(accels.len(), count, "two commands share a default");
+    }
+
     #[tokio::test]
     async fn post_process_failure_leaves_no_pending_row() {
         let mut reg = EngineRegistry::default();
         reg.register_llm(Arc::new(NoopLlmEngine));
 
-        let textio = Arc::new(FakeTextIo {
-            selection: "bad text".into(),
-            replaced: Mutex::new(None),
-        });
+        let textio = Arc::new(FakeTextIo::with_selection("bad text"));
 
         let config_pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&config_pool).await.unwrap();

@@ -3,7 +3,10 @@
 mod commands;
 mod events;
 mod hotkeys;
+mod macfocus;
+mod nswindow;
 mod overlay;
+mod palette;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,7 +32,7 @@ use tauri::{Manager, Wry};
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
-use crate::commands::{feature_registry, ActiveMeetingSession, HotkeyRegStatus};
+use crate::commands::{feature_registry, ActiveMeetingSession, HotkeyRegStatus, PaletteSession};
 
 /// A download in flight: what the UI is waiting on, plus everything needed to
 /// stop it. Aborting drops the transfer mid-write, so the partial file has to
@@ -143,6 +146,28 @@ pub struct AppState {
     /// Bumped whenever the input preview starts or stops, so a 30s auto-stop
     /// timer can tell whether it is still about the preview it was armed for.
     pub preview_generation: AtomicU64,
+    /// The open prompt-palette session, or `None` when the palette is closed.
+    ///
+    /// It owns its own `BusyGuard`, which is why the slot exists at all: the
+    /// palette's busy window runs from open to dismissal, which is longer than
+    /// the hotkey handler that opened it, so the guard has to live somewhere
+    /// that outlives the handler future. Taking the session out of this slot
+    /// is what "the session is over" means everywhere — cancel, delivery and
+    /// the staleness check all go through it, so a cancel racing a finished
+    /// request cannot both win.
+    pub palette: Mutex<Option<PaletteSession>>,
+    /// Ids for palette sessions. Monotonic, so the stamp a request carries can
+    /// be compared against the live session after an await — the same trick
+    /// `dictation_run_counter` plays, for the same reason.
+    pub palette_counter: AtomicU64,
+    /// Serialises everything that fires a synthetic Cmd+C or Cmd+V at the
+    /// frontmost app: the rewrite shortcut, the palette and the screen-capture
+    /// shortcut.
+    ///
+    /// **One flag for all three, deliberately.** Two of these interleaved is a
+    /// corrupted document, not a race that can be lost gracefully: the second
+    /// one's ⌘C lands while the first one's ⌘V is still in flight.
+    pub selection_busy: Arc<AtomicBool>,
 }
 
 fn on_tray_menu_event(app: &tauri::AppHandle, e: tauri::menu::MenuEvent) {
@@ -195,6 +220,25 @@ fn main() {
                 // device and keeps the macOS orange indicator lit, which looks
                 // exactly like the app recording behind their back. Losing the
                 // window is as clear a signal to stop as the 30s timer.
+                // Clicking into another app closes the palette without
+                // inserting anything. It deliberately does NOT hand focus back
+                // to the app the palette came from — see
+                // `palette::PaletteEvent::restores_focus`.
+                tauri::WindowEvent::Focused(false) if window.label() == palette::LABEL => {
+                    let app = window.app_handle().clone();
+                    if let Some(state) = app.try_state::<Arc<AppState>>() {
+                        let state = state.inner().clone();
+                        let for_task = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            commands::close_palette_for(
+                                &state,
+                                &for_task,
+                                palette::PaletteEvent::Blur,
+                            )
+                            .await;
+                        });
+                    }
+                }
                 tauri::WindowEvent::Focused(false) if window.label() == "main" => {
                     let app = window.app_handle().clone();
                     if let Some(state) = app.try_state::<Arc<AppState>>() {
@@ -231,6 +275,7 @@ fn main() {
             commands::list_presets,
             commands::upsert_preset,
             commands::delete_preset,
+            commands::set_meeting_speaker_name,
             commands::list_app_profiles,
             commands::upsert_app_profile,
             commands::delete_app_profile,
@@ -307,6 +352,15 @@ fn main() {
             commands::delete_transcript,
             commands::render_transcript_subtitles,
             commands::export_transcript,
+            commands::open_palette,
+            commands::get_palette_session,
+            commands::palette_ready,
+            commands::run_palette,
+            commands::cancel_palette,
+            commands::list_palette_history,
+            commands::clear_palette_history,
+            commands::capture_screen_text,
+            commands::get_ocr_languages,
         ])
         .build(tauri::generate_context!())
         .expect("error while building KEA")
@@ -571,6 +625,9 @@ fn build_state(
         preroll_enabled: Arc::new(AtomicBool::new(true)),
         dictation_locked: AtomicBool::new(false),
         preview_generation: AtomicU64::new(0),
+        palette: Mutex::new(None),
+        palette_counter: AtomicU64::new(0),
+        selection_busy: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -763,6 +820,13 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
     // without the HUD.
     if let Err(e) = overlay::create(app.handle()) {
         tracing::warn!(error = %e, "failed to create the dictation overlay window");
+    }
+
+    // Same reasoning as the overlay, and it matters more here: the palette is
+    // opened from a keyboard shortcut while the user is mid-sentence in
+    // another app, so a page load on the open path would be felt every time.
+    if let Err(e) = palette::create(app.handle()) {
+        tracing::warn!(error = %e, "failed to create the prompt palette window");
     }
 
     install_tray(app)?;

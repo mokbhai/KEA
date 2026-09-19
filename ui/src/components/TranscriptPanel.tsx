@@ -1,5 +1,46 @@
 import { useEffect, useRef } from "react";
 
+/**
+ * A row of `meeting_speakers`. Declared here rather than in `api.ts` because
+ * the backend already sends it on `MeetingDetail` and the shared type has yet
+ * to catch up.
+ */
+export type MeetingSpeakerRow = {
+  meeting_id: string;
+  speaker_key: string;
+  display_name: string;
+  source: "channel" | "user";
+};
+
+/**
+ * Names for the two channels before anyone renames them.
+ *
+ * Mirrors `SpeakerChannel::display_name` in
+ * `crates/core/src/meetings/attribution.rs`; the backend labels the notes
+ * prompt, this labels the screen, and the two must agree.
+ */
+const DEFAULT_SPEAKER_NAMES: Record<string, string> = {
+  local: "You",
+  remote: "Others",
+};
+
+/**
+ * What to call the speaker of a segment, or `null` for "do not say".
+ *
+ * `mixed` is deliberately absent from the table above: it means attribution
+ * could not tell the sides apart, so the honest rendering is no chip at all
+ * rather than a third speaker named "Mixed" or a coin flip between the two.
+ */
+export function speakerDisplayName(
+  speakerKey: string | null | undefined,
+  speakers: MeetingSpeakerRow[] = [],
+): string | null {
+  if (!speakerKey) return null;
+  const named = speakers.find((s) => s.speaker_key === speakerKey);
+  if (named) return named.display_name;
+  return DEFAULT_SPEAKER_NAMES[speakerKey] ?? null;
+}
+
 export type TranscriptSegment = {
   meeting_id: string;
   sequence: number;

@@ -191,6 +191,68 @@ pub fn mix_frames(mic: &PcmFrame, system: &PcmFrame) -> PcmFrame {
     }
 }
 
+/// A meeting's two capture sources brought onto one timeline, plus the mixed
+/// signal built from them.
+///
+/// `mic`, `system` and `mixed` are the same length at the same rate, so one
+/// sample index cuts all three at the same instant. That is the whole point:
+/// the segment boundary is decided on `mixed` (everything that was said) and
+/// applied to the two halves, which is what lets speaker attribution compare
+/// them window for window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlignedSources {
+    pub mic: PcmFrame,
+    pub system: PcmFrame,
+    pub mixed: PcmFrame,
+}
+
+/// Bring the mic and system buffers onto one timeline.
+///
+/// The two are independent streams: the loopback capture opens a beat after
+/// the mic's, and either can miss a callback, so their buffers are never the
+/// same length. What they *do* share is the moment they are read — one poll
+/// drains both — so the last sample of each is "now".
+///
+/// So align at the tail, by padding the front of the shorter side with
+/// silence. Aligning at the head instead would bake the stream-open skew into
+/// every window of every segment for the rest of the meeting, and attribution
+/// compares the two sides window for window.
+///
+/// Silence is the honest padding: a source that was not yet capturing
+/// contributes nothing, and a window where both sides are silent is dropped
+/// from the vote rather than awarded to either.
+pub fn align_meeting_sources(mic: &PcmFrame, system: &PcmFrame) -> AlignedSources {
+    // The mic is the timeline. Its rate is the device's, and the segment
+    // offsets already stored against it are counted in its samples; resampling
+    // it to match the loopback device would move every boundary.
+    let rate = if mic.sample_rate_hz != 0 {
+        mic.sample_rate_hz
+    } else {
+        system.sample_rate_hz
+    };
+
+    let system_at_rate = if system.sample_rate_hz == rate {
+        system.samples.clone()
+    } else {
+        resample_linear(system, rate).samples
+    };
+
+    let len = mic.samples.len().max(system_at_rate.len());
+    let pad_front = |samples: &[f32]| -> PcmFrame {
+        let mut out = vec![0.0f32; len - samples.len()];
+        out.extend_from_slice(samples);
+        PcmFrame {
+            samples: out,
+            sample_rate_hz: rate,
+        }
+    };
+
+    let mic = pad_front(&mic.samples);
+    let system = pad_front(&system_at_rate);
+    let mixed = mix_frames(&mic, &system);
+    AlignedSources { mic, system, mixed }
+}
+
 /// Downmix interleaved `channels`-channel audio to mono, converting each sample
 /// with `to_f32` (identity for `f32` input, scaling for integer formats).
 ///
@@ -808,5 +870,97 @@ mod tests {
         let out = accumulate_frames(&frames);
         assert_eq!(out.samples, vec![0.1, 0.2, 0.3]);
         assert_eq!(out.sample_rate_hz, 16_000);
+    }
+
+    /// The loopback stream opens after the mic's, so its buffer is short. The
+    /// missing audio is at the *start* — padding it there is what keeps the
+    /// two sides describing the same instants.
+    #[test]
+    fn a_short_system_buffer_is_padded_at_the_front() {
+        let mic = PcmFrame {
+            samples: vec![0.1, 0.2, 0.3, 0.4],
+            sample_rate_hz: 16_000,
+        };
+        let system = PcmFrame {
+            samples: vec![0.5, 0.6],
+            sample_rate_hz: 16_000,
+        };
+        let aligned = align_meeting_sources(&mic, &system);
+        assert_eq!(aligned.mic.samples, vec![0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(aligned.system.samples, vec![0.0, 0.0, 0.5, 0.6]);
+        // Both tails land on the same index, so the mix is the average there.
+        assert_eq!(aligned.mixed.samples[3], (0.4 + 0.6) / 2.0);
+        assert_eq!(aligned.mixed.samples[0], 0.1 / 2.0);
+    }
+
+    #[test]
+    fn a_long_system_buffer_pads_the_mic_instead_of_dropping_audio() {
+        let mic = PcmFrame {
+            samples: vec![0.4],
+            sample_rate_hz: 16_000,
+        };
+        let system = PcmFrame {
+            samples: vec![0.1, 0.2, 0.3],
+            sample_rate_hz: 16_000,
+        };
+        let aligned = align_meeting_sources(&mic, &system);
+        assert_eq!(aligned.mic.samples, vec![0.0, 0.0, 0.4]);
+        assert_eq!(aligned.system.samples, vec![0.1, 0.2, 0.3]);
+        assert_eq!(aligned.mixed.samples.len(), 3);
+    }
+
+    /// The loopback device runs at its own rate; the mic's is the timeline,
+    /// because the stored segment offsets are counted in its samples.
+    #[test]
+    fn the_system_source_is_resampled_onto_the_mic_rate() {
+        let mic = PcmFrame {
+            samples: vec![0.0; 160],
+            sample_rate_hz: 16_000,
+        };
+        let system = PcmFrame {
+            samples: vec![0.5; 480],
+            sample_rate_hz: 48_000,
+        };
+        let aligned = align_meeting_sources(&mic, &system);
+        assert_eq!(aligned.mic.sample_rate_hz, 16_000);
+        assert_eq!(aligned.system.sample_rate_hz, 16_000);
+        assert_eq!(aligned.mixed.sample_rate_hz, 16_000);
+        assert_eq!(aligned.system.samples.len(), 160);
+        assert_eq!(aligned.mic.samples.len(), 160);
+    }
+
+    /// Mic-only: nothing to align against, and the mix must not be halved.
+    #[test]
+    fn an_absent_system_source_leaves_the_mic_alone() {
+        let mic = PcmFrame {
+            samples: vec![0.2, 0.4],
+            sample_rate_hz: 16_000,
+        };
+        let empty = PcmFrame {
+            samples: vec![],
+            sample_rate_hz: 0,
+        };
+        let aligned = align_meeting_sources(&mic, &empty);
+        assert_eq!(aligned.mic.samples, vec![0.2, 0.4]);
+        assert_eq!(aligned.system.samples, vec![0.0, 0.0]);
+        assert_eq!(aligned.mixed.sample_rate_hz, 16_000);
+    }
+
+    /// Before the first mic callback there is no timeline yet; the system
+    /// source supplies the rate rather than the frame inheriting a rate of 0.
+    #[test]
+    fn the_system_rate_is_used_when_the_mic_has_not_produced_a_frame_yet() {
+        let empty = PcmFrame {
+            samples: vec![],
+            sample_rate_hz: 0,
+        };
+        let system = PcmFrame {
+            samples: vec![0.1, 0.2],
+            sample_rate_hz: 48_000,
+        };
+        let aligned = align_meeting_sources(&empty, &system);
+        assert_eq!(aligned.mic.sample_rate_hz, 48_000);
+        assert_eq!(aligned.mic.samples, vec![0.0, 0.0]);
+        assert_eq!(aligned.system.samples, vec![0.1, 0.2]);
     }
 }

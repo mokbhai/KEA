@@ -20,23 +20,30 @@ use tokio::sync::mpsc;
 
 use crate::commands::trigger_tts_inner;
 use crate::commands::{
-    apply_dictation_settings, dictation_gate, dictation_hotkey_action, execute_rewrite,
-    hold_dictation_action, lock_cancel_action, meeting_hotkey_action, record_hotkey_reg_status,
-    register_hotkey, resolve_accelerator, run_dictation_action, start_meeting_inner,
-    stop_meeting_inner, try_acquire_busy, HotkeyAction, MeetingHotkeyAction, DICTATION_ACTION_ID,
-    HOTKEY_ACTIONS, LOCK_CANCEL_ACTION_ID, MEETINGS_ACTION_ID, REWRITE_ACTION_ID, TTS_ACTION_ID,
+    apply_dictation_settings, capture_screen_text_inner, close_palette_for, dictation_gate,
+    dictation_hotkey_action, execute_rewrite, hold_dictation_action, lock_cancel_action,
+    meeting_hotkey_action, notify_palette, open_palette_session, palette_is_open,
+    record_hotkey_reg_status, register_hotkey, resolve_accelerator, run_dictation_action,
+    start_meeting_inner, stop_meeting_inner, try_acquire_busy, BusyGuard, HotkeyAction,
+    MeetingHotkeyAction, DICTATION_ACTION_ID, HOTKEY_ACTIONS, LOCK_CANCEL_ACTION_ID,
+    MEETINGS_ACTION_ID, OCR_ACTION_ID, PALETTE_ACTION_ID, REWRITE_ACTION_ID, TTS_ACTION_ID,
 };
 use crate::commands::{capture_app_context_now, profile_for, rewrite_input_for_profile};
 use crate::events::{
     emit_meeting_error, emit_rewrite_error, emit_rewrite_progress, emit_tts_error,
 };
+use crate::palette::{PaletteEvent, PaletteOrigin};
 use crate::AppState;
 use kea_features::ProfileOverrides;
 
 /// What one hotkey press runs. Boxed because the handlers are `async fn` bodies
 /// of different shapes held in one table.
 type HandlerFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
-type Handler = for<'a> fn(&'a Arc<AppState>, &'a AppHandle) -> HandlerFuture<'a>;
+/// The press's [`BusyGuard`] is passed **by value**, not held by the dispatch
+/// loop: most handlers bind it and let it drop when they return, but the
+/// palette moves it into its session, because its busy window runs from open
+/// to dismissal rather than for the length of its open handler.
+type Handler = for<'a> fn(&'a Arc<AppState>, &'a AppHandle, BusyGuard) -> HandlerFuture<'a>;
 
 /// One dispatchable hotkey: the [`HOTKEY_ACTIONS`] row, the flag that keeps a
 /// second press out while the first is still running, and the handler.
@@ -48,31 +55,39 @@ struct Dispatch {
 
 /// The handler for an action id, or `None` when the action has no dispatch arm.
 ///
-/// The four handlers are not interchangeable: dictation gates on the meeting
-/// and in-flight state before choosing start/stop/ignore, and meetings reads
-/// its own recording/processing pair. Only the busy-flag plumbing is shared.
+/// The handlers are not interchangeable: dictation gates on the meeting and
+/// in-flight state before choosing start/stop/ignore, meetings reads its own
+/// recording/processing pair, and the palette pair keep the press's guard
+/// instead of letting it drop. Only the busy-flag plumbing is shared.
 fn handler_for(action_id: &str) -> Option<Handler> {
     match action_id {
         REWRITE_ACTION_ID => Some(handle_rewrite),
         DICTATION_ACTION_ID => Some(handle_dictation),
         TTS_ACTION_ID => Some(handle_tts),
         MEETINGS_ACTION_ID => Some(handle_meetings),
+        PALETTE_ACTION_ID => Some(handle_palette),
+        OCR_ACTION_ID => Some(handle_ocr_capture),
         _ => None,
     }
 }
 
 /// The busy flag an action serialises on.
 ///
-/// Every feature gets its own, so presses queued during a long handler are
-/// dropped rather than replaying as fresh starts. Dictation's lives on the
-/// state instead of being minted here: hold-to-talk drives the same handlers
-/// from its own task, and a chord and a Cmd+Shift+D arriving together must
-/// contend for one flag, not one each.
+/// An action with no shared state gets its own, so presses queued during a
+/// long handler are dropped rather than replaying as fresh starts. The two
+/// shared flags live on the state instead of being minted here, and for the
+/// same reason in both cases — more than one trigger reaches the same
+/// mutually-exclusive machinery.
 fn busy_flag(action_id: &str, state: &Arc<AppState>) -> Arc<AtomicBool> {
-    if action_id == DICTATION_ACTION_ID {
-        state.dictation_busy.clone()
-    } else {
-        Arc::new(AtomicBool::new(false))
+    match action_id {
+        DICTATION_ACTION_ID => state.dictation_busy.clone(),
+        // The second instance of the same rule, and the sharper one: the
+        // rewrite shortcut, the palette and the screen-capture shortcut all
+        // fire a synthetic Cmd+C or Cmd+V at the same app, and two of those
+        // interleaved is a corrupted document rather than a race that can be
+        // lost gracefully. One flag for all three.
+        REWRITE_ACTION_ID | PALETTE_ACTION_ID | OCR_ACTION_ID => state.selection_busy.clone(),
+        _ => Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -156,6 +171,23 @@ pub fn spawn_dispatch_loop(state: Arc<AppState>, app: AppHandle, mut rx: mpsc::R
                 continue;
             }
 
+            // The palette shortcut toggles, and the toggle has to be decided
+            // *before* the busy gate: an open palette holds the shared
+            // selection flag for as long as it is up, so the ordinary gate
+            // would drop this press rather than act on it — and the user would
+            // be left with no way to close the palette from the keyboard they
+            // opened it with. Same shape as the Escape case above, and for the
+            // same reason: the rule is about this one action, not about the
+            // table.
+            if action_id == PALETTE_ACTION_ID && palette_is_open(&state) {
+                let state = state.clone();
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    close_palette_for(&state, &app, PaletteEvent::Hotkey).await;
+                });
+                continue;
+            }
+
             let Some(entry) = table.iter().find(|e| e.action.action_id == action_id) else {
                 continue;
             };
@@ -170,8 +202,7 @@ pub fn spawn_dispatch_loop(state: Arc<AppState>, app: AppHandle, mut rx: mpsc::R
             let app = app.clone();
             let handle = entry.handle;
             tauri::async_runtime::spawn(async move {
-                let _busy = guard;
-                handle(&state, &app).await;
+                handle(&state, &app, guard).await;
             });
         }
     });
@@ -203,8 +234,13 @@ pub fn spawn_saved_dictation_settings(
     });
 }
 
-fn handle_rewrite<'a>(state: &'a Arc<AppState>, app: &'a AppHandle) -> HandlerFuture<'a> {
+fn handle_rewrite<'a>(
+    state: &'a Arc<AppState>,
+    app: &'a AppHandle,
+    busy: BusyGuard,
+) -> HandlerFuture<'a> {
     Box::pin(async move {
+        let _busy = busy;
         emit_rewrite_progress(app, "Capturing selection...");
         // Probed FIRST, before anything that could change which app is
         // frontmost. By the time the rewrite returns the user may well have
@@ -225,24 +261,39 @@ fn handle_rewrite<'a>(state: &'a Arc<AppState>, app: &'a AppHandle) -> HandlerFu
     })
 }
 
-fn handle_dictation<'a>(state: &'a Arc<AppState>, app: &'a AppHandle) -> HandlerFuture<'a> {
+fn handle_dictation<'a>(
+    state: &'a Arc<AppState>,
+    app: &'a AppHandle,
+    busy: BusyGuard,
+) -> HandlerFuture<'a> {
     Box::pin(async move {
+        let _busy = busy;
         let (meeting_active, in_flight, current) = dictation_gate(state).await;
         let action = dictation_hotkey_action(current, meeting_active, in_flight);
         run_dictation_action(action, state, app).await;
     })
 }
 
-fn handle_tts<'a>(state: &'a Arc<AppState>, app: &'a AppHandle) -> HandlerFuture<'a> {
+fn handle_tts<'a>(
+    state: &'a Arc<AppState>,
+    app: &'a AppHandle,
+    busy: BusyGuard,
+) -> HandlerFuture<'a> {
     Box::pin(async move {
+        let _busy = busy;
         if let Err(error) = trigger_tts_inner(state, app).await {
             emit_tts_error(app, &error);
         }
     })
 }
 
-fn handle_meetings<'a>(state: &'a Arc<AppState>, app: &'a AppHandle) -> HandlerFuture<'a> {
+fn handle_meetings<'a>(
+    state: &'a Arc<AppState>,
+    app: &'a AppHandle,
+    busy: BusyGuard,
+) -> HandlerFuture<'a> {
     Box::pin(async move {
+        let _busy = busy;
         let recording = {
             state
                 .active_meeting
@@ -265,6 +316,38 @@ fn handle_meetings<'a>(state: &'a Arc<AppState>, app: &'a AppHandle) -> HandlerF
                     emit_meeting_error(app, &error);
                 }
             }
+        }
+    })
+}
+
+/// Opens the palette. **The guard is moved into the session**, not dropped
+/// when this future returns: the shortcut stays locked out until the palette
+/// closes, which is the whole point of sharing one flag with rewrite.
+fn handle_palette<'a>(
+    state: &'a Arc<AppState>,
+    app: &'a AppHandle,
+    busy: BusyGuard,
+) -> HandlerFuture<'a> {
+    Box::pin(async move {
+        open_palette_session(state, app, PaletteOrigin::Selection, None, busy).await;
+    })
+}
+
+/// Region capture → OCR → the palette, prefilled. Also moves its guard: the
+/// region selector is open for as long as the user takes, and a rewrite fired
+/// during it would paste into whatever is behind the crosshair.
+fn handle_ocr_capture<'a>(
+    state: &'a Arc<AppState>,
+    app: &'a AppHandle,
+    busy: BusyGuard,
+) -> HandlerFuture<'a> {
+    Box::pin(async move {
+        // A notification rather than `emit_rewrite_error`: the shortcut is
+        // pressed from someone else's app, so the settings window — where that
+        // banner lives — is very likely closed, and a capture that could not
+        // start is not something to discover later in the log.
+        if let Err(error) = capture_screen_text_inner(state, app, busy).await {
+            notify_palette(app, &error);
         }
     })
 }

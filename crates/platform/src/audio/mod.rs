@@ -21,8 +21,9 @@ pub mod util;
 pub use cues::{cue_pcm, Cue};
 pub use decode::{decode_file, is_probably_decodable, DecodeError, DECODE_SAMPLE_RATE_HZ};
 pub use util::{
-    accumulate_frames, choose_input_device, chunk_pcm_by_duration, cut_points, downmix_to_mono,
-    mix_frames, resample_linear, rms_level, DeviceChoice, FrameCounters, RingBuffer,
+    accumulate_frames, align_meeting_sources, choose_input_device, chunk_pcm_by_duration,
+    cut_points, downmix_to_mono, mix_frames, resample_linear, rms_level, AlignedSources,
+    DeviceChoice, FrameCounters, RingBuffer,
 };
 
 /// Mono PCM samples at a specific sample rate (alias: capture buffer unit).
@@ -40,8 +41,19 @@ pub type PcmBuffer = PcmFrame;
 /// asked to transcribe silence tend to invent text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpeechSegment {
+    /// The mixed signal — everything that was said. This is what STT hears,
+    /// and what the cut point was decided on.
     pub pcm: PcmFrame,
     pub has_speech: bool,
+    /// The two halves of `pcm`, cut at the same sample index and therefore
+    /// comparable window for window — what speaker attribution needs.
+    ///
+    /// Both are `None` when the meeting had no system source. That is not a
+    /// degraded `Local`: with one source there is nothing to compare, so the
+    /// caller decides from the capture mode rather than inventing a second
+    /// speaker from a channel that was never recorded.
+    pub mic: Option<PcmFrame>,
+    pub system: Option<PcmFrame>,
 }
 
 /// An input device the user can record from.
@@ -128,6 +140,12 @@ pub trait AudioIo: Send + Sync {
 
     /// Begin meeting capture (mic + system when available). `prefer_system_audio` controls
     /// whether system/loopback capture is attempted when the platform supports it.
+    ///
+    /// The returned receiver carries the *mic* frames only. System audio is
+    /// buffered beside them and mixed at drain time — mixing per callback is
+    /// what dropped and duplicated system frames — so the mixed signal is
+    /// available from [`try_drain_meeting_segment`](Self::try_drain_meeting_segment)
+    /// and [`drain_meeting_sources`](Self::drain_meeting_sources), not here.
     async fn start_meeting(
         &mut self,
         prefer_system_audio: bool,
@@ -146,11 +164,22 @@ pub trait AudioIo: Send + Sync {
         ))
     }
 
-    /// Drain frames accumulated since last drain (for live segmented transcription).
-    async fn drain_meeting_buffer(&mut self) -> Result<PcmFrame, AudioIoError> {
-        Ok(PcmFrame {
-            samples: vec![],
-            sample_rate_hz: 16_000,
+    /// Take everything buffered since the last drain — the meeting's tail,
+    /// after the last cut point — as the mixed signal plus its two halves.
+    ///
+    /// Returns a [`SpeechSegment`] rather than a bare frame so the final
+    /// segment of a meeting can be attributed to a speaker like every other
+    /// one; `has_speech` is always true here because the tail is taken on
+    /// stop, not at a detected pause.
+    async fn drain_meeting_sources(&mut self) -> Result<SpeechSegment, AudioIoError> {
+        Ok(SpeechSegment {
+            pcm: PcmFrame {
+                samples: vec![],
+                sample_rate_hz: 16_000,
+            },
+            has_speech: true,
+            mic: None,
+            system: None,
         })
     }
 
@@ -355,11 +384,16 @@ mod audio_trait_tests {
             Ok(self.buffered.clone())
         }
 
-        async fn drain_meeting_buffer(&mut self) -> Result<PcmFrame, AudioIoError> {
-            Ok(self.pending_drains.pop().unwrap_or(PcmFrame {
-                samples: vec![],
-                sample_rate_hz: 16_000,
-            }))
+        async fn drain_meeting_sources(&mut self) -> Result<SpeechSegment, AudioIoError> {
+            Ok(SpeechSegment {
+                pcm: self.pending_drains.pop().unwrap_or(PcmFrame {
+                    samples: vec![],
+                    sample_rate_hz: 16_000,
+                }),
+                has_speech: true,
+                mic: None,
+                system: None,
+            })
         }
     }
 
@@ -380,8 +414,8 @@ mod audio_trait_tests {
         };
         let _rx = io.start_meeting(false).await.unwrap();
         assert_eq!(io.meeting_state(), MeetingState::Recording);
-        let chunk = io.drain_meeting_buffer().await.unwrap();
-        assert_eq!(chunk.samples.len(), 1600);
+        let chunk = io.drain_meeting_sources().await.unwrap();
+        assert_eq!(chunk.pcm.samples.len(), 1600);
     }
 
     #[tokio::test]
@@ -400,8 +434,8 @@ mod audio_trait_tests {
         assert_eq!(io.meeting_state(), MeetingState::Idle);
         assert!(io.start_meeting(true).await.is_err());
         assert!(io.stop_meeting().await.is_err());
-        let drained = io.drain_meeting_buffer().await.unwrap();
-        assert!(drained.samples.is_empty());
+        let drained = io.drain_meeting_sources().await.unwrap();
+        assert!(drained.pcm.samples.is_empty());
     }
 
     struct FakePlayAudioIo {

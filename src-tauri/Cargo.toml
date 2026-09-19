@@ -64,5 +64,10 @@ sqlx.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
+# The palette's "copy the answer" delivery. Already the clipboard crate on the
+# paste path inside kea-platform; `TextIo` has no "just copy this" method, so
+# the one place that needs one reaches for the same crate rather than inventing
+# a second clipboard abstraction. See `commands::copy_to_clipboard`.
+arboard.workspace = true
 futures-util.workspace = true
 sha2.workspace = true

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use crate::error::KeaError;
+use crate::meetings::SpeakerChannel;
 
 /// Where a meeting stands, as persisted in `meetings.status`.
 ///
@@ -84,6 +85,48 @@ impl TryFrom<String> for CaptureMode {
     }
 }
 
+/// Who chose a speaker's display name, as persisted in
+/// `meeting_speakers.source`. See [`MeetingStatus`] for why it is an enum.
+///
+/// The distinction is load-bearing rather than informational: a name a human
+/// typed must survive anything attribution decides afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerSource {
+    /// The default this feature wrote when the meeting started.
+    Channel,
+    /// A name the user typed.
+    User,
+}
+
+impl SpeakerSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SpeakerSource::Channel => "channel",
+            SpeakerSource::User => "user",
+        }
+    }
+
+    // Not `FromStr`: the caller wants an `Option`, not a `Result`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "channel" => Some(SpeakerSource::Channel),
+            "user" => Some(SpeakerSource::User),
+            _ => None,
+        }
+    }
+}
+
+impl TryFrom<String> for SpeakerSource {
+    type Error = KeaError;
+
+    fn try_from(s: String) -> Result<Self, KeaError> {
+        SpeakerSource::from_str(&s)
+            .ok_or_else(|| KeaError::Other(format!("unknown speaker source {s:?}")))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Meeting {
     pub id: String,
@@ -107,6 +150,24 @@ pub struct MeetingSegment {
     pub start_offset_ms: i64,
     pub end_offset_ms: i64,
     pub text: String,
+    /// Which speaker said this, joined to [`MeetingSpeaker::speaker_key`].
+    ///
+    /// A plain `String` rather than [`SpeakerChannel`] because the column is
+    /// deliberately an open set: channel attribution writes `local`/`remote`
+    /// today, and model diarization will write `spk0`, `spk1`, … into the same
+    /// column. `None` is "unknown", which is every row written before
+    /// attribution existed.
+    pub speaker_key: Option<String>,
+}
+
+/// One side of a meeting, and what to call it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct MeetingSpeaker {
+    pub meeting_id: String,
+    pub speaker_key: String,
+    pub display_name: String,
+    #[sqlx(try_from = "String")]
+    pub source: SpeakerSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
@@ -127,6 +188,9 @@ pub struct MeetingDetail {
     pub meeting: Meeting,
     pub segments: Vec<MeetingSegment>,
     pub notes: Option<MeetingNotes>,
+    /// The meeting's speakers, ordered by key. Empty for meetings recorded
+    /// before attribution existed.
+    pub speakers: Vec<MeetingSpeaker>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +208,9 @@ pub struct NewSegment {
     pub start_offset_ms: i64,
     pub end_offset_ms: i64,
     pub text: String,
+    /// `None` when the sources could not be told apart — an honest "unknown",
+    /// never a default side.
+    pub speaker: Option<SpeakerChannel>,
 }
 
 pub struct MeetingRepo {
@@ -199,12 +266,14 @@ impl MeetingRepo {
         };
 
         let segments = sqlx::query_as::<_, MeetingSegment>(
-            "SELECT id, meeting_id, sequence, start_offset_ms, end_offset_ms, text
+            "SELECT id, meeting_id, sequence, start_offset_ms, end_offset_ms, text, speaker_key
              FROM meeting_segments WHERE meeting_id = ? ORDER BY sequence ASC",
         )
         .bind(id)
         .fetch_all(&self.pool)
         .await?;
+
+        let speakers = self.speakers(id).await?;
 
         let notes = sqlx::query_as::<_, MeetingNotes>(
             "SELECT meeting_id, summary, decisions, action_items, follow_ups, open_questions,
@@ -219,7 +288,69 @@ impl MeetingRepo {
             meeting,
             segments,
             notes,
+            speakers,
         }))
+    }
+
+    pub async fn speakers(&self, meeting_id: &str) -> Result<Vec<MeetingSpeaker>, KeaError> {
+        let rows = sqlx::query_as::<_, MeetingSpeaker>(
+            "SELECT meeting_id, speaker_key, display_name, source
+             FROM meeting_speakers WHERE meeting_id = ? ORDER BY speaker_key ASC",
+        )
+        .bind(meeting_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Record the default name for one side of a meeting, leaving any existing
+    /// row alone.
+    ///
+    /// `DO NOTHING` rather than an upsert: this runs when a meeting starts, and
+    /// a meeting restarted or re-attributed must not clobber a name the user
+    /// has since typed.
+    pub async fn ensure_speaker(
+        &self,
+        meeting_id: &str,
+        channel: SpeakerChannel,
+        display_name: &str,
+    ) -> Result<(), KeaError> {
+        sqlx::query(
+            "INSERT INTO meeting_speakers(meeting_id, speaker_key, display_name, source)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(meeting_id, speaker_key) DO NOTHING",
+        )
+        .bind(meeting_id)
+        .bind(channel.as_str())
+        .bind(display_name)
+        .bind(SpeakerSource::Channel.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Rename one side of a meeting. Always wins over the default, and marks
+    /// the row `user` so nothing written by attribution overwrites it later.
+    pub async fn set_speaker_name(
+        &self,
+        meeting_id: &str,
+        speaker_key: &str,
+        display_name: &str,
+    ) -> Result<(), KeaError> {
+        sqlx::query(
+            "INSERT INTO meeting_speakers(meeting_id, speaker_key, display_name, source)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(meeting_id, speaker_key) DO UPDATE SET
+                 display_name = excluded.display_name,
+                 source = excluded.source",
+        )
+        .bind(meeting_id)
+        .bind(speaker_key)
+        .bind(display_name)
+        .bind(SpeakerSource::User.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn append_segment(
@@ -229,14 +360,15 @@ impl MeetingRepo {
     ) -> Result<i64, KeaError> {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO meeting_segments(
-                meeting_id, sequence, start_offset_ms, end_offset_ms, text
-            ) VALUES (?, ?, ?, ?, ?) RETURNING id",
+                meeting_id, sequence, start_offset_ms, end_offset_ms, text, speaker_key
+            ) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(meeting_id)
         .bind(seg.sequence)
         .bind(seg.start_offset_ms)
         .bind(seg.end_offset_ms)
         .bind(&seg.text)
+        .bind(seg.speaker.map(|c| c.as_str()))
         .fetch_one(&self.pool)
         .await?;
         Ok(id)
@@ -366,6 +498,7 @@ mod tests {
                     start_offset_ms: 0,
                     end_offset_ms: 30_000,
                     text: "Hello everyone".into(),
+                    speaker: Some(SpeakerChannel::Local),
                 },
             )
             .await
@@ -464,5 +597,137 @@ mod tests {
 
         repo.delete("m2").await.unwrap();
         assert!(repo.get("m2").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_segments_speaker_key_survives_the_roundtrip() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&pool).await.unwrap();
+        let repo = MeetingRepo::new(pool);
+        repo.create(&NewMeeting {
+            id: "m3".into(),
+            title: "Sync".into(),
+            capture_mode: CaptureMode::MicAndSystem,
+            stt_engine_id: None,
+            llm_engine_id: None,
+        })
+        .await
+        .unwrap();
+
+        for (sequence, speaker) in [
+            (0, Some(SpeakerChannel::Local)),
+            (1, Some(SpeakerChannel::Remote)),
+            // Ambiguous, and stored as such rather than forced onto a side.
+            (2, Some(SpeakerChannel::Mixed)),
+            (3, None),
+        ] {
+            repo.append_segment(
+                "m3",
+                &NewSegment {
+                    sequence,
+                    start_offset_ms: sequence as i64 * 1000,
+                    end_offset_ms: sequence as i64 * 1000 + 1000,
+                    text: format!("line {sequence}"),
+                    speaker,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let detail = repo.get("m3").await.unwrap().unwrap();
+        let keys: Vec<Option<&str>> = detail
+            .segments
+            .iter()
+            .map(|s| s.speaker_key.as_deref())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![Some("local"), Some("remote"), Some("mixed"), None]
+        );
+    }
+
+    /// A name the user typed must survive attribution seeding the defaults
+    /// again — that is the whole reason `source` is stored.
+    #[tokio::test]
+    async fn a_user_named_speaker_is_not_overwritten_by_the_default() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&pool).await.unwrap();
+        let repo = MeetingRepo::new(pool);
+        repo.create(&NewMeeting {
+            id: "m4".into(),
+            title: "Sync".into(),
+            capture_mode: CaptureMode::MicAndSystem,
+            stt_engine_id: None,
+            llm_engine_id: None,
+        })
+        .await
+        .unwrap();
+
+        repo.ensure_speaker("m4", SpeakerChannel::Local, "You")
+            .await
+            .unwrap();
+        repo.ensure_speaker("m4", SpeakerChannel::Remote, "Others")
+            .await
+            .unwrap();
+        repo.set_speaker_name("m4", "remote", "Priya")
+            .await
+            .unwrap();
+        repo.ensure_speaker("m4", SpeakerChannel::Remote, "Others")
+            .await
+            .unwrap();
+
+        let speakers = repo.speakers("m4").await.unwrap();
+        assert_eq!(speakers.len(), 2);
+        assert_eq!(speakers[0].speaker_key, "local");
+        assert_eq!(speakers[0].display_name, "You");
+        assert_eq!(speakers[0].source, SpeakerSource::Channel);
+        assert_eq!(speakers[1].display_name, "Priya");
+        assert_eq!(speakers[1].source, SpeakerSource::User);
+
+        let detail = repo.get("m4").await.unwrap().unwrap();
+        assert_eq!(detail.speakers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_meeting_takes_its_speakers_with_it() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&pool).await.unwrap();
+        let repo = MeetingRepo::new(pool.clone());
+        repo.create(&NewMeeting {
+            id: "m5".into(),
+            title: "Sync".into(),
+            capture_mode: CaptureMode::MicAndSystem,
+            stt_engine_id: None,
+            llm_engine_id: None,
+        })
+        .await
+        .unwrap();
+        repo.ensure_speaker("m5", SpeakerChannel::Local, "You")
+            .await
+            .unwrap();
+        repo.delete("m5").await.unwrap();
+
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meeting_speakers")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn speaker_source_keeps_its_stored_spelling() {
+        for (source, text) in [
+            (SpeakerSource::Channel, "channel"),
+            (SpeakerSource::User, "user"),
+        ] {
+            assert_eq!(source.as_str(), text);
+            assert_eq!(SpeakerSource::from_str(text), Some(source));
+            assert_eq!(
+                serde_json::to_string(&source).unwrap(),
+                format!("\"{text}\"")
+            );
+        }
+        assert_eq!(SpeakerSource::from_str("robot"), None);
     }
 }

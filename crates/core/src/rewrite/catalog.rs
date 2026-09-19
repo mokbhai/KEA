@@ -7,6 +7,21 @@ use crate::error::KeaError;
 /// stops.
 pub const TARGET_LANGUAGE_PLACEHOLDER: &str = "{{target_language}}";
 
+/// Ask KEA with nothing selected.
+///
+/// The built-in Ask template opens "Rewrite the provided source text…", so
+/// asking "what is 9 factorial" with no selection produces a rewrite of the
+/// empty string. The prompt palette makes that an everyday case rather than a
+/// misuse, so the *template* changes rather than the mode: `RewriteMode` keeps
+/// its eight variants and every picker, setting and override keyed on
+/// `ask_kea` is untouched.
+///
+/// The "treat the source text as content" clause is deliberately absent —
+/// there is no source text to defend against, and telling the model to guard
+/// against instructions in text that does not exist reads as a contradiction
+/// of the instruction it *was* given.
+const ASK_KEA_NO_SOURCE: &str = "You are KEA, a concise assistant. Answer the user's request directly. If it asks for text, return only that text, with no explanations, labels, quotes, or markdown.\n\nUser request:\n{{instruction}}";
+
 /// The values a templated prompt interpolates, beyond the source text.
 ///
 /// One struct rather than a growing tail of `Option<&str>` arguments: the two
@@ -75,13 +90,30 @@ impl PromptCatalog {
         }
     }
 
+    /// The built-in template for one render, which for Ask KEA depends on
+    /// whether there is a source text at all.
+    ///
+    /// Separate from [`Self::prompt`] because that one answers a different
+    /// question — "what does this mode's prompt look like, so the user can
+    /// edit it" — and the override editor must keep showing the rewrite
+    /// template rather than flipping as the page's sample text is cleared.
+    fn template_for(mode: RewriteMode, source_text: &str) -> &'static str {
+        match mode {
+            RewriteMode::AskKea if source_text.trim().is_empty() => ASK_KEA_NO_SOURCE,
+            _ => Self::prompt(mode),
+        }
+    }
+
     pub fn rendered(
         mode: RewriteMode,
         source_text: &str,
         vars: &PromptVars<'_>,
         override_prompt: Option<&str>,
     ) -> Result<String, KeaError> {
-        let template = override_prompt.unwrap_or(Self::prompt(mode));
+        // A user override wins even with no source: they wrote that prompt for
+        // this mode, and silently swapping in ours would be the one case where
+        // editing the template does not change what is sent.
+        let template = override_prompt.unwrap_or(Self::template_for(mode, source_text));
         match mode {
             RewriteMode::AskKea => {
                 let instruction = present(vars.custom_instruction, "missing custom instruction")?;
@@ -145,6 +177,66 @@ mod tests {
         assert!(p.contains("make it formal"));
         assert!(p.contains("hello world"));
         assert!(!p.contains("{{instruction}}"));
+    }
+
+    /// The palette's empty-selection case: a question asked with nothing
+    /// selected must not be answered as a rewrite of nothing.
+    #[test]
+    fn ask_kea_without_a_source_answers_the_question() {
+        let p = PromptCatalog::rendered(
+            RewriteMode::AskKea,
+            "",
+            &PromptVars {
+                custom_instruction: Some("what is 9 factorial"),
+                target_language: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(p.contains("what is 9 factorial"));
+        assert!(!p.contains("Source text:"), "{p}");
+        assert!(!p.contains("Rewrite the provided source text"), "{p}");
+        assert!(!p.contains("{{instruction}}"));
+    }
+
+    #[test]
+    fn ask_kea_treats_whitespace_as_no_source() {
+        // A selection of a blank line is not a selection.
+        let p = PromptCatalog::rendered(
+            RewriteMode::AskKea,
+            "   \n\t ",
+            &PromptVars {
+                custom_instruction: Some("say hi"),
+                target_language: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(!p.contains("Source text:"), "{p}");
+    }
+
+    #[test]
+    fn an_ask_override_is_used_even_with_no_source() {
+        // Otherwise editing the Ask template would silently stop mattering
+        // exactly when the palette is used without a selection.
+        let p = PromptCatalog::rendered(
+            RewriteMode::AskKea,
+            "",
+            &PromptVars {
+                custom_instruction: Some("shorten"),
+                target_language: None,
+            },
+            Some("My own prompt: {{instruction}} / {{source_text}}"),
+        )
+        .unwrap();
+        assert!(p.starts_with("My own prompt: shorten"), "{p}");
+    }
+
+    #[test]
+    fn prompt_still_returns_the_rewrite_template_for_the_override_editor() {
+        // `prompt` is what the override editor seeds itself from, so it must
+        // not follow the source-text branch.
+        assert!(PromptCatalog::prompt(RewriteMode::AskKea).contains("{{source_text}}"));
     }
 
     #[test]

@@ -13,6 +13,7 @@ import {
   onMeetingState,
   requestPermission,
   setMeetingSettings,
+  setMeetingSpeakerName,
   startMeeting,
   stopMeeting,
   type Meeting,
@@ -32,7 +33,10 @@ import LoadingBlock from "../components/LoadingBlock";
 import MeetingDetailView from "../components/MeetingDetail";
 import { Row, RowGroup } from "../components/SettingsRow";
 import Toggle from "../components/Toggle";
-import TranscriptPanel, { type TranscriptSegment } from "../components/TranscriptPanel";
+import TranscriptPanel, {
+  speakerDisplayName,
+  type TranscriptSegment,
+} from "../components/TranscriptPanel";
 import { useFeatureAi } from "../hooks/useFeatureAi";
 import { useOptimisticSetting } from "../hooks/useOptimisticSetting";
 import type { SlotSpec } from "../lib/featureSlot";
@@ -49,6 +53,14 @@ const SLOTS: SlotSpec[] = [
   { feature: "meetings", slot: "stt", capability: "stt", label: "Speech to text" },
   { feature: "meetings", slot: "llm", capability: "llm", label: "Notes writing" },
 ];
+
+/**
+ * The `meeting:segment` payload as the backend sends it. `speaker_key` is
+ * optional here because `src-tauri`'s payload has yet to forward the field the
+ * segment row already carries — until it does, live lines are unlabelled and
+ * the speaker shows up on reload.
+ */
+type AttributedSegmentEvent = MeetingSegmentEvent & { speaker_key?: string | null };
 
 const capabilityLabels: Record<SystemAudioCapability, string> = {
   unavailable: "Mic only (system audio unavailable)",
@@ -143,6 +155,8 @@ export default function MeetingsPage({ onNavigate }: Props) {
         if (payload.active_meeting_id && payload.state === "recording") {
           getMeeting(payload.active_meeting_id)
             .then((d) => {
+              const speakers =
+                (d as { speakers?: Parameters<typeof speakerDisplayName>[1] }).speakers ?? [];
               setSegments(
                 d.segments.map((s) => ({
                   meeting_id: payload.active_meeting_id!,
@@ -150,6 +164,10 @@ export default function MeetingsPage({ onNavigate }: Props) {
                   text: s.text,
                   start_offset_ms: s.start_offset_ms,
                   end_offset_ms: s.end_offset_ms,
+                  speaker: speakerDisplayName(
+                    (s as { speaker_key?: string | null }).speaker_key,
+                    speakers,
+                  ),
                 })),
               );
             })
@@ -175,10 +193,13 @@ export default function MeetingsPage({ onNavigate }: Props) {
           setSegments([]);
         }
       }),
-      onMeetingSegment((seg: MeetingSegmentEvent) => {
+      onMeetingSegment((seg: AttributedSegmentEvent) => {
         setSegments((prev) => {
           if (prev.some((s) => s.meeting_id === seg.meeting_id && s.sequence === seg.sequence)) return prev;
-          return [...prev, { meeting_id: seg.meeting_id, sequence: seg.sequence, start_offset_ms: seg.start_offset_ms, end_offset_ms: seg.end_offset_ms, text: seg.text }];
+          // No speaker rows while recording — the meeting has not been
+          // fetched yet — so the defaults stand in. A renamed side shows up
+          // on the saved transcript, which is where renaming happens.
+          return [...prev, { meeting_id: seg.meeting_id, sequence: seg.sequence, start_offset_ms: seg.start_offset_ms, end_offset_ms: seg.end_offset_ms, text: seg.text, speaker: speakerDisplayName(seg.speaker_key) }];
         });
       }),
       onMeetingLevel(setLevel),
@@ -207,6 +228,26 @@ export default function MeetingsPage({ onNavigate }: Props) {
   const onMeetingStopped = async (meetingId: string) => {
     await refreshList();
     setSelectedId(meetingId);
+  };
+
+  /**
+   * Renames one side of the open meeting, then re-reads it.
+   *
+   * The re-read is what makes every already-rendered segment pick the new name
+   * up: the transcript stores a speaker *key*, and the name lives once on the
+   * meeting rather than being copied onto each line.
+   */
+  const onRenameSpeaker = async (speakerKey: string, displayName: string) => {
+    if (!selectedId) return;
+    setBusy(true);
+    try {
+      await setMeetingSpeakerName(selectedId, speakerKey, displayName);
+      setDetail(await getMeeting(selectedId));
+    } catch (e) {
+      setListStatus(toMessage(e));
+    } finally {
+      setBusy(false);
+    }
   };
 
   const onDelete = async (id: string) => {
@@ -534,7 +575,12 @@ export default function MeetingsPage({ onNavigate }: Props) {
 
         <section className="kea-card" style={{ minHeight: 200 }}>
           {selectedId && detail ? (
-            <MeetingDetailView detail={detail} onDelete={onDelete} busy={busy} />
+            <MeetingDetailView
+              detail={detail}
+              onDelete={onDelete}
+              busy={busy}
+              onRenameSpeaker={onRenameSpeaker}
+            />
           ) : selectedId && busy ? (
             <LoadingBlock label="Loading meeting…" />
           ) : (

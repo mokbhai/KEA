@@ -263,4 +263,57 @@ describe("MeetingsPage", () => {
       vi.useRealTimers();
     }
   });
+
+  it("labels a live segment with the speaker the backend attributed it to", async () => {
+    mockWorld({ bindings: readyBindings });
+    render(<MeetingsPage />);
+    await screen.findByRole("heading", { level: 1, name: "Meetings" });
+
+    await act(async () => {
+      emitTauriEvent("meeting:state", { state: "recording" });
+      emitTauriEvent("meeting:segment", {
+        meeting_id: "meeting-1",
+        sequence: 0,
+        start_offset_ms: 0,
+        end_offset_ms: 5000,
+        text: "shall we start",
+        speaker_key: "local",
+      });
+      emitTauriEvent("meeting:segment", {
+        meeting_id: "meeting-1",
+        sequence: 1,
+        start_offset_ms: 5000,
+        end_offset_ms: 9000,
+        text: "yes go ahead",
+        speaker_key: "remote",
+      });
+    });
+
+    expect(await screen.findByText("shall we start")).toBeTruthy();
+    expect(screen.getByText("You")).toBeTruthy();
+    expect(screen.getByText("Others")).toBeTruthy();
+  });
+
+  // Attribution only produces a verdict when both channels were recorded.
+  // A segment it could not decide reads as unattributed, not as a guess.
+  it("leaves an ambiguous live segment unlabelled", async () => {
+    mockWorld({ bindings: readyBindings });
+    render(<MeetingsPage />);
+    await screen.findByRole("heading", { level: 1, name: "Meetings" });
+
+    await act(async () => {
+      emitTauriEvent("meeting:state", { state: "recording" });
+      emitTauriEvent("meeting:segment", {
+        meeting_id: "meeting-1",
+        sequence: 0,
+        start_offset_ms: 0,
+        end_offset_ms: 5000,
+        text: "crosstalk",
+        speaker_key: "mixed",
+      });
+    });
+
+    const line = (await screen.findByText("crosstalk")).closest("li");
+    expect(line?.textContent).toBe("[00:00]crosstalk");
+  });
 });

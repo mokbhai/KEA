@@ -11,6 +11,11 @@ pub enum ActionStatus {
     Started,
     Ok,
     Error,
+    /// The user called it off — a dismissed prompt palette, a stopped file
+    /// transcription. Distinct from `Error` on purpose: a run the user ended
+    /// is not a fault, and reporting it as one trains people to ignore the
+    /// colour that is supposed to mean something went wrong.
+    Cancelled,
 }
 
 impl ActionStatus {
@@ -19,6 +24,7 @@ impl ActionStatus {
             ActionStatus::Started => "started",
             ActionStatus::Ok => "ok",
             ActionStatus::Error => "error",
+            ActionStatus::Cancelled => "cancelled",
         }
     }
 
@@ -29,6 +35,7 @@ impl ActionStatus {
             "started" => Some(ActionStatus::Started),
             "ok" => Some(ActionStatus::Ok),
             "error" => Some(ActionStatus::Error),
+            "cancelled" => Some(ActionStatus::Cancelled),
             _ => None,
         }
     }
