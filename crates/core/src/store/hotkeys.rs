@@ -2,7 +2,7 @@ use sqlx::SqlitePool;
 
 use crate::error::KeaError;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct HotkeyBindingRow {
     pub feature_id: String,
     pub command: String,
@@ -23,7 +23,7 @@ impl HotkeyBindingRepo {
         feature_id: &str,
         command: &str,
     ) -> Result<Option<HotkeyBindingRow>, KeaError> {
-        let row = sqlx::query_as::<_, (String, String, String)>(
+        let row = sqlx::query_as::<_, HotkeyBindingRow>(
             "SELECT feature_id, command, accelerator FROM hotkey_bindings
              WHERE feature_id = ? AND command = ?",
         )
@@ -31,11 +31,7 @@ impl HotkeyBindingRepo {
         .bind(command)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(feature_id, command, accelerator)| HotkeyBindingRow {
-            feature_id,
-            command,
-            accelerator,
-        }))
+        Ok(row)
     }
 
     pub async fn set(
@@ -57,20 +53,13 @@ impl HotkeyBindingRepo {
     }
 
     pub async fn list(&self) -> Result<Vec<HotkeyBindingRow>, KeaError> {
-        let rows = sqlx::query_as::<_, (String, String, String)>(
+        let rows = sqlx::query_as::<_, HotkeyBindingRow>(
             "SELECT feature_id, command, accelerator FROM hotkey_bindings
              ORDER BY feature_id, command",
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(feature_id, command, accelerator)| HotkeyBindingRow {
-                feature_id,
-                command,
-                accelerator,
-            })
-            .collect())
+        Ok(rows)
     }
 
     pub async fn delete(&self, feature_id: &str, command: &str) -> Result<(), KeaError> {

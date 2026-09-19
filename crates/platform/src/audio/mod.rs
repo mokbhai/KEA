@@ -4,21 +4,24 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod cues;
 #[cfg(target_os = "macos")]
 pub mod loopback;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod macos_sck;
-#[cfg(not(target_os = "macos"))]
-pub mod stub;
-pub mod cues;
 pub mod playback;
 pub mod segment;
+#[cfg(not(target_os = "macos"))]
+pub mod stub;
 pub mod util;
 
 pub use cues::{cue_pcm, Cue};
-pub use util::{accumulate_frames, chunk_pcm_by_duration, mix_frames, resample_linear, rms_level};
+pub use util::{
+    accumulate_frames, chunk_pcm_by_duration, downmix_to_mono, mix_frames, resample_linear,
+    rms_level,
+};
 
 /// Mono PCM samples at a specific sample rate (alias: capture buffer unit).
 #[derive(Debug, Clone, PartialEq)]
@@ -71,9 +74,7 @@ pub enum AudioIoError {
 #[async_trait]
 pub trait AudioIo: Send + Sync {
     /// Begin mic capture; frames arrive via the returned receiver.
-    async fn start_mic(
-        &mut self,
-    ) -> Result<tokio::sync::mpsc::Receiver<PcmFrame>, AudioIoError>;
+    async fn start_mic(&mut self) -> Result<tokio::sync::mpsc::Receiver<PcmFrame>, AudioIoError>;
 
     /// Stop capture and return the full buffered mono PCM at the device's native rate.
     async fn stop_mic(&mut self) -> Result<PcmFrame, AudioIoError>;
@@ -99,13 +100,17 @@ pub trait AudioIo: Send + Sync {
         prefer_system_audio: bool,
     ) -> Result<tokio::sync::mpsc::Receiver<PcmFrame>, AudioIoError> {
         let _ = (self, prefer_system_audio);
-        Err(AudioIoError::Other("meeting capture not implemented".into()))
+        Err(AudioIoError::Other(
+            "meeting capture not implemented".into(),
+        ))
     }
 
     /// Stop meeting capture; return full mixed mono PCM buffer.
     async fn stop_meeting(&mut self) -> Result<PcmFrame, AudioIoError> {
         let _ = self;
-        Err(AudioIoError::Other("meeting capture not implemented".into()))
+        Err(AudioIoError::Other(
+            "meeting capture not implemented".into(),
+        ))
     }
 
     /// Drain frames accumulated since last drain (for live segmented transcription).
@@ -134,6 +139,18 @@ pub trait AudioIo: Send + Sync {
     async fn play(&self, pcm: PcmFrame) -> Result<(), AudioIoError> {
         let _ = pcm;
         Ok(())
+    }
+}
+
+/// Construct the active platform [`AudioIo`] implementation for this OS.
+pub fn new_audio_io() -> Box<dyn AudioIo> {
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(macos::MacAudioIo::new())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Box::new(stub::StubAudioIo::new())
     }
 }
 
@@ -240,13 +257,10 @@ mod audio_trait_tests {
         }
 
         async fn drain_meeting_buffer(&mut self) -> Result<PcmFrame, AudioIoError> {
-            Ok(self
-                .pending_drains
-                .pop()
-                .unwrap_or(PcmFrame {
-                    samples: vec![],
-                    sample_rate_hz: 16_000,
-                }))
+            Ok(self.pending_drains.pop().unwrap_or(PcmFrame {
+                samples: vec![],
+                sample_rate_hz: 16_000,
+            }))
         }
     }
 
@@ -280,7 +294,10 @@ mod audio_trait_tests {
                 sample_rate_hz: 16_000,
             },
         };
-        assert_eq!(io.system_audio_capability(), SystemAudioCapability::Unavailable);
+        assert_eq!(
+            io.system_audio_capability(),
+            SystemAudioCapability::Unavailable
+        );
         assert_eq!(io.meeting_state(), MeetingState::Idle);
         assert!(io.start_meeting(true).await.is_err());
         assert!(io.stop_meeting().await.is_err());
@@ -339,7 +356,13 @@ mod audio_trait_tests {
         };
         io.play(frame.clone()).await.unwrap();
         assert_eq!(
-            io.last_played.lock().unwrap().as_ref().unwrap().samples.len(),
+            io.last_played
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .samples
+                .len(),
             100
         );
     }

@@ -280,13 +280,19 @@ export type SystemAudioCapability =
 
 export type PermStatus = "Unknown" | "Granted" | "Denied";
 
+/** Mirrors `kea_core::store::meetings::MeetingStatus`. */
+export type MeetingStatus = "recording" | "completed" | "error";
+
+/** Mirrors `kea_core::store::meetings::CaptureMode`. */
+export type CaptureMode = "mic_only" | "mic_and_system";
+
 export type Meeting = {
   id: string;
   title: string;
   started_at: string;
   ended_at: string | null;
-  status: string;
-  capture_mode: string;
+  status: MeetingStatus;
+  capture_mode: CaptureMode;
   stt_engine_id: string | null;
   llm_engine_id: string | null;
   error: string | null;
@@ -411,12 +417,15 @@ export const onMeetingError = (handler: (message: string) => void): Promise<Unli
     handler(event.payload.message),
   );
 
+/** Mirrors `kea_core::store::actions::ActionStatus`. */
+export type ActionStatus = "started" | "ok" | "error";
+
 export type ActionRow = {
   id: number;
   feature_id: string;
   command: string;
   engine_id: string;
-  status: string;
+  status: ActionStatus;
 };
 
 export type ActionDetail = {
@@ -426,7 +435,7 @@ export type ActionDetail = {
   engine_id: string;
   model: string | null;
   provider_ref: string | null;
-  status: string;
+  status: ActionStatus;
   error: string | null;
   started_at: string;
   finished_at: string | null;
@@ -442,10 +451,13 @@ export type ConversationSummary = {
   created_at: string;
 };
 
+/** Mirrors `kea_core::store::conversations::MessageRole`. */
+export type MessageRole = "user" | "assistant";
+
 export type Message = {
   id: number;
   conversation_id: number;
-  role: string;
+  role: MessageRole;
   content: string;
   token_count: number | null;
   created_at: string;

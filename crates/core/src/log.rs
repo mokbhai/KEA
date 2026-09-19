@@ -83,18 +83,17 @@ mod tests {
             let _guard = init_logging(dir.path(), "info");
             info!("hello-kea");
         } // guard drop flushes
-        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
-            .filter_map(|e| e.ok()).collect();
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
         assert!(!files.is_empty(), "expected a log file to be created");
     }
 
     #[test]
     fn current_log_path_joins_kea_log() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(
-            current_log_path(dir.path()),
-            dir.path().join("kea.log")
-        );
+        assert_eq!(current_log_path(dir.path()), dir.path().join("kea.log"));
     }
 
     #[test]

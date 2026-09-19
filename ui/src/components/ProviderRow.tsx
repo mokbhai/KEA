@@ -12,6 +12,8 @@ import {
   type ProviderTestResult,
 } from "../api";
 import { useSavedFlash } from "../hooks/useSavedFlash";
+import { needsKey } from "../lib/engines";
+import { toMessage } from "../lib/format";
 import { Row } from "./SettingsRow";
 
 const emptyConfig = (): ProviderConfig => ({ base_url: "", default_model: "" });
@@ -22,7 +24,7 @@ type Props = {
 };
 
 export default function ProviderRow({ provider, onRemoved }: Props) {
-  const isLocal = provider.provider_ref === "local-llm";
+  const keyless = !needsKey(provider);
   const [hasKey, setHasKey] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [replacing, setReplacing] = useState(false);
@@ -55,8 +57,8 @@ export default function ProviderRow({ provider, onRemoved }: Props) {
     };
   }, [provider.provider_ref]);
 
-  const keyState = hasKey ? "API key saved ✓" : isLocal ? "No key needed" : "Key missing";
-  const ready = hasKey || isLocal;
+  const keyState = hasKey ? "API key saved ✓" : keyless ? "No key needed" : "Key missing";
+  const ready = hasKey || keyless;
 
   const saveKey = async () => {
     const secret = keyDraft.trim();
@@ -71,7 +73,7 @@ export default function ProviderRow({ provider, onRemoved }: Props) {
       setReplacing(false);
       flash("key");
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toMessage(e));
     } finally {
       setBusy(false);
     }
@@ -86,7 +88,7 @@ export default function ProviderRow({ provider, onRemoved }: Props) {
       setReplacing(false);
       setKeyDraft("");
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toMessage(e));
     } finally {
       setBusy(false);
     }
@@ -99,7 +101,7 @@ export default function ProviderRow({ provider, onRemoved }: Props) {
     try {
       setTestResult(await testProvider(provider.provider_ref));
     } catch (e) {
-      setTestResult({ ok: false, message: e instanceof Error ? e.message : String(e) });
+      setTestResult({ ok: false, message: toMessage(e) });
     } finally {
       setBusy(false);
     }
@@ -118,7 +120,7 @@ export default function ProviderRow({ provider, onRemoved }: Props) {
       lastSavedConfig.current = config;
       flash("config");
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toMessage(e));
     }
   };
 
@@ -132,7 +134,7 @@ export default function ProviderRow({ provider, onRemoved }: Props) {
       await removeCustomProvider(provider.provider_ref);
       onRemoved();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toMessage(e));
       setBusy(false);
     }
   };
@@ -191,7 +193,7 @@ export default function ProviderRow({ provider, onRemoved }: Props) {
                     e.preventDefault();
                     void saveKey();
                   }}
-                  placeholder={isLocal ? "Optional — only if your server needs one" : "Paste API key"}
+                  placeholder={keyless ? "Optional — only if your server needs one" : "Paste API key"}
                   aria-label={`${provider.name} API key`}
                   autoComplete="off"
                 />

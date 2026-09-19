@@ -6,6 +6,7 @@ import {
   type EffectiveHotkey,
   type HotkeyRegStatus,
 } from "../api";
+import { toMessage } from "../lib/format";
 import {
   acceleratorPartLabel,
   parseAcceleratorParts,
@@ -119,7 +120,7 @@ export default function HotkeyRow({
       })
       .catch((e) => {
         if (cancelled) return;
-        setError(e instanceof Error ? e.message : String(e));
+        setError(toMessage(e));
         clearPending();
       });
     return () => {

@@ -1,4 +1,5 @@
-//! macOS permission checks via Core Graphics (Screen Recording) and AVFoundation (Microphone).
+//! macOS permission checks via Core Graphics (Screen Recording), AVFoundation
+//! (Microphone) and the Accessibility APIs (`AXIsProcessTrusted`).
 //!
 //! # Manual verification — Screen Recording
 //! 1. Call `request(ScreenRecording)` once; macOS shows a permission dialog.
@@ -13,9 +14,17 @@
 //!    `NotDetermined` → [`PermStatus::Unknown`],
 //!    `Authorized` → [`PermStatus::Granted`],
 //!    `Denied` / `Restricted` → [`PermStatus::Denied`].
+//!
+//! # Manual verification — Accessibility
+//! 1. Call `request(Accessibility)`; macOS shows the trust dialog, which offers
+//!    to open System Settings when the process is not yet trusted.
+//! 2. Grant access in **System Settings → Privacy & Security → Accessibility**.
+//! 3. `status(Accessibility)` should return [`PermStatus::Granted`]; the grant
+//!    only takes effect for a process that is relaunched afterwards.
 
-use async_trait::async_trait;
 use super::{PermError, PermKind, PermStatus, Permissions};
+use crate::textio::macos_ax;
+use async_trait::async_trait;
 use core_graphics::access::ScreenCaptureAccess;
 
 use block2::RcBlock;
@@ -60,7 +69,7 @@ impl MacPermissions {
     }
 
     fn screen_recording_status() -> PermStatus {
-        let access = ScreenCaptureAccess::default();
+        let access = ScreenCaptureAccess;
         if access.preflight() {
             PermStatus::Granted
         } else {
@@ -70,6 +79,16 @@ impl MacPermissions {
 
     fn microphone_status() -> PermStatus {
         av_auth_status_to_perm(microphone_auth_status())
+    }
+
+    /// Accessibility has no "not determined" state to report: a process is
+    /// trusted or it is not.
+    fn accessibility_status() -> PermStatus {
+        if macos_ax::is_ax_trusted() {
+            PermStatus::Granted
+        } else {
+            PermStatus::Denied
+        }
     }
 
     async fn request_microphone() -> Result<PermStatus, PermError> {
@@ -105,13 +124,14 @@ impl Permissions for MacPermissions {
         match kind {
             PermKind::ScreenRecording => Self::screen_recording_status(),
             PermKind::Microphone => Self::microphone_status(),
+            PermKind::Accessibility => Self::accessibility_status(),
         }
     }
 
     async fn request(&self, kind: PermKind) -> Result<PermStatus, PermError> {
         match kind {
             PermKind::ScreenRecording => {
-                let access = ScreenCaptureAccess::default();
+                let access = ScreenCaptureAccess;
                 if access.preflight() {
                     return Ok(PermStatus::Granted);
                 }
@@ -122,6 +142,12 @@ impl Permissions for MacPermissions {
                 })
             }
             PermKind::Microphone => Self::request_microphone().await,
+            // Accessibility can only be granted by hand in System Settings; the
+            // system prompt is the shortcut that opens it there.
+            PermKind::Accessibility => {
+                let _ = macos_ax::prompt_ax_trust();
+                Ok(Self::accessibility_status())
+            }
         }
     }
 }
@@ -148,16 +174,31 @@ mod tests {
 
     #[test]
     fn av_auth_status_maps_denied_to_denied() {
-        assert_eq!(
-            av_auth_status_to_perm(AV_AUTH_DENIED),
-            PermStatus::Denied
-        );
+        assert_eq!(av_auth_status_to_perm(AV_AUTH_DENIED), PermStatus::Denied);
     }
 
     #[test]
     fn av_auth_status_maps_restricted_to_denied() {
         assert_eq!(
             av_auth_status_to_perm(AV_AUTH_RESTRICTED),
+            PermStatus::Denied
+        );
+    }
+
+    #[test]
+    fn accessibility_status_follows_ax_trust() {
+        let _trust = macos_ax::AxTrustOverride::force(true);
+        assert_eq!(
+            MacPermissions::new().status(PermKind::Accessibility),
+            PermStatus::Granted
+        );
+    }
+
+    #[test]
+    fn accessibility_status_denied_when_untrusted() {
+        let _trust = macos_ax::AxTrustOverride::force(false);
+        assert_eq!(
+            MacPermissions::new().status(PermKind::Accessibility),
             PermStatus::Denied
         );
     }

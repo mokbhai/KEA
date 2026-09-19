@@ -1,17 +1,25 @@
-use async_trait::async_trait;
 use crate::traits::{
     AudioPcm, EngineCaps, EngineError, LlmEngine, LlmRequest, LlmResponse, SttEngine, SttOpts,
     Transcript, TtsEngine, TtsOpts,
 };
+use async_trait::async_trait;
 
 pub struct NoopLlmEngine;
 
 #[async_trait]
 impl LlmEngine for NoopLlmEngine {
-    fn id(&self) -> &str { "noop" }
-    fn capabilities(&self) -> EngineCaps { EngineCaps { models: vec!["echo".into()] } }
+    fn id(&self) -> &str {
+        "noop"
+    }
+    fn capabilities(&self) -> EngineCaps {
+        EngineCaps {
+            models: vec!["echo".into()],
+        }
+    }
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, EngineError> {
-        Ok(LlmResponse { text: format!("echo: {}", req.prompt) })
+        Ok(LlmResponse {
+            text: format!("echo: {}", req.prompt),
+        })
     }
 }
 

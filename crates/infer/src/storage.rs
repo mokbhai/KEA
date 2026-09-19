@@ -114,10 +114,7 @@ mod tests {
         assert!(!storage.is_installed("ggml-base.en"));
         std::fs::write(&path, b"fake").unwrap();
         assert!(storage.is_installed("ggml-base.en"));
-        assert_eq!(
-            storage.installed_models(),
-            vec!["ggml-base.en".to_string()]
-        );
+        assert_eq!(storage.installed_models(), vec!["ggml-base.en".to_string()]);
     }
 
     #[test]
@@ -158,11 +155,15 @@ mod tests {
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(model_dir.join("tokens.txt"), b"tok").unwrap();
         assert!(storage.is_onnx_installed("vits-piper-en-us-lessac-medium"));
-        storage.remove_onnx("vits-piper-en-us-lessac-medium").unwrap();
+        storage
+            .remove_onnx("vits-piper-en-us-lessac-medium")
+            .unwrap();
         assert!(!storage.is_onnx_installed("vits-piper-en-us-lessac-medium"));
         assert!(!model_dir.exists());
         // removing again is a no-op
-        storage.remove_onnx("vits-piper-en-us-lessac-medium").unwrap();
+        storage
+            .remove_onnx("vits-piper-en-us-lessac-medium")
+            .unwrap();
     }
 
     #[test]

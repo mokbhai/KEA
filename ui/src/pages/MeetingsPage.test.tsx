@@ -33,7 +33,7 @@ const meetingHandlers = {
       title: "Test capture",
       started_at: "2026-07-17T10:00:00Z",
       ended_at: "2026-07-17T10:00:10Z",
-      status: "done",
+      status: "completed",
       capture_mode: "mic_only",
       stt_engine_id: "whisper",
       llm_engine_id: "openai",
@@ -48,7 +48,7 @@ const meetingHandlers = {
       title: "Test capture",
       started_at: "2026-07-17T10:00:00Z",
       ended_at: "2026-07-17T10:00:10Z",
-      status: "done",
+      status: "completed",
       capture_mode: "mic_only",
       stt_engine_id: "whisper",
       llm_engine_id: "openai",
@@ -176,6 +176,26 @@ describe("MeetingsPage", () => {
 
     expect(await screen.findByText(/This feature only —/)).toBeTruthy();
     expect(screen.queryByText(/isn't downloaded yet/)).toBeNull();
+  });
+
+  it("puts a refused setting back instead of showing a value the backend rejected", async () => {
+    mockWorld({
+      bindings: readyBindings,
+      extra: {
+        set_meeting_settings: () => {
+          throw new Error("disk is read-only");
+        },
+      },
+    });
+    render(<MeetingsPage />);
+
+    const toggle = await screen.findByRole("switch", { name: "Record system audio too" });
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    await userEvent.click(toggle);
+
+    expect(await screen.findByText("disk is read-only")).toBeTruthy();
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
   });
 
   it("runs a labelled test capture that stops itself after ten seconds", async () => {

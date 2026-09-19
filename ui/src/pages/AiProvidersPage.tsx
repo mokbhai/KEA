@@ -14,12 +14,12 @@ import DefaultsPicker, {
   CAPABILITY_LABELS,
   type Capability,
 } from "../components/DefaultsPicker";
+import LoadingBlock from "../components/LoadingBlock";
 import ProviderRow from "../components/ProviderRow";
 import { Row, RowGroup } from "../components/SettingsRow";
-import Spinner from "../components/Spinner";
 import { usePendingActivation } from "../hooks/usePendingActivation";
 import { describeBinding } from "../lib/featureSlot";
-import { slugify } from "../lib/format";
+import { slugify, toMessage } from "../lib/format";
 
 const CAPABILITIES: { capability: Capability; icon: string }[] = [
   { capability: "llm", icon: "✍️" },
@@ -45,7 +45,7 @@ export default function AiProvidersPage() {
     try {
       setProviders(await listProviders());
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toMessage(e));
       setProviders([]);
     }
   }, []);
@@ -105,7 +105,7 @@ export default function AiProvidersPage() {
       setNewUrl("");
       await refreshProviders();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toMessage(e));
     }
   };
 
@@ -123,10 +123,7 @@ export default function AiProvidersPage() {
       <section style={{ marginBottom: 32 }}>
         <h2 style={{ margin: "0 0 12px" }}>Providers</h2>
         {providers === null ? (
-          <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 60 }}>
-            <Spinner size={16} />
-            <span className="kea-muted">Loading providers…</span>
-          </div>
+          <LoadingBlock label="Loading providers…" minHeight={60} />
         ) : (
           <RowGroup aria-label="Providers">
             {providers.map((provider) => (

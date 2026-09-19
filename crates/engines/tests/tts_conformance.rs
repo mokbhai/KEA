@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use kea_engines::stt::audio::pcm_to_wav_bytes;
+use kea_engines::traits::AudioPcm;
 use kea_engines::{
     bytes_to_pcm_wav, CredentialSource, NoopTtsEngine, OpenAiTtsEngine, ProviderConfig,
     ProviderConfigSource, ReqwestHttpClient, TtsEngine, TtsOpts,
 };
-use kea_engines::stt::audio::pcm_to_wav_bytes;
-use kea_engines::traits::AudioPcm;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -163,8 +163,12 @@ async fn tts_engine_trait_conformance() {
             continue;
         }
 
-        let pcm = result.expect(&case.name);
-        assert!(!pcm.samples.is_empty(), "{}: samples must be non-empty", case.name);
+        let pcm = result.expect(case.name);
+        assert!(
+            !pcm.samples.is_empty(),
+            "{}: samples must be non-empty",
+            case.name
+        );
         if let Some(rate) = case.expect_sample_rate {
             assert_eq!(
                 pcm.sample_rate_hz, rate,

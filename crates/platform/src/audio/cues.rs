@@ -50,17 +50,32 @@ impl Cue {
         match self {
             // Rising major sixth: the "done" shape most desktop apps use.
             Cue::Success => &[
-                Tone { freq_hz: 784.0, duration_ms: 55 },
-                Tone { freq_hz: 1318.5, duration_ms: 75 },
+                Tone {
+                    freq_hz: 784.0,
+                    duration_ms: 55,
+                },
+                Tone {
+                    freq_hz: 1318.5,
+                    duration_ms: 75,
+                },
             ],
             // Falling, and lower throughout, so it is distinguishable from
             // success without relying on the listener catching both notes.
             Cue::Error => &[
-                Tone { freq_hz: 415.3, duration_ms: 90 },
-                Tone { freq_hz: 277.2, duration_ms: 120 },
+                Tone {
+                    freq_hz: 415.3,
+                    duration_ms: 90,
+                },
+                Tone {
+                    freq_hz: 277.2,
+                    duration_ms: 120,
+                },
             ],
             // Single neutral blip: neither rising nor falling.
-            Cue::Cancel => &[Tone { freq_hz: 587.3, duration_ms: 90 }],
+            Cue::Cancel => &[Tone {
+                freq_hz: 587.3,
+                duration_ms: 90,
+            }],
         }
     }
 }
@@ -103,10 +118,7 @@ fn render_tone(tone: Tone, sample_rate_hz: u32, amplitude: f32) -> Vec<f32> {
             amplitude * (TAU * tone.freq_hz * t).sin()
         })
         .collect();
-    apply_fade_envelope(
-        &mut samples,
-        samples_for_duration(FADE_MS, sample_rate_hz),
-    );
+    apply_fade_envelope(&mut samples, samples_for_duration(FADE_MS, sample_rate_hz));
     samples
 }
 

@@ -6,6 +6,7 @@ import {
   type PermStatus,
   type PermissionStatusItem,
 } from "../api";
+import { toMessage } from "../lib/format";
 
 function statusColor(status: PermStatus): string {
   switch (status) {
@@ -43,7 +44,7 @@ export default function PermissionPanel() {
       const items = await getAllPermissionStatuses();
       setPerms(items);
     } catch (e) {
-      setPermsStatus(e instanceof Error ? e.message : String(e));
+      setPermsStatus(toMessage(e));
     } finally {
       setPermsBusy(false);
     }
@@ -69,7 +70,7 @@ export default function PermissionPanel() {
           : `${permissionLabel(kind)} permission not granted — check System Settings.`,
       );
     } catch (e) {
-      setPermsStatus(e instanceof Error ? e.message : String(e));
+      setPermsStatus(toMessage(e));
     } finally {
       setPermsBusy(false);
     }

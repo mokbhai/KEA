@@ -71,8 +71,7 @@ pub fn register_rewrite_service(tx: mpsc::UnboundedSender<String>) {
         let fn_ptr: unsafe extern "C-unwind" fn() =
             std::mem::transmute(rewrite_with_kea as *const ());
         let types_str = std::ffi::CString::new("v@:@@^@").unwrap();
-        let ok: Bool =
-            objc2::ffi::class_addMethod(cls_raw, sel, fn_ptr, types_str.as_ptr());
+        let ok: Bool = objc2::ffi::class_addMethod(cls_raw, sel, fn_ptr, types_str.as_ptr());
         assert!(ok.is_true(), "class_addMethod failed");
 
         objc2::ffi::objc_registerClassPair(cls_raw);

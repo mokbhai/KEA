@@ -8,14 +8,17 @@ import {
   type TtsSettings,
 } from "../api";
 import FeatureAiCard from "../components/FeatureAiCard";
-import FeatureBanner, { type FixNavigate } from "../components/FeatureBanner";
+import FeatureBanner from "../components/FeatureBanner";
 import HotkeyRow from "../components/HotkeyRow";
+import LoadingBlock from "../components/LoadingBlock";
 import { Row, RowGroup } from "../components/SettingsRow";
 import Spinner from "../components/Spinner";
 import { useFeatureAi } from "../hooks/useFeatureAi";
-import { useSavedFlash } from "../hooks/useSavedFlash";
+import { useOptimisticSetting } from "../hooks/useOptimisticSetting";
 import { OPENAI_TTS_VOICES } from "../lib/capabilityDefaults";
 import type { SlotSpec } from "../lib/featureSlot";
+import { toMessage } from "../lib/format";
+import type { Navigate } from "../lib/nav";
 
 const TTS_FEATURE = "tts";
 const TTS_COMMAND = "read_selection";
@@ -25,43 +28,30 @@ const SLOTS: SlotSpec[] = [
 ];
 
 type Props = {
-  onNavigate?: FixNavigate;
+  onNavigate?: Navigate;
 };
 
 export default function ReadAloudPage({ onNavigate }: Props) {
   const ai = useFeatureAi(SLOTS);
-  const [settings, setSettings] = useState<TtsSettings>({
-    active_voice: null,
-    active_model: null,
+  const tts = useOptimisticSetting<TtsSettings>({
+    initial: { active_voice: null, active_model: null },
+    persist: setTtsSettings,
   });
-  const [settingsStatus, setSettingsStatus] = useState<string | null>(null);
+  const settings = tts.value;
+  const { setValue: setSettings, setError: setSettingsError } = tts;
   const [settingsLoading, setSettingsLoading] = useState(true);
   const [runStatus, setRunStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [savedKey, flash] = useSavedFlash();
+  // A save and a run both lock the whole panel, as they did when this was a
+  // single `busy`.
+  const anyBusy = busy || tts.busy;
 
   useEffect(() => {
     getTtsSettings()
       .then(setSettings)
-      .catch((e) => setSettingsStatus(e instanceof Error ? e.message : String(e)))
+      .catch((e) => setSettingsError(toMessage(e)))
       .finally(() => setSettingsLoading(false));
-  }, []);
-
-  const saveSettings = async (next: TtsSettings, key: string) => {
-    const prev = settings;
-    setSettings(next);
-    setBusy(true);
-    setSettingsStatus(null);
-    try {
-      await setTtsSettings(next);
-      flash(key);
-    } catch (e) {
-      setSettings(prev);
-      setSettingsStatus(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  }, [setSettings, setSettingsError]);
 
   const effective = ai.statuses?.[0]?.effective ?? null;
 
@@ -78,7 +68,7 @@ export default function ReadAloudPage({ onNavigate }: Props) {
       );
       setRunStatus("Playing a sample sentence…");
     } catch (e) {
-      setRunStatus(e instanceof Error ? e.message : String(e));
+      setRunStatus(toMessage(e));
     } finally {
       setBusy(false);
     }
@@ -91,7 +81,7 @@ export default function ReadAloudPage({ onNavigate }: Props) {
       await runReadAloud();
       setRunStatus("Read-aloud started.");
     } catch (e) {
-      setRunStatus(e instanceof Error ? e.message : String(e));
+      setRunStatus(toMessage(e));
     } finally {
       setBusy(false);
     }
@@ -104,7 +94,7 @@ export default function ReadAloudPage({ onNavigate }: Props) {
       await triggerTts();
       setRunStatus("TTS triggered.");
     } catch (e) {
-      setRunStatus(e instanceof Error ? e.message : String(e));
+      setRunStatus(toMessage(e));
     } finally {
       setBusy(false);
     }
@@ -125,10 +115,7 @@ export default function ReadAloudPage({ onNavigate }: Props) {
       <section style={{ marginBottom: 24 }}>
         <h2 style={{ margin: "0 0 12px" }}>Behavior</h2>
         {settingsLoading ? (
-          <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 44 }}>
-            <Spinner size={16} />
-            <span className="kea-muted">Loading settings…</span>
-          </div>
+          <LoadingBlock label="Loading settings…" minHeight={44} />
         ) : (
           <>
             <RowGroup aria-label="Read aloud behavior">
@@ -140,17 +127,14 @@ export default function ReadAloudPage({ onNavigate }: Props) {
                 checkRegistration
               />
               <Row label="Voice" hint="Used by the cloud voices; local voices bring their own.">
-                {savedKey === "voice" && <span className="kea-saved">Saved ✓</span>}
+                {tts.savedKey === "voice" && <span className="kea-saved">Saved ✓</span>}
                 <select
                   className="kea-select"
                   aria-label="Voice"
                   value={settings.active_voice ?? ""}
-                  disabled={busy}
+                  disabled={anyBusy}
                   onChange={(e) =>
-                    void saveSettings(
-                      { ...settings, active_voice: e.target.value || null },
-                      "voice",
-                    )
+                    void tts.save({ active_voice: e.target.value || null }, "voice")
                   }
                 >
                   <option value="">Default</option>
@@ -171,15 +155,12 @@ export default function ReadAloudPage({ onNavigate }: Props) {
                   <input
                     className="kea-input"
                     value={settings.active_model ?? ""}
-                    disabled={busy}
+                    disabled={anyBusy}
                     onChange={(e) =>
                       setSettings({ ...settings, active_model: e.target.value || null })
                     }
                     onBlur={(e) =>
-                      void saveSettings(
-                        { ...settings, active_model: e.target.value || null },
-                        "model",
-                      )
+                      void tts.save({ active_model: e.target.value || null }, "model")
                     }
                     placeholder="e.g. tts-1, tts-1-hd, or local ONNX model id"
                   />
@@ -187,13 +168,13 @@ export default function ReadAloudPage({ onNavigate }: Props) {
                     Only used when the chosen voice above carries no model of its own.
                   </span>
                 </label>
-                {savedKey === "model" && <span className="kea-saved">Saved ✓</span>}
+                {tts.savedKey === "model" && <span className="kea-saved">Saved ✓</span>}
               </div>
             </details>
 
-            {settingsStatus && (
+            {tts.error && (
               <p style={{ marginTop: 8, fontSize: "0.8125rem", color: "var(--danger)" }}>
-                {settingsStatus}
+                {tts.error}
               </p>
             )}
           </>
@@ -211,15 +192,15 @@ export default function ReadAloudPage({ onNavigate }: Props) {
               type="button"
               className="kea-btn kea-btn--primary"
               onClick={() => void playSample()}
-              disabled={busy || !effective}
+              disabled={anyBusy || !effective}
             >
-              {busy ? <Spinner size={14} /> : "▶︎"} Play sample
+              {anyBusy ? <Spinner size={14} /> : "▶︎"} Play sample
             </button>
             <button
               type="button"
               className="kea-btn"
               onClick={() => void onReadSelection()}
-              disabled={busy}
+              disabled={anyBusy}
             >
               Read my selection
             </button>
@@ -227,7 +208,7 @@ export default function ReadAloudPage({ onNavigate }: Props) {
               type="button"
               className="kea-btn"
               onClick={() => void onTriggerTts()}
-              disabled={busy}
+              disabled={anyBusy}
             >
               Trigger the shortcut path
             </button>

@@ -1,12 +1,15 @@
-import { useCallback, useState } from "react";
+import { useState } from "react";
 import { previewRewrite, triggerRewrite } from "../api";
 import FeatureAiCard from "../components/FeatureAiCard";
-import FeatureBanner, { type FixNavigate } from "../components/FeatureBanner";
+import FeatureBanner from "../components/FeatureBanner";
 import HotkeyRow from "../components/HotkeyRow";
-import SettingsForm, { type RewriteSettings } from "../components/SettingsForm";
+import SettingsForm from "../components/SettingsForm";
 import Spinner from "../components/Spinner";
 import { useFeatureAi } from "../hooks/useFeatureAi";
+import { useRewriteSettings } from "../hooks/useRewriteSettings";
 import type { SlotSpec } from "../lib/featureSlot";
+import { toMessage } from "../lib/format";
+import type { Navigate } from "../lib/nav";
 
 const SAMPLE = "i think we should probaly ship this on friday, lmk what u think";
 
@@ -16,24 +19,17 @@ const SLOTS: SlotSpec[] = [
 
 type Props = {
   onRunSetup?: () => void;
-  onNavigate?: FixNavigate;
+  onNavigate?: Navigate;
 };
 
 export default function RewritePage({ onRunSetup, onNavigate }: Props) {
   const ai = useFeatureAi(SLOTS);
-  const [settings, setSettings] = useState<RewriteSettings>({
-    mode: "improve",
-    preset_id: null,
-    custom_instruction: "",
-  });
+  const rewrite = useRewriteSettings();
+  const { settings } = rewrite;
   const [sample, setSample] = useState(SAMPLE);
   const [result, setResult] = useState<string | null>(null);
   const [runStatus, setRunStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-
-  const onSettingsChange = useCallback((next: RewriteSettings) => {
-    setSettings(next);
-  }, []);
 
   const runSample = async () => {
     setBusy(true);
@@ -48,7 +44,7 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
       );
       setResult(text);
     } catch (e) {
-      setRunStatus(e instanceof Error ? e.message : String(e));
+      setRunStatus(toMessage(e));
     } finally {
       setBusy(false);
     }
@@ -70,7 +66,7 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
         text ? "Rewritten and replaced in the app you were last in." : "Rewrite completed.",
       );
     } catch (e) {
-      setRunStatus(e instanceof Error ? e.message : String(e));
+      setRunStatus(toMessage(e));
     } finally {
       setBusy(false);
     }
@@ -99,7 +95,7 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
       <section style={{ marginBottom: 24 }}>
         <h2 style={{ margin: "0 0 12px" }}>Behavior</h2>
         <SettingsForm
-          onChange={onSettingsChange}
+          rewrite={rewrite}
           leadingRows={
             <HotkeyRow
               feature="rewrite"

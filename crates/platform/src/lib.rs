@@ -8,8 +8,8 @@ pub mod permissions;
 pub mod textio;
 
 pub use audio::{
-    accumulate_frames, chunk_pcm_by_duration, cue_pcm, mix_frames, resample_linear, rms_level,
-    AudioIo, AudioIoError, Cue, DictationState, MeetingState, PcmBuffer, PcmFrame,
+    accumulate_frames, chunk_pcm_by_duration, cue_pcm, mix_frames, new_audio_io, resample_linear,
+    rms_level, AudioIo, AudioIoError, Cue, DictationState, MeetingState, PcmBuffer, PcmFrame,
     SystemAudioCapability,
 };
 pub use hotkeys::hold::{HoldAction, HoldModifiers, HoldToTalk, DEFAULT_MIN_HOLD};
@@ -21,24 +21,9 @@ pub use textio::{ClipboardPlan, ReplaceMode, TextIo, TextIoError};
 
 /// Construct the active platform [`Hotkeys`] implementation for this OS.
 pub fn new_hotkeys() -> Box<dyn Hotkeys> {
-    platform_hotkeys()
-}
-
-/// Construct the active platform [`TextIo`] implementation for this OS.
-pub fn new_text_io() -> Box<dyn TextIo> {
-    platform_text_io()
-}
-
-/// Construct the active platform [`AudioIo`] implementation for this OS.
-pub fn new_audio_io() -> Box<dyn AudioIo> {
-    platform_audio_io()
-}
-
-/// Returns the OS-selected [`Hotkeys`] backend.
-pub fn platform_hotkeys() -> Box<dyn Hotkeys> {
     #[cfg(target_os = "macos")]
     {
-        return Box::new(hotkeys::macos::MacHotkeys::new());
+        Box::new(hotkeys::macos::MacHotkeys::new())
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -46,46 +31,16 @@ pub fn platform_hotkeys() -> Box<dyn Hotkeys> {
     }
 }
 
-/// Returns the OS-selected [`TextIo`] backend.
-pub fn platform_text_io() -> Box<dyn TextIo> {
+/// Construct the active platform [`TextIo`] implementation for this OS.
+pub fn new_text_io() -> Box<dyn TextIo> {
     #[cfg(target_os = "macos")]
     {
-        return Box::new(textio::macos::MacTextIo::new());
+        Box::new(textio::macos::MacTextIo::new())
     }
     #[cfg(not(target_os = "macos"))]
     {
         Box::new(textio::stub::StubTextIo::new())
     }
-}
-
-/// macOS [`Hotkeys`] constructor (explicit; same as [`platform_hotkeys`] on macOS).
-#[cfg(target_os = "macos")]
-pub fn macos_hotkeys() -> Box<dyn Hotkeys> {
-    Box::new(hotkeys::macos::MacHotkeys::new())
-}
-
-/// macOS [`TextIo`] constructor (explicit; same as [`platform_text_io`] on macOS).
-#[cfg(target_os = "macos")]
-pub fn macos_textio() -> Box<dyn TextIo> {
-    Box::new(textio::macos::MacTextIo::new())
-}
-
-/// Returns the OS-selected [`AudioIo`] backend.
-pub fn platform_audio_io() -> Box<dyn AudioIo> {
-    #[cfg(target_os = "macos")]
-    {
-        return Box::new(audio::macos::MacAudioIo::new());
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Box::new(audio::stub::StubAudioIo::new())
-    }
-}
-
-/// macOS [`AudioIo`] constructor (explicit; same as [`platform_audio_io`] on macOS).
-#[cfg(target_os = "macos")]
-pub fn macos_audio() -> Box<dyn AudioIo> {
-    Box::new(audio::macos::MacAudioIo::new())
 }
 
 #[cfg(test)]
@@ -136,7 +91,9 @@ mod tests {
             let binding = hotkeys::HotkeyBinding {
                 accelerator: "Cmd+Shift+R".into(),
             };
-            assert!(hk.register(binding.clone(), "action.rewrite".into()).is_err());
+            assert!(hk
+                .register(binding.clone(), "action.rewrite".into())
+                .is_err());
             assert!(hk.unregister(&binding).is_err());
         }
 

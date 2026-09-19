@@ -13,12 +13,11 @@ impl PromptOverrideRepo {
     }
 
     pub async fn get(&self, mode: RewriteMode) -> Result<Option<String>, KeaError> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT prompt FROM rewrite_prompt_overrides WHERE mode = ?",
-        )
-        .bind(mode.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT prompt FROM rewrite_prompt_overrides WHERE mode = ?")
+                .bind(mode.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.map(|(prompt,)| prompt))
     }
 

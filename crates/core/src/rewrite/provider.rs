@@ -108,7 +108,9 @@ mod tests {
             Some("sk-test".into())
         );
         assert_eq!(
-            CredentialSource::api_key(&adapter, "missing").await.unwrap(),
+            CredentialSource::api_key(&adapter, "missing")
+                .await
+                .unwrap(),
             None
         );
     }

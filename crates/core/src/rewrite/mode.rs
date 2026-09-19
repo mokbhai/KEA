@@ -25,6 +25,8 @@ impl RewriteMode {
         }
     }
 
+    // Not `FromStr`: the caller wants an `Option`, not a `Result`.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "improve" => Some(RewriteMode::Improve),

@@ -1,12 +1,13 @@
 import { useState } from "react";
 import { deleteBinding } from "../api";
 import DefaultsPicker from "./DefaultsPicker";
+import LoadingBlock from "./LoadingBlock";
 import { Row, RowGroup } from "./SettingsRow";
-import Spinner from "./Spinner";
 import { useSavedFlash } from "../hooks/useSavedFlash";
 import { usePendingActivation } from "../hooks/usePendingActivation";
 import type { FeatureAi } from "../hooks/useFeatureAi";
 import type { SlotStatus } from "../lib/featureSlot";
+import { toMessage } from "../lib/format";
 
 type Props = {
   ai: FeatureAi;
@@ -46,7 +47,7 @@ export default function FeatureAiCard({ ai, title = "AI", featureLabel }: Props)
       flash(key);
       ai.reload();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toMessage(e));
     } finally {
       setBusyKey(null);
     }
@@ -56,10 +57,7 @@ export default function FeatureAiCard({ ai, title = "AI", featureLabel }: Props)
     <section style={{ marginBottom: 24 }}>
       <h2 style={{ margin: "0 0 12px" }}>{title}</h2>
       {ai.statuses === null ? (
-        <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 44 }}>
-          <Spinner size={16} />
-          <span className="kea-muted">Loading…</span>
-        </div>
+        <LoadingBlock label="Loading…" minHeight={44} />
       ) : (
         <>
           <RowGroup aria-label={`${featureLabel} AI`}>

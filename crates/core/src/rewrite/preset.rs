@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 use crate::error::KeaError;
 use crate::store::settings::SettingsRepo;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct RewritePreset {
     pub id: String,
     pub name: String,
@@ -35,33 +35,22 @@ impl PresetRepo {
     }
 
     pub async fn list(&self) -> Result<Vec<RewritePreset>, KeaError> {
-        let rows = sqlx::query_as::<_, (String, String, String)>(
+        let rows = sqlx::query_as::<_, RewritePreset>(
             "SELECT id, name, instruction FROM rewrite_presets ORDER BY sort_order, name",
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, name, instruction)| RewritePreset {
-                id,
-                name,
-                instruction,
-            })
-            .collect())
+        Ok(rows)
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<RewritePreset>, KeaError> {
-        let row = sqlx::query_as::<_, (String, String, String)>(
+        let row = sqlx::query_as::<_, RewritePreset>(
             "SELECT id, name, instruction FROM rewrite_presets WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, name, instruction)| RewritePreset {
-            id,
-            name,
-            instruction,
-        }))
+        Ok(row)
     }
 
     pub async fn delete(&self, id: &str) -> Result<(), KeaError> {

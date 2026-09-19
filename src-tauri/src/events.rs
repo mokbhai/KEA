@@ -1,4 +1,5 @@
 use kea_infer::DownloadProgress;
+use kea_platform::{DictationState, MeetingState};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
@@ -25,9 +26,51 @@ pub fn emit_rewrite_error(app: &AppHandle, message: &str) {
     );
 }
 
+/// The lifecycle payloads carry the wire string rather than the state enum
+/// itself: the platform enums serialize as their variant names, and the
+/// frontend and the overlay have always matched lowercase. The enum stays the
+/// argument type at every emit site; the mapping to the wire happens once, in
+/// the `*_state_wire` functions below.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct DictationStatePayload {
     pub state: String,
+}
+
+/// The `dictation:state` value for each state.
+pub fn dictation_state_wire(state: DictationState) -> &'static str {
+    match state {
+        DictationState::Idle => "idle",
+        DictationState::Listening => "listening",
+        DictationState::Processing => "processing",
+    }
+}
+
+/// The `meeting:state` value for each state.
+pub fn meeting_state_wire(state: MeetingState) -> &'static str {
+    match state {
+        MeetingState::Idle => "idle",
+        MeetingState::Recording => "recording",
+        MeetingState::Processing => "processing",
+    }
+}
+
+/// What the TTS feature publishes on `tts:state`. There is no platform enum
+/// for it — reading aloud is not an audio-capture state — so the two values
+/// the UI knows about live here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TtsState {
+    Idle,
+    Reading,
+}
+
+impl TtsState {
+    /// The `tts:state` value for each state.
+    pub fn wire(self) -> &'static str {
+        match self {
+            TtsState::Idle => "idle",
+            TtsState::Reading => "reading",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -42,14 +85,14 @@ pub struct ModelDownloadProgressPayload {
     pub bytes_total: u64,
 }
 
-pub fn emit_dictation_state(app: &AppHandle, state: &str) {
+pub fn emit_dictation_state(app: &AppHandle, state: DictationState) {
     // Driven from the emit site rather than the frontend so the floating HUD
     // tracks dictation whether or not the main window is open.
     crate::overlay::sync_visibility(app, state);
     let _ = app.emit(
         "dictation:state",
         DictationStatePayload {
-            state: state.to_string(),
+            state: dictation_state_wire(state).to_string(),
         },
     );
 }
@@ -127,11 +170,11 @@ pub struct MeetingLevelPayload {
     pub level: f32,
 }
 
-pub fn emit_meeting_state(app: &AppHandle, state: &str) {
+pub fn emit_meeting_state(app: &AppHandle, state: MeetingState) {
     let _ = app.emit(
         "meeting:state",
         MeetingStatePayload {
-            state: state.to_string(),
+            state: meeting_state_wire(state).to_string(),
         },
     );
 }
@@ -158,11 +201,11 @@ pub struct TtsStatePayload {
     pub state: String,
 }
 
-pub fn emit_tts_state(app: &AppHandle, state: &str) {
+pub fn emit_tts_state(app: &AppHandle, state: TtsState) {
     let _ = app.emit(
         "tts:state",
         TtsStatePayload {
-            state: state.to_string(),
+            state: state.wire().to_string(),
         },
     );
 }
@@ -266,6 +309,21 @@ mod tests {
     fn meeting_level_payload_serializes() {
         let json = serde_json::to_string(&MeetingLevelPayload { level: 0.25 }).unwrap();
         assert_eq!(json, r#"{"level":0.25}"#);
+    }
+
+    #[test]
+    fn state_wire_values_are_the_lowercase_contract() {
+        assert_eq!(dictation_state_wire(DictationState::Idle), "idle");
+        assert_eq!(dictation_state_wire(DictationState::Listening), "listening");
+        assert_eq!(
+            dictation_state_wire(DictationState::Processing),
+            "processing"
+        );
+        assert_eq!(meeting_state_wire(MeetingState::Idle), "idle");
+        assert_eq!(meeting_state_wire(MeetingState::Recording), "recording");
+        assert_eq!(meeting_state_wire(MeetingState::Processing), "processing");
+        assert_eq!(TtsState::Idle.wire(), "idle");
+        assert_eq!(TtsState::Reading.wire(), "reading");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Non-macOS stub until Windows/Linux platform tasks land.
 
-use super::{TextIo, TextIoError};
+use super::{ReplaceMode, TextIo, TextIoError};
 use async_trait::async_trait;
 
 pub struct StubTextIo;
@@ -19,13 +19,9 @@ impl TextIo for StubTextIo {
         ))
     }
 
-    async fn replace(&self, _text: &str) -> Result<(), TextIoError> {
-        Err(TextIoError::Other(
-            "text I/O is not yet implemented on this platform".into(),
-        ))
-    }
-
-    async fn insert_at_cursor(&self, _text: &str) -> Result<(), TextIoError> {
+    /// `replace` and `insert_at_cursor` are the trait's defaults over this, so
+    /// all three report the same thing.
+    async fn replace_with_mode(&self, _text: &str, _mode: ReplaceMode) -> Result<(), TextIoError> {
         Err(TextIoError::Other(
             "text I/O is not yet implemented on this platform".into(),
         ))

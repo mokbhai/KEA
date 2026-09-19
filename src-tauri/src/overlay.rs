@@ -15,7 +15,10 @@
 //!    must appear over the full-screen window, not be stranded on the desktop
 //!    Space behind it. Repeat on a second Space and with Mission Control open.
 
-use tauri::{AppHandle, Manager, PhysicalPosition, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use kea_platform::DictationState;
+use tauri::{
+    AppHandle, Manager, PhysicalPosition, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+};
 
 /// Window label the frontend matches on to render the HUD.
 pub const LABEL: &str = "overlay";
@@ -173,14 +176,17 @@ pub fn reposition(window: &WebviewWindow) {
     let _ = window.set_position(PhysicalPosition::new(x, y));
 }
 
-/// True when a `dictation:state` value means the overlay should be on screen.
-pub fn visible_for_state(state: &str) -> bool {
-    matches!(state, "listening" | "processing")
+/// True when a dictation state means the overlay should be on screen.
+pub fn visible_for_state(state: DictationState) -> bool {
+    matches!(
+        state,
+        DictationState::Listening | DictationState::Processing
+    )
 }
 
 /// Shows or hides the overlay for a dictation state. No-op when the overlay
 /// failed to build, so dictation still works without it.
-pub fn sync_visibility(app: &AppHandle, state: &str) {
+pub fn sync_visibility(app: &AppHandle, state: DictationState) {
     let Some(window) = app.get_webview_window(LABEL) else {
         return;
     };
@@ -248,6 +254,9 @@ mod tests {
     /// screen-saver level.
     #[cfg(target_os = "macos")]
     #[test]
+    // The point of the test is to pin the constant, so a constant assertion is
+    // exactly what it is.
+    #[allow(clippy::assertions_on_constants)]
     fn window_level_is_above_floating_and_below_the_screen_saver() {
         assert!(STATUS_WINDOW_LEVEL > 3);
         assert!(STATUS_WINDOW_LEVEL < 1000);
@@ -255,9 +264,8 @@ mod tests {
 
     #[test]
     fn visible_for_state_covers_the_active_states_only() {
-        assert!(visible_for_state("listening"));
-        assert!(visible_for_state("processing"));
-        assert!(!visible_for_state("idle"));
-        assert!(!visible_for_state(""));
+        assert!(visible_for_state(DictationState::Listening));
+        assert!(visible_for_state(DictationState::Processing));
+        assert!(!visible_for_state(DictationState::Idle));
     }
 }

@@ -1,7 +1,9 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::future::Future;
+use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -9,6 +11,7 @@ use kea_core::dictation::{DictationSettings, DictationSettingsRepo};
 use kea_core::log::{current_log_path, tail_log_file};
 use kea_core::meetings::{MeetingSettings, MeetingSettingsRepo};
 use kea_core::resolve::Resolution;
+use kea_core::resolve::SlotResolver;
 use kea_core::rewrite::{
     build_llm_request, PresetRepo, PromptOverrideRepo, ProviderConfig, ProviderConfigRepo,
     RewriteInput, RewriteMode, RewritePreset,
@@ -21,18 +24,22 @@ use kea_core::store::meetings::{Meeting, MeetingDetail};
 use kea_core::store::settings::SettingsRepo;
 use kea_core::tts::{TtsSettings, TtsSettingsRepo};
 use kea_engines::{EngineRegistry, TtsOpts};
-use kea_features::demo::run_ping;
+use kea_features::demo::{run_ping, DemoFeature};
+use kea_features::run_rewrite_with_storage;
+use kea_features::tts::run_tts_with_player;
 use kea_features::{
     drain_and_stop_meeting, run_dictation_with_storage, run_meeting_poll_segment,
-    run_meeting_start, run_meeting_stop, run_tts_synthesize, ActiveMeeting, CapKind,
-    ContentStorageOpts, MeetingRunContext,
+    run_meeting_start, run_meeting_stop, ActiveMeeting, CapKind, ContentStorageOpts,
+    DictationFeature, FeatureRegistry, MeetingFeature, MeetingRunContext, RewriteFeature,
+    TtsFeature,
 };
-use kea_features::run_rewrite_with_storage;
-use kea_core::resolve::SlotResolver;
-use kea_infer::{temp_file_for, StreamedFile, DownloadTransport, InferError, ModelDownloader, ModelRegistry, ModelStorage, OnnxModelEntry};
+use kea_infer::{
+    temp_file_for, DownloadTransport, InferError, ModelDownloader, ModelKind, ModelRegistry,
+    ModelStorage, OnnxModelEntry, StreamedFile,
+};
 use kea_platform::{
     new_text_io, parse_accelerator, AudioIo, AudioIoError, Cue, DictationState, HoldAction,
-    HotkeyBinding, Hotkeys, MeetingState, PermKind, PermStatus, PcmFrame, SystemAudioCapability,
+    HotkeyBinding, Hotkeys, MeetingState, PcmFrame, PermKind, PermStatus, SystemAudioCapability,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -42,10 +49,10 @@ use tauri_plugin_notification::NotificationExt;
 use tokio::sync::watch;
 
 use crate::events::{
-    emit_dictation_error, emit_dictation_level, emit_dictation_state, emit_meeting_error,
-    emit_meeting_level, emit_meeting_segment, emit_meeting_state,
+    dictation_state_wire, emit_dictation_error, emit_dictation_level, emit_dictation_state,
+    emit_meeting_error, emit_meeting_level, emit_meeting_segment, emit_meeting_state,
     emit_model_download_complete, emit_model_download_error, emit_model_download_progress,
-    emit_tts_state, MeetingSegmentPayload,
+    emit_tts_state, meeting_state_wire, MeetingSegmentPayload, TtsState,
 };
 use crate::{ActiveDownload, AppState};
 
@@ -64,6 +71,75 @@ pub const TTS_COMMAND_ID: &str = "read_selection";
 pub const MEETINGS_ACTION_ID: &str = "meetings:toggle_meeting";
 pub const MEETINGS_FEATURE_ID: &str = "meetings";
 pub const MEETINGS_COMMAND_ID: &str = "toggle_meeting";
+
+/// One global hotkey: the `(feature, command)` pair the DB rows and the UI
+/// address it by, plus the action id the dispatch loop matches on.
+///
+/// No accelerator here on purpose — the default belongs to the feature that
+/// declares the command ([`kea_features::Command::default_accelerator`]) and is
+/// read back through [`compiled_default_accelerator`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotkeyAction {
+    pub feature: &'static str,
+    pub command: &'static str,
+    pub action_id: &'static str,
+}
+
+/// Every command that owns a global hotkey.
+///
+/// This is the one table the hotkey paths read — startup registration,
+/// `set_hotkey`, its rebind cleanup, collision detection and the
+/// effective-hotkey lookup — so adding a feature hotkey is a row here rather
+/// than another arm in five matches.
+pub const HOTKEY_ACTIONS: [HotkeyAction; 4] = [
+    HotkeyAction {
+        feature: REWRITE_FEATURE_ID,
+        command: REWRITE_COMMAND_ID,
+        action_id: REWRITE_ACTION_ID,
+    },
+    HotkeyAction {
+        feature: DICTATION_FEATURE_ID,
+        command: DICTATION_COMMAND_ID,
+        action_id: DICTATION_ACTION_ID,
+    },
+    HotkeyAction {
+        feature: TTS_FEATURE_ID,
+        command: TTS_COMMAND_ID,
+        action_id: TTS_ACTION_ID,
+    },
+    HotkeyAction {
+        feature: MEETINGS_FEATURE_ID,
+        command: MEETINGS_COMMAND_ID,
+        action_id: MEETINGS_ACTION_ID,
+    },
+];
+
+/// The descriptor for a `(feature, command)` pair, or `None` when the pair is
+/// not a global hotkey — a binding persisted for some other command, say.
+pub fn hotkey_action(feature: &str, command: &str) -> Option<HotkeyAction> {
+    HOTKEY_ACTIONS
+        .iter()
+        .copied()
+        .find(|a| a.feature == feature && a.command == command)
+}
+
+/// The registered features, built once.
+///
+/// Also the app's [`AppState::features`](crate::AppState) — it is immutable
+/// after startup, and the hotkey defaults have to be readable from pure
+/// helpers that never see the state.
+pub fn feature_registry() -> &'static FeatureRegistry {
+    static REGISTRY: OnceLock<FeatureRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut reg = FeatureRegistry::default();
+        reg.register(Arc::new(DemoFeature));
+        reg.register(Arc::new(RewriteFeature));
+        reg.register(Arc::new(DictationFeature));
+        reg.register(Arc::new(MeetingFeature));
+        reg.register(Arc::new(TtsFeature));
+        reg
+    })
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct EffectiveHotkey {
@@ -111,14 +187,18 @@ pub fn try_acquire_busy(flag: &Arc<AtomicBool>) -> Option<BusyGuard> {
 
 /// Pure helper: resolve the effective hotkey for a known (feature, command) pair.
 /// Returns the DB row if present, otherwise the compiled default.
-pub fn effective_hotkey(feature: &str, command: &str, db_accel: Option<String>) -> Option<EffectiveHotkey> {
+pub fn effective_hotkey(
+    feature: &str,
+    command: &str,
+    db_accel: Option<String>,
+) -> Option<EffectiveHotkey> {
     match db_accel {
         Some(accel) => Some(EffectiveHotkey {
             accelerator: accel,
             source: "custom".into(),
         }),
         None => compiled_default_accelerator(feature, command).map(|a| EffectiveHotkey {
-            accelerator: a.to_string(),
+            accelerator: a,
             source: "default".into(),
         }),
     }
@@ -139,16 +219,23 @@ pub fn record_hotkey_reg_status(
             (false, Some(e.clone()))
         }
     };
-    statuses.insert(key, HotkeyRegStatus {
-        feature: feature.to_string(),
-        command: command.to_string(),
-        ok,
-        error,
-    });
+    statuses.insert(
+        key,
+        HotkeyRegStatus {
+            feature: feature.to_string(),
+            command: command.to_string(),
+            ok,
+            error,
+        },
+    );
 }
 
 /// Pure helper: clears a single registration-status entry when re-registration succeeds.
-pub fn clear_hotkey_reg_status(statuses: &mut HashMap<String, HotkeyRegStatus>, feature: &str, command: &str) {
+pub fn clear_hotkey_reg_status(
+    statuses: &mut HashMap<String, HotkeyRegStatus>,
+    feature: &str,
+    command: &str,
+) {
     let key = format!("{feature}:{command}");
     statuses.remove(&key);
 }
@@ -238,32 +325,21 @@ pub fn system_audio_capability_dto(cap: SystemAudioCapability) -> String {
     }
 }
 
-fn parse_perm_kind(kind: &str) -> Result<PermKind, String> {
-    match kind {
-        "microphone" => Ok(PermKind::Microphone),
-        "screen_recording" => Ok(PermKind::ScreenRecording),
-        "accessibility" => Err(
-            "accessibility is queried via get_all_permission_statuses or accessibility_status()"
-                .into(),
-        ),
-        _ => Err(format!("unknown permission kind: {kind}")),
-    }
-}
+/// The permission kinds the UI can ask about, paired with the snake_case names
+/// the IPC layer speaks. One table, so the parser and the status list cannot
+/// drift apart.
+const PERM_KINDS: [(&str, PermKind); 3] = [
+    ("microphone", PermKind::Microphone),
+    ("screen_recording", PermKind::ScreenRecording),
+    ("accessibility", PermKind::Accessibility),
+];
 
-/// Best-effort Accessibility trust probe (macOS AX APIs).
-pub fn accessibility_status() -> PermStatus {
-    #[cfg(target_os = "macos")]
-    {
-        if kea_platform::textio::macos_ax::is_ax_trusted() {
-            PermStatus::Granted
-        } else {
-            PermStatus::Denied
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        PermStatus::Unknown
-    }
+fn parse_perm_kind(kind: &str) -> Result<PermKind, String> {
+    PERM_KINDS
+        .iter()
+        .find(|(name, _)| *name == kind)
+        .map(|(_, perm)| *perm)
+        .ok_or_else(|| format!("unknown permission kind: {kind}"))
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -272,29 +348,28 @@ pub struct PermissionStatusItem {
     pub status: PermStatus,
 }
 
-pub fn all_permission_statuses(permissions: &dyn kea_platform::Permissions) -> Vec<PermissionStatusItem> {
-    vec![
-        PermissionStatusItem {
-            kind: "microphone".into(),
-            status: permissions.status(PermKind::Microphone),
-        },
-        PermissionStatusItem {
-            kind: "screen_recording".into(),
-            status: permissions.status(PermKind::ScreenRecording),
-        },
-        PermissionStatusItem {
-            kind: "accessibility".into(),
-            status: accessibility_status(),
-        },
-    ]
+pub fn all_permission_statuses(
+    permissions: &dyn kea_platform::Permissions,
+) -> Vec<PermissionStatusItem> {
+    PERM_KINDS
+        .iter()
+        .map(|(name, perm)| PermissionStatusItem {
+            kind: (*name).into(),
+            status: permissions.status(*perm),
+        })
+        .collect()
 }
 
-pub fn onnx_catalog_for_kind(kind: &str) -> Result<Vec<OnnxModelEntry>, String> {
-    match kind {
-        "parakeet" => Ok(ModelRegistry::parakeet_catalog()),
-        "tts" => Ok(ModelRegistry::tts_catalog()),
-        _ => Err(format!("unknown onnx model kind: {kind} (expected parakeet or tts)")),
-    }
+/// Parses the model kind an IPC command was handed. Every command that takes a
+/// `kind: String` funnels through here, so the unknown-kind rejection lives in
+/// one place and everything downstream works on the enum.
+pub fn parse_model_kind(kind: &str) -> Result<ModelKind, String> {
+    ModelKind::try_from(kind).map_err(|e| e.to_string())
+}
+
+pub fn onnx_catalog_for_kind(kind: ModelKind) -> Result<Vec<OnnxModelEntry>, String> {
+    ModelRegistry::onnx_catalog(kind)
+        .ok_or_else(|| format!("unknown onnx model kind: {kind} (expected parakeet or tts)"))
 }
 
 pub fn installed_onnx_model_ids(storage: &ModelStorage, catalog: &[OnnxModelEntry]) -> Vec<String> {
@@ -338,7 +413,10 @@ pub fn provider_entries(custom: &[CustomProvider]) -> Vec<ProviderEntry> {
         })
         .collect();
     for provider in custom {
-        if entries.iter().any(|e| e.provider_ref == provider.provider_ref) {
+        if entries
+            .iter()
+            .any(|e| e.provider_ref == provider.provider_ref)
+        {
             continue;
         }
         entries.push(ProviderEntry {
@@ -498,7 +576,11 @@ pub const CLEARTEXT_KEY_WARNING: &str = "key sent over plain http";
 /// Whether testing this provider would put the bearer key on the wire in
 /// cleartext (pure, unit-testable).
 pub fn sends_key_in_cleartext(base_url: &str, has_key: bool) -> bool {
-    has_key && base_url.trim_start().to_ascii_lowercase().starts_with("http://")
+    has_key
+        && base_url
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("http://")
 }
 
 /// Appends the cleartext warning to a result's message, keeping `ok` as-is.
@@ -621,25 +703,16 @@ pub fn validate_engine_for_slot(
     }
 }
 
-pub fn default_rewrite_accelerator() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "Cmd+Shift+R"
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        "CommandOrControl+Shift+R"
-    }
-}
-
-pub async fn resolve_rewrite_accelerator(config_pool: &SqlitePool) -> String {
+/// The live accelerator for one global hotkey: the user's row when there is
+/// one, otherwise the feature's compiled-in default.
+pub async fn resolve_accelerator(config_pool: &SqlitePool, action: &HotkeyAction) -> String {
     let repo = HotkeyBindingRepo::new(config_pool.clone());
-    match repo
-        .get(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID)
-        .await
-    {
+    match repo.get(action.feature, action.command).await {
         Ok(Some(row)) => row.accelerator,
-        _ => default_rewrite_accelerator().to_string(),
+        // Every row in HOTKEY_ACTIONS names a command whose feature declares a
+        // default; falling back to empty keeps this total rather than panicking
+        // if one is ever dropped, and registration then fails visibly.
+        _ => compiled_default_accelerator(action.feature, action.command).unwrap_or_default(),
     }
 }
 
@@ -774,8 +847,10 @@ pub async fn execute_rewrite(state: &AppState, input: RewriteInput) -> Result<St
     .await
 }
 
-pub fn register_rewrite_hotkey(
+/// Bind `accelerator` to one global-hotkey action.
+pub fn register_hotkey(
     hotkeys: &mut Box<dyn Hotkeys>,
+    action: &HotkeyAction,
     accelerator: &str,
 ) -> Result<(), String> {
     hotkeys
@@ -783,124 +858,19 @@ pub fn register_rewrite_hotkey(
             HotkeyBinding {
                 accelerator: accelerator.to_string(),
             },
-            REWRITE_ACTION_ID.into(),
-        )
-        .map_err(|e| e.to_string())
-}
-
-pub fn default_dictation_accelerator() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "Cmd+Shift+D"
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        "CommandOrControl+Shift+D"
-    }
-}
-
-pub async fn resolve_dictation_accelerator(config_pool: &SqlitePool) -> String {
-    let repo = HotkeyBindingRepo::new(config_pool.clone());
-    match repo
-        .get(DICTATION_FEATURE_ID, DICTATION_COMMAND_ID)
-        .await
-    {
-        Ok(Some(row)) => row.accelerator,
-        _ => default_dictation_accelerator().to_string(),
-    }
-}
-
-pub fn register_dictation_hotkey(
-    hotkeys: &mut Box<dyn Hotkeys>,
-    accelerator: &str,
-) -> Result<(), String> {
-    hotkeys
-        .register(
-            HotkeyBinding {
-                accelerator: accelerator.to_string(),
-            },
-            DICTATION_ACTION_ID.into(),
-        )
-        .map_err(|e| e.to_string())
-}
-
-pub fn default_tts_accelerator() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "Cmd+Shift+T"
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        "CommandOrControl+Shift+T"
-    }
-}
-
-pub async fn resolve_tts_accelerator(config_pool: &SqlitePool) -> String {
-    let repo = HotkeyBindingRepo::new(config_pool.clone());
-    match repo.get(TTS_FEATURE_ID, TTS_COMMAND_ID).await {
-        Ok(Some(row)) => row.accelerator,
-        _ => default_tts_accelerator().to_string(),
-    }
-}
-
-pub fn register_tts_hotkey(
-    hotkeys: &mut Box<dyn Hotkeys>,
-    accelerator: &str,
-) -> Result<(), String> {
-    hotkeys
-        .register(
-            HotkeyBinding {
-                accelerator: accelerator.to_string(),
-            },
-            TTS_ACTION_ID.into(),
-        )
-        .map_err(|e| e.to_string())
-}
-
-pub fn default_meeting_accelerator() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "Cmd+Shift+M"
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        "CommandOrControl+Shift+M"
-    }
-}
-
-pub async fn resolve_meeting_accelerator(config_pool: &SqlitePool) -> String {
-    let repo = HotkeyBindingRepo::new(config_pool.clone());
-    match repo
-        .get(MEETINGS_FEATURE_ID, MEETINGS_COMMAND_ID)
-        .await
-    {
-        Ok(Some(row)) => row.accelerator,
-        _ => default_meeting_accelerator().to_string(),
-    }
-}
-
-pub fn register_meeting_hotkey(
-    hotkeys: &mut Box<dyn Hotkeys>,
-    accelerator: &str,
-) -> Result<(), String> {
-    hotkeys
-        .register(
-            HotkeyBinding {
-                accelerator: accelerator.to_string(),
-            },
-            MEETINGS_ACTION_ID.into(),
+            action.action_id.into(),
         )
         .map_err(|e| e.to_string())
 }
 
 pub async fn trigger_tts_inner(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
-    emit_tts_state(app, "reading");
+    emit_tts_state(app, TtsState::Reading);
     // Any early failure between here and the terminal emit must still return
     // the UI to idle, otherwise the global status banner sticks on
     // "Reading selection aloud…".
     let result = trigger_tts_run(state, app).await;
     if result.is_err() {
-        emit_tts_state(app, "idle");
+        emit_tts_state(app, TtsState::Idle);
     }
     result
 }
@@ -914,46 +884,54 @@ async fn trigger_tts_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(), S
     let actions = ActionRepo::new(state.data_pool.clone());
     let textio = new_text_io();
 
-    let (action_id, pcm) = run_tts_synthesize(
+    // The action lifecycle lives in the feature; this only supplies the way
+    // the app reaches the speakers. Playback goes to the free function on a
+    // blocking thread rather than through `state.audio`, whose mutex guards
+    // capture and must not be held for the length of the audio.
+    run_tts_with_player(
         &state.engines,
         &bindings,
         &actions,
         textio.as_ref(),
         &settings,
+        |pcm| async move {
+            tokio::task::spawn_blocking(move || {
+                kea_platform::audio::playback::play_pcm_blocking(&pcm)
+            })
+            .await
+            .map_err(|e| format!("playback failed: {e}"))?
+            .map_err(|e| e.to_string())
+        },
     )
     .await?;
 
-    let play_result = tokio::task::spawn_blocking(move || {
-        kea_platform::audio::playback::play_pcm_blocking(&pcm)
-    })
-    .await
-    .map_err(|e| format!("playback failed: {e}"))?;
-
-    match play_result {
-        Ok(()) => {
-            actions
-                .finish(action_id, "ok", None)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        Err(e) => {
-            if let Err(inner) = actions
-                .finish(action_id, "error", Some(&e.to_string()))
-                .await
-            {
-                tracing::warn!(
-                    error = %inner,
-                    action_id = %action_id,
-                    "tts: failed to finish action as error in DB"
-                );
-            }
-            emit_tts_state(app, "idle");
-            return Err(e.to_string());
-        }
-    }
-
-    emit_tts_state(app, "idle");
+    emit_tts_state(app, TtsState::Idle);
     Ok(())
+}
+
+/// Reads the three inputs [`dictation_hotkey_action`] and
+/// [`hold_dictation_action`] gate on, in the order that keeps the answer
+/// right: the meeting flags come first because during meeting synthesis the
+/// audio lock is free but starting dictation would still be wrong, and reading
+/// them first avoids any park-and-replay behind that lock.
+///
+/// This is only the hotkey gate. `start_dictation_run` and
+/// `get_dictation_state` answer different questions with deliberately
+/// different precedence and do not share it.
+pub async fn dictation_gate(state: &Arc<AppState>) -> (bool, bool, DictationState) {
+    let meeting_active = state
+        .active_meeting
+        .lock()
+        .map(|guard| guard.is_some())
+        .unwrap_or(false)
+        || state.meeting_processing.load(Ordering::SeqCst);
+    let in_flight = state
+        .dictation_current_run
+        .lock()
+        .map(|guard| guard.is_some())
+        .unwrap_or(false);
+    let current = state.audio.lock().await.state();
+    (meeting_active, in_flight, current)
 }
 
 /// Toggle push-to-talk: global-hotkey currently delivers press events only.
@@ -964,7 +942,11 @@ pub enum DictationHotkeyAction {
     Ignore,
 }
 
-pub fn dictation_hotkey_action(current: DictationState, meeting_active: bool, in_flight: bool) -> DictationHotkeyAction {
+pub fn dictation_hotkey_action(
+    current: DictationState,
+    meeting_active: bool,
+    in_flight: bool,
+) -> DictationHotkeyAction {
     if meeting_active {
         return DictationHotkeyAction::Ignore;
     }
@@ -1054,18 +1036,7 @@ fn spawn_hold_to_talk_dispatch(
                 continue;
             };
 
-            let meeting_active = state
-                .active_meeting
-                .lock()
-                .map(|guard| guard.is_some())
-                .unwrap_or(false)
-                || state.meeting_processing.load(Ordering::SeqCst);
-            let in_flight = state
-                .dictation_current_run
-                .lock()
-                .map(|guard| guard.is_some())
-                .unwrap_or(false);
-            let current = state.audio.lock().await.state();
+            let (meeting_active, in_flight, current) = dictation_gate(&state).await;
 
             match hold_dictation_action(event, current, meeting_active, in_flight) {
                 DictationHotkeyAction::Start => {
@@ -1123,9 +1094,7 @@ impl ReplayAudioIo {
 
 #[async_trait]
 impl AudioIo for ReplayAudioIo {
-    async fn start_mic(
-        &mut self,
-    ) -> Result<tokio::sync::mpsc::Receiver<PcmFrame>, AudioIoError> {
+    async fn start_mic(&mut self) -> Result<tokio::sync::mpsc::Receiver<PcmFrame>, AudioIoError> {
         self.state = DictationState::Listening;
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         Ok(rx)
@@ -1276,11 +1245,83 @@ where
     }
 }
 
-fn onnx_storage_for<'a>(state: &'a AppState, kind: &str) -> Result<&'a ModelStorage, String> {
+/// What registering a download needs, whichever family it belongs to. The key
+/// is deliberately not a field: [`start_download`] derives it from
+/// `(kind, model_id)` so the start side has exactly one producer and the key
+/// [`cancel_model_download`] re-derives cannot drift from it.
+struct DownloadRequest<'a> {
+    kind: ModelKind,
+    model_id: &'a str,
+    /// Where the transfer stages bytes, so a cancel can clear the partial file.
+    temp_path: PathBuf,
+    /// How a second start for the same model is refused; the two families word
+    /// it differently.
+    busy_message: String,
+}
+
+/// Registers one transfer and owns the whole contract `cancel_model_download`
+/// depends on: the key it re-derives, the temp path it deletes, and the single
+/// terminal event the UI waits on.
+///
+/// The commands above it keep only what is family-specific — storage, catalog
+/// entry, the transfer closure. That split is the point: the cancellation
+/// contract used to be written out once per kind, so a fix to one copy left
+/// cancel broken for the other.
+fn start_download<Fut>(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    request: DownloadRequest<'_>,
+    run: impl FnOnce(AppHandle) -> Fut + Send + 'static,
+) -> Result<(), String>
+where
+    Fut: std::future::Future<Output = Result<(), InferError>> + Send + 'static,
+{
+    let DownloadRequest {
+        kind,
+        model_id,
+        temp_path,
+        busy_message,
+    } = request;
+    let key = kind.download_key(model_id);
+
+    let mut guard = state.active_downloads.lock().map_err(|e| e.to_string())?;
+    if guard.contains_key(&key) {
+        return Err(busy_message);
+    }
+
+    let app_handle = app.clone();
+    let state_for_cleanup = state.clone();
+    let mid = model_id.to_string();
+    let cleanup_key = key.clone();
+    // The handle is registered while the lock is held, so a task that finishes
+    // instantly cannot have its entry removed before it was ever inserted.
+    let task = tauri::async_runtime::spawn(async move {
+        let outcome = run_download_task(&mid, run(app_handle.clone())).await;
+        {
+            let mut guard = state_for_cleanup.active_downloads.lock().unwrap();
+            guard.remove(&cleanup_key);
+        }
+        match outcome {
+            Ok(()) => emit_model_download_complete(&app_handle, &mid),
+            Err(message) => emit_model_download_error(&app_handle, &mid, &message),
+        }
+    });
+    guard.insert(
+        key,
+        ActiveDownload {
+            model_id: model_id.to_string(),
+            temp_path,
+            task,
+        },
+    );
+    Ok(())
+}
+
+fn onnx_storage_for(state: &AppState, kind: ModelKind) -> Result<&ModelStorage, String> {
     match kind {
-        "parakeet" => Ok(&state.parakeet_storage),
-        "tts" => Ok(&state.tts_storage),
-        _ => Err(format!("unknown onnx model kind: {kind}")),
+        ModelKind::Parakeet => Ok(&state.parakeet_storage),
+        ModelKind::Tts => Ok(&state.tts_storage),
+        ModelKind::Whisper => Err(format!("unknown onnx model kind: {kind}")),
     }
 }
 
@@ -1322,74 +1363,85 @@ pub fn open_accessibility_settings() -> Result<(), String> {
     Ok(())
 }
 
-fn stop_level_poll(state: &AppState) {
-    if let Ok(mut guard) = state.level_poll_cancel.lock() {
+/// The cancel half of a running poll loop, parked on [`AppState`] so the next
+/// spawn can stop the previous one.
+type PollCancel = Mutex<Option<watch::Sender<bool>>>;
+
+/// How often the level polls sample the meter.
+const LEVEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+fn stop_poll(slot: &PollCancel) {
+    if let Ok(mut guard) = slot.lock() {
         if let Some(tx) = guard.take() {
             let _ = tx.send(true);
         }
     }
+}
+
+/// Runs `tick` every `every` on the async runtime until the loop is cancelled
+/// through `slot` or `tick` asks to stop, replacing whatever loop `slot` was
+/// holding.
+fn spawn_cancellable_poll<F, Fut>(slot: &PollCancel, every: Duration, tick: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = ControlFlow<()>> + Send + 'static,
+{
+    stop_poll(slot);
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(cancel_tx);
+    }
+
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(every);
+        loop {
+            tokio::select! {
+                changed = cancel_rx.changed() => {
+                    if changed.is_ok() && *cancel_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if tick().await.is_break() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn stop_level_poll(state: &AppState) {
+    stop_poll(&state.level_poll_cancel);
 }
 
 fn stop_segment_poll(state: &AppState) {
-    if let Ok(mut guard) = state.segment_poll_cancel.lock() {
-        if let Some(tx) = guard.take() {
-            let _ = tx.send(true);
+    stop_poll(&state.segment_poll_cancel);
+}
+
+/// Publishes the input meter on `emit` until the level poll is cancelled.
+/// Dictation and meetings share the one slot: only one of them records at a
+/// time, so starting either stops the other's meter.
+fn spawn_audio_level_poll(state: &Arc<AppState>, app: &AppHandle, emit: fn(&AppHandle, f32)) {
+    let poll_state = state.clone();
+    let poll_app = app.clone();
+    spawn_cancellable_poll(&state.level_poll_cancel, LEVEL_POLL_INTERVAL, move || {
+        let state = poll_state.clone();
+        let app = poll_app.clone();
+        async move {
+            let level = state.audio.lock().await.current_level();
+            emit(&app, level);
+            ControlFlow::Continue(())
         }
-    }
+    });
 }
 
 fn spawn_level_poll(state: &Arc<AppState>, app: &AppHandle) {
-    stop_level_poll(state);
-    let (cancel_tx, mut cancel_rx) = watch::channel(false);
-    if let Ok(mut guard) = state.level_poll_cancel.lock() {
-        *guard = Some(cancel_tx);
-    }
-
-    let state = state.clone();
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(50));
-        loop {
-            tokio::select! {
-                changed = cancel_rx.changed() => {
-                    if changed.is_ok() && *cancel_rx.borrow() {
-                        break;
-                    }
-                }
-                _ = interval.tick() => {
-                    let level = state.audio.lock().await.current_level();
-                    emit_dictation_level(&app, level);
-                }
-            }
-        }
-    });
+    spawn_audio_level_poll(state, app, emit_dictation_level);
 }
 
 fn spawn_meeting_level_poll(state: &Arc<AppState>, app: &AppHandle) {
-    stop_level_poll(state);
-    let (cancel_tx, mut cancel_rx) = watch::channel(false);
-    if let Ok(mut guard) = state.level_poll_cancel.lock() {
-        *guard = Some(cancel_tx);
-    }
-
-    let state = state.clone();
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(50));
-        loop {
-            tokio::select! {
-                changed = cancel_rx.changed() => {
-                    if changed.is_ok() && *cancel_rx.borrow() {
-                        break;
-                    }
-                }
-                _ = interval.tick() => {
-                    let level = state.audio.lock().await.current_level();
-                    emit_meeting_level(&app, level);
-                }
-            }
-        }
-    });
+    spawn_audio_level_poll(state, app, emit_meeting_level);
 }
 
 /// How often the loop asks whether the buffer has reached a cut point. The
@@ -1399,107 +1451,91 @@ fn spawn_meeting_level_poll(state: &Arc<AppState>, app: &AppHandle) {
 const SEGMENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 fn spawn_segment_poll(state: &Arc<AppState>, app: &AppHandle, interval_secs: u32) {
-    stop_segment_poll(state);
-    let (cancel_tx, mut cancel_rx) = watch::channel(false);
-    if let Ok(mut guard) = state.segment_poll_cancel.lock() {
-        *guard = Some(cancel_tx);
-    }
-
-    let state = state.clone();
-    let app = app.clone();
     // The configured length is passed to the cut logic as the hard cap, not
     // used as the tick rate.
     let _ = interval_secs;
-    let poll_interval = SEGMENT_POLL_INTERVAL;
-    tauri::async_runtime::spawn(async move {
-        let mut interval = tokio::time::interval(poll_interval);
-        loop {
-            tokio::select! {
-                changed = cancel_rx.changed() => {
-                    if changed.is_ok() && *cancel_rx.borrow() {
-                        break;
-                    }
-                }
-                _ = interval.tick() => {
-                    let poll_state = {
-                        let guard = state.active_meeting.lock().expect("active_meeting lock");
-                        guard.as_ref().map(|active| {
-                            (
-                                active.session.meeting_id.clone(),
-                                active.sequence,
-                                active.elapsed_ms,
-                            )
-                        })
-                    };
-                    let Some((meeting_id, mut sequence, mut elapsed_ms)) = poll_state else {
-                        break;
-                    };
+    let state_for_poll = state.clone();
+    let app_for_poll = app.clone();
+    spawn_cancellable_poll(
+        &state.segment_poll_cancel,
+        SEGMENT_POLL_INTERVAL,
+        move || {
+            let state = state_for_poll.clone();
+            let app = app_for_poll.clone();
+            async move {
+                let poll_state = {
+                    let guard = state.active_meeting.lock().expect("active_meeting lock");
+                    guard.as_ref().map(|active| {
+                        (
+                            active.session.meeting_id.clone(),
+                            active.sequence,
+                            active.elapsed_ms,
+                        )
+                    })
+                };
+                let Some((meeting_id, mut sequence, mut elapsed_ms)) = poll_state else {
+                    return ControlFlow::Break(());
+                };
 
-                    let settings = match MeetingSettingsRepo::new(SettingsRepo::new(
-                        state.config_pool.clone(),
-                    ))
-                    .get()
-                    .await
+                let settings =
+                    match MeetingSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
+                        .get()
+                        .await
                     {
                         Ok(s) => s,
                         Err(e) => {
                             emit_meeting_error(&app, &e.to_string());
-                            continue;
+                            return ControlFlow::Continue(());
                         }
                     };
 
-                    let bindings = BindingRepo::new(state.config_pool.clone());
-                    let actions = ActionRepo::new(state.data_pool.clone());
-                    let meetings = &state.meeting_repo;
+                let bindings = BindingRepo::new(state.config_pool.clone());
+                let actions = ActionRepo::new(state.data_pool.clone());
+                let meetings = &state.meeting_repo;
 
-                    let poll_result = {
-                        let mut audio = state.audio.lock().await;
-                        let mut ctx = MeetingRunContext {
-                            engines: &state.engines,
-                            bindings: &bindings,
-                            actions: &actions,
-                            meetings,
-                            audio: audio.as_mut(),
-                            settings: &settings,
-                        };
-                        run_meeting_poll_segment(
-                            &mut ctx,
-                            &meeting_id,
-                            &mut sequence,
-                            &mut elapsed_ms,
-                        )
+                let poll_result = {
+                    let mut audio = state.audio.lock().await;
+                    let mut ctx = MeetingRunContext {
+                        engines: &state.engines,
+                        bindings: &bindings,
+                        actions: &actions,
+                        meetings,
+                        audio: audio.as_mut(),
+                        settings: &settings,
+                    };
+                    run_meeting_poll_segment(&mut ctx, &meeting_id, &mut sequence, &mut elapsed_ms)
                         .await
-                    };
+                };
 
-                    if let Ok(mut guard) = state.active_meeting.lock() {
-                        if let Some(active) = guard.as_mut() {
-                            if active.session.meeting_id == meeting_id {
-                                active.sequence = sequence;
-                                active.elapsed_ms = elapsed_ms;
-                            }
+                if let Ok(mut guard) = state.active_meeting.lock() {
+                    if let Some(active) = guard.as_mut() {
+                        if active.session.meeting_id == meeting_id {
+                            active.sequence = sequence;
+                            active.elapsed_ms = elapsed_ms;
                         }
-                    }
-
-                    match poll_result {
-                        Ok(Some(ev)) => {
-                            emit_meeting_segment(
-                                &app,
-                                &MeetingSegmentPayload {
-                                    meeting_id: ev.meeting_id,
-                                    sequence: ev.sequence,
-                                    text: ev.text,
-                                    start_offset_ms: ev.start_offset_ms,
-                                    end_offset_ms: ev.end_offset_ms,
-                                },
-                            );
-                        }
-                        Ok(None) => {}
-                        Err(e) => emit_meeting_error(&app, &e),
                     }
                 }
+
+                match poll_result {
+                    Ok(Some(ev)) => {
+                        emit_meeting_segment(
+                            &app,
+                            &MeetingSegmentPayload {
+                                meeting_id: ev.meeting_id,
+                                sequence: ev.sequence,
+                                text: ev.text,
+                                start_offset_ms: ev.start_offset_ms,
+                                end_offset_ms: ev.end_offset_ms,
+                            },
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => emit_meeting_error(&app, &e),
+                }
+                ControlFlow::Continue(())
             }
-        }
-    });
+        },
+    );
 }
 
 pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Result<String, String> {
@@ -1511,10 +1547,7 @@ pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Resu
     }
 
     {
-        let guard = state
-            .active_meeting
-            .lock()
-            .map_err(|e| e.to_string())?;
+        let guard = state.active_meeting.lock().map_err(|e| e.to_string())?;
         if guard.is_some() {
             return Err("a meeting is already recording".into());
         }
@@ -1554,10 +1587,7 @@ pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Resu
 
     let meeting_id = session.meeting_id.clone();
     {
-        let mut guard = state
-            .active_meeting
-            .lock()
-            .map_err(|e| e.to_string())?;
+        let mut guard = state.active_meeting.lock().map_err(|e| e.to_string())?;
         *guard = Some(ActiveMeetingSession {
             session,
             sequence: 0,
@@ -1565,7 +1595,7 @@ pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Resu
         });
     }
 
-    emit_meeting_state(app, "recording");
+    emit_meeting_state(app, MeetingState::Recording);
     spawn_meeting_level_poll(state, app);
     spawn_segment_poll(state, app, settings.segment_duration_secs);
 
@@ -1580,11 +1610,10 @@ pub async fn stop_meeting_inner(
     stop_level_poll(state);
 
     let session = {
-        let mut guard = state
-            .active_meeting
-            .lock()
-            .map_err(|e| e.to_string())?;
-        guard.take().ok_or_else(|| "no meeting is recording".to_string())?
+        let mut guard = state.active_meeting.lock().map_err(|e| e.to_string())?;
+        guard
+            .take()
+            .ok_or_else(|| "no meeting is recording".to_string())?
     };
 
     // Mark the post-capture processing window so dictation / a new meeting
@@ -1599,7 +1628,7 @@ pub async fn stop_meeting_inner(
     }
     let _processing_guard = ProcessingGuard(&state.meeting_processing);
 
-    emit_meeting_state(app, "processing");
+    emit_meeting_state(app, MeetingState::Processing);
 
     let bindings = BindingRepo::new(state.config_pool.clone());
     let actions = ActionRepo::new(state.data_pool.clone());
@@ -1624,10 +1653,10 @@ pub async fn stop_meeting_inner(
     .await;
 
     match &detail {
-        Ok(_) => emit_meeting_state(app, "idle"),
+        Ok(_) => emit_meeting_state(app, MeetingState::Idle),
         Err(e) => {
             emit_meeting_error(app, e);
-            emit_meeting_state(app, "idle");
+            emit_meeting_state(app, MeetingState::Idle);
         }
     }
 
@@ -1669,17 +1698,20 @@ async fn start_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(
             return Err("dictation is processing".into());
         }
         if let Err(e) = audio.start_mic().await {
-            emit_dictation_state(app, "idle");
+            emit_dictation_state(app, DictationState::Idle);
             return Err(e.to_string());
         }
     }
 
-    emit_dictation_state(app, "listening");
+    emit_dictation_state(app, DictationState::Listening);
     spawn_level_poll(state, app);
     Ok(())
 }
 
-pub async fn stop_dictation_inner(state: &Arc<AppState>, app: &AppHandle) -> Result<String, String> {
+pub async fn stop_dictation_inner(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+) -> Result<String, String> {
     let result = stop_dictation_run(state, app).await;
     spawn_dictation_cue(state, cue_for_dictation_outcome(&result));
     result
@@ -1712,7 +1744,7 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
                     .map_err(|e| e.to_string())?
                     .is_some();
                 if !in_flight {
-                    emit_dictation_state(app, "idle");
+                    emit_dictation_state(app, DictationState::Idle);
                 }
             }
             return Err("dictation is not listening".into());
@@ -1720,7 +1752,7 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
         match audio.stop_mic().await {
             Ok(pcm) => pcm,
             Err(e) => {
-                emit_dictation_state(app, "idle");
+                emit_dictation_state(app, DictationState::Idle);
                 return Err(e.to_string());
             }
         }
@@ -1751,7 +1783,7 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
             let mut g = self.flag.lock().unwrap_or_else(|p| p.into_inner());
             if *g == Some(self.run_id) {
                 *g = None;
-                emit_dictation_state(self.app, "idle");
+                emit_dictation_state(self.app, DictationState::Idle);
             }
         }
     }
@@ -1761,7 +1793,7 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
         app,
     };
 
-    emit_dictation_state(app, "processing");
+    emit_dictation_state(app, DictationState::Processing);
 
     let settings = match DictationSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
         .get()
@@ -2011,9 +2043,7 @@ pub async fn test_provider(
 }
 
 #[tauri::command]
-pub async fn list_providers(
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<ProviderEntry>, String> {
+pub async fn list_providers(state: State<'_, Arc<AppState>>) -> Result<Vec<ProviderEntry>, String> {
     let settings = SettingsRepo::new(state.config_pool.clone());
     let custom = load_custom_providers(&settings).await?;
     Ok(provider_entries(&custom))
@@ -2092,10 +2122,7 @@ pub async fn upsert_preset(
 }
 
 #[tauri::command]
-pub async fn delete_preset(
-    state: State<'_, Arc<AppState>>,
-    id: String,
-) -> Result<(), String> {
+pub async fn delete_preset(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
     PresetRepo::new(state.config_pool.clone())
         .delete(&id)
         .await
@@ -2153,9 +2180,7 @@ pub async fn get_effective_hotkey(
 }
 
 #[tauri::command]
-pub fn get_hotkey_registration_status(
-    state: State<'_, Arc<AppState>>,
-) -> Vec<HotkeyRegStatus> {
+pub fn get_hotkey_registration_status(state: State<'_, Arc<AppState>>) -> Vec<HotkeyRegStatus> {
     let guard = state
         .hotkey_reg_status
         .lock()
@@ -2184,14 +2209,14 @@ fn same_accelerator(a: &str, b: &str) -> bool {
 }
 
 /// Compiled-in default accelerator for the known global-hotkey pairs, if any.
-fn compiled_default_accelerator(feature: &str, command: &str) -> Option<&'static str> {
-    match (feature, command) {
-        (REWRITE_FEATURE_ID, REWRITE_COMMAND_ID) => Some(default_rewrite_accelerator()),
-        (DICTATION_FEATURE_ID, DICTATION_COMMAND_ID) => Some(default_dictation_accelerator()),
-        (TTS_FEATURE_ID, TTS_COMMAND_ID) => Some(default_tts_accelerator()),
-        (MEETINGS_FEATURE_ID, MEETINGS_COMMAND_ID) => Some(default_meeting_accelerator()),
-        _ => None,
-    }
+///
+/// Read off the feature's own `Command`, so the shell can never offer a default
+/// the feature does not declare.
+fn compiled_default_accelerator(feature: &str, command: &str) -> Option<String> {
+    let action = hotkey_action(feature, command)?;
+    feature_registry()
+        .find_command(action.feature, action.command)
+        .and_then(|c| c.default_accelerator)
 }
 
 /// Check for cross-feature accelerator collisions: return `Some("feature/command")`
@@ -2203,24 +2228,19 @@ fn check_hotkey_collision(
     accelerator: &str,
     bindings: &[HotkeyBindingRow],
 ) -> Option<String> {
-    for &(other_feature, other_command) in &[
-        (REWRITE_FEATURE_ID, REWRITE_COMMAND_ID),
-        (DICTATION_FEATURE_ID, DICTATION_COMMAND_ID),
-        (TTS_FEATURE_ID, TTS_COMMAND_ID),
-        (MEETINGS_FEATURE_ID, MEETINGS_COMMAND_ID),
-    ] {
-        if other_feature == feature && other_command == command {
+    for other in HOTKEY_ACTIONS {
+        if other.feature == feature && other.command == command {
             continue;
         }
         let other_effective = bindings
             .iter()
-            .find(|b| b.feature_id == other_feature && b.command == other_command)
-            .map(|b| b.accelerator.as_str())
-            .or_else(|| compiled_default_accelerator(other_feature, other_command));
+            .find(|b| b.feature_id == other.feature && b.command == other.command)
+            .map(|b| b.accelerator.clone())
+            .or_else(|| compiled_default_accelerator(other.feature, other.command));
 
         if let Some(other_accel) = other_effective {
-            if same_accelerator(accelerator, other_accel) {
-                return Some(format!("{other_feature}/{other_command}"));
+            if same_accelerator(accelerator, &other_accel) {
+                return Some(format!("{}/{}", other.feature, other.command));
             }
         }
     }
@@ -2265,7 +2285,7 @@ fn old_hotkey_action(
     let other_owner = bindings.iter().find(|b| {
         same_accelerator(&b.accelerator, &old_accel)
             && (b.feature_id != feature || b.command != command)
-            && compiled_default_accelerator(&b.feature_id, &b.command).is_some()
+            && hotkey_action(&b.feature_id, &b.command).is_some()
     });
     match other_owner {
         Some(owner) => OldHotkeyAction::Reassign {
@@ -2298,18 +2318,13 @@ pub async fn set_hotkey(
     // clean up even though old_row is None.
     let old_accel = match &old_row {
         Some(old) => Some(old.accelerator.clone()),
-        None => compiled_default_accelerator(&feature, &command).map(str::to_string),
+        None => compiled_default_accelerator(&feature, &command),
     };
 
     // --- collision detection: prevent two features from sharing an accelerator ---
-    let all_bindings = binding_repo
-        .list()
-        .await
-        .map_err(|e| e.to_string())?;
+    let all_bindings = binding_repo.list().await.map_err(|e| e.to_string())?;
 
-    if let Some(owner) =
-        check_hotkey_collision(&feature, &command, &accelerator, &all_bindings)
-    {
+    if let Some(owner) = check_hotkey_collision(&feature, &command, &accelerator, &all_bindings) {
         return Err(format!(
             "accelerator '{accelerator}' is already used by {owner}"
         ));
@@ -2331,24 +2346,12 @@ pub async fn set_hotkey(
     // is scoped: the std Mutex guard must not live across the persist await.
     let registered = {
         let mut hotkeys = state.hotkeys.lock().map_err(|e| e.to_string())?;
-        match (feature.as_str(), command.as_str()) {
-            (REWRITE_FEATURE_ID, REWRITE_COMMAND_ID) => {
-                register_rewrite_hotkey(&mut hotkeys, &accelerator)?;
+        match hotkey_action(&feature, &command) {
+            Some(action) => {
+                register_hotkey(&mut hotkeys, &action, &accelerator)?;
                 true
             }
-            (DICTATION_FEATURE_ID, DICTATION_COMMAND_ID) => {
-                register_dictation_hotkey(&mut hotkeys, &accelerator)?;
-                true
-            }
-            (TTS_FEATURE_ID, TTS_COMMAND_ID) => {
-                register_tts_hotkey(&mut hotkeys, &accelerator)?;
-                true
-            }
-            (MEETINGS_FEATURE_ID, MEETINGS_COMMAND_ID) => {
-                register_meeting_hotkey(&mut hotkeys, &accelerator)?;
-                true
-            }
-            _ => {
+            None => {
                 tracing::debug!(feature = %feature, command = %command,
                     "hotkey persisted but is not a global-hotkey feature");
                 false
@@ -2391,21 +2394,11 @@ pub async fn set_hotkey(
             } => {
                 // MacHotkeys::register replaces the existing by_accel/by_id
                 // entry, so this hands the old accelerator back to its owner.
-                let result = match (owner_feature.as_str(), owner_command.as_str()) {
-                    (REWRITE_FEATURE_ID, REWRITE_COMMAND_ID) => {
-                        register_rewrite_hotkey(&mut hotkeys, &old_accel)
-                    }
-                    (DICTATION_FEATURE_ID, DICTATION_COMMAND_ID) => {
-                        register_dictation_hotkey(&mut hotkeys, &old_accel)
-                    }
-                    (TTS_FEATURE_ID, TTS_COMMAND_ID) => {
-                        register_tts_hotkey(&mut hotkeys, &old_accel)
-                    }
-                    (MEETINGS_FEATURE_ID, MEETINGS_COMMAND_ID) => {
-                        register_meeting_hotkey(&mut hotkeys, &old_accel)
-                    }
-                    // Unreachable: Reassign only targets known pairs.
-                    _ => Ok(()),
+                // `old_hotkey_action` only reassigns to pairs in HOTKEY_ACTIONS,
+                // so the lookup is the same invariant, structurally.
+                let result = match hotkey_action(&owner_feature, &owner_command) {
+                    Some(action) => register_hotkey(&mut hotkeys, &action, &old_accel),
+                    None => Ok(()),
                 };
                 if let Err(err) = result {
                     tracing::warn!(
@@ -2420,10 +2413,7 @@ pub async fn set_hotkey(
 
     // Clear any startup registration failure record for this action.
     {
-        let mut statuses = state
-            .hotkey_reg_status
-            .lock()
-            .map_err(|e| e.to_string())?;
+        let mut statuses = state.hotkey_reg_status.lock().map_err(|e| e.to_string())?;
         clear_hotkey_reg_status(&mut statuses, &feature, &command);
     }
 
@@ -2480,7 +2470,7 @@ pub async fn preview_rewrite(
 
     let resolver = SlotResolver::new(&state.engines, &bindings);
     let binding = match resolver
-        .resolve_llm(REWRITE_FEATURE_ID, "llm")
+        .resolve(REWRITE_FEATURE_ID, CapKind::Llm)
         .await
         .map_err(|e| e.to_string())?
     {
@@ -2522,7 +2512,7 @@ pub async fn run_demo(state: State<'_, Arc<AppState>>, prompt: String) -> Result
     let bindings = BindingRepo::new(state.config_pool.clone());
     let resolver = SlotResolver::new(&state.engines, &bindings);
     let binding = match resolver
-        .resolve_llm("demo", "llm")
+        .resolve("demo", CapKind::Llm)
         .await
         .map_err(|e| e.to_string())?
     {
@@ -2559,50 +2549,30 @@ pub async fn download_whisper_model(
     model_id: String,
     app: AppHandle,
 ) -> Result<(), String> {
-    let key = download_key("whisper", &model_id);
     let storage = ModelStorage::new(state.model_storage.root.clone());
     let temp_path = temp_file_for(&storage.path_for(&model_id));
-
-    let mut guard = state.active_downloads.lock().map_err(|e| e.to_string())?;
-    if guard.contains_key(&key) {
-        return Err(format!("download of '{model_id}' already in progress"));
-    }
-
     let downloader = new_model_downloader(storage);
-    let app_handle = app.clone();
-    let state_for_cleanup = state.inner().clone();
     let mid = model_id.clone();
-    let cleanup_key = key.clone();
-    tracing::info!(model = %model_id, kind = "whisper", "model download started");
-    // The handle is registered while the lock is held, so a task that finishes
-    // instantly cannot have its entry removed before it was ever inserted.
-    let task = tauri::async_runtime::spawn(async move {
-        let outcome = run_download_task(&mid, async {
+
+    start_download(
+        state.inner(),
+        &app,
+        DownloadRequest {
+            kind: ModelKind::Whisper,
+            model_id: &model_id,
+            temp_path,
+            busy_message: format!("download of '{model_id}' already in progress"),
+        },
+        move |app| async move {
             downloader
                 .download_whisper(&mid, |progress| {
-                    emit_model_download_progress(&app_handle, &progress);
+                    emit_model_download_progress(&app, &progress);
                 })
                 .await
                 .map(|_| ())
-        })
-        .await;
-        {
-            let mut guard = state_for_cleanup.active_downloads.lock().unwrap();
-            guard.remove(&cleanup_key);
-        }
-        match outcome {
-            Ok(()) => emit_model_download_complete(&app_handle, &mid),
-            Err(message) => emit_model_download_error(&app_handle, &mid, &message),
-        }
-    });
-    guard.insert(
-        key,
-        ActiveDownload {
-            model_id,
-            temp_path,
-            task,
         },
-    );
+    )?;
+    tracing::info!(model = %model_id, kind = "whisper", "model download started");
     Ok(())
 }
 
@@ -2700,10 +2670,10 @@ pub async fn get_system_audio_capability(
 }
 
 #[tauri::command]
-pub fn get_permission_status(state: State<'_, Arc<AppState>>, kind: String) -> Result<PermStatus, String> {
-    if kind == "accessibility" {
-        return Ok(accessibility_status());
-    }
+pub fn get_permission_status(
+    state: State<'_, Arc<AppState>>,
+    kind: String,
+) -> Result<PermStatus, String> {
     let kind = parse_perm_kind(&kind)?;
     Ok(state.permissions.status(kind))
 }
@@ -2713,15 +2683,6 @@ pub async fn request_permission(
     state: State<'_, Arc<AppState>>,
     kind: String,
 ) -> Result<PermStatus, String> {
-    if kind == "accessibility" {
-        // Accessibility must be granted manually in System Settings (macOS); the
-        // system prompt offers to open it directly when not yet trusted.
-        #[cfg(target_os = "macos")]
-        {
-            let _ = kea_platform::textio::macos_ax::prompt_ax_trust();
-        }
-        return Ok(accessibility_status());
-    }
     let kind = parse_perm_kind(&kind)?;
     state
         .permissions
@@ -2731,9 +2692,7 @@ pub async fn request_permission(
 }
 
 #[tauri::command]
-pub fn get_all_permission_statuses(
-    state: State<'_, Arc<AppState>>,
-) -> Vec<PermissionStatusItem> {
+pub fn get_all_permission_statuses(state: State<'_, Arc<AppState>>) -> Vec<PermissionStatusItem> {
     all_permission_statuses(state.permissions.as_ref())
 }
 
@@ -2788,14 +2747,12 @@ pub async fn stop_meeting(
 }
 
 #[tauri::command]
-pub async fn get_dictation_state(
-    state: State<'_, Arc<AppState>>,
-) -> Result<String, String> {
+pub async fn get_dictation_state(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     let audio = state.audio.lock().await;
     let audio_state = audio.state();
     // Listening wins; idle with in-flight processing is reported as "processing"
     if audio_state == DictationState::Listening {
-        return Ok("listening".into());
+        return Ok(dictation_state_wire(DictationState::Listening).into());
     }
     let in_flight = state
         .dictation_current_run
@@ -2803,18 +2760,9 @@ pub async fn get_dictation_state(
         .map_err(|e| e.to_string())?
         .is_some();
     if in_flight {
-        return Ok("processing".into());
+        return Ok(dictation_state_wire(DictationState::Processing).into());
     }
-    Ok(dictation_state_str(audio_state))
-}
-
-fn dictation_state_str(s: DictationState) -> String {
-    match s {
-        DictationState::Idle => "idle",
-        DictationState::Listening => "listening",
-        DictationState::Processing => "processing",
-    }
-    .into()
+    Ok(dictation_state_wire(audio_state).into())
 }
 
 #[derive(serde::Serialize)]
@@ -2837,26 +2785,17 @@ pub async fn get_meeting_state(
     // post-capture synthesis window as "processing" so a remounted page
     // doesn't show a lying Idle while notes are still generating.
     let state_str = if active_meeting_id.is_some() {
-        "recording".to_string()
+        meeting_state_wire(MeetingState::Recording).to_string()
     } else if state.meeting_processing.load(Ordering::SeqCst) {
-        "processing".to_string()
+        meeting_state_wire(MeetingState::Processing).to_string()
     } else {
         let audio = state.audio.lock().await;
-        meeting_state_str(audio.meeting_state())
+        meeting_state_wire(audio.meeting_state()).to_string()
     };
     Ok(MeetingStatePayload {
         state: state_str,
         active_meeting_id,
     })
-}
-
-fn meeting_state_str(s: MeetingState) -> String {
-    match s {
-        MeetingState::Idle => "idle",
-        MeetingState::Recording => "recording",
-        MeetingState::Processing => "processing",
-    }
-    .into()
 }
 
 #[tauri::command]
@@ -2908,10 +2847,7 @@ pub async fn list_messages(
 }
 
 #[tauri::command]
-pub async fn delete_conversation(
-    state: State<'_, Arc<AppState>>,
-    id: i64,
-) -> Result<(), String> {
+pub async fn delete_conversation(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
     ConversationRepo::new(state.data_pool.clone())
         .delete_conversation(id)
         .await
@@ -2919,7 +2855,10 @@ pub async fn delete_conversation(
 }
 
 #[tauri::command]
-pub fn tail_logs(state: State<'_, Arc<AppState>>, max_bytes: Option<usize>) -> Result<String, String> {
+pub fn tail_logs(
+    state: State<'_, Arc<AppState>>,
+    max_bytes: Option<usize>,
+) -> Result<String, String> {
     let path = current_log_path(&state.log_dir);
     if !path.exists() {
         return Ok(String::new());
@@ -2981,26 +2920,17 @@ pub async fn set_tts_settings(
 }
 
 #[tauri::command]
-pub async fn run_read_aloud(
-    state: State<'_, Arc<AppState>>,
-    app: AppHandle,
-) -> Result<(), String> {
+pub async fn run_read_aloud(state: State<'_, Arc<AppState>>, app: AppHandle) -> Result<(), String> {
     trigger_tts_inner(&state, &app).await
 }
 
 #[tauri::command]
-pub async fn trigger_tts(
-    state: State<'_, Arc<AppState>>,
-    app: AppHandle,
-) -> Result<(), String> {
+pub async fn trigger_tts(state: State<'_, Arc<AppState>>, app: AppHandle) -> Result<(), String> {
     trigger_tts_inner(&state, &app).await
 }
 
 #[tauri::command]
-pub async fn read_selection(
-    state: State<'_, Arc<AppState>>,
-    app: AppHandle,
-) -> Result<(), String> {
+pub async fn read_selection(state: State<'_, Arc<AppState>>, app: AppHandle) -> Result<(), String> {
     trigger_tts_inner(&state, &app).await
 }
 
@@ -3069,17 +2999,15 @@ pub async fn preview_voice(
         samples: pcm.samples,
         sample_rate_hz: pcm.sample_rate_hz,
     };
-    tokio::task::spawn_blocking(move || {
-        kea_platform::audio::playback::play_pcm_blocking(&frame)
-    })
-    .await
-    .map_err(|e| format!("playback failed: {e}"))?
-    .map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(move || kea_platform::audio::playback::play_pcm_blocking(&frame))
+        .await
+        .map_err(|e| format!("playback failed: {e}"))?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn list_onnx_models(kind: String) -> Result<Vec<OnnxModelEntry>, String> {
-    onnx_catalog_for_kind(&kind)
+    onnx_catalog_for_kind(parse_model_kind(&kind)?)
 }
 
 #[tauri::command]
@@ -3087,8 +3015,9 @@ pub fn list_installed_onnx_models(
     state: State<'_, Arc<AppState>>,
     kind: String,
 ) -> Result<Vec<String>, String> {
-    let storage = onnx_storage_for(&state, &kind)?;
-    let catalog = onnx_catalog_for_kind(&kind)?;
+    let kind = parse_model_kind(&kind)?;
+    let storage = onnx_storage_for(&state, kind)?;
+    let catalog = onnx_catalog_for_kind(kind)?;
     Ok(installed_onnx_model_ids(storage, &catalog))
 }
 
@@ -3099,25 +3028,34 @@ pub async fn download_onnx_model(
     model_id: String,
     app: AppHandle,
 ) -> Result<(), String> {
-    let storage = ModelStorage::new(onnx_storage_for(&state, &kind)?.root.clone());
-    let entry = onnx_catalog_for_kind(&kind)?
+    let kind = parse_model_kind(&kind)?;
+    let storage = ModelStorage::new(onnx_storage_for(&state, kind)?.root.clone());
+    let entry = onnx_catalog_for_kind(kind)?
         .into_iter()
         .find(|e| e.id == model_id)
         .ok_or_else(|| format!("unknown {kind} model: {model_id}"))?;
 
-    let key = download_key(&kind, &model_id);
     let temp_path = temp_file_for(&storage.onnx_dir_for(&model_id));
-
-    let mut guard = state.active_downloads.lock().map_err(|e| e.to_string())?;
-    if guard.contains_key(&key) {
-        return Err(format!("download of '{model_id}' ({kind}) already in progress"));
-    }
-
     let downloader = new_model_downloader(storage);
-    let app_handle = app.clone();
-    let state_for_cleanup = state.inner().clone();
-    let mid = model_id.clone();
-    let cleanup_key = key.clone();
+    let task_entry = entry.clone();
+
+    start_download(
+        state.inner(),
+        &app,
+        DownloadRequest {
+            kind,
+            model_id: &model_id,
+            temp_path,
+            busy_message: format!("download of '{model_id}' ({kind}) already in progress"),
+        },
+        move |app| async move {
+            downloader
+                .download_onnx(&task_entry, |progress| {
+                    emit_model_download_progress(&app, &progress);
+                })
+                .await
+        },
+    )?;
     tracing::info!(
         model = %model_id,
         kind = %kind,
@@ -3125,44 +3063,7 @@ pub async fn download_onnx_model(
         url = %entry.url,
         "model download started"
     );
-    // The handle is registered while the lock is held, so a task that finishes
-    // instantly cannot have its entry removed before it was ever inserted.
-    let task = tauri::async_runtime::spawn(async move {
-        let outcome = run_download_task(&mid, async {
-            downloader
-                .download_onnx(&entry, |progress| {
-                    emit_model_download_progress(&app_handle, &progress);
-                })
-                .await
-        })
-        .await;
-        {
-            let mut guard = state_for_cleanup.active_downloads.lock().unwrap();
-            guard.remove(&cleanup_key);
-        }
-        match outcome {
-            Ok(()) => emit_model_download_complete(&app_handle, &mid),
-            Err(message) => emit_model_download_error(&app_handle, &mid, &message),
-        }
-    });
-    guard.insert(
-        key,
-        ActiveDownload {
-            model_id,
-            temp_path,
-            task,
-        },
-    );
     Ok(())
-}
-
-/// Identifies a download in `active_downloads`. Start and cancel must derive
-/// the same key from the same (kind, model) pair or a cancel silently misses.
-pub fn download_key(kind: &str, model_id: &str) -> String {
-    match kind {
-        "whisper" => format!("whisper:{model_id}"),
-        _ => format!("onnx:{kind}:{model_id}"),
-    }
 }
 
 /// Stops an in-flight download and clears the partial file.
@@ -3179,7 +3080,8 @@ pub async fn cancel_model_download(
     model_id: String,
     app: AppHandle,
 ) -> Result<(), String> {
-    let key = download_key(&kind, &model_id);
+    let kind = parse_model_kind(&kind)?;
+    let key = kind.download_key(&model_id);
     let active = {
         let mut guard = state.active_downloads.lock().map_err(|e| e.to_string())?;
         guard.remove(&key)
@@ -3209,12 +3111,8 @@ pub async fn cancel_model_download(
 /// Validates an IPC-supplied model id against the kind's catalog before any
 /// filesystem call — the id becomes a path component, so an unknown id
 /// (including any traversal attempt) must be rejected (pure, unit-testable).
-pub fn validate_model_id_for_delete(kind: &str, model_id: &str) -> Result<(), String> {
-    let known = match kind {
-        "whisper" => ModelRegistry::find_whisper(model_id).is_some(),
-        _ => onnx_catalog_for_kind(kind)?.iter().any(|e| e.id == model_id),
-    };
-    if known {
+pub fn validate_model_id_for_delete(kind: ModelKind, model_id: &str) -> Result<(), String> {
+    if ModelRegistry::find(kind, model_id).is_some() {
         Ok(())
     } else {
         Err(format!("unknown {kind} model: {model_id}"))
@@ -3232,19 +3130,12 @@ pub async fn delete_model(
     kind: String,
     model_id: String,
 ) -> Result<(), String> {
-    let default_slot = match kind.as_str() {
-        "whisper" | "parakeet" => "stt",
-        "tts" => "tts",
-        _ => {
-            return Err(format!(
-                "unknown model kind: {kind} (expected whisper, parakeet, or tts)"
-            ))
-        }
-    };
-    validate_model_id_for_delete(&kind, &model_id)?;
-    match kind.as_str() {
-        "whisper" => state.model_storage.remove_model(&model_id),
-        _ => onnx_storage_for(&state, &kind)?.remove_onnx(&model_id),
+    let kind = parse_model_kind(&kind)?;
+    let default_slot = kind.default_slot();
+    validate_model_id_for_delete(kind, &model_id)?;
+    match kind {
+        ModelKind::Whisper => state.model_storage.remove_model(&model_id),
+        _ => onnx_storage_for(&state, kind)?.remove_onnx(&model_id),
     }
     .map_err(|e| format!("failed to remove model files: {e}"))?;
 
@@ -3333,11 +3224,11 @@ mod tests {
     use kea_core::secrets::{CredentialStore, InMemoryCredentialStore};
     use kea_core::store::db::{open_pool, run_config_migrations};
     use kea_core::store::settings::SettingsRepo;
-    use kea_features::{DictationFeature, Feature, MeetingFeature, RewriteFeature, TtsFeature};
     use kea_engines::{
         noop::NoopLlmEngine, register_phase1_engines, register_phase2_stt_engines,
-        register_phase4_tts_engines, ReqwestHttpClient, EngineRegistry,
+        register_phase4_tts_engines, EngineRegistry, ReqwestHttpClient,
     };
+    use kea_features::{DictationFeature, Feature, MeetingFeature, RewriteFeature, TtsFeature};
     use kea_platform::{DictationState, SystemAudioCapability};
     use std::sync::Arc;
 
@@ -3403,20 +3294,20 @@ mod tests {
     #[test]
     fn validate_model_id_for_delete_accepts_catalog_ids_only() {
         let whisper_id = ModelRegistry::whisper_catalog()[0].id.clone();
-        assert!(validate_model_id_for_delete("whisper", &whisper_id).is_ok());
+        assert!(validate_model_id_for_delete(ModelKind::Whisper, &whisper_id).is_ok());
         let tts_id = ModelRegistry::tts_catalog()[0].id.clone();
-        assert!(validate_model_id_for_delete("tts", &tts_id).is_ok());
+        assert!(validate_model_id_for_delete(ModelKind::Tts, &tts_id).is_ok());
 
         // unknown ids are rejected before any filesystem call
-        assert!(validate_model_id_for_delete("whisper", "nonexistent").is_err());
-        assert!(validate_model_id_for_delete("parakeet", "nonexistent").is_err());
+        assert!(validate_model_id_for_delete(ModelKind::Whisper, "nonexistent").is_err());
+        assert!(validate_model_id_for_delete(ModelKind::Parakeet, "nonexistent").is_err());
 
         // traversal attempts are never catalog ids
-        assert!(validate_model_id_for_delete("whisper", "../../etc/passwd").is_err());
-        assert!(validate_model_id_for_delete("tts", "/etc/passwd").is_err());
+        assert!(validate_model_id_for_delete(ModelKind::Whisper, "../../etc/passwd").is_err());
+        assert!(validate_model_id_for_delete(ModelKind::Tts, "/etc/passwd").is_err());
 
-        // unknown kinds bubble the catalog error
-        assert!(validate_model_id_for_delete("bogus", "anything").is_err());
+        // unknown kinds never reach here — they are rejected at the IPC boundary
+        assert!(parse_model_kind("bogus").is_err());
     }
 
     #[tokio::test]
@@ -3430,7 +3321,10 @@ mod tests {
             .unwrap();
 
         let got = load_custom_providers(&settings).await.unwrap();
-        assert!(got.is_empty(), "corrupt value should yield no custom providers");
+        assert!(
+            got.is_empty(),
+            "corrupt value should yield no custom providers"
+        );
     }
 
     #[tokio::test]
@@ -3468,11 +3362,8 @@ mod tests {
     #[test]
     fn provider_test_surfaces_the_server_explanation() {
         // Real OpenWebUI bodies: the status is identical, the cause is not.
-        let no_token = provider_test_result_for_response(
-            401,
-            false,
-            r#"{"detail":"Not authenticated"}"#,
-        );
+        let no_token =
+            provider_test_result_for_response(401, false, r#"{"detail":"Not authenticated"}"#);
         assert!(no_token.message.contains("Not authenticated"));
 
         let bad_token = provider_test_result_for_response(
@@ -3499,7 +3390,10 @@ mod tests {
     fn server_detail_ignores_html_and_caps_length() {
         assert_eq!(server_detail("<!DOCTYPE html><html>…"), None);
         assert_eq!(server_detail("   "), None);
-        assert_eq!(server_detail("plain text reason").as_deref(), Some("plain text reason"));
+        assert_eq!(
+            server_detail("plain text reason").as_deref(),
+            Some("plain text reason")
+        );
         let long = "x".repeat(500);
         assert_eq!(server_detail(&long).unwrap().chars().count(), 160);
     }
@@ -3643,7 +3537,11 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(bindings.get(DEFAULT_FEATURE_ID, "tts").await.unwrap().is_some());
+        assert!(bindings
+            .get(DEFAULT_FEATURE_ID, "tts")
+            .await
+            .unwrap()
+            .is_some());
 
         // The referenced model clears it.
         assert_eq!(
@@ -3652,7 +3550,11 @@ mod tests {
                 .unwrap(),
             vec![DEFAULT_FEATURE_ID.to_string()]
         );
-        assert!(bindings.get(DEFAULT_FEATURE_ID, "tts").await.unwrap().is_none());
+        assert!(bindings
+            .get(DEFAULT_FEATURE_ID, "tts")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -3660,7 +3562,11 @@ mod tests {
         let pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&pool).await.unwrap();
         let bindings = kea_core::store::bindings::BindingRepo::new(pool);
-        for feature in [DEFAULT_FEATURE_ID, DICTATION_FEATURE_ID, MEETINGS_FEATURE_ID] {
+        for feature in [
+            DEFAULT_FEATURE_ID,
+            DICTATION_FEATURE_ID,
+            MEETINGS_FEATURE_ID,
+        ] {
             bindings
                 .set(
                     feature,
@@ -3700,7 +3606,11 @@ mod tests {
                 MEETINGS_FEATURE_ID.to_string()
             ]
         );
-        for feature in [DEFAULT_FEATURE_ID, DICTATION_FEATURE_ID, MEETINGS_FEATURE_ID] {
+        for feature in [
+            DEFAULT_FEATURE_ID,
+            DICTATION_FEATURE_ID,
+            MEETINGS_FEATURE_ID,
+        ] {
             assert!(
                 bindings.get(feature, "stt").await.unwrap().is_none(),
                 "{feature}/stt should have been cleared"
@@ -3871,33 +3781,90 @@ mod tests {
         assert_eq!(row.accelerator, "Alt+K");
     }
 
-    #[test]
-    fn rewrite_feature_default_hotkey_is_non_empty() {
-        let f = RewriteFeature;
-        let cmd = &f.commands()[0];
-        assert_eq!(cmd.id, REWRITE_COMMAND_ID);
-        assert!(cmd.default_accelerator.is_some());
+    /// The descriptor for a pair that must be in the table.
+    fn action_for(feature: &str, command: &str) -> HotkeyAction {
+        hotkey_action(feature, command).expect("a known global-hotkey pair")
     }
 
-    #[tokio::test]
-    async fn resolve_rewrite_accelerator_falls_back_to_default() {
-        let pool = open_pool("sqlite::memory:").await.unwrap();
-        run_config_migrations(&pool).await.unwrap();
+    /// Asserts the feature itself declares `expected` for `command`, and that
+    /// the shell reads back exactly that. The two used to be separate copies of
+    /// the same `cfg` block, and nothing bound them together.
+    fn assert_default_accelerator(f: &dyn Feature, command: &str, expected: &str) {
+        let cmd = f
+            .commands()
+            .into_iter()
+            .find(|c| c.id == command)
+            .expect("declared command");
+        assert_eq!(cmd.default_accelerator.as_deref(), Some(expected));
         assert_eq!(
-            resolve_rewrite_accelerator(&pool).await,
-            default_rewrite_accelerator()
+            compiled_default_accelerator(f.id(), command).as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    const EXPECTED_MODIFIERS: &str = "Cmd+Shift";
+    #[cfg(not(target_os = "macos"))]
+    const EXPECTED_MODIFIERS: &str = "CommandOrControl+Shift";
+
+    #[test]
+    fn rewrite_feature_default_hotkey_matches_the_shell() {
+        assert_default_accelerator(
+            &RewriteFeature,
+            REWRITE_COMMAND_ID,
+            &format!("{EXPECTED_MODIFIERS}+R"),
         );
     }
 
     #[tokio::test]
-    async fn resolve_rewrite_accelerator_reads_db() {
+    async fn resolve_accelerator_falls_back_to_the_features_default() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        for action in HOTKEY_ACTIONS {
+            assert_eq!(
+                resolve_accelerator(&pool, &action).await,
+                compiled_default_accelerator(action.feature, action.command).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_accelerator_reads_db() {
         let pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&pool).await.unwrap();
         HotkeyBindingRepo::new(pool.clone())
             .set(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID, "Alt+K")
             .await
             .unwrap();
-        assert_eq!(resolve_rewrite_accelerator(&pool).await, "Alt+K");
+        let action = action_for(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID);
+        assert_eq!(resolve_accelerator(&pool, &action).await, "Alt+K");
+    }
+
+    #[test]
+    fn hotkey_actions_cover_every_declaring_feature_exactly_once() {
+        // The table and the features are the same four rows: each descriptor
+        // names a command its feature actually declares, and no pair repeats.
+        for action in HOTKEY_ACTIONS {
+            assert!(
+                feature_registry()
+                    .find_command(action.feature, action.command)
+                    .is_some(),
+                "{}/{} is not declared by its feature",
+                action.feature,
+                action.command
+            );
+            assert_eq!(
+                action.action_id,
+                format!("{}:{}", action.feature, action.command)
+            );
+        }
+        let mut pairs: Vec<_> = HOTKEY_ACTIONS
+            .iter()
+            .map(|a| (a.feature, a.command))
+            .collect();
+        pairs.sort();
+        pairs.dedup();
+        assert_eq!(pairs.len(), HOTKEY_ACTIONS.len());
     }
 
     fn binding_row(feature_id: &str, command: &str, accelerator: &str) -> HotkeyBindingRow {
@@ -4009,16 +3976,21 @@ mod tests {
     #[test]
     fn collision_detects_other_features_custom_row() {
         // Rewrite has Cmd+Shift+D in DB → dictation can't also use Cmd+Shift+D.
-        let bindings = vec![
-            binding_row(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID, "Cmd+Shift+D"),
-        ];
+        let bindings = vec![binding_row(
+            REWRITE_FEATURE_ID,
+            REWRITE_COMMAND_ID,
+            "Cmd+Shift+D",
+        )];
         let hit = check_hotkey_collision(
             DICTATION_FEATURE_ID,
             DICTATION_COMMAND_ID,
             "Cmd+Shift+D",
             &bindings,
         );
-        assert_eq!(hit, Some(format!("{REWRITE_FEATURE_ID}/{REWRITE_COMMAND_ID}")));
+        assert_eq!(
+            hit,
+            Some(format!("{REWRITE_FEATURE_ID}/{REWRITE_COMMAND_ID}"))
+        );
     }
 
     #[test]
@@ -4029,7 +4001,7 @@ mod tests {
         let hit = check_hotkey_collision(
             DICTATION_FEATURE_ID,
             DICTATION_COMMAND_ID,
-            compiled_default_accelerator(MEETINGS_FEATURE_ID, MEETINGS_COMMAND_ID).unwrap(),
+            &compiled_default_accelerator(MEETINGS_FEATURE_ID, MEETINGS_COMMAND_ID).unwrap(),
             &bindings,
         );
         assert_eq!(
@@ -4042,15 +4014,13 @@ mod tests {
     fn collision_allows_self_rebind() {
         // Rewrite moves from Cmd+Shift+R to Alt+K — both its DB row and the
         // new value belong to rewrite, so no collision with itself.
-        let bindings = vec![
-            binding_row(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID, "Cmd+Shift+R"),
-        ];
-        let hit = check_hotkey_collision(
+        let bindings = vec![binding_row(
             REWRITE_FEATURE_ID,
             REWRITE_COMMAND_ID,
-            "Alt+K",
-            &bindings,
-        );
+            "Cmd+Shift+R",
+        )];
+        let hit =
+            check_hotkey_collision(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID, "Alt+K", &bindings);
         assert_eq!(hit, None);
     }
 
@@ -4060,9 +4030,11 @@ mod tests {
         // which parses to the same id on macOS → collision.
         #[cfg(target_os = "macos")]
         {
-            let bindings = vec![
-                binding_row(DICTATION_FEATURE_ID, DICTATION_COMMAND_ID, "Cmd+Shift+R"),
-            ];
+            let bindings = vec![binding_row(
+                DICTATION_FEATURE_ID,
+                DICTATION_COMMAND_ID,
+                "Cmd+Shift+R",
+            )];
             let hit = check_hotkey_collision(
                 REWRITE_FEATURE_ID,
                 REWRITE_COMMAND_ID,
@@ -4228,20 +4200,11 @@ mod tests {
     }
 
     #[test]
-    fn dictation_feature_default_hotkey_is_non_empty() {
-        let f = DictationFeature;
-        let cmd = &f.commands()[0];
-        assert_eq!(cmd.id, DICTATION_COMMAND_ID);
-        assert!(cmd.default_accelerator.is_some());
-    }
-
-    #[tokio::test]
-    async fn resolve_dictation_accelerator_falls_back_to_default() {
-        let pool = open_pool("sqlite::memory:").await.unwrap();
-        run_config_migrations(&pool).await.unwrap();
-        assert_eq!(
-            resolve_dictation_accelerator(&pool).await,
-            default_dictation_accelerator()
+    fn dictation_feature_default_hotkey_matches_the_shell() {
+        assert_default_accelerator(
+            &DictationFeature,
+            DICTATION_COMMAND_ID,
+            &format!("{EXPECTED_MODIFIERS}+D"),
         );
     }
 
@@ -4273,33 +4236,25 @@ mod tests {
     }
 
     #[test]
-    fn meeting_feature_default_hotkey_is_non_empty() {
-        let f = MeetingFeature;
-        assert_eq!(f.id(), MEETINGS_FEATURE_ID);
-        let cmd = &f.commands()[0];
-        assert_eq!(cmd.id, MEETINGS_COMMAND_ID);
-        assert!(cmd.default_accelerator.is_some());
-    }
-
-    #[tokio::test]
-    async fn resolve_meeting_accelerator_falls_back_to_default() {
-        let pool = open_pool("sqlite::memory:").await.unwrap();
-        run_config_migrations(&pool).await.unwrap();
-        assert_eq!(
-            resolve_meeting_accelerator(&pool).await,
-            default_meeting_accelerator()
+    fn meeting_feature_default_hotkey_matches_the_shell() {
+        assert_eq!(MeetingFeature.id(), MEETINGS_FEATURE_ID);
+        assert_default_accelerator(
+            &MeetingFeature,
+            MEETINGS_COMMAND_ID,
+            &format!("{EXPECTED_MODIFIERS}+M"),
         );
     }
 
     #[tokio::test]
-    async fn resolve_meeting_accelerator_reads_db() {
+    async fn resolve_accelerator_reads_db_for_meetings() {
         let pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&pool).await.unwrap();
         HotkeyBindingRepo::new(pool.clone())
             .set(MEETINGS_FEATURE_ID, MEETINGS_COMMAND_ID, "Cmd+Shift+N")
             .await
             .unwrap();
-        assert_eq!(resolve_meeting_accelerator(&pool).await, "Cmd+Shift+N");
+        let action = action_for(MEETINGS_FEATURE_ID, MEETINGS_COMMAND_ID);
+        assert_eq!(resolve_accelerator(&pool, &action).await, "Cmd+Shift+N");
     }
 
     async fn phase4_registry() -> EngineRegistry {
@@ -4327,31 +4282,25 @@ mod tests {
     }
 
     #[test]
-    fn tts_feature_default_hotkey_is_non_empty() {
-        let f = TtsFeature;
-        assert_eq!(f.id(), TTS_FEATURE_ID);
-        let cmd = &f.commands()[0];
-        assert_eq!(cmd.id, TTS_COMMAND_ID);
-        assert!(cmd.default_accelerator.is_some());
-    }
-
-    #[tokio::test]
-    async fn resolve_tts_accelerator_falls_back_to_default() {
-        let pool = open_pool("sqlite::memory:").await.unwrap();
-        run_config_migrations(&pool).await.unwrap();
-        assert_eq!(
-            resolve_tts_accelerator(&pool).await,
-            default_tts_accelerator()
+    fn tts_feature_default_hotkey_matches_the_shell() {
+        assert_eq!(TtsFeature.id(), TTS_FEATURE_ID);
+        assert_default_accelerator(
+            &TtsFeature,
+            TTS_COMMAND_ID,
+            &format!("{EXPECTED_MODIFIERS}+T"),
         );
     }
 
     #[test]
     fn onnx_catalog_for_kind_returns_parakeet_and_tts() {
-        let parakeet = onnx_catalog_for_kind("parakeet").unwrap();
+        let parakeet = onnx_catalog_for_kind(ModelKind::Parakeet).unwrap();
         assert!(!parakeet.is_empty());
-        let tts = onnx_catalog_for_kind("tts").unwrap();
+        let tts = onnx_catalog_for_kind(ModelKind::Tts).unwrap();
         assert!(!tts.is_empty());
-        assert!(onnx_catalog_for_kind("unknown").is_err());
+        // Whisper is a single ggml file, not an ONNX bundle, and unknown kind
+        // strings never get this far — they are rejected at the IPC boundary.
+        assert!(onnx_catalog_for_kind(ModelKind::Whisper).is_err());
+        assert!(parse_model_kind("unknown").is_err());
     }
 
     #[test]
@@ -4365,6 +4314,20 @@ mod tests {
         std::fs::write(model_dir.join("tokens.txt"), b"tok").unwrap();
         let installed = installed_onnx_model_ids(&storage, &catalog);
         assert_eq!(installed, vec![catalog[0].id.clone()]);
+    }
+
+    #[test]
+    fn parse_perm_kind_accepts_every_ui_kind() {
+        assert_eq!(parse_perm_kind("microphone"), Ok(PermKind::Microphone));
+        assert_eq!(
+            parse_perm_kind("screen_recording"),
+            Ok(PermKind::ScreenRecording)
+        );
+        assert_eq!(
+            parse_perm_kind("accessibility"),
+            Ok(PermKind::Accessibility)
+        );
+        assert!(parse_perm_kind("camera").is_err());
     }
 
     #[test]
@@ -4443,15 +4406,12 @@ mod tests {
 
     #[test]
     fn effective_hotkey_returns_default_when_no_db_row() {
-        let result = effective_hotkey(
-            REWRITE_FEATURE_ID,
-            REWRITE_COMMAND_ID,
-            None,
-        );
+        let result = effective_hotkey(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID, None);
         assert_eq!(
             result,
             Some(EffectiveHotkey {
-                accelerator: default_rewrite_accelerator().into(),
+                accelerator: compiled_default_accelerator(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID)
+                    .unwrap(),
                 source: "default".into(),
             })
         );
@@ -4465,11 +4425,7 @@ mod tests {
     #[test]
     fn effective_hotkey_returns_custom_for_unknown_pair_with_db_row() {
         // Even unknown pairs get a custom result if the DB had a row.
-        let result = effective_hotkey(
-            "unknown",
-            "unknown_cmd",
-            Some("Cmd+Y".to_string()),
-        );
+        let result = effective_hotkey("unknown", "unknown_cmd", Some("Cmd+Y".to_string()));
         assert_eq!(
             result,
             Some(EffectiveHotkey {
@@ -4488,12 +4444,7 @@ mod tests {
         assert!(entry.ok);
         assert!(entry.error.is_none());
 
-        record_hotkey_reg_status(
-            &mut m,
-            "dictation",
-            "push_to_talk",
-            Err("conflict".into()),
-        );
+        record_hotkey_reg_status(&mut m, "dictation", "push_to_talk", Err("conflict".into()));
         let entry = m.get("dictation:push_to_talk").unwrap();
         assert!(!entry.ok);
         assert_eq!(entry.error.as_deref(), Some("conflict"));
@@ -4585,7 +4536,9 @@ mod tests {
 
     #[test]
     fn cues_read_both_the_string_and_the_bool_shape() {
-        assert!(!cues_enabled_from_setting(Some(&serde_json::json!("false"))));
+        assert!(!cues_enabled_from_setting(Some(&serde_json::json!(
+            "false"
+        ))));
         assert!(!cues_enabled_from_setting(Some(&serde_json::json!(false))));
         assert!(cues_enabled_from_setting(Some(&serde_json::json!("true"))));
         assert!(cues_enabled_from_setting(Some(&serde_json::json!(true))));
@@ -4623,14 +4576,43 @@ mod tests {
     fn cancel_and_start_agree_on_the_download_key() {
         // A cancel that derives a different key than the start silently misses:
         // the task keeps running and the UI never escapes its pending state.
-        assert_eq!(download_key("whisper", "ggml-base.en"), "whisper:ggml-base.en");
         assert_eq!(
-            download_key("parakeet", "parakeet-tdt-0.6b-v3"),
+            ModelKind::Whisper.download_key("ggml-base.en"),
+            "whisper:ggml-base.en"
+        );
+        assert_eq!(
+            ModelKind::Parakeet.download_key("parakeet-tdt-0.6b-v3"),
             "onnx:parakeet:parakeet-tdt-0.6b-v3"
         );
-        assert_eq!(download_key("tts", "vits-piper"), "onnx:tts:vits-piper");
+        assert_eq!(
+            ModelKind::Tts.download_key("vits-piper"),
+            "onnx:tts:vits-piper"
+        );
         // Same id under two kinds must not collide.
-        assert_ne!(download_key("parakeet", "shared-id"), download_key("tts", "shared-id"));
+        assert_ne!(
+            ModelKind::Parakeet.download_key("shared-id"),
+            ModelKind::Tts.download_key("shared-id")
+        );
+    }
+
+    #[test]
+    fn a_bogus_kind_is_refused_at_the_boundary_rather_than_keyed() {
+        // The old string match failed open: a bogus kind still produced a key,
+        // so the download started under a name no cancel could ever re-derive.
+        // Both start and cancel now parse before they can key anything.
+        let error = parse_model_kind("bogus").expect_err("bogus kind must not parse");
+        assert!(
+            error.contains("unknown model kind: bogus"),
+            "unexpected message: {error}"
+        );
+        // Every kind that does parse keys identically on both sides.
+        for kind in ["whisper", "parakeet", "tts"] {
+            let parsed = parse_model_kind(kind).expect("catalog kind");
+            assert_eq!(
+                parsed.download_key("m"),
+                parse_model_kind(kind).unwrap().download_key("m")
+            );
+        }
     }
 
     #[tokio::test]
@@ -4740,7 +4722,9 @@ mod tests {
         .await;
 
         assert!(
-            outcome.expect("fetch_to_file hung past its connect timeout").is_err(),
+            outcome
+                .expect("fetch_to_file hung past its connect timeout")
+                .is_err(),
             "an unreachable host must surface as an error"
         );
     }

@@ -35,26 +35,27 @@ pub enum TextIoError {
 pub trait TextIo: Send + Sync {
     async fn capture_selection(&self) -> Result<String, TextIoError>;
 
+    /// Replace the current selection using the given mode.
+    ///
+    /// The single required replacement method: `replace` and
+    /// `insert_at_cursor` are both defined in terms of it. It used to default
+    /// to `replace` while `replace` defaulted back to it, so an impl that
+    /// overrode neither compiled cleanly and blew the stack on first use.
+    /// An impl that only supports the clipboard path implements this one and
+    /// ignores `mode`.
+    async fn replace_with_mode(&self, text: &str, mode: ReplaceMode) -> Result<(), TextIoError>;
+
     /// Replace the current selection using the default clipboard+paste path (D4).
     async fn replace(&self, text: &str) -> Result<(), TextIoError> {
         self.replace_with_mode(text, ReplaceMode::ClipboardPaste)
             .await
     }
 
-    /// Replace the current selection using the given mode.
-    async fn replace_with_mode(
-        &self,
-        text: &str,
-        mode: ReplaceMode,
-    ) -> Result<(), TextIoError> {
-        let _ = mode;
-        self.replace(text).await
-    }
-
     /// Insert text at the caret without requiring a prior selection (dictation).
     /// Defaults to the same clipboard+paste path as `replace`; OS impls may override.
     async fn insert_at_cursor(&self, text: &str) -> Result<(), TextIoError> {
-        self.replace(text).await
+        self.replace_with_mode(text, ReplaceMode::ClipboardPaste)
+            .await
     }
 }
 
@@ -203,7 +204,11 @@ mod tests {
             Ok(text)
         }
 
-        async fn replace(&self, text: &str) -> Result<(), TextIoError> {
+        async fn replace_with_mode(
+            &self,
+            text: &str,
+            _mode: ReplaceMode,
+        ) -> Result<(), TextIoError> {
             // paste_via_clipboard_sync pattern: save → set → paste → restore.
             let plan = self.clipboard.plan();
             self.clipboard.set(text);
@@ -243,10 +248,7 @@ mod tests {
         let captured = fake.capture_selection().await.unwrap();
         assert_eq!(captured, "selected text");
         // Clipboard must be restored to user's original data after capture.
-        assert_eq!(
-            fake.clipboard.get().as_deref(),
-            Some(user_clipboard)
-        );
+        assert_eq!(fake.clipboard.get().as_deref(), Some(user_clipboard));
     }
 
     #[tokio::test]
@@ -261,10 +263,7 @@ mod tests {
         // capture_selection saves original, synthesizes copy, restores.
         let captured = fake.capture_selection().await.unwrap();
         assert_eq!(captured, "original selection");
-        assert_eq!(
-            fake.clipboard.get().as_deref(),
-            Some(user_clipboard)
-        );
+        assert_eq!(fake.clipboard.get().as_deref(), Some(user_clipboard));
 
         // paste_via_clipboard_sync: saves current clipboard (=user's original
         // since capture already restored it), sets rewritten text, pastes,
@@ -272,10 +271,7 @@ mod tests {
         // capture_selection restoring, paste would save the SELECTION, not the
         // user's data, and restore the wrong thing.
         fake.replace("rewritten text").await.unwrap();
-        assert_eq!(
-            fake.clipboard.get().as_deref(),
-            Some(user_clipboard)
-        );
+        assert_eq!(fake.clipboard.get().as_deref(), Some(user_clipboard));
         assert_eq!(
             fake.replaced.lock().unwrap().as_deref(),
             Some("rewritten text")
@@ -324,9 +320,6 @@ mod tests {
             last_mode: std::sync::Mutex::new(None),
         };
         fake.insert_at_cursor("dictated").await.unwrap();
-        assert_eq!(
-            fake.replaced.lock().unwrap().as_deref(),
-            Some("dictated")
-        );
+        assert_eq!(fake.replaced.lock().unwrap().as_deref(), Some("dictated"));
     }
 }

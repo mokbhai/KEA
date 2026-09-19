@@ -14,10 +14,7 @@ pub struct LocalTtsEngine {
 
 impl LocalTtsEngine {
     pub fn new(inference: Arc<dyn SherpaTtsInference>, storage: Arc<ModelStorage>) -> Self {
-        Self {
-            inference,
-            storage,
-        }
+        Self { inference, storage }
     }
 }
 

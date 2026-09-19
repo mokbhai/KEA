@@ -5,16 +5,19 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 
 use crate::error::InferError;
-use crate::whisper::{AudioPcm, WhisperOpts};
+use crate::types::AudioPcm;
 
 #[async_trait]
 pub trait SherpaSttInference: Send + Sync {
-    async fn transcribe_parakeet(
-        &self,
-        pcm: AudioPcm,
-        model_dir: &Path,
-        opts: WhisperOpts,
-    ) -> Result<String, InferError>;
+    /// Transcribes mono PCM with the ONNX bundle in `model_dir`.
+    ///
+    /// There is deliberately no language parameter. The NeMo transducer this
+    /// drives has no language setting — sherpa's `OfflineTransducerModelConfig`
+    /// carries only the encoder/decoder/joiner paths — so a language argument
+    /// could only ever be accepted and dropped, which is what this signature
+    /// used to do. A parameter that looks honoured all the way down from the
+    /// STT setting is worse than one that was never plumbed.
+    async fn transcribe(&self, pcm: AudioPcm, model_dir: &Path) -> Result<String, InferError>;
 }
 
 #[cfg(feature = "sherpa")]
@@ -69,16 +72,10 @@ fn find_first_existing(dir: &Path, names: &[&str]) -> Result<PathBuf, InferError
 #[cfg(feature = "sherpa")]
 #[async_trait]
 impl SherpaSttInference for SherpaOnnxSttInference {
-    async fn transcribe_parakeet(
-        &self,
-        pcm: AudioPcm,
-        model_dir: &Path,
-        opts: WhisperOpts,
-    ) -> Result<String, InferError> {
+    async fn transcribe(&self, pcm: AudioPcm, model_dir: &Path) -> Result<String, InferError> {
         let model_dir = model_dir.to_path_buf();
         let samples = pcm.samples;
         let sample_rate = pcm.sample_rate_hz;
-        let _language = opts.language;
 
         tokio::task::spawn_blocking(move || {
             use sherpa_onnx::{
@@ -126,12 +123,7 @@ mod tests {
 
     #[async_trait]
     impl SherpaSttInference for FakeSherpaSttInference {
-        async fn transcribe_parakeet(
-            &self,
-            pcm: AudioPcm,
-            _model_dir: &Path,
-            _opts: WhisperOpts,
-        ) -> Result<String, InferError> {
+        async fn transcribe(&self, pcm: AudioPcm, _model_dir: &Path) -> Result<String, InferError> {
             Ok(format!("parakeet: {} samples", pcm.samples.len()))
         }
     }
@@ -145,13 +137,12 @@ mod tests {
     async fn fake_inference_returns_sample_count() {
         let inference = FakeSherpaSttInference;
         let out = inference
-            .transcribe_parakeet(
+            .transcribe(
                 AudioPcm {
                     samples: vec![0.0; 1600],
                     sample_rate_hz: 16_000,
                 },
                 Path::new("/tmp/parakeet-model"),
-                WhisperOpts::default(),
             )
             .await
             .unwrap();

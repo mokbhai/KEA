@@ -1,17 +1,17 @@
 use kea_core::dictation::DictationSettings;
-use kea_core::resolve::{Resolution, SlotResolver};
-use kea_core::rewrite::{RewriteInput, build_llm_request};
+use kea_core::resolve::SlotResolver;
+use kea_core::rewrite::{build_llm_request, RewriteInput};
 use kea_core::rewrite::{PresetRepo, PromptOverrideRepo, RewriteMode};
 use kea_core::store::actions::{ActionRepo, NewAction};
-use kea_core::store::bindings::BindingRepo;
-use kea_engines::EngineRegistry;
+use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_engines::traits::{AudioPcm, SttOpts};
-use kea_platform::TextIo;
+use kea_engines::EngineRegistry;
 use kea_platform::audio::util::resample_linear;
+use kea_platform::TextIo;
 use kea_platform::{AudioIo, PcmFrame};
 
-use crate::feature::{CapKind, CapSlot, Command, Feature};
-use crate::rewrite::{ContentStorageOpts, maybe_record_conversation};
+use crate::feature::{ActionGuard, CapKind, CapSlot, Command, Feature};
+use crate::rewrite::{maybe_record_conversation, ContentStorageOpts};
 
 const WHISPER_SAMPLE_RATE_HZ: u32 = 16_000;
 
@@ -61,6 +61,7 @@ fn pcm_to_audio(pcm: PcmFrame) -> AudioPcm {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_dictation(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
@@ -85,6 +86,7 @@ pub async fn run_dictation(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_dictation_with_storage(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
@@ -96,48 +98,58 @@ pub async fn run_dictation_with_storage(
     settings: &DictationSettings,
     storage: ContentStorageOpts<'_>,
 ) -> Result<String, String> {
-    let _frame_rx = audio
-        .start_mic()
-        .await
-        .map_err(|e| e.to_string())?;
+    let _frame_rx = audio.start_mic().await.map_err(|e| e.to_string())?;
     let pcm = audio.stop_mic().await.map_err(|e| e.to_string())?;
 
     let resolver = SlotResolver::new(engines, bindings);
-    let binding = match resolver.resolve_stt("dictation", "stt").await {
-        Ok(Resolution::Bound(b)) => b,
-        Ok(Resolution::NeedsChoice(_)) => {
-            return Err("multiple stt engines available; bind the dictation stt slot".into());
-        }
-        Ok(Resolution::Unresolvable) => return Err("no stt engine available".into()),
-        Err(e) => return Err(e.to_string()),
-    };
-    let engine_id = binding.engine_id.clone();
+    let binding = resolver
+        .require_stt("dictation")
+        .await
+        .map_err(|e| e.to_string())?;
 
     let action_id = actions
         .record(NewAction {
             feature_id: "dictation".into(),
             command: "push_to_talk".into(),
-            engine_id: engine_id.clone(),
+            engine_id: binding.engine_id.clone(),
             model: binding.model.clone(),
             provider_ref: binding.provider_ref.clone(),
         })
         .await
         .map_err(|e| e.to_string())?;
 
-    let engine = match engines.stt(&engine_id) {
-        Some(eng) => eng,
-        None => {
-            let msg = format!("no stt engine '{engine_id}'");
-            if let Err(inner) = actions.finish(action_id, "error", Some(&msg)).await {
-                tracing::warn!(
-                    error = %inner,
-                    action_id = %action_id,
-                    "dictation: failed to finish action as error in DB"
-                );
-            }
-            return Err(msg);
+    // From here the ledger row exists, so every exit closes it.
+    let guard = ActionGuard::new(actions, action_id, "dictation");
+    let result = run_dictation_inner(
+        engines, &resolver, presets, overrides, textio, settings, storage, &binding, action_id, pcm,
+    )
+    .await;
+    match result {
+        Ok(text) => {
+            guard.succeed().await;
+            Ok(text)
         }
-    };
+        Err(e) => Err(guard.fail(e).await),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_dictation_inner(
+    engines: &EngineRegistry,
+    resolver: &SlotResolver<'_>,
+    presets: &PresetRepo,
+    overrides: &PromptOverrideRepo,
+    textio: &dyn TextIo,
+    settings: &DictationSettings,
+    storage: ContentStorageOpts<'_>,
+    binding: &Binding,
+    action_id: i64,
+    pcm: PcmFrame,
+) -> Result<String, String> {
+    let engine_id = &binding.engine_id;
+    let engine = engines
+        .stt(engine_id)
+        .ok_or_else(|| format!("no stt engine '{engine_id}'"))?;
 
     let stt_opts = SttOpts {
         model: binding
@@ -148,22 +160,10 @@ pub async fn run_dictation_with_storage(
         provider_ref: binding.provider_ref.clone(),
     };
 
-    let transcript = match engine.transcribe(pcm_to_audio(pcm), stt_opts).await {
-        Ok(t) => t,
-        Err(e) => {
-            if let Err(inner) = actions
-                .finish(action_id, "error", Some(&e.to_string()))
-                .await
-            {
-                tracing::warn!(
-                    error = %inner,
-                    action_id = %action_id,
-                    "dictation: failed to finish action as error in DB"
-                );
-            }
-            return Err(e.to_string());
-        }
-    };
+    let transcript = engine
+        .transcribe(pcm_to_audio(pcm), stt_opts)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let mut final_text = transcript.text;
     tracing::info!(
@@ -176,51 +176,15 @@ pub async fn run_dictation_with_storage(
 
     if settings.post_process {
         let transcript_text = final_text.clone();
-        let llm_binding = match resolver.resolve_llm("rewrite", "llm").await {
-            Ok(Resolution::Bound(b)) => b,
-            Ok(Resolution::NeedsChoice(_)) => {
-                let msg = "multiple llm engines available; bind the rewrite llm slot";
-                if let Err(inner) = actions
-                    .finish(action_id, "error", Some(msg))
-                    .await
-                {
-                    tracing::warn!(
-                        error = %inner,
-                        action_id = %action_id,
-                        "dictation: failed to finish action as error in DB"
-                    );
-                }
-                return Err("multiple llm engines available; bind the rewrite llm slot for audio refinement"
-                    .into());
-            }
-            Ok(Resolution::Unresolvable) => {
-                let msg = "no llm engine available";
-                if let Err(inner) = actions
-                    .finish(action_id, "error", Some(msg))
-                    .await
-                {
-                    tracing::warn!(
-                        error = %inner,
-                        action_id = %action_id,
-                        "dictation: failed to finish action as error in DB"
-                    );
-                }
-                return Err("no llm engine available for audio refinement".into());
-            }
-            Err(e) => {
-                if let Err(inner) = actions.finish(action_id, "error", Some(&e.to_string())).await {
-                    tracing::warn!(
-                        error = %inner,
-                        action_id = %action_id,
-                        "dictation: failed to finish action as error in DB"
-                    );
-                }
-                return Err(e.to_string());
-            }
-        };
+        // Dictation borrows rewrite's slot, so its failures name what the
+        // binding was wanted for.
+        let llm_binding = resolver
+            .require_llm("rewrite")
+            .await
+            .map_err(|e| e.with_purpose("audio refinement"))?;
         let llm_engine_id = llm_binding.engine_id.clone();
 
-        let mut llm_req = match build_llm_request(
+        let mut llm_req = build_llm_request(
             &RewriteInput {
                 source_text: final_text.clone(),
                 mode: RewriteMode::AudioRefinement,
@@ -231,88 +195,38 @@ pub async fn run_dictation_with_storage(
             overrides,
         )
         .await
-        {
-            Ok(req) => req,
-            Err(e) => {
-                if let Err(inner) = actions.finish(action_id, "error", Some(&e.to_string())).await {
-                    tracing::warn!(
-                        error = %inner,
-                        action_id = %action_id,
-                        "dictation: failed to finish action as error in DB"
-                    );
-                }
-                return Err(e.to_string());
-            }
-        };
+        .map_err(|e| e.to_string())?;
 
         llm_req.model = llm_binding.model.clone();
         // Same reason as run_rewrite: the provider lives on the binding, not on
         // the shared engine instance.
         llm_req.provider_ref = llm_binding.provider_ref.clone();
 
-        let llm = match engines.llm(&llm_engine_id) {
-            Some(eng) => eng,
-            None => {
-                let msg = format!("no llm engine '{llm_engine_id}'");
-                if let Err(inner) = actions.finish(action_id, "error", Some(&msg)).await {
-                    tracing::warn!(
-                        error = %inner,
-                        action_id = %action_id,
-                        "dictation: failed to finish action as error in DB"
-                    );
-                }
-                return Err(msg);
-            }
-        };
+        let llm = engines
+            .llm(&llm_engine_id)
+            .ok_or_else(|| format!("no llm engine '{llm_engine_id}'"))?;
 
-        final_text = match llm.complete(llm_req).await {
-            Ok(resp) => {
-                if let Err(e) = maybe_record_conversation(
-                    storage,
-                    action_id,
-                    "dictation",
-                    &llm_engine_id,
-                    llm_binding.model.clone(),
-                    llm_binding.provider_ref.clone(),
-                    &transcript_text,
-                    &resp.text,
-                )
-                .await
-                {
-                    if let Err(inner) = actions
-                        .finish(action_id, "error", Some(&e))
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %inner,
-                            action_id = %action_id,
-                            "dictation: failed to finish action as error in DB"
-                        );
-                    }
-                    return Err(e);
-                }
-                tracing::info!(
-                    action_id = %action_id,
-                    engine = %llm_engine_id,
-                    chars = resp.text.chars().count(),
-                    "dictation: post-processed"
-                );
-                resp.text
-            }
-            Err(e) => {
-                if let Err(inner) = actions
-                    .finish(action_id, "error", Some(&e.to_string()))
-                    .await
-                {
-                    tracing::warn!(
-                        error = %inner,
-                        action_id = %action_id,
-                        "dictation: failed to finish action as error in DB"
-                    );
-                }
-                return Err(e.to_string());
-            }
-        };
+        let resp = llm.complete(llm_req).await.map_err(|e| e.to_string())?;
+
+        maybe_record_conversation(
+            storage,
+            action_id,
+            "dictation",
+            &llm_engine_id,
+            llm_binding.model.clone(),
+            llm_binding.provider_ref.clone(),
+            &transcript_text,
+            &resp.text,
+        )
+        .await?;
+
+        tracing::info!(
+            action_id = %action_id,
+            engine = %llm_engine_id,
+            chars = resp.text.chars().count(),
+            "dictation: post-processed"
+        );
+        final_text = resp.text;
     }
 
     // The paste is the one step whose outcome the OS will not report (see
@@ -332,13 +246,6 @@ pub async fn run_dictation_with_storage(
             elapsed_ms = insert_started.elapsed().as_millis() as u64,
             "dictation: insertion failed"
         );
-        if let Err(inner) = actions.finish(action_id, "error", Some(&e.to_string())).await {
-            tracing::warn!(
-                error = %inner,
-                action_id = %action_id,
-                "dictation: failed to finish action as error in DB"
-            );
-        }
         return Err(e.to_string());
     }
 
@@ -348,14 +255,6 @@ pub async fn run_dictation_with_storage(
         "dictation: inserted"
     );
 
-    if let Err(e) = actions.finish(action_id, "ok", None).await {
-        tracing::warn!(
-            error = %e,
-            action_id = %action_id,
-            "dictation: failed to finish action as ok in DB"
-        );
-    }
-
     Ok(final_text)
 }
 
@@ -363,11 +262,12 @@ pub async fn run_dictation_with_storage(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use kea_core::store::conversations::ConversationRepo;
+    use kea_core::store::actions::ActionStatus;
+    use kea_core::store::conversations::{ConversationRepo, MessageRole};
     use kea_core::store::db::{open_pool, run_config_migrations, run_data_migrations};
     use kea_engines::noop::NoopLlmEngine;
     use kea_engines::traits::{EngineCaps, EngineError, SttEngine, Transcript};
-    use kea_platform::{AudioIoError, DictationState, TextIoError};
+    use kea_platform::{AudioIoError, DictationState, ReplaceMode, TextIoError};
     use std::sync::{Arc, Mutex};
 
     struct FakeStt {
@@ -445,7 +345,11 @@ mod tests {
             Ok(String::new())
         }
 
-        async fn replace(&self, _text: &str) -> Result<(), TextIoError> {
+        async fn replace_with_mode(
+            &self,
+            _text: &str,
+            _mode: ReplaceMode,
+        ) -> Result<(), TextIoError> {
             Ok(())
         }
 
@@ -455,12 +359,7 @@ mod tests {
         }
     }
 
-    async fn test_repos() -> (
-        BindingRepo,
-        ActionRepo,
-        PresetRepo,
-        PromptOverrideRepo,
-    ) {
+    async fn test_repos() -> (BindingRepo, ActionRepo, PresetRepo, PromptOverrideRepo) {
         let config_pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&config_pool).await.unwrap();
         let data_pool = open_pool("sqlite::memory:").await.unwrap();
@@ -530,7 +429,7 @@ mod tests {
         assert_eq!(rows[0].feature_id, "dictation");
         assert_eq!(rows[0].command, "push_to_talk");
         assert_eq!(rows[0].engine_id, "fake-stt");
-        assert_eq!(rows[0].status, "ok");
+        assert_eq!(rows[0].status, ActionStatus::Ok);
     }
 
     #[tokio::test]
@@ -573,11 +472,14 @@ mod tests {
         assert!(out.contains("echo:"));
         assert!(out.contains("transcribed speech"));
         assert!(out.contains("um hello"));
-        assert_eq!(textio.inserted.lock().unwrap().as_deref(), Some(out.as_str()));
+        assert_eq!(
+            textio.inserted.lock().unwrap().as_deref(),
+            Some(out.as_str())
+        );
 
         let rows = actions.recent(1).await.unwrap();
         assert_eq!(rows[0].feature_id, "dictation");
-        assert_eq!(rows[0].status, "ok");
+        assert_eq!(rows[0].status, ActionStatus::Ok);
     }
 
     #[tokio::test]
@@ -643,7 +545,7 @@ mod tests {
         rewrite_conversations
             .append_message(&kea_core::store::conversations::NewMessage {
                 conversation_id: rewrite_conv_id,
-                role: "user".into(),
+                role: MessageRole::User,
                 content: "hello".into(),
                 token_count: None,
             })
@@ -652,7 +554,7 @@ mod tests {
         rewrite_conversations
             .append_message(&kea_core::store::conversations::NewMessage {
                 conversation_id: rewrite_conv_id,
-                role: "assistant".into(),
+                role: MessageRole::Assistant,
                 content: "hi there".into(),
                 token_count: None,
             })
@@ -660,18 +562,28 @@ mod tests {
             .unwrap();
 
         let recent = conversations.list_recent(10).await.unwrap();
-        assert_eq!(recent.len(), 2, "both dictation and rewrite conversations are listed");
+        assert_eq!(
+            recent.len(),
+            2,
+            "both dictation and rewrite conversations are listed"
+        );
         let features: Vec<&str> = recent.iter().map(|r| r.feature_id.as_str()).collect();
-        assert!(features.contains(&"dictation"), "dictation conversation present");
-        assert!(features.contains(&"rewrite"), "rewrite conversation present");
+        assert!(
+            features.contains(&"dictation"),
+            "dictation conversation present"
+        );
+        assert!(
+            features.contains(&"rewrite"),
+            "rewrite conversation present"
+        );
         let dictation_row = recent.iter().find(|r| r.feature_id == "dictation").unwrap();
         assert_eq!(dictation_row.engine_id, "noop");
 
         let messages = conversations.list_messages(dictation_row.id).await.unwrap();
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].role, MessageRole::User);
         assert_eq!(messages[0].content, "um hello");
-        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].role, MessageRole::Assistant);
     }
 
     #[tokio::test]

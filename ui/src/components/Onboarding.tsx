@@ -4,6 +4,7 @@ import ConnectStep, { type AiChoice } from "./onboarding/ConnectStep";
 import HotkeysStep from "./onboarding/HotkeysStep";
 import PermissionsStep from "./onboarding/PermissionsStep";
 import VoiceStep from "./onboarding/VoiceStep";
+import { toMessage } from "../lib/format";
 
 type Props = {
   onFinish: () => void;
@@ -75,7 +76,7 @@ export default function Onboarding({ onFinish }: Props) {
       await commit();
       advance();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toMessage(e));
     } finally {
       setBusy(false);
     }

@@ -1,13 +1,14 @@
-use kea_core::resolve::{Resolution, SlotResolver};
-use kea_core::rewrite::{RewriteInput, build_llm_request};
+use kea_core::resolve::SlotResolver;
+use kea_core::rewrite::{build_llm_request, RewriteInput};
 use kea_core::rewrite::{PresetRepo, PromptOverrideRepo};
 use kea_core::store::actions::{ActionRepo, NewAction};
-use kea_core::store::bindings::BindingRepo;
-use kea_core::store::conversations::{ConversationRepo, NewConversation, NewMessage};
+use kea_core::store::bindings::{Binding, BindingRepo};
+use kea_core::store::conversations::{ConversationRepo, MessageRole, NewConversation, NewMessage};
+use kea_engines::traits::LlmRequest;
 use kea_engines::EngineRegistry;
 use kea_platform::TextIo;
 
-use crate::feature::{CapKind, CapSlot, Command, Feature};
+use crate::feature::{ActionGuard, CapKind, CapSlot, Command, Feature};
 
 /// Optional conversation persistence for History (gated by `store_content`).
 #[derive(Clone, Copy, Default)]
@@ -41,6 +42,7 @@ impl<'a> ContentStorageOpts<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn maybe_record_conversation(
     storage: ContentStorageOpts<'_>,
     action_id: i64,
@@ -71,7 +73,7 @@ pub(crate) async fn maybe_record_conversation(
 
     repo.append_message(&NewMessage {
         conversation_id: conv_id,
-        role: "user".into(),
+        role: MessageRole::User,
         content: user_content.into(),
         token_count: None,
     })
@@ -80,7 +82,7 @@ pub(crate) async fn maybe_record_conversation(
 
     repo.append_message(&NewMessage {
         conversation_id: conv_id,
-        role: "assistant".into(),
+        role: MessageRole::Assistant,
         content: assistant_content.into(),
         token_count: None,
     })
@@ -146,6 +148,7 @@ pub async fn run_rewrite(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_rewrite_with_storage(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
@@ -164,14 +167,10 @@ pub async fn run_rewrite_with_storage(
     }
 
     let resolver = SlotResolver::new(engines, bindings);
-    let binding = match resolver.resolve_llm("rewrite", "llm").await {
-        Ok(Resolution::Bound(b)) => b,
-        Ok(Resolution::NeedsChoice(_)) => {
-            return Err("multiple llm engines available; bind the rewrite llm slot".into());
-        }
-        Ok(Resolution::Unresolvable) => return Err("no llm engine available".into()),
-        Err(e) => return Err(e.to_string()),
-    };
+    let binding = resolver
+        .require_llm("rewrite")
+        .await
+        .map_err(|e| e.to_string())?;
     let engine_id = binding.engine_id.clone();
 
     let mut llm_req = build_llm_request(&input, presets, overrides)
@@ -195,81 +194,53 @@ pub async fn run_rewrite_with_storage(
         .await
         .map_err(|e| e.to_string())?;
 
-    let engine = match engines.llm(&engine_id) {
-        Some(eng) => eng,
-        None => {
-            let msg = format!("no llm engine '{engine_id}'");
-            if let Err(inner) = actions.finish(action_id, "error", Some(&msg)).await {
-                tracing::warn!(
-                    error = %inner,
-                    action_id = %action_id,
-                    "rewrite: failed to finish action as error in DB"
-                );
-            }
-            return Err(msg);
+    // From here the ledger row exists, so every exit closes it.
+    let guard = ActionGuard::new(actions, action_id, "rewrite");
+    let result = run_rewrite_inner(
+        engines, textio, storage, &binding, &input, llm_req, action_id,
+    )
+    .await;
+    match result {
+        Ok(text) => {
+            guard.succeed().await;
+            Ok(text)
         }
-    };
-
-    let response = match engine.complete(llm_req).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            if let Err(inner) = actions
-                .finish(action_id, "error", Some(&e.to_string()))
-                .await
-            {
-                tracing::warn!(
-                    error = %inner,
-                    action_id = %action_id,
-                    "rewrite: failed to finish action as error in DB"
-                );
-            }
-            return Err(e.to_string());
-        }
-    };
-
-    if let Err(e) = textio.replace(&response.text).await {
-        if let Err(inner) = actions.finish(action_id, "error", Some(&e.to_string())).await {
-            tracing::warn!(
-                error = %inner,
-                action_id = %action_id,
-                "rewrite: failed to finish action as error in DB"
-            );
-        }
-        return Err(e.to_string());
+        Err(e) => Err(guard.fail(e).await),
     }
+}
 
-    if let Err(e) = maybe_record_conversation(
+async fn run_rewrite_inner(
+    engines: &EngineRegistry,
+    textio: &dyn TextIo,
+    storage: ContentStorageOpts<'_>,
+    binding: &Binding,
+    input: &RewriteInput,
+    llm_req: LlmRequest,
+    action_id: i64,
+) -> Result<String, String> {
+    let engine_id = &binding.engine_id;
+    let engine = engines
+        .llm(engine_id)
+        .ok_or_else(|| format!("no llm engine '{engine_id}'"))?;
+
+    let response = engine.complete(llm_req).await.map_err(|e| e.to_string())?;
+
+    textio
+        .replace(&response.text)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    maybe_record_conversation(
         storage,
         action_id,
         "rewrite",
-        &engine_id,
+        engine_id,
         binding.model.clone(),
         binding.provider_ref.clone(),
         &input.source_text,
         &response.text,
     )
-    .await
-    {
-        if let Err(inner) = actions.finish(action_id, "error", Some(&e)).await {
-            tracing::warn!(
-                error = %inner,
-                action_id = %action_id,
-                "rewrite: failed to finish action as error in DB"
-            );
-        }
-        return Err(e);
-    }
-
-    if let Err(e) = actions
-        .finish(action_id, "ok", None)
-        .await
-    {
-        tracing::warn!(
-            error = %e,
-            action_id = %action_id,
-            "rewrite: failed to finish action as ok in DB"
-        );
-    }
+    .await?;
 
     Ok(response.text)
 }
@@ -279,10 +250,11 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use kea_core::rewrite::RewriteMode;
+    use kea_core::store::actions::ActionStatus;
     use kea_core::store::conversations::ConversationRepo;
     use kea_core::store::db::{open_pool, run_config_migrations, run_data_migrations};
     use kea_engines::noop::NoopLlmEngine;
-    use kea_platform::TextIoError;
+    use kea_platform::{ReplaceMode, TextIoError};
     use std::sync::{Arc, Mutex};
 
     struct FakeTextIo {
@@ -296,7 +268,11 @@ mod tests {
             Ok(self.selection.clone())
         }
 
-        async fn replace(&self, text: &str) -> Result<(), TextIoError> {
+        async fn replace_with_mode(
+            &self,
+            text: &str,
+            _mode: ReplaceMode,
+        ) -> Result<(), TextIoError> {
             *self.replaced.lock().unwrap() = Some(text.to_string());
             Ok(())
         }
@@ -354,14 +330,17 @@ mod tests {
 
         assert!(out.contains("echo:"));
         assert!(out.contains("bad text"));
-        assert_eq!(textio.replaced.lock().unwrap().as_deref(), Some(out.as_str()));
+        assert_eq!(
+            textio.replaced.lock().unwrap().as_deref(),
+            Some(out.as_str())
+        );
 
         let rows = actions.recent(1).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].feature_id, "rewrite");
         assert_eq!(rows[0].command, "rewrite_selection");
         assert_eq!(rows[0].engine_id, "noop");
-        assert_eq!(rows[0].status, "ok");
+        assert_eq!(rows[0].status, ActionStatus::Ok);
     }
 
     #[tokio::test]
@@ -410,9 +389,9 @@ mod tests {
 
         let messages = conversations.list_messages(recent[0].id).await.unwrap();
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].role, MessageRole::User);
         assert_eq!(messages[0].content, "bad text");
-        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].role, MessageRole::Assistant);
         assert!(messages[1].content.contains("echo:"));
     }
 
@@ -499,11 +478,14 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(err.contains("no such table"), "expected table-missing error, got: {err}");
+        assert!(
+            err.contains("no such table"),
+            "expected table-missing error, got: {err}"
+        );
 
         let rows = actions.recent(1).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, "error");
+        assert_eq!(rows[0].status, ActionStatus::Error);
 
         let detail = actions.get(rows[0].id).await.unwrap().unwrap();
         assert!(
@@ -511,7 +493,11 @@ mod tests {
             "action row should carry an error message"
         );
         assert!(
-            detail.error.as_deref().unwrap_or("").contains("no such table"),
+            detail
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("no such table"),
             "error message should mention the table issue, got: {:?}",
             detail.error
         );
@@ -536,11 +522,11 @@ mod custom_provider_tests {
     use kea_core::rewrite::{RewriteInput, RewriteMode};
     use kea_core::store::bindings::Binding;
     use kea_core::store::db::{open_pool, run_config_migrations, run_data_migrations};
-    use kea_engines::http::{HttpClient, MultipartPart};
+    use kea_engines::http::{Auth, HttpClient, MultipartPart};
     use kea_engines::provider::{CredentialSource, ProviderConfig, ProviderConfigSource};
     use kea_engines::traits::EngineError;
     use kea_engines::OpenAiCompatibleLlmEngine;
-    use kea_platform::{TextIo, TextIoError};
+    use kea_platform::{ReplaceMode, TextIo, TextIoError};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -555,7 +541,11 @@ mod custom_provider_tests {
             Ok(self.selection.clone())
         }
 
-        async fn replace(&self, text: &str) -> Result<(), TextIoError> {
+        async fn replace_with_mode(
+            &self,
+            text: &str,
+            _mode: ReplaceMode,
+        ) -> Result<(), TextIoError> {
             *self.replaced.lock().unwrap() = Some(text.to_string());
             Ok(())
         }
@@ -574,34 +564,32 @@ mod custom_provider_tests {
         async fn post_json(
             &self,
             url: &str,
-            bearer: &str,
+            auth: Auth<'_>,
             _body: serde_json::Value,
-        ) -> Result<(u16, String), EngineError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((url.to_string(), bearer.to_string()));
-            Ok((
-                200,
-                r#"{"choices":[{"message":{"content":"polished"}}]}"#.to_string(),
-            ))
+        ) -> Result<String, EngineError> {
+            let bearer = match auth {
+                Auth::Bearer(key) => key.to_string(),
+                Auth::None => String::new(),
+            };
+            self.calls.lock().unwrap().push((url.to_string(), bearer));
+            Ok(r#"{"choices":[{"message":{"content":"polished"}}]}"#.to_string())
         }
 
         async fn post_multipart(
             &self,
             _url: &str,
-            _bearer: &str,
+            _auth: Auth<'_>,
             _parts: Vec<MultipartPart>,
-        ) -> Result<(u16, String), EngineError> {
+        ) -> Result<String, EngineError> {
             unreachable!("rewrite never uploads multipart")
         }
 
         async fn post_binary(
             &self,
             _url: &str,
-            _bearer: &str,
+            _auth: Auth<'_>,
             _body: serde_json::Value,
-        ) -> Result<(u16, Vec<u8>), EngineError> {
+        ) -> Result<Vec<u8>, EngineError> {
             unreachable!("rewrite never asks for binary")
         }
     }

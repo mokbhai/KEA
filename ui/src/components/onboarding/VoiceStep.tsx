@@ -10,7 +10,8 @@ import {
   OPENAI_TTS_VOICES,
   type CapabilityOption,
 } from "../../lib/capabilityDefaults";
-import Spinner from "../Spinner";
+import { toMessage } from "../../lib/format";
+import LoadingBlock from "../LoadingBlock";
 import type { AiChoice } from "./ConnectStep";
 
 type Props = {
@@ -111,7 +112,7 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
           }
         }
       } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        if (!cancelled) setError(toMessage(e));
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -170,13 +171,13 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
       if (sttChoice === "local" && sttLocal?.model === modelId) {
         void applyDefaultChoice("stt", { ...sttLocal, model: modelId })
           .then(() => flashSaved("stt"))
-          .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+          .catch((e) => setError(toMessage(e)));
       }
       const voice = ttsVoices.find((v) => v.id === localVoiceId);
       if (ttsMode === "local" && voice?.model === modelId) {
         void applyDefaultChoice("tts", voice)
           .then(() => flashSaved("tts"))
-          .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+          .catch((e) => setError(toMessage(e)));
       }
     },
     onError: (modelId, message) => {
@@ -191,7 +192,7 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
     setError(null);
     startOptionDownload(option).catch((e) => {
       if (option.model) startedRef.current.delete(option.model);
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toMessage(e));
     });
   };
 
@@ -240,7 +241,7 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
         if (voice) await previewVoice(voice.engine, voice.model, null);
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toMessage(e));
     }
   };
 
@@ -253,10 +254,7 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
 
   if (loading) {
     return (
-      <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 80 }}>
-        <Spinner size={16} />
-        <span className="kea-muted">Loading voice options…</span>
-      </div>
+      <LoadingBlock label="Loading voice options…" minHeight={80} />
     );
   }
 

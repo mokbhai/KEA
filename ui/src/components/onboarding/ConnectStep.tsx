@@ -17,7 +17,7 @@ import {
   type Capability,
   type DefaultChoice,
 } from "../../lib/capabilityDefaults";
-import { slugify } from "../../lib/format";
+import { slugify, toMessage } from "../../lib/format";
 
 export type AiChoice = "openai" | "local" | "custom";
 
@@ -164,7 +164,7 @@ export default function ConnectStep({ setCommit, onCommitted }: Props) {
       }
       setTestResult(await testProvider("openai"));
     } catch (e) {
-      setTestResult({ ok: false, message: e instanceof Error ? e.message : String(e) });
+      setTestResult({ ok: false, message: toMessage(e) });
     } finally {
       setTesting(false);
     }

@@ -1,12 +1,17 @@
-use kea_engines::{EngineRegistry, LlmRequest};
 use crate::feature::{CapKind, CapSlot, Feature};
+use kea_engines::{EngineRegistry, LlmRequest};
 
 pub struct DemoFeature;
 
 impl Feature for DemoFeature {
-    fn id(&self) -> &str { "demo" }
+    fn id(&self) -> &str {
+        "demo"
+    }
     fn required_caps(&self) -> Vec<CapSlot> {
-        vec![CapSlot { name: "llm", kind: CapKind::Llm }]
+        vec![CapSlot {
+            name: "llm",
+            kind: CapKind::Llm,
+        }]
     }
 }
 
@@ -20,7 +25,8 @@ pub async fn run_ping(
     provider_ref: Option<String>,
     prompt: &str,
 ) -> Result<String, String> {
-    let engine = engines.llm(engine_id)
+    let engine = engines
+        .llm(engine_id)
         .ok_or_else(|| format!("no llm engine '{engine_id}'"))?;
     let resp = engine
         .complete(LlmRequest {
@@ -28,15 +34,16 @@ pub async fn run_ping(
             model: None,
             provider_ref,
         })
-        .await.map_err(|e| e.to_string())?;
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(resp.text)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kea_engines::{EngineRegistry, noop::NoopLlmEngine};
     use crate::feature::Feature;
+    use kea_engines::{noop::NoopLlmEngine, EngineRegistry};
     use std::sync::Arc;
 
     #[test]

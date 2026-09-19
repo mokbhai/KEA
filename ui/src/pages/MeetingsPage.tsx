@@ -25,17 +25,19 @@ import {
 } from "../api";
 import Banner from "../components/Banner";
 import FeatureAiCard from "../components/FeatureAiCard";
-import FeatureBanner, { type FixNavigate } from "../components/FeatureBanner";
+import FeatureBanner from "../components/FeatureBanner";
 import HotkeyRow from "../components/HotkeyRow";
 import LevelMeter from "../components/LevelMeter";
+import LoadingBlock from "../components/LoadingBlock";
 import MeetingDetailView from "../components/MeetingDetail";
 import { Row, RowGroup } from "../components/SettingsRow";
-import Spinner from "../components/Spinner";
 import Toggle from "../components/Toggle";
 import TranscriptPanel, { type TranscriptSegment } from "../components/TranscriptPanel";
 import { useFeatureAi } from "../hooks/useFeatureAi";
-import { useSavedFlash } from "../hooks/useSavedFlash";
+import { useOptimisticSetting } from "../hooks/useOptimisticSetting";
 import type { SlotSpec } from "../lib/featureSlot";
+import { toMessage } from "../lib/format";
+import type { Navigate } from "../lib/nav";
 
 const MEETINGS_FEATURE = "meetings";
 const MEETINGS_COMMAND = "toggle_meeting";
@@ -56,7 +58,7 @@ const capabilityLabels: Record<SystemAudioCapability, string> = {
 };
 
 type Props = {
-  onNavigate?: FixNavigate;
+  onNavigate?: Navigate;
 };
 
 export default function MeetingsPage({ onNavigate }: Props) {
@@ -77,13 +79,12 @@ export default function MeetingsPage({ onNavigate }: Props) {
   const [testing, setTesting] = useState(false);
   const testTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
-  const [settings, setSettings] = useState<MeetingSettings>({
-    segment_duration_secs: 30,
-    prefer_system_audio: true,
+  const meetingSettings = useOptimisticSetting<MeetingSettings>({
+    initial: { segment_duration_secs: 30, prefer_system_audio: true },
+    persist: setMeetingSettings,
   });
-  const [settingsStatus, setSettingsStatus] = useState<string | null>(null);
-  const [settingsBusy, setSettingsBusy] = useState(false);
-  const [savedKey, flash] = useSavedFlash();
+  const settings = meetingSettings.value;
+  const { setValue: setSettings, setError: setSettingsError } = meetingSettings;
   // Set once the user edits a setting, so the mount fetch can't clobber input
   // typed before it resolves.
   const settingsTouchedRef = useRef(false);
@@ -96,19 +97,9 @@ export default function MeetingsPage({ onNavigate }: Props) {
   const stateRef = useRef<MeetingState>(state);
   stateRef.current = state;
 
-  const saveSettings = async (next: MeetingSettings, key: string) => {
+  const saveSettings = (patch: Partial<MeetingSettings>, key: string) => {
     settingsTouchedRef.current = true;
-    setSettings(next);
-    setSettingsBusy(true);
-    setSettingsStatus(null);
-    try {
-      await setMeetingSettings(next);
-      flash(key);
-    } catch (e) {
-      setSettingsStatus(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSettingsBusy(false);
-    }
+    return meetingSettings.save(patch, key);
   };
 
   const refreshList = useCallback(async () => {
@@ -116,7 +107,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
       const items = await listMeetings(50);
       setMeetings(items);
     } catch (e) {
-      setListStatus(e instanceof Error ? e.message : String(e));
+      setListStatus(toMessage(e));
     }
   }, []);
 
@@ -135,7 +126,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
       .then(setDetail)
       .catch((e) => {
         setDetail(null);
-        setListStatus(e instanceof Error ? e.message : String(e));
+        setListStatus(toMessage(e));
       })
       .finally(() => setBusy(false));
   }, [selectedId]);
@@ -173,8 +164,8 @@ export default function MeetingsPage({ onNavigate }: Props) {
       .then((loaded) => {
         if (!settingsTouchedRef.current) setSettings(loaded);
       })
-      .catch((e) => setSettingsStatus(e instanceof Error ? e.message : String(e)));
-  }, []);
+      .catch((e) => setSettingsError(toMessage(e)));
+  }, [setSettings, setSettingsError]);
 
   useEffect(() => {
     const unsubs = Promise.all([
@@ -230,7 +221,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
       }
       await refreshList();
     } catch (e) {
-      setListStatus(e instanceof Error ? e.message : String(e));
+      setListStatus(toMessage(e));
     } finally {
       setBusy(false);
     }
@@ -249,7 +240,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
           : "Screen Recording permission not granted — check System Settings.",
       );
     } catch (e) {
-      setMeetingStatus(e instanceof Error ? e.message : String(e));
+      setMeetingStatus(toMessage(e));
     } finally {
       setMeetingBusy(false);
     }
@@ -264,7 +255,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
       setMeetingStatus("Recording — speak into the mic.");
       return true;
     } catch (e) {
-      setMeetingStatus(e instanceof Error ? e.message : String(e));
+      setMeetingStatus(toMessage(e));
       return false;
     } finally {
       setMeetingBusy(false);
@@ -280,7 +271,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
       setMeetingStatus(`Meeting saved: ${saved.meeting.title}`);
       await onMeetingStopped(saved.meeting.id);
     } catch (e) {
-      setMeetingStatus(e instanceof Error ? e.message : String(e));
+      setMeetingStatus(toMessage(e));
     } finally {
       setMeetingBusy(false);
       setTesting(false);
@@ -357,13 +348,15 @@ export default function MeetingsPage({ onNavigate }: Props) {
             label="Record system audio too"
             hint={`Right now: ${capabilityLabels[capability]}.`}
           >
-            {savedKey === "prefer_system_audio" && <span className="kea-saved">Saved ✓</span>}
+            {meetingSettings.savedKey === "prefer_system_audio" && (
+              <span className="kea-saved">Saved ✓</span>
+            )}
             <Toggle
               label="Record system audio too"
               checked={settings.prefer_system_audio}
-              disabled={settingsBusy}
+              disabled={meetingSettings.busy}
               onChange={(next) =>
-                void saveSettings({ ...settings, prefer_system_audio: next }, "prefer_system_audio")
+                void saveSettings({ prefer_system_audio: next }, "prefer_system_audio")
               }
             />
           </Row>
@@ -371,7 +364,9 @@ export default function MeetingsPage({ onNavigate }: Props) {
             label="Transcribe every"
             hint="How often live transcript segments appear. Applies from the next meeting."
           >
-            {savedKey === "segment_duration_secs" && <span className="kea-saved">Saved ✓</span>}
+            {meetingSettings.savedKey === "segment_duration_secs" && (
+              <span className="kea-saved">Saved ✓</span>
+            )}
             <input
               className="kea-input"
               type="number"
@@ -380,7 +375,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
               max={120}
               step={5}
               value={settings.segment_duration_secs}
-              disabled={settingsBusy}
+              disabled={meetingSettings.busy}
               onChange={(e) => {
                 settingsTouchedRef.current = true;
                 const v = parseInt(e.target.value, 10);
@@ -393,19 +388,16 @@ export default function MeetingsPage({ onNavigate }: Props) {
                 // value inside the advisory 5-120s range (negatives would
                 // fail u32 deserialization outright).
                 const clamped = Math.min(120, Math.max(5, v));
-                void saveSettings(
-                  { ...settings, segment_duration_secs: clamped },
-                  "segment_duration_secs",
-                );
+                void saveSettings({ segment_duration_secs: clamped }, "segment_duration_secs");
               }}
               style={{ width: 88 }}
             />
             <span className="kea-muted">seconds</span>
           </Row>
         </RowGroup>
-        {settingsStatus && (
+        {meetingSettings.error && (
           <p style={{ marginTop: 8, fontSize: "0.8125rem", color: "var(--danger)" }}>
-            {settingsStatus}
+            {meetingSettings.error}
           </p>
         )}
       </section>
@@ -544,12 +536,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
           {selectedId && detail ? (
             <MeetingDetailView detail={detail} onDelete={onDelete} busy={busy} />
           ) : selectedId && busy ? (
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <Spinner size={16} />
-              <span className="kea-muted" style={{ margin: 0 }}>
-                Loading meeting…
-              </span>
-            </div>
+            <LoadingBlock label="Loading meeting…" />
           ) : (
             <p className="kea-muted" style={{ margin: 0 }}>
               Select a meeting to view notes and transcript.

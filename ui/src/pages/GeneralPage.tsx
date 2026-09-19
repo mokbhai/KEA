@@ -11,6 +11,7 @@ import PermissionPanel from "../components/PermissionPanel";
 import { Row, RowGroup } from "../components/SettingsRow";
 import Toggle from "../components/Toggle";
 import { useSavedFlash } from "../hooks/useSavedFlash";
+import { toMessage } from "../lib/format";
 import { useTheme, type ThemePreference } from "../theme";
 
 export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) {
@@ -39,7 +40,7 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
   useEffect(() => {
     getAutostart()
       .then(setAutostartEnabled)
-      .catch((e) => setAutostartError(e instanceof Error ? e.message : String(e)));
+      .catch((e) => setAutostartError(toMessage(e)));
     getSetting("updates.auto_check")
       .then((v) => {
         if (v === "false") setAutoCheck(false);
@@ -67,7 +68,7 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
       flash("autostart");
     } catch (e) {
       setAutostartEnabled(previous);
-      setAutostartError(e instanceof Error ? e.message : String(e));
+      setAutostartError(toMessage(e));
     } finally {
       setAutostartBusy(false);
     }
@@ -114,7 +115,7 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
         setUpdateResult(status.error ?? "Unknown status");
       }
     } catch (e) {
-      setUpdateResult(e instanceof Error ? e.message : String(e));
+      setUpdateResult(toMessage(e));
     } finally {
       setUpdateBusy(false);
     }
@@ -127,7 +128,7 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
       await showNotification("KEA", "Hello from KEA! This is a test notification.");
       setNotifStatus("Test notification sent.");
     } catch (e) {
-      setNotifStatus(e instanceof Error ? e.message : String(e));
+      setNotifStatus(toMessage(e));
     } finally {
       setNotifBusy(false);
     }
@@ -140,7 +141,7 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
       await setSetting("onboarding.completed", "false");
       onRunSetup();
     } catch (e) {
-      setSetupError(e instanceof Error ? e.message : String(e));
+      setSetupError(toMessage(e));
     } finally {
       setSetupBusy(false);
     }

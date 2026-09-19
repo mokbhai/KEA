@@ -12,8 +12,10 @@ import {
   type ConversationSummary,
   type Message,
 } from "../api";
+import { toMessage } from "../lib/format";
 import Banner from "../components/Banner";
 import HistoryPanel, { statusClass } from "../components/HistoryPanel";
+import LoadingBlock from "../components/LoadingBlock";
 import { Row, RowGroup } from "../components/SettingsRow";
 import Spinner from "../components/Spinner";
 import Toggle from "../components/Toggle";
@@ -56,7 +58,7 @@ export default function HistoryPage() {
       await setSetting("history.store_conversations", String(enabled));
     } catch (e) {
       setStoreConversations(prev);
-      setStatus(e instanceof Error ? e.message : String(e));
+      setStatus(toMessage(e));
     } finally {
       setStoreBusy(false);
     }
@@ -67,7 +69,7 @@ export default function HistoryPage() {
       const rows = await listActions(query || undefined, limit);
       setActions(rows);
     } catch (e) {
-      setStatus(e instanceof Error ? e.message : String(e));
+      setStatus(toMessage(e));
     }
   }, [query, limit]);
 
@@ -76,7 +78,7 @@ export default function HistoryPage() {
       const rows = await listConversations(limit);
       setConversations(rows);
     } catch (e) {
-      setStatus(e instanceof Error ? e.message : String(e));
+      setStatus(toMessage(e));
     }
   }, [limit]);
 
@@ -97,7 +99,7 @@ export default function HistoryPage() {
       .then(setActionDetail)
       .catch((e) => {
         setActionDetail(null);
-        setStatus(e instanceof Error ? e.message : String(e));
+        setStatus(toMessage(e));
       })
       .finally(() => setBusy(false));
   }, [selectedActionId]);
@@ -116,7 +118,7 @@ export default function HistoryPage() {
       .then(setLinkedAction)
       .catch((e) => {
         setLinkedAction(null);
-        setStatus(e instanceof Error ? e.message : String(e));
+        setStatus(toMessage(e));
       });
   }, [selectedConversationId, conversations]);
 
@@ -134,7 +136,7 @@ export default function HistoryPage() {
       .catch((e) => {
         if (stale) return;
         setMessages([]);
-        setStatus(e instanceof Error ? e.message : String(e));
+        setStatus(toMessage(e));
       })
       .finally(() => {
         if (!stale) setMessagesLoading(false);
@@ -162,7 +164,7 @@ export default function HistoryPage() {
       }
       await refreshConversations();
     } catch (e) {
-      setStatus(e instanceof Error ? e.message : String(e));
+      setStatus(toMessage(e));
     }
   };
 
@@ -353,10 +355,7 @@ export default function HistoryPage() {
         <aside className="kea-card" style={{ marginTop: 24 }}>
           <h2 style={{ margin: "0 0 12px" }}>Detail</h2>
           {busy && !actionDetail ? (
-            <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 60 }}>
-              <Spinner size={16} />
-              <span className="kea-muted">Loading detail…</span>
-            </div>
+            <LoadingBlock label="Loading detail…" minHeight={60} />
           ) : (
             <>
           {actionDetail && (

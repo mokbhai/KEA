@@ -8,6 +8,10 @@ pub enum EngineError {
     Auth(String),
     #[error("HTTP {status}: {body}")]
     Http { status: u16, body: String },
+    /// A rate limit or a server-side fault: the same request may well work a
+    /// moment later, which `Http` gives the caller no way to tell.
+    #[error("HTTP {status}: {body} — temporary, try again in a moment")]
+    Retryable { status: u16, body: String },
     #[error("bad configuration: {0}")]
     Config(String),
     #[error("model not installed: {0} — download it in Settings")]
@@ -18,18 +22,41 @@ pub enum EngineError {
 
 impl EngineError {
     pub fn http(status: u16, body: String) -> Self {
-        let body = if body.len() > 200 {
+        EngineError::Http {
+            status,
+            body: Self::preview(body),
+        }
+    }
+
+    pub fn retryable(status: u16, body: String) -> Self {
+        EngineError::Retryable {
+            status,
+            body: Self::preview(body),
+        }
+    }
+
+    /// A 401/403 from the server: the key is wrong, not merely absent, so the
+    /// user gets the same "check the API key" advice as a missing one. The
+    /// status and body stay in the message so the cause is still visible.
+    pub fn auth_rejected(status: u16, body: String) -> Self {
+        EngineError::Auth(format!("HTTP {status}: {}", Self::preview(body)))
+    }
+
+    /// Trims a response body down to something that fits in an error message.
+    fn preview(body: String) -> String {
+        if body.len() > 200 {
             let truncated: String = body.chars().take(200).collect();
             format!("{}…", truncated)
         } else {
             body
-        };
-        EngineError::Http { status, body }
+        }
     }
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct EngineCaps { pub models: Vec<String> }
+pub struct EngineCaps {
+    pub models: Vec<String>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlmRequest {
@@ -52,7 +79,9 @@ pub struct LlmRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct LlmResponse { pub text: String }
+pub struct LlmResponse {
+    pub text: String,
+}
 
 #[async_trait]
 pub trait LlmEngine: Send + Sync {

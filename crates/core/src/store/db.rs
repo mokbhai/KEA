@@ -1,9 +1,9 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use crate::error::KeaError;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
-use crate::error::KeaError;
 
 pub async fn open_pool(url: &str) -> Result<SqlitePool, KeaError> {
     // Enable foreign-key enforcement explicitly on every pooled connection.
@@ -23,8 +23,7 @@ pub async fn open_pool(url: &str) -> Result<SqlitePool, KeaError> {
         .await?)
 }
 
-static CONFIG_MIGRATOR: sqlx::migrate::Migrator =
-    sqlx::migrate!("./migrations/config");
+static CONFIG_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/config");
 
 pub async fn run_config_migrations(pool: &SqlitePool) -> Result<(), KeaError> {
     CONFIG_MIGRATOR.run(pool).await?;
@@ -48,7 +47,9 @@ mod tests {
         run_config_migrations(&pool).await.unwrap();
         // settings table exists -> this query succeeds (0 rows)
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM settings")
-            .fetch_one(&pool).await.unwrap();
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -67,7 +68,9 @@ mod tests {
         run_data_migrations(&pool).await.unwrap();
 
         let fk: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
-            .fetch_one(&pool).await.unwrap();
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(fk, 1, "foreign_keys must be enabled");
 
         sqlx::query("INSERT INTO meetings (id,title,capture_mode,status,started_at) VALUES ('m1','t','mic_only','recording',datetime('now'))")
@@ -76,9 +79,14 @@ mod tests {
             .execute(&pool).await.unwrap();
 
         sqlx::query("DELETE FROM meetings WHERE id='m1'")
-            .execute(&pool).await.unwrap();
-        let orphans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meeting_segments WHERE meeting_id='m1'")
-            .fetch_one(&pool).await.unwrap();
+            .execute(&pool)
+            .await
+            .unwrap();
+        let orphans: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM meeting_segments WHERE meeting_id='m1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(orphans, 0, "ON DELETE CASCADE did not fire");
 
         let _ = std::fs::remove_file(&db);

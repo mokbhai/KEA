@@ -1,4 +1,4 @@
-//! OS permission status and request helpers (Screen Recording, Microphone).
+//! OS permission status and request helpers (Screen Recording, Microphone, Accessibility).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ mod stub;
 pub enum PermKind {
     Microphone,
     ScreenRecording,
+    Accessibility,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,8 +31,8 @@ pub enum PermError {
 
 /// Platform permission probe and request surface.
 ///
-/// Screen Recording grant on macOS requires manual acceptance in System Settings
-/// when the request dialog is dismissed or denied.
+/// Screen Recording and Accessibility grants on macOS require manual acceptance
+/// in System Settings when the request dialog is dismissed or denied.
 #[async_trait]
 pub trait Permissions: Send + Sync {
     fn status(&self, kind: PermKind) -> PermStatus;
@@ -42,7 +43,7 @@ pub trait Permissions: Send + Sync {
 pub fn new_permissions() -> Box<dyn Permissions> {
     #[cfg(target_os = "macos")]
     {
-        return Box::new(macos::MacPermissions::new());
+        Box::new(macos::MacPermissions::new())
     }
     #[cfg(not(target_os = "macos"))]
     {

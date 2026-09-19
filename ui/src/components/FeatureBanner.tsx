@@ -1,11 +1,22 @@
 import Banner from "./Banner";
 import type { FeatureAi } from "../hooks/useFeatureAi";
+import type { BlockedCause } from "../lib/featureSlot";
+import type { Navigate, Page } from "../lib/nav";
 
-export type FixNavigate = (page: "ai-providers" | "models") => void;
+/**
+ * What clears each cause: a page to send the user to, or the slot picker when
+ * `page` is absent. The copy lives here, with the button that shows it.
+ */
+const ACTIONS: Record<BlockedCause, { label: string; page?: Page }> = {
+  unset: { label: "Choose…" },
+  unavailable: { label: "Change…" },
+  model: { label: "Open Models", page: "models" },
+  credentials: { label: "Open AI Providers", page: "ai-providers" },
+};
 
 type Props = {
   ai: FeatureAi;
-  onNavigate?: FixNavigate;
+  onNavigate?: Navigate;
 };
 
 /**
@@ -20,12 +31,12 @@ export default function FeatureBanner({ ai, onNavigate }: Props) {
     <>
       {ai.error && <Banner variant="error">{ai.error}</Banner>}
       {blocked.map((status) => {
-        const reason = status.blocked!;
+        const action = ACTIONS[status.blocked!.cause];
         const act = () => {
-          if (reason.fix === "picker") ai.openPicker(status.spec);
-          else onNavigate?.(reason.fix);
+          if (action.page) onNavigate?.(action.page);
+          else ai.openPicker(status.spec);
         };
-        const actionable = reason.fix === "picker" || onNavigate;
+        const actionable = !action.page || onNavigate;
         return (
           <Banner
             key={`${status.spec.feature}/${status.spec.slot}`}
@@ -33,12 +44,12 @@ export default function FeatureBanner({ ai, onNavigate }: Props) {
             action={
               actionable ? (
                 <button type="button" className="kea-btn" onClick={act}>
-                  {reason.actionLabel}
+                  {action.label}
                 </button>
               ) : undefined
             }
           >
-            {status.spec.label} — {reason.message}
+            {status.spec.label} — {status.blocked!.message}
           </Banner>
         );
       })}

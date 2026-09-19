@@ -7,13 +7,19 @@ pub mod stt;
 pub mod traits;
 pub mod tts;
 
-pub use http::{HttpClient, MultipartPart, ReqwestHttpClient};
+pub use http::{Auth, HttpClient, MultipartPart, ReqwestHttpClient};
 pub use llm::{OpenAiCompatibleLlmEngine, OpenAiLlmEngine};
 pub use noop::{NoopLlmEngine, NoopSttEngine, NoopTtsEngine};
-pub use provider::{CredentialSource, ProviderConfig, ProviderConfigSource};
+pub use provider::{
+    CredentialSource, Defaults, ProviderConfig, ProviderConfigSource, ResolvedProvider,
+    OPENAI_BASE_URL,
+};
 pub use registry::EngineRegistry;
-pub use stt::{OpenAiSttEngine, ParakeetSttEngine, WhisperSttEngine, pcm_to_wav_bytes};
-pub use tts::{LocalTtsEngine, OpenAiTtsEngine, bytes_to_pcm_wav};
+pub use stt::{
+    pcm_to_wav_bytes, resample_to_rate, OpenAiSttEngine, ParakeetSttEngine, WhisperSttEngine,
+    STT_SAMPLE_RATE_HZ,
+};
+pub use tts::{bytes_to_pcm_wav, LocalTtsEngine, OpenAiTtsEngine};
 
 #[cfg(feature = "whisper")]
 pub use stt::register_whisper_stt_engine;
@@ -21,9 +27,9 @@ pub use stt::register_whisper_stt_engine;
 #[cfg(feature = "parakeet")]
 pub use stt::register_parakeet_stt_engine;
 
+pub use traits::*;
 #[cfg(feature = "tts-local")]
 pub use tts::register_sherpa_tts_engine;
-pub use traits::*;
 
 use std::sync::Arc;
 

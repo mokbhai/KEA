@@ -47,7 +47,7 @@ const MEETING = {
   title: "Test capture",
   started_at: "2026-07-17T10:00:00Z",
   ended_at: "2026-07-17T10:00:10Z",
-  status: "done",
+  status: "completed",
   capture_mode: "mic_only",
   stt_engine_id: "whisper",
   llm_engine_id: "openai",

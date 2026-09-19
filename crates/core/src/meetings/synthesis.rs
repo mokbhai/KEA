@@ -68,11 +68,7 @@ pub fn format_transcript_for_synthesis(segments: &[MeetingSegment]) -> String {
     )
 }
 
-pub fn build_meeting_notes_request(
-    title: &str,
-    started_at: &str,
-    transcript: &str,
-) -> LlmRequest {
+pub fn build_meeting_notes_request(title: &str, started_at: &str, transcript: &str) -> LlmRequest {
     let user_prompt = format!(
         "Meeting title: {title}\nStarted: {started_at}\n\n<transcript>\n{transcript}\n</transcript>"
     );
@@ -140,7 +136,12 @@ pub fn sanitize_meeting_title(raw: &str) -> String {
     let components: Vec<&str> = result.split_whitespace().collect();
     result = components.join(" ");
     if result.chars().count() > 100 {
-        result = result.chars().take(100).collect::<String>().trim().to_string();
+        result = result
+            .chars()
+            .take(100)
+            .collect::<String>()
+            .trim()
+            .to_string();
     }
     result
 }
@@ -152,11 +153,8 @@ mod tests {
 
     #[test]
     fn notes_prompt_wraps_transcript_in_tags() {
-        let req = build_meeting_notes_request(
-            "Weekly Sync",
-            "2026-06-26T10:00:00Z",
-            "Alice: hello",
-        );
+        let req =
+            build_meeting_notes_request("Weekly Sync", "2026-06-26T10:00:00Z", "Alice: hello");
         assert!(req.prompt.contains("<transcript>"));
         assert!(req.prompt.contains("Alice: hello"));
         assert!(req.prompt.contains("summary"));

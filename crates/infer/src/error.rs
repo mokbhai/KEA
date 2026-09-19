@@ -8,6 +8,9 @@ pub enum InferError {
     #[error("model not found: {0}")]
     ModelNotFound(String),
 
+    #[error("unknown model kind: {0} (expected whisper, parakeet, or tts)")]
+    UnknownModelKind(String),
+
     #[error("hash mismatch for model '{model_id}': expected {expected}.., got {actual}..")]
     HashMismatch {
         model_id: String,
