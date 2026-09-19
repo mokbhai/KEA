@@ -150,6 +150,11 @@ pub fn sync_visibility(app: &AppHandle, state: DictationState) {
         // resolution since the window was built.
         reposition(&window);
         let _ = window.show();
+        // `show()` alone is not enough over a full-screen app — see
+        // `crate::nswindow::order_front_without_activating`. Called after
+        // `show()` so it is ordering a window the system already considers
+        // visible.
+        crate::nswindow::order_front_without_activating(&window);
     } else {
         let _ = window.hide();
     }

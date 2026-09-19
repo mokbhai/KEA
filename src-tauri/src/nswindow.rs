@@ -89,6 +89,44 @@ pub fn float_over_fullscreen(window: &WebviewWindow) {
     }
 }
 
+/// Orders `window` onto the active space without activating KEA.
+///
+/// Tauri's `show()` reaches tao's `set_visible(true)`, which calls
+/// `makeKeyAndOrderFront:`. That is the right call for an ordinary window and
+/// the wrong one here. Our overlay is built `focusable(false)`, so AppKit
+/// refuses to make it key — and from a *background* application, ordering a
+/// window front that way does not reliably put it on another app's full-screen
+/// space. The reported symptom was exactly that: the HUD appears over ordinary
+/// windows and never over a full-screen app.
+///
+/// `orderFrontRegardless` is the documented call for showing a window without
+/// activating its application, which is precisely what a dictation HUD is.
+///
+/// The collection behaviour and level are re-applied here rather than trusted
+/// from build time. They are cheap setters, they are idempotent, and the
+/// alternative is depending on the claim that nothing else ever touches them —
+/// a claim this file used to make in a comment and could not prove.
+#[cfg(target_os = "macos")]
+pub fn order_front_without_activating(window: &WebviewWindow) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let ns_window = match window.ns_window() {
+        Ok(ptr) if !ptr.is_null() => ptr as *mut AnyObject,
+        _ => return,
+    };
+
+    // SAFETY: a live NSWindow owned by tao, and three plain setters on it.
+    unsafe {
+        let _: () = msg_send![ns_window, setCollectionBehavior: floating_collection_behavior()];
+        let _: () = msg_send![ns_window, setLevel: STATUS_WINDOW_LEVEL];
+        let _: () = msg_send![ns_window, orderFrontRegardless];
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn order_front_without_activating(_window: &WebviewWindow) {}
+
 #[cfg(not(target_os = "macos"))]
 pub fn float_over_fullscreen(_window: &WebviewWindow) {}
 
