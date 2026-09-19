@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod api;
 mod commands;
 mod events;
 mod hotkeys;
@@ -118,6 +119,20 @@ pub struct AppState {
     /// (STT + synthesis, after `active_meeting` was taken). Consulted so a
     /// hotkey press can't park on the audio lock and replay as a fresh start.
     pub meeting_processing: AtomicBool,
+    /// True while an interim notes pass is running.
+    ///
+    /// A trigger that arrives while one is in flight is *dropped*, not queued:
+    /// queuing turns a slow provider into an unbounded backlog that keeps
+    /// billing after the meeting has ended. The next cadence window asks again.
+    ///
+    /// An `Arc<AtomicBool>` rather than a bare one so it is claimed through
+    /// `commands::try_acquire_busy` — the same owner the hotkey handlers use
+    /// for exactly this "drop the second trigger" rule.
+    pub interim_notes_in_flight: Arc<AtomicBool>,
+    /// Where a meeting title may come from besides the summariser, or `None`
+    /// on a build with no calendar. Read only at stop, and only when
+    /// `meetings.calendar_titles` is on.
+    pub calendar: Option<Arc<dyn kea_features::meeting::MeetingTitleSource>>,
     /// Serialises dictation handlers so a trigger arriving during one is
     /// dropped rather than queued. Shared state rather than a local of the
     /// hotkey loop because hold-to-talk drives the same handlers from its own
@@ -160,6 +175,19 @@ pub struct AppState {
     /// be compared against the live session after an await — the same trick
     /// `dictation_run_counter` plays, for the same reason.
     pub palette_counter: AtomicU64,
+    /// Serialises read-aloud across its triggers.
+    ///
+    /// On the state rather than minted by the hotkey table for the same reason
+    /// as the two flags below it: the shortcut is no longer the only thing
+    /// that starts a read, and two reads at once is two voices over each
+    /// other. See `hotkeys::busy_flag`.
+    pub tts_busy: Arc<AtomicBool>,
+    /// The local API server while it is listening, or `None`.
+    ///
+    /// The handle is what stops it, so the toggle on the settings page has
+    /// something to turn off; its presence is also the honest answer to "is
+    /// the API running", which a settings row must not infer from the setting.
+    pub api_server: Mutex<Option<api::ServerHandle>>,
     /// Serialises everything that fires a synthetic Cmd+C or Cmd+V at the
     /// frontmost app: the rewrite shortcut, the palette and the screen-capture
     /// shortcut.
@@ -314,6 +342,12 @@ fn main() {
             commands::list_meetings,
             commands::get_meeting,
             commands::delete_meeting,
+            commands::meeting_markdown,
+            commands::export_meeting_markdown,
+            commands::set_meeting_action_item_status,
+            commands::add_meeting_action_item,
+            commands::set_meeting_title,
+            commands::open_path_in_file_manager,
             commands::start_meeting,
             commands::stop_meeting,
             commands::get_meeting_state,
@@ -361,6 +395,12 @@ fn main() {
             commands::clear_palette_history,
             commands::capture_screen_text,
             commands::get_ocr_languages,
+            api::settings::get_api_settings,
+            api::settings::set_api_enabled,
+            api::settings::set_api_rate_limit,
+            api::settings::reveal_api_token,
+            api::settings::regenerate_api_token,
+            api::settings::install_cli_shim,
         ])
         .build(tauri::generate_context!())
         .expect("error while building KEA")
@@ -371,6 +411,18 @@ fn main() {
                 if let Some(w) = app_handle.get_webview_window("main") {
                     let _ = w.show();
                     let _ = w.set_focus();
+                }
+            }
+            // `kea://…`. LaunchServices routes an `open` to the running
+            // bundle as a kAEGetURL Apple Event, or launches the bundle and
+            // delivers it once launch completes; Tauri surfaces both as this
+            // one event. **This closure is on the event loop and must not
+            // block**, so the URL is handed to the drain and nothing more —
+            // see `api::spawn_url_service`.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = &event {
+                for url in urls {
+                    api::dispatch_url(app_handle, url.to_string());
                 }
             }
             #[cfg(not(target_os = "macos"))]
@@ -576,6 +628,22 @@ fn spawn_startup_maintenance(data_pool: &SqlitePool, log_dir: &Path) {
     });
 }
 
+/// The platform calendar behind `kea-features`'s title port.
+///
+/// The adapter exists so the notes path depends on a trait that hands back a
+/// title and nothing else: there is no method here that could return an
+/// attendee list, a location or a body, so the "calendar data never reaches an
+/// engine" rule holds by construction rather than by review. Constructing it
+/// reads no calendar and asks for no permission — `title_for_recording` is the
+/// first thing that touches EventKit, and only when a stop asks for a title.
+struct PlatformCalendarTitles(Box<dyn kea_platform::calendar::CalendarIo>);
+
+impl kea_features::meeting::MeetingTitleSource for PlatformCalendarTitles {
+    fn title_for(&self, started_at: &str, ended_at: Option<&str>) -> Option<String> {
+        kea_platform::calendar::title_for_recording(self.0.as_ref(), started_at, ended_at)
+    }
+}
+
 /// Assemble the shared application state. The platform handles (hotkeys, audio,
 /// permissions) are constructed here so the composition root does not hold
 /// half-built state.
@@ -618,6 +686,10 @@ fn build_state(
         dictation_app_context: Mutex::new(None),
         preview_playing: AtomicBool::new(false),
         meeting_processing: AtomicBool::new(false),
+        interim_notes_in_flight: Arc::new(AtomicBool::new(false)),
+        calendar: Some(Arc::new(PlatformCalendarTitles(
+            kea_platform::calendar::new_calendar_io(),
+        ))),
         dictation_busy: Arc::new(AtomicBool::new(false)),
         hold_to_talk_enabled: Arc::new(AtomicBool::new(false)),
         hold_to_talk_installed: Mutex::new(false),
@@ -628,6 +700,8 @@ fn build_state(
         palette: Mutex::new(None),
         palette_counter: AtomicU64::new(0),
         selection_busy: Arc::new(AtomicBool::new(false)),
+        tts_busy: Arc::new(AtomicBool::new(false)),
+        api_server: Mutex::new(None),
     })
 }
 
@@ -803,13 +877,32 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     spawn_macos_rewrite_service(&state, &app_handle, config_pool.clone());
 
+    // The URL scheme's sibling of the Services drain above, and started for
+    // the same reason at the same point: a `kea://` invocation can arrive at
+    // any moment after launch, and the handler needs the pools and registries
+    // that only exist once `setup` has got this far.
+    app.manage(api::KeaUrlSender(api::spawn_url_service(
+        &state,
+        &app_handle,
+    )));
+
     hotkeys::spawn_dispatch_loop(state.clone(), app_handle.clone(), action_rx);
 
     // Deliberately after the dispatcher is up: the hold-to-talk listener drives
     // the same dictation handlers.
     hotkeys::spawn_saved_dictation_settings(&state, &app_handle, config_pool.clone());
 
-    app.manage(state);
+    app.manage(state.clone());
+
+    // Off unless the user turned it on. A failure to bind is logged, never
+    // fatal: the app is entirely usable without the API.
+    {
+        let state = state.clone();
+        let app_handle = app_handle.clone();
+        tauri::async_runtime::spawn(async move {
+            api::start_if_enabled(&state, &app_handle).await;
+        });
+    }
 
     #[cfg(feature = "updater")]
     spawn_launch_update_check(app_handle, config_pool);

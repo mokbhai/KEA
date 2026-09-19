@@ -21,20 +21,18 @@ use tokio::sync::mpsc;
 use crate::commands::trigger_tts_inner;
 use crate::commands::{
     apply_dictation_settings, capture_screen_text_inner, close_palette_for, dictation_gate,
-    dictation_hotkey_action, execute_rewrite, hold_dictation_action, lock_cancel_action,
-    meeting_hotkey_action, notify_palette, open_palette_session, palette_is_open,
-    record_hotkey_reg_status, register_hotkey, resolve_accelerator, run_dictation_action,
-    start_meeting_inner, stop_meeting_inner, try_acquire_busy, BusyGuard, HotkeyAction,
-    MeetingHotkeyAction, DICTATION_ACTION_ID, HOTKEY_ACTIONS, LOCK_CANCEL_ACTION_ID,
+    dictation_hotkey_action, hold_dictation_action, lock_cancel_action, meeting_hotkey_action,
+    notify_user, open_palette_session, palette_is_open, record_hotkey_reg_status, register_hotkey,
+    resolve_accelerator, run_dictation_action, run_selection_rewrite, start_meeting_inner,
+    stop_meeting_inner, try_acquire_busy, BusyGuard, HotkeyAction, MeetingHotkeyAction,
+    RewriteOverride, DICTATION_ACTION_ID, HOTKEY_ACTIONS, LOCK_CANCEL_ACTION_ID,
     MEETINGS_ACTION_ID, OCR_ACTION_ID, PALETTE_ACTION_ID, REWRITE_ACTION_ID, TTS_ACTION_ID,
 };
-use crate::commands::{capture_app_context_now, profile_for, rewrite_input_for_profile};
 use crate::events::{
     emit_meeting_error, emit_rewrite_error, emit_rewrite_progress, emit_tts_error,
 };
 use crate::palette::{PaletteEvent, PaletteOrigin};
 use crate::AppState;
-use kea_features::ProfileOverrides;
 
 /// What one hotkey press runs. Boxed because the handlers are `async fn` bodies
 /// of different shapes held in one table.
@@ -87,6 +85,11 @@ fn busy_flag(action_id: &str, state: &Arc<AppState>) -> Arc<AtomicBool> {
         // interleaved is a corrupted document rather than a race that can be
         // lost gracefully. One flag for all three.
         REWRITE_ACTION_ID | PALETTE_ACTION_ID | OCR_ACTION_ID => state.selection_busy.clone(),
+        // Third instance, and it moved here for the same reason the first two
+        // did: `kea://read-aloud` and `POST /v1/speak` are now triggers too,
+        // and a flag minted inside this table would be invisible to them —
+        // two reads at once is two voices over each other.
+        TTS_ACTION_ID => state.tts_busy.clone(),
         _ => Arc::new(AtomicBool::new(false)),
     }
 }
@@ -242,19 +245,10 @@ fn handle_rewrite<'a>(
     Box::pin(async move {
         let _busy = busy;
         emit_rewrite_progress(app, "Capturing selection...");
-        // Probed FIRST, before anything that could change which app is
-        // frontmost. By the time the rewrite returns the user may well have
-        // switched away, so a later probe would answer about the wrong app.
-        let ctx = capture_app_context_now(state).await;
-        let profile = profile_for(&state.config_pool, ctx.as_ref()).await;
-        let input = rewrite_input_for_profile(&state.config_pool, profile.as_ref()).await;
-        match execute_rewrite(
-            state,
-            input,
-            &ProfileOverrides::from_profile(profile.as_ref()),
-        )
-        .await
-        {
+        // The capture-and-insert path itself lives in `run_selection_rewrite`,
+        // shared with `kea://rewrite` and `POST /v1/rewrite`; the shortcut
+        // adds no opinion of its own, hence the default override.
+        match run_selection_rewrite(state, &RewriteOverride::default()).await {
             Ok(_) => emit_rewrite_progress(app, "Done"),
             Err(error) => emit_rewrite_error(app, &error),
         }
@@ -347,7 +341,7 @@ fn handle_ocr_capture<'a>(
         // banner lives — is very likely closed, and a capture that could not
         // start is not something to discover later in the log.
         if let Err(error) = capture_screen_text_inner(state, app, busy).await {
-            notify_palette(app, &error);
+            notify_user(app, &error);
         }
     })
 }

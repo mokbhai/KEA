@@ -1,24 +1,33 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  addMeetingActionItem,
   deleteMeeting,
+  exportMeetingMarkdown,
   getMeeting,
   getMeetingSettings,
   getMeetingState,
   getPermissionStatus,
   getSystemAudioCapability,
   listMeetings,
+  meetingMarkdown,
   onMeetingError,
   onMeetingLevel,
+  onMeetingNotes,
   onMeetingSegment,
   onMeetingState,
   requestPermission,
+  revealPath,
+  setMeetingActionItemStatus,
   setMeetingSettings,
   setMeetingSpeakerName,
+  setMeetingTitle,
   startMeeting,
   stopMeeting,
+  type ActionItemStatus,
   type Meeting,
   type MeetingDetail,
   type MeetingSegmentEvent,
+  type MeetingNotes,
   type MeetingSettings,
   type MeetingState,
   type PermStatus,
@@ -54,14 +63,6 @@ const SLOTS: SlotSpec[] = [
   { feature: "meetings", slot: "llm", capability: "llm", label: "Notes writing" },
 ];
 
-/**
- * The `meeting:segment` payload as the backend sends it. `speaker_key` is
- * optional here because `src-tauri`'s payload has yet to forward the field the
- * segment row already carries — until it does, live lines are unlabelled and
- * the speaker shows up on reload.
- */
-type AttributedSegmentEvent = MeetingSegmentEvent & { speaker_key?: string | null };
-
 const capabilityLabels: Record<SystemAudioCapability, string> = {
   unavailable: "Mic only (system audio unavailable)",
   mic_only: "Mic only",
@@ -71,6 +72,39 @@ const capabilityLabels: Record<SystemAudioCapability, string> = {
 
 type Props = {
   onNavigate?: Navigate;
+};
+
+/**
+ * The cost note that sits next to the interim-notes toggle.
+ *
+ * Spelled out rather than left as "uses AI": this spends the user's tokens on
+ * a schedule they did not press a button for, and somebody who turns it on and
+ * leaves a four-hour meeting running should not be surprised by the bill.
+ */
+function interimHint(settings: MeetingSettings): string {
+  const everyMinutes = settings.interim_every_minutes;
+  const everySegments = settings.interim_every_segments;
+  return (
+    `Writes notes every ${everySegments} segments or ${everyMinutes} minutes, ` +
+    `whichever comes first — about ${Math.round(60 / Math.max(1, everyMinutes))} AI ` +
+    "calls an hour, billed to your notes provider. Off by default."
+  );
+}
+
+/**
+ * What the page shows before the first `get_meeting_settings` resolves.
+ *
+ * Mirrors `MeetingSettings::default()` in
+ * `crates/core/src/meetings/settings.rs`: both cost-spending features are off,
+ * so a page that renders for a frame before the read lands never shows them on.
+ */
+const SETTINGS_PLACEHOLDER: MeetingSettings = {
+  segment_duration_secs: 30,
+  prefer_system_audio: true,
+  interim_notes: false,
+  interim_every_segments: 8,
+  interim_every_minutes: 5,
+  calendar_titles: false,
 };
 
 export default function MeetingsPage({ onNavigate }: Props) {
@@ -91,9 +125,15 @@ export default function MeetingsPage({ onNavigate }: Props) {
   const [testing, setTesting] = useState(false);
   const testTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
+  const [liveNotes, setLiveNotes] = useState<MeetingNotes | null>(null);
+  const [calendarPerm, setCalendarPerm] = useState<PermStatus>("Unknown");
+
   const meetingSettings = useOptimisticSetting<MeetingSettings>({
-    initial: { segment_duration_secs: 30, prefer_system_audio: true },
+    initial: SETTINGS_PLACEHOLDER,
     persist: setMeetingSettings,
+    // A save writes the object whole, so re-reading first is what stops one
+    // toggle from reverting a field another window or the API just changed.
+    reread: getMeetingSettings,
   });
   const settings = meetingSettings.value;
   const { setValue: setSettings, setError: setSettingsError } = meetingSettings;
@@ -146,6 +186,9 @@ export default function MeetingsPage({ onNavigate }: Props) {
   useEffect(() => {
     void getSystemAudioCapability().then(setCapability);
     void getPermissionStatus("screen_recording").then(setScreenPerm);
+    // Asked for, never requested: reading the status does not prompt, and the
+    // prompt is what the toggle is for.
+    getPermissionStatus("calendar").then(setCalendarPerm).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -155,8 +198,6 @@ export default function MeetingsPage({ onNavigate }: Props) {
         if (payload.active_meeting_id && payload.state === "recording") {
           getMeeting(payload.active_meeting_id)
             .then((d) => {
-              const speakers =
-                (d as { speakers?: Parameters<typeof speakerDisplayName>[1] }).speakers ?? [];
               setSegments(
                 d.segments.map((s) => ({
                   meeting_id: payload.active_meeting_id!,
@@ -164,10 +205,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
                   text: s.text,
                   start_offset_ms: s.start_offset_ms,
                   end_offset_ms: s.end_offset_ms,
-                  speaker: speakerDisplayName(
-                    (s as { speaker_key?: string | null }).speaker_key,
-                    speakers,
-                  ),
+                  speaker: speakerDisplayName(s.speaker_key, d.speakers),
                 })),
               );
             })
@@ -191,9 +229,12 @@ export default function MeetingsPage({ onNavigate }: Props) {
         setState(next);
         if (next === "recording") {
           setSegments([]);
+          // Last meeting's notes are not this meeting's notes.
+          setLiveNotes(null);
         }
       }),
-      onMeetingSegment((seg: AttributedSegmentEvent) => {
+      onMeetingNotes(setLiveNotes),
+      onMeetingSegment((seg: MeetingSegmentEvent) => {
         setSegments((prev) => {
           if (prev.some((s) => s.meeting_id === seg.meeting_id && s.sequence === seg.sequence)) return prev;
           // No speaker rows while recording — the meeting has not been
@@ -250,6 +291,74 @@ export default function MeetingsPage({ onNavigate }: Props) {
     }
   };
 
+  /**
+   * Re-reads the open meeting after a write.
+   *
+   * Every action-item and title write goes through here for the same reason
+   * the speaker rename does: the row is the source of truth, and re-reading is
+   * cheaper than mirroring the backend's dedupe and prose-rendering rules in
+   * the page.
+   */
+  const mutateMeeting = async (write: (id: string) => Promise<unknown>) => {
+    if (!selectedId) return;
+    setBusy(true);
+    setListStatus(null);
+    try {
+      await write(selectedId);
+      setDetail(await getMeeting(selectedId));
+    } catch (e) {
+      setListStatus(toMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onSetActionItemStatus = (id: number, status: ActionItemStatus) =>
+    mutateMeeting(() => setMeetingActionItemStatus(id, status));
+
+  const onAddActionItem = (text: string) =>
+    mutateMeeting((meetingId) => addMeetingActionItem(meetingId, text));
+
+  const onRenameTitle = (title: string) =>
+    mutateMeeting((meetingId) => setMeetingTitle(meetingId, title));
+
+  /**
+   * Copy in the webview rather than through the Rust clipboard path.
+   *
+   * `kea_platform`'s clipboard is wired into the save/paste/restore state
+   * machine built for text insertion; reusing it for a plain copy would drag
+   * in the clipboard-restore decision and the change-count verification for no
+   * benefit.
+   */
+  const onCopyMarkdown = async () => {
+    if (!selectedId) return;
+    setBusy(true);
+    try {
+      await navigator.clipboard.writeText(await meetingMarkdown(selectedId));
+      setListStatus("Copied the meeting to the clipboard as Markdown.");
+    } catch (e) {
+      setListStatus(toMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onSaveMarkdown = async () => {
+    if (!selectedId) return;
+    setBusy(true);
+    try {
+      const path = await exportMeetingMarkdown(selectedId);
+      setListStatus(`Saved to ${path}`);
+      // Revealing it is what makes a fixed destination acceptable: the user
+      // never has to know where Downloads is.
+      await revealPath(path).catch(() => {});
+    } catch (e) {
+      setListStatus(toMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const onDelete = async (id: string) => {
     if (!window.confirm("Delete this meeting and its transcript?")) return;
     setBusy(true);
@@ -279,6 +388,24 @@ export default function MeetingsPage({ onNavigate }: Props) {
         result === "Granted"
           ? "Screen Recording permission granted."
           : "Screen Recording permission not granted — check System Settings.",
+      );
+    } catch (e) {
+      setMeetingStatus(toMessage(e));
+    } finally {
+      setMeetingBusy(false);
+    }
+  };
+
+  const requestCalendar = async () => {
+    setMeetingBusy(true);
+    setMeetingStatus(null);
+    try {
+      const result = await requestPermission("calendar");
+      setCalendarPerm(result);
+      setMeetingStatus(
+        result === "Granted"
+          ? "Calendar access granted — meetings will be named after the event they happened during."
+          : "Calendar access not granted — meetings keep their generated titles.",
       );
     } catch (e) {
       setMeetingStatus(toMessage(e));
@@ -402,6 +529,50 @@ export default function MeetingsPage({ onNavigate }: Props) {
             />
           </Row>
           <Row
+            label="Notes while the meeting runs"
+            hint={interimHint(settings)}
+          >
+            {meetingSettings.savedKey === "interim_notes" && (
+              <span className="kea-saved">Saved ✓</span>
+            )}
+            <Toggle
+              label="Notes while the meeting runs"
+              checked={settings.interim_notes ?? false}
+              disabled={meetingSettings.busy}
+              onChange={(next) => void saveSettings({ interim_notes: next }, "interim_notes")}
+            />
+          </Row>
+          <Row
+            label="Name meetings from your calendar"
+            hint="Uses the title of the calendar event you were in. Your calendar is read on this Mac and never sent to an AI provider."
+          >
+            {meetingSettings.savedKey === "calendar_titles" && (
+              <span className="kea-saved">Saved ✓</span>
+            )}
+            {settings.calendar_titles && calendarPerm !== "Granted" && (
+              <button
+                type="button"
+                className="kea-btn"
+                onClick={() => void requestCalendar()}
+                disabled={actionBusy}
+              >
+                Grant access
+              </button>
+            )}
+            <Toggle
+              label="Name meetings from your calendar"
+              checked={settings.calendar_titles ?? false}
+              disabled={meetingSettings.busy}
+              onChange={(next) => {
+                void saveSettings({ calendar_titles: next }, "calendar_titles");
+                // Asking on the toggle rather than on the first recording: the
+                // prompt is the point at which the user has said yes to this,
+                // and interrupting a meeting to ask would be the opposite.
+                if (next && calendarPerm !== "Granted") void requestCalendar();
+              }}
+            />
+          </Row>
+          <Row
             label="Transcribe every"
             hint="How often live transcript segments appear. Applies from the next meeting."
           >
@@ -503,6 +674,33 @@ export default function MeetingsPage({ onNavigate }: Props) {
         </div>
       </section>
 
+      {liveNotes && (
+        <section style={{ marginBottom: 24 }}>
+          <h2 style={{ margin: "0 0 12px" }}>Notes so far</h2>
+          <div className="kea-card">
+            {/*
+              Said plainly, because a stale summary read as a final one is the
+              way this feature misleads: the fold can compress out a point
+              mentioned once, and the full-transcript pass at stop is what
+              fixes it.
+            */}
+            <p className="kea-muted" style={{ margin: "0 0 8px", fontSize: "0.8125rem" }}>
+              Updated every few minutes while the meeting runs. The full notes are
+              written when you stop.
+            </p>
+            {liveNotes.summary.trim() && (
+              <p style={{ margin: "0 0 8px", whiteSpace: "pre-wrap" }}>{liveNotes.summary}</p>
+            )}
+            {liveNotes.action_items.trim() && (
+              <>
+                <h3 style={{ margin: "0 0 4px", fontSize: 14 }}>Action items</h3>
+                <p style={{ margin: 0, whiteSpace: "pre-wrap" }}>{liveNotes.action_items}</p>
+              </>
+            )}
+          </div>
+        </section>
+      )}
+
       <section style={{ marginBottom: 24 }}>
         <h2 style={{ margin: "0 0 12px" }}>Live transcript</h2>
         <div className="kea-card">
@@ -580,6 +778,11 @@ export default function MeetingsPage({ onNavigate }: Props) {
               onDelete={onDelete}
               busy={busy}
               onRenameSpeaker={onRenameSpeaker}
+              onRenameTitle={onRenameTitle}
+              onSetActionItemStatus={onSetActionItemStatus}
+              onAddActionItem={onAddActionItem}
+              onCopyMarkdown={onCopyMarkdown}
+              onSaveMarkdown={onSaveMarkdown}
             />
           ) : selectedId && busy ? (
             <LoadingBlock label="Loading meeting…" />

@@ -1,7 +1,7 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { onInvoke, resetTauriMocks } from "./test-utils/tauri";
+import { emitTauriEvent, onInvoke, resetTauriMocks } from "./test-utils/tauri";
 import { featureHandlers, openAiBinding } from "./test-utils/featureWorld";
 import App from "./App";
 
@@ -221,6 +221,32 @@ describe("AppShell", () => {
     expect(
       await screen.findByRole("heading", { level: 1, name: "App profiles" }),
     ).toBeTruthy();
+  });
+
+  // `kea://open/<page>` reaches the frontend as an event carrying a bare page
+  // name off a URL. Nothing else routes it, so without this listener the
+  // window opens on whatever page it was last showing.
+  it("routes to the page a kea://open URL names", async () => {
+    await renderShell();
+
+    act(() => emitTauriEvent("api:open-page", "profiles"));
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "App profiles" }),
+    ).toBeTruthy();
+  });
+
+  // The payload is untrusted: it is whatever somebody typed after
+  // `kea://open/`. Validated through `isPage`, never cast.
+  it("ignores an api:open-page payload that is not a page", async () => {
+    await renderShell();
+    const before = screen.getByRole("heading", { level: 1 }).textContent;
+
+    act(() => emitTauriEvent("api:open-page", "../../etc/passwd"));
+
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(before),
+    );
   });
 
   it("closes the drawer after navigating from it", async () => {

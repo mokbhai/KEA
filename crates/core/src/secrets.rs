@@ -3,6 +3,15 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// The credential-store slot holding the local API's bearer token.
+///
+/// A `provider_ref` like any other, so the token inherits the same keychain
+/// item and ACL as the provider API keys and needs no storage code of its own.
+/// The name is here rather than in the app layer because this module is what
+/// decides what a `provider_ref` means, and a second module inventing its own
+/// spelling of this string would silently mint a second token.
+pub const LOCAL_API_TOKEN_REF: &str = "local-api-token";
+
 #[async_trait]
 pub trait CredentialStore: Send + Sync {
     async fn get(&self, provider_ref: &str) -> Result<Option<String>, KeaError>;

@@ -591,6 +591,12 @@ export type MeetingStatus = "recording" | "completed" | "error";
 /** Mirrors `kea_core::store::meetings::CaptureMode`. */
 export type CaptureMode = "mic_only" | "mic_and_system";
 
+/** Mirrors `kea_core::store::meetings::TitleSource`. */
+export type TitleSource = "calendar" | "llm" | "user";
+
+/** Mirrors `kea_core::store::meetings::ActionItemStatus`. */
+export type ActionItemStatus = "open" | "done" | "dropped";
+
 export type Meeting = {
   id: string;
   title: string;
@@ -601,6 +607,8 @@ export type Meeting = {
   stt_engine_id: string | null;
   llm_engine_id: string | null;
   error: string | null;
+  /** Who named this meeting. Rows written before the column read as "llm". */
+  title_source: TitleSource;
 };
 
 export type MeetingSegment = {
@@ -643,16 +651,39 @@ export type MeetingNotes = {
   model: string | null;
 };
 
+/** Mirrors `kea_core::store::meetings::ActionItem`. */
+export type MeetingActionItem = {
+  id: number;
+  meeting_id: string;
+  text: string;
+  owner: string | null;
+  due_hint: string | null;
+  source_seq: number | null;
+  status: ActionItemStatus;
+};
+
 export type MeetingDetail = {
   meeting: Meeting;
   segments: MeetingSegment[];
   notes: MeetingNotes | null;
   speakers: MeetingSpeaker[];
+  /**
+   * Action items as rows. Empty for a meeting recorded before the table
+   * existed — `notes.action_items` still carries their prose, which is why
+   * both renderings stay correct.
+   */
+  action_items: MeetingActionItem[];
 };
 
 export type MeetingSettings = {
   segment_duration_secs: number;
   prefer_system_audio: boolean;
+  /** Write notes on a cadence during the meeting, not only at stop. */
+  interim_notes: boolean;
+  interim_every_segments: number;
+  interim_every_minutes: number;
+  /** Name a meeting after the calendar event it happened during. */
+  calendar_titles: boolean;
 };
 
 export const getMeetingSettings = () =>
@@ -664,13 +695,22 @@ export const setMeetingSettings = (settings: MeetingSettings) =>
 export const getSystemAudioCapability = () =>
   invoke<SystemAudioCapability>("get_system_audio_capability");
 
-export const getPermissionStatus = (
-  kind: "microphone" | "screen_recording" | "accessibility",
-) => invoke<PermStatus>("get_permission_status", { kind });
+/**
+ * The permission kinds the backend knows, spelled exactly as `PERM_KINDS` in
+ * `src-tauri/src/commands.rs`. A kind added there and not here is rejected at
+ * the command boundary with "unknown permission kind".
+ */
+export type PermissionKind =
+  | "microphone"
+  | "screen_recording"
+  | "accessibility"
+  | "calendar";
 
-export const requestPermission = (
-  kind: "microphone" | "screen_recording" | "accessibility",
-) => invoke<PermStatus>("request_permission", { kind });
+export const getPermissionStatus = (kind: PermissionKind) =>
+  invoke<PermStatus>("get_permission_status", { kind });
+
+export const requestPermission = (kind: PermissionKind) =>
+  invoke<PermStatus>("request_permission", { kind });
 
 export const openAccessibilitySettings = () =>
   invoke<void>("open_accessibility_settings");
@@ -685,6 +725,18 @@ export const getAllPermissionStatuses = () =>
 
 export const showNotification = (title: string, body: string) =>
   invoke<void>("show_notification", { title, body });
+
+/**
+ * A `kea://open/<page>` URL asking the settings window to switch pages.
+ *
+ * The payload is a bare page name that came off a URL, so it arrives as an
+ * unvalidated `string`; `isPage` in `lib/nav.ts` is what turns it into a
+ * `Page`, and anything else is ignored rather than navigated to.
+ */
+export const onApiOpenPage = (
+  handler: (page: string) => void,
+): Promise<UnlistenFn> =>
+  listen<string>("api:open-page", (event) => handler(event.payload));
 
 export const listMeetings = (limit?: number) =>
   invoke<Meeting[]>("list_meetings", { limit });
@@ -705,6 +757,31 @@ export const setMeetingSpeakerName = (
     speakerKey,
     displayName,
   });
+
+/** The meeting rendered as Markdown, for the clipboard. */
+export const meetingMarkdown = (meetingId: string) =>
+  invoke<string>("meeting_markdown", { meetingId });
+
+/** Writes the Markdown to `~/Downloads` and returns the path it wrote. */
+export const exportMeetingMarkdown = (meetingId: string) =>
+  invoke<string>("export_meeting_markdown", { meetingId });
+
+export const setMeetingActionItemStatus = (id: number, status: ActionItemStatus) =>
+  invoke<void>("set_meeting_action_item_status", { id, status });
+
+export const addMeetingActionItem = (meetingId: string, text: string) =>
+  invoke<void>("add_meeting_action_item", { meetingId, text });
+
+/**
+ * Rename a meeting. Stored with `title_source = "user"`, which is what stops a
+ * later synthesis or calendar match from overwriting it.
+ */
+export const setMeetingTitle = (meetingId: string, title: string) =>
+  invoke<void>("set_meeting_title", { meetingId, title });
+
+/** Show a file KEA just wrote in the system file manager. */
+export const revealPath = (path: string) =>
+  invoke<void>("open_path_in_file_manager", { path });
 
 export const startMeeting = () => invoke<string>("start_meeting");
 
@@ -742,6 +819,25 @@ export const onMeetingLevel = (handler: (level: number) => void): Promise<Unlist
 
 export const onMeetingError = (handler: (message: string) => void): Promise<UnlistenFn> =>
   listen<RewriteEventPayload>("meeting:error", (event) =>
+    handler(event.payload.message),
+  );
+
+/** Interim notes, emitted on a cadence while a meeting is recording. */
+export const onMeetingNotes = (
+  handler: (notes: MeetingNotes) => void,
+): Promise<UnlistenFn> =>
+  listen<MeetingNotes>("meeting:notes", (event) => handler(event.payload));
+
+/**
+ * An interim notes pass that did not produce notes.
+ *
+ * Separate from `onMeetingError`: the recording is fine, an optional extra did
+ * not happen, and the full pass at stop still runs.
+ */
+export const onMeetingNotesError = (
+  handler: (message: string) => void,
+): Promise<UnlistenFn> =>
+  listen<RewriteEventPayload>("meeting:notes_error", (event) =>
     handler(event.payload.message),
   );
 
@@ -951,6 +1047,43 @@ export type UpdateStatus = {
 };
 
 export const checkUpdate = () => invoke<UpdateStatus>("check_update");
+
+// ---------------------------------------------------------------------------
+// Local API and URL scheme
+// ---------------------------------------------------------------------------
+
+/**
+ * The state of the scriptable HTTP API.
+ *
+ * `running` is asked of the live server handle, not inferred from `enabled`:
+ * a socket that failed to bind must not read as on.
+ */
+export type ApiSettings = {
+  enabled: boolean;
+  running: boolean;
+  socket_path: string;
+  token_file: string;
+  max_rewrites_per_minute: number;
+  /** False where there are no unix sockets, and so no API to enable. */
+  supported: boolean;
+};
+
+export const getApiSettings = () => invoke<ApiSettings>("get_api_settings");
+
+/** Binds or unbinds the socket, then records the setting. */
+export const setApiEnabled = (enabled: boolean) =>
+  invoke<ApiSettings>("set_api_enabled", { enabled });
+
+export const setApiRateLimit = (limit: number) =>
+  invoke<void>("set_api_rate_limit", { limit });
+
+export const revealApiToken = () => invoke<string>("reveal_api_token");
+
+/** Mints a new token; every script holding the old one stops working. */
+export const regenerateApiToken = () => invoke<string>("regenerate_api_token");
+
+/** Symlinks the bundled `kea` shim onto the PATH; resolves with its path. */
+export const installCliShim = () => invoke<string>("install_cli_shim");
 
 // ---------------------------------------------------------------------------
 // File transcription (drag-drop, SRT/VTT export)

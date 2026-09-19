@@ -6,7 +6,7 @@ import {
   type MutableRefObject,
 } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { getBinding, getSetting, setSetting, onDictationError, onMeetingError, onRewriteError, onRewriteProgress, onTtsError, onTtsState } from "./api";
+import { getBinding, getSetting, setSetting, onApiOpenPage, onDictationError, onMeetingError, onRewriteError, onRewriteProgress, onTtsError, onTtsState } from "./api";
 import Onboarding from "./components/Onboarding";
 import Spinner from "./components/Spinner";
 import StatusPill from "./components/StatusPill";
@@ -22,7 +22,7 @@ import ProfilesPage from "./pages/ProfilesPage";
 import ReadAloudPage from "./pages/ReadAloudPage";
 import RewritePage from "./pages/RewritePage";
 import VocabularyPage from "./pages/VocabularyPage";
-import type { Page } from "./lib/nav";
+import { isPage, type Page } from "./lib/nav";
 import { ThemeProvider, useTheme } from "./theme";
 
 const MOBILE_BREAKPOINT = 768;
@@ -191,10 +191,30 @@ function AppShell() {
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [isMobile, drawerOpen, closeDrawer]);
 
-  const navigate = (next: Page) => {
-    setPage(next);
-    if (isMobile) closeDrawer();
-  };
+  // A callback rather than a plain function because the `api:open-page`
+  // listener below subscribes to it: a fresh identity every render would
+  // resubscribe on every keystroke anywhere in the shell.
+  const navigate = useCallback(
+    (next: Page) => {
+      setPage(next);
+      if (isMobile) closeDrawer();
+    },
+    [isMobile, closeDrawer],
+  );
+
+  // `kea://open/<page>` shows the window and emits the page name; routing
+  // belongs to the frontend, so this is where that URL finally lands somewhere.
+  useEffect(() => {
+    const unsub = onApiOpenPage((page) => {
+      // The payload came off a URL. Validated, never cast — an unrecognised
+      // name leaves the window on the page it was already showing rather than
+      // routing to nothing.
+      if (isPage(page)) navigate(page);
+    });
+    return () => {
+      void unsub.then((fn) => fn());
+    };
+  }, [navigate]);
 
   const completeOnboarding = async () => {
     await setSetting("onboarding.completed", "true");

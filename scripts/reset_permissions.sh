@@ -21,6 +21,9 @@ tccutil reset ScreenCapture "$BUNDLE_ID" 2>/dev/null || true
 echo "Resetting Microphone permissions..."
 tccutil reset Microphone "$BUNDLE_ID" 2>/dev/null || true
 
+echo "Resetting Calendar permissions..."
+tccutil reset Calendar "$BUNDLE_ID" 2>/dev/null || true
+
 echo "Resetting all remaining TCC permissions..."
 tccutil reset All "$BUNDLE_ID" 2>/dev/null || true
 

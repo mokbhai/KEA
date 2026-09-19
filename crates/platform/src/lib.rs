@@ -1,7 +1,8 @@
 //! Platform providers: OS integration behind traits (hotkeys, text I/O, audio,
-//! permissions, screen capture/OCR).
+//! permissions, screen capture/OCR, calendar).
 
 pub mod audio;
+pub mod calendar;
 pub mod hotkeys;
 #[cfg(target_os = "macos")]
 pub mod macos_services;
@@ -14,6 +15,9 @@ pub use audio::{
     accumulate_frames, chunk_pcm_by_duration, cue_pcm, mix_frames, new_audio_io, resample_linear,
     rms_level, AudioIo, AudioIoError, Cue, DictationState, MeetingState, PcmBuffer, PcmFrame,
     SystemAudioCapability,
+};
+pub use calendar::{
+    new_calendar_io, title_for_recording, CalendarError, CalendarEvent, CalendarIo,
 };
 pub use hotkeys::hold::{HoldAction, HoldModifiers, HoldToTalk, DEFAULT_MIN_HOLD};
 pub use hotkeys::{
@@ -74,6 +78,26 @@ mod tests {
         // selector and OCR needs a screen, neither of which a test has.
         let _screen = new_screen_capture();
         let _ocr = new_text_recognizer();
+        let _calendar = new_calendar_io();
+    }
+
+    /// Reading a status must never take the process down, whatever the answer.
+    ///
+    /// `Calendar` is the one that can: it asks EventKit, and `class!` *panics*
+    /// when the framework is not linked. Nothing else in a Tauri app pulls
+    /// EventKit in, so without the `#[link]` in `calendar::macos` this test —
+    /// and the Permissions panel — crashes instead of reporting a status.
+    #[test]
+    fn every_permission_status_can_be_read_without_panicking() {
+        let permissions = new_permissions();
+        for kind in [
+            PermKind::Microphone,
+            PermKind::ScreenRecording,
+            PermKind::Accessibility,
+            PermKind::Calendar,
+        ] {
+            let _status = permissions.status(kind);
+        }
     }
 
     /// Verify the non-macOS composition path constructs without panic and that
@@ -91,6 +115,7 @@ mod tests {
             let _permissions = new_permissions();
             let _screen = new_screen_capture();
             let _ocr = new_text_recognizer();
+            let _calendar = new_calendar_io();
         }
 
         #[test]

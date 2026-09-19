@@ -71,3 +71,24 @@ tempfile.workspace = true
 arboard.workspace = true
 futures-util.workspace = true
 sha2.workspace = true
+# The local API server (see `crate::api`). hyper and hyper-util are already in
+# the tree as reqwest's HTTP *client*; naming them here turns on hyper's
+# `server` feature, which adds no new crate to the graph but does recompile
+# hyper (and therefore reqwest) with the server modules linked in. That is the
+# real cost — a rebuild and a few tens of KB of binary — and it buys correct
+# HTTP/1.1 framing (chunked bodies, header folding, malformed-request
+# rejection) that a hand-rolled reader over a socket would get subtly wrong.
+hyper = { version = "1", features = ["server", "http1"] }
+# `TokioIo` only; it is what lets hyper serve over an arbitrary tokio stream,
+# which is the whole reason a unix socket is possible here.
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+http = "1"
+# `RunEvent::Opened` hands us `url::Url` already, and `query_pairs()` is the
+# percent- and plus-decoding the kea:// grammar needs. Parsing it by hand would
+# be a second, worse decoder.
+url = "2"
+# 32 bytes from the OS CSPRNG for the API token. Already in the tree
+# transitively; named here because minting a bearer token from anything less
+# than the platform entropy source is the kind of shortcut that ages badly.
+getrandom = "0.3"

@@ -1,18 +1,23 @@
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use kea_core::dictation::{apply_vocabulary, hint_terms};
 use kea_core::meetings::{
-    attribute_segment, build_meeting_notes_request, build_meeting_title_request,
-    format_transcript_for_synthesis, parse_meeting_notes_json, sanitize_meeting_title,
-    MeetingSettings, SpeakerChannel, MEETING_NOTES_PROMPT_VERSION,
+    attribute_segment, build_interim_notes_request, build_meeting_notes_request,
+    build_meeting_title_request, build_notes_repair_request, format_transcript_for_synthesis,
+    parse_meeting_notes_json, render_action_items_prose, sanitize_meeting_title,
+    should_run_interim, InterimCadence, MeetingSettings, ParsedMeetingNotes, SpeakerChannel,
+    MAX_CONSECUTIVE_INTERIM_FAILURES, MEETING_INTERIM_PROMPT_VERSION, MEETING_NOTES_PROMPT_VERSION,
 };
 use kea_core::resolve::SlotResolver;
 use kea_core::store::actions::{ActionRepo, ActionStatus, NewAction};
-use kea_core::store::bindings::BindingRepo;
+use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_core::store::meetings::{
-    CaptureMode, Meeting, MeetingDetail, MeetingNotes, MeetingRepo, MeetingSpeaker, MeetingStatus,
-    NewMeeting, NewSegment,
+    ActionItem, CaptureMode, Meeting, MeetingDetail, MeetingNotes, MeetingRepo, MeetingSpeaker,
+    MeetingStatus, NewActionItem, NewMeeting, NewSegment, TitleSource,
 };
 use kea_core::store::vocabulary::VocabularyEntry;
-use kea_engines::traits::{AudioPcm, SttOpts, Transcript};
+use kea_engines::traits::{AudioPcm, LlmEngine, SttOpts, Transcript};
 use kea_engines::EngineRegistry;
 use kea_platform::audio::util::resample_linear;
 use kea_platform::audio::SpeechSegment;
@@ -184,6 +189,188 @@ pub async fn transcribe_meeting_segment(
     Ok(transcript.text)
 }
 
+/// Resolve the meetings LLM slot once, returning the engine and its binding.
+///
+/// Notes, the repair round trip, the interim pass and the title call all need
+/// the same two things from the same slot; resolving them in one place is what
+/// keeps `provider_ref` and `model` from being forgotten on one of the paths.
+async fn meetings_llm(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+) -> Result<(std::sync::Arc<dyn LlmEngine>, Binding), String> {
+    let binding = SlotResolver::new(engines, bindings)
+        .require_llm("meetings")
+        .await
+        .map_err(|e| e.to_string())?;
+    let engine = engines
+        .llm(&binding.engine_id)
+        .ok_or_else(|| format!("no llm engine '{}'", binding.engine_id))?;
+    Ok((engine, binding))
+}
+
+/// Complete `req` and parse the reply as notes, with exactly one repair round
+/// trip if it will not parse.
+///
+/// Four layers get JSON out of a provider that promises none of tool calling,
+/// JSON schema mode or `response_format`: the prompt carries a literal example
+/// (`meeting_notes_system_prompt`), the parser strips fences and scans for the
+/// first balanced object (`parse_meeting_notes_json`), this function asks once
+/// more, and the caller below keeps the raw text rather than failing the
+/// meeting. `response_format` is the fifth layer and is *not* implemented here
+/// — see the note on [`synthesize_meeting_notes`].
+///
+/// Exactly one retry. A loop bills the user once per attempt against a server
+/// that has already shown it cannot produce the shape.
+async fn complete_notes(
+    engine: &dyn LlmEngine,
+    binding: &Binding,
+    mut req: kea_engines::LlmRequest,
+) -> Result<ParsedMeetingNotes, String> {
+    req.model = binding.model.clone();
+    req.provider_ref = binding.provider_ref.clone();
+    let first = engine.complete(req).await.map_err(|e| e.to_string())?;
+
+    match parse_meeting_notes_json(&first.text) {
+        Ok(parsed) => Ok(parsed),
+        Err(e) => {
+            tracing::warn!(error = %e, "meeting: notes reply was not JSON, asking once more");
+            let mut repair = build_notes_repair_request(&first.text);
+            repair.model = binding.model.clone();
+            repair.provider_ref = binding.provider_ref.clone();
+            let second = engine.complete(repair).await.map_err(|e| e.to_string())?;
+            parse_meeting_notes_json(&second.text).map_err(|e| {
+                // Carried up so the caller can keep the raw text as the
+                // summary rather than failing a meeting the user already paid
+                // to transcribe.
+                format!("{e}|raw:{}", second.text)
+            })
+        }
+    }
+}
+
+/// Notes from a reply that would not parse even after the repair round trip.
+///
+/// The raw text becomes the summary and the structured fields stay empty.
+/// Before this, a malformed reply marked the whole meeting
+/// [`MeetingStatus::Error`] through [`ActiveMeeting::fail`] and the user lost a
+/// transcript they had already paid to produce.
+fn notes_from_unparsable_reply(raw: &str) -> ParsedMeetingNotes {
+    ParsedMeetingNotes {
+        summary: raw.trim().to_string(),
+        ..Default::default()
+    }
+}
+
+/// Split the `{error}|raw:{text}` marker [`complete_notes`] uses to carry a
+/// failed reply's text up with its error.
+fn unparsable_reply_text(error: &str) -> Option<&str> {
+    error.split_once("|raw:").map(|(_, raw)| raw)
+}
+
+/// Turn parsed notes into the row to store, and persist the action items as
+/// rows at the same time.
+///
+/// The rows are the source of truth and `meeting_notes.action_items` is a
+/// derived view of them, re-rendered on every write, so `MeetingDetail` and
+/// anything else reading the column keeps working and a meeting recorded
+/// before the table still renders.
+async fn persist_notes(
+    meetings: &MeetingRepo,
+    meeting_id: &str,
+    parsed: &ParsedMeetingNotes,
+    prompt_version: &str,
+    binding: &Binding,
+) -> Result<MeetingNotes, String> {
+    let incoming: Vec<NewActionItem> = parsed
+        .action_item_rows()
+        .into_iter()
+        .map(|item| NewActionItem {
+            text: item.text,
+            owner: item.owner,
+            due_hint: item.due_hint,
+            source_seq: None,
+        })
+        .collect();
+
+    let rows = meetings
+        .merge_action_items(meeting_id, &incoming)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let notes = MeetingNotes {
+        meeting_id: meeting_id.to_string(),
+        summary: parsed.summary.clone(),
+        decisions: parsed.decisions.clone(),
+        action_items: action_items_prose(&rows, &parsed.action_items),
+        follow_ups: parsed.follow_ups.clone(),
+        open_questions: parsed.open_questions.clone(),
+        prompt_version: prompt_version.to_string(),
+        engine_id: Some(binding.engine_id.clone()),
+        model: binding.model.clone(),
+    };
+
+    meetings
+        .upsert_notes(&notes)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(notes)
+}
+
+/// The prose column: the rows rendered back, or what the model wrote if there
+/// are no rows to render.
+fn action_items_prose(rows: &[ActionItem], fallback: &str) -> String {
+    if rows.is_empty() {
+        return fallback.to_string();
+    }
+    let parsed: Vec<kea_core::meetings::ParsedActionItem> = rows
+        .iter()
+        .map(|row| kea_core::meetings::ParsedActionItem {
+            text: row.text.clone(),
+            owner: row.owner.clone(),
+            due_hint: row.due_hint.clone(),
+        })
+        .collect();
+    render_action_items_prose(&parsed)
+}
+
+/// The final pass at stop: the whole transcript, in one request.
+///
+/// # `response_format` is deliberately absent
+///
+/// Layer 3 of the plan's JSON reliability design — sending
+/// `"response_format": {"type": "json_object"}`, retrying without it on a 400
+/// that mentions the field, and remembering the answer per provider — needs
+/// `json_mode` on `LlmRequest` and a branch in `post_chat_completion`, both in
+/// `kea-engines`, which this change does not own. Layers 1, 2 and 4 (the
+/// literal example, the tolerant parser and the one repair round trip) are all
+/// here and carry the load without it; layer 3 is a latency and token saving
+/// on providers that support it, not a correctness requirement.
+async fn synthesize_notes_parsed(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    meeting: &Meeting,
+    segments: &[kea_core::MeetingSegment],
+    speakers: &[MeetingSpeaker],
+) -> Result<(ParsedMeetingNotes, Binding), String> {
+    let (engine, binding) = meetings_llm(engines, bindings).await?;
+
+    let transcript = format_transcript_for_synthesis(segments, speakers);
+    let req = build_meeting_notes_request(&meeting.title, &meeting.started_at, &transcript);
+
+    let parsed = match complete_notes(engine.as_ref(), &binding, req).await {
+        Ok(parsed) => parsed,
+        Err(e) => match unparsable_reply_text(&e) {
+            Some(raw) => {
+                tracing::warn!("meeting: keeping an unparsable notes reply as the summary");
+                notes_from_unparsable_reply(raw)
+            }
+            None => return Err(e),
+        },
+    };
+    Ok((parsed, binding))
+}
+
 pub async fn synthesize_meeting_notes(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
@@ -191,22 +378,8 @@ pub async fn synthesize_meeting_notes(
     segments: &[kea_core::MeetingSegment],
     speakers: &[MeetingSpeaker],
 ) -> Result<MeetingNotes, String> {
-    let binding = SlotResolver::new(engines, bindings)
-        .require_llm("meetings")
-        .await
-        .map_err(|e| e.to_string())?;
-    let engine_id = &binding.engine_id;
-
-    let engine = engines
-        .llm(engine_id)
-        .ok_or_else(|| format!("no llm engine '{engine_id}'"))?;
-
-    let transcript = format_transcript_for_synthesis(segments, speakers);
-    let mut req = build_meeting_notes_request(&meeting.title, &meeting.started_at, &transcript);
-    req.model = binding.model.clone();
-    req.provider_ref = binding.provider_ref.clone();
-    let resp = engine.complete(req).await.map_err(|e| e.to_string())?;
-    let parsed = parse_meeting_notes_json(&resp.text).map_err(|e| e.to_string())?;
+    let (parsed, binding) =
+        synthesize_notes_parsed(engines, bindings, meeting, segments, speakers).await?;
 
     Ok(MeetingNotes {
         meeting_id: meeting.id.clone(),
@@ -221,20 +394,195 @@ pub async fn synthesize_meeting_notes(
     })
 }
 
+/// One interim notes pass, folding the segments recorded since `from_sequence`
+/// into the notes already stored.
+///
+/// # What this deliberately does not do
+///
+/// It takes no [`ActiveMeeting`], so it *cannot* call [`ActiveMeeting::fail`].
+/// A failed interim pass is an optional extra that did not happen: the meeting
+/// stays `Recording`, the ledger row stays open, and capture is untouched. The
+/// caller logs, emits `meeting:notes_error`, and counts the failure against
+/// [`MAX_CONSECUTIVE_INTERIM_FAILURES`].
+///
+/// It also never touches the meeting title. An interim pass can run long
+/// before the title step, and after item 17 that title may be a calendar title
+/// that must never reach an engine.
+pub async fn run_interim_notes_pass(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    meetings: &MeetingRepo,
+    meeting_id: &str,
+    from_sequence: i32,
+) -> Result<InterimPass, String> {
+    let detail = meetings
+        .get(meeting_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("meeting {meeting_id} not found"))?;
+
+    let new_segments: Vec<kea_core::MeetingSegment> = detail
+        .segments
+        .iter()
+        .filter(|s| s.sequence >= from_sequence)
+        .cloned()
+        .collect();
+
+    // Nothing was said since the last pass. Returning early is not an
+    // optimisation: sending an empty transcript invites the model to
+    // re-summarise from nothing and quietly shrink the notes.
+    if new_segments.is_empty() {
+        return Ok(InterimPass {
+            notes: detail.notes,
+            next_sequence: from_sequence,
+        });
+    }
+
+    let previous = detail
+        .notes
+        .as_ref()
+        .map(|n| ParsedMeetingNotes {
+            summary: n.summary.clone(),
+            decisions: n.decisions.clone(),
+            action_items: n.action_items.clone(),
+            follow_ups: n.follow_ups.clone(),
+            open_questions: n.open_questions.clone(),
+            action_item_rows: Vec::new(),
+        })
+        .unwrap_or_default();
+
+    let (engine, binding) = meetings_llm(engines, bindings).await?;
+    let req = build_interim_notes_request(&previous, &new_segments, &detail.speakers);
+    let parsed = match complete_notes(engine.as_ref(), &binding, req).await {
+        Ok(parsed) => parsed,
+        // An interim pass that cannot be parsed keeps the previous notes
+        // rather than replacing good notes with a raw error string; the final
+        // pass at stop is where an unparsable reply is worth keeping.
+        Err(e) => return Err(e.split("|raw:").next().unwrap_or(&e).to_string()),
+    };
+
+    let next_sequence = new_segments
+        .iter()
+        .map(|s| s.sequence)
+        .max()
+        .map(|max| max + 1)
+        .unwrap_or(from_sequence);
+
+    let notes = persist_notes(
+        meetings,
+        meeting_id,
+        &parsed,
+        MEETING_INTERIM_PROMPT_VERSION,
+        &binding,
+    )
+    .await?;
+
+    Ok(InterimPass {
+        notes: Some(notes),
+        next_sequence,
+    })
+}
+
+/// What one interim pass produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterimPass {
+    /// The stored notes after the pass, or the ones already there when there
+    /// was nothing new to fold in.
+    pub notes: Option<MeetingNotes>,
+    /// The first segment sequence the *next* pass should start from.
+    pub next_sequence: i32,
+}
+
+/// One meeting's interim schedule: when the next pass is due, how many have
+/// run, and when to give up.
+///
+/// The owner of every counter the cadence rule reads, so the app layer stores
+/// one of these beside the active meeting and never does the arithmetic
+/// itself. The in-flight guard stays in the app layer — it is an `AtomicBool`
+/// on the shared state, not per-meeting bookkeeping — and this struct is
+/// deliberately not `Sync`-clever: it is touched only from the poll task.
+pub struct InterimSchedule {
+    cadence: InterimCadence,
+    /// The first segment not yet folded into the notes.
+    next_sequence: i32,
+    segments_since: u32,
+    last_pass: Instant,
+    passes: u32,
+    consecutive_failures: u32,
+}
+
+impl InterimSchedule {
+    pub fn new(cadence: InterimCadence) -> Self {
+        Self {
+            cadence,
+            next_sequence: 0,
+            segments_since: 0,
+            // The meeting start is pass zero for cadence purposes, so the
+            // first pass waits a full window rather than firing on segment 8
+            // of a meeting that is 40 seconds old.
+            last_pass: Instant::now(),
+            passes: 0,
+            consecutive_failures: 0,
+        }
+    }
+
+    /// Record that one more segment has been transcribed.
+    pub fn note_segment(&mut self) {
+        self.segments_since = self.segments_since.saturating_add(1);
+    }
+
+    /// Where the next pass starts reading.
+    pub fn next_sequence(&self) -> i32 {
+        self.next_sequence
+    }
+
+    /// Whether the schedule has given up for the rest of this meeting.
+    pub fn is_disabled(&self) -> bool {
+        self.consecutive_failures >= MAX_CONSECUTIVE_INTERIM_FAILURES
+    }
+
+    /// Whether a pass is due now.
+    pub fn is_due(&self) -> bool {
+        !self.is_disabled()
+            && should_run_interim(
+                self.segments_since,
+                self.elapsed().as_secs(),
+                self.passes,
+                &self.cadence,
+            )
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.last_pass.elapsed()
+    }
+
+    /// A pass finished. Resets the counters and clears the failure streak.
+    pub fn record_success(&mut self, next_sequence: i32) {
+        self.next_sequence = next_sequence;
+        self.segments_since = 0;
+        self.last_pass = Instant::now();
+        self.passes = self.passes.saturating_add(1);
+        self.consecutive_failures = 0;
+    }
+
+    /// A pass failed.
+    ///
+    /// The segment counter is *not* reset: those segments still have not been
+    /// folded in, and pretending they have would silently drop them from the
+    /// interim notes for the rest of the meeting. The clock is reset so a
+    /// failing provider is retried on the cadence rather than on every tick.
+    pub fn record_failure(&mut self) {
+        self.last_pass = Instant::now();
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+    }
+}
+
 pub async fn synthesize_meeting_title(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
     summary: &str,
 ) -> Result<String, String> {
-    let binding = SlotResolver::new(engines, bindings)
-        .require_llm("meetings")
-        .await
-        .map_err(|e| e.to_string())?;
-    let engine_id = &binding.engine_id;
-
-    let engine = engines
-        .llm(engine_id)
-        .ok_or_else(|| format!("no llm engine '{engine_id}'"))?;
+    let (engine, binding) = meetings_llm(engines, bindings).await?;
 
     let mut req = build_meeting_title_request(summary);
     req.model = binding.model.clone();
@@ -544,6 +892,48 @@ pub async fn drain_and_stop_meeting(audio: &mut dyn AudioIo) -> Result<SpeechSeg
 /// segment, synthesize notes/title, and finalize the meeting + action rows.
 /// Takes no audio handle — the caller has already drained and released
 /// capture via [`drain_and_stop_meeting`] and passes the drained result in.
+/// Somewhere a recording can get a name that is not generated.
+///
+/// The port for calendar titles, kept here rather than taking
+/// `kea_platform::calendar::CalendarIo` directly for one structural reason:
+/// this trait gives the notes path *only* a title. There is no method that
+/// returns an event, so no future edit to `finalize_meeting` can reach an
+/// attendee list, a location or a body, and the privacy rule stops being
+/// something a reviewer has to check.
+///
+/// `'static` and `Send + Sync` because the implementation is blocking — see
+/// [`calendar_title`].
+pub trait MeetingTitleSource: Send + Sync + 'static {
+    /// The title of the event this recording happened during, or `None` for
+    /// any reason at all. Implementations never fail: a calendar that cannot
+    /// be read has no title to offer, which is the same answer as an empty
+    /// calendar and leads to the same fallback.
+    fn title_for(&self, started_at: &str, ended_at: Option<&str>) -> Option<String>;
+}
+
+/// Everything the stop needs beyond the repos: today, only the calendar.
+///
+/// A struct rather than two more positional arguments, and
+/// [`MeetingStopOptions::default`] is exactly today's behaviour, so
+/// [`run_meeting_stop`] keeps the signature its one caller already uses while
+/// [`run_meeting_stop_with`] is the door for the calendar.
+#[derive(Default)]
+pub struct MeetingStopOptions {
+    /// Where a title may come from. `None` is "no calendar on this build".
+    pub calendar: Option<Arc<dyn MeetingTitleSource>>,
+    /// The `meetings.calendar_titles` setting. `false` skips the lookup
+    /// entirely — no permission check, no EventKit initialization, nothing.
+    pub calendar_titles: bool,
+}
+
+/// How long the calendar read is given before the stop gives up on it.
+///
+/// EventKit's first access on a machine with a large store can be slow. This
+/// path is already doing STT and LLM work so it is not latency-critical, but
+/// hanging the stop on a calendar lookup would be a much worse bug than
+/// falling through to the generated title.
+const CALENDAR_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_meeting_stop(
     engines: &EngineRegistry,
@@ -553,6 +943,30 @@ pub async fn run_meeting_stop(
     session: &ActiveMeeting,
     drain_result: Result<SpeechSegment, String>,
     vocabulary: &[VocabularyEntry],
+) -> Result<MeetingDetail, String> {
+    run_meeting_stop_with(
+        engines,
+        bindings,
+        actions,
+        meetings,
+        session,
+        drain_result,
+        vocabulary,
+        MeetingStopOptions::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_meeting_stop_with(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    actions: &ActionRepo,
+    meetings: &MeetingRepo,
+    session: &ActiveMeeting,
+    drain_result: Result<SpeechSegment, String>,
+    vocabulary: &[VocabularyEntry],
+    opts: MeetingStopOptions,
 ) -> Result<MeetingDetail, String> {
     let meeting_id = &session.meeting_id;
 
@@ -572,6 +986,7 @@ pub async fn run_meeting_stop(
         &existing,
         drain_result,
         vocabulary,
+        &opts,
     )
     .await
     {
@@ -600,6 +1015,7 @@ async fn finalize_meeting(
     existing: &MeetingDetail,
     drain_result: Result<SpeechSegment, String>,
     vocabulary: &[VocabularyEntry],
+    opts: &MeetingStopOptions,
 ) -> Result<(), String> {
     let meeting_id = &session.meeting_id;
 
@@ -629,7 +1045,11 @@ async fn finalize_meeting(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("meeting {meeting_id} not found"))?;
 
-    let notes = synthesize_meeting_notes(
+    // The final pass reads the whole transcript rather than folding, even when
+    // interim passes already wrote this row. The fold is an approximation, and
+    // the version the user keeps is the one place a fresh full-context read is
+    // worth paying for.
+    let (parsed, binding) = synthesize_notes_parsed(
         engines,
         bindings,
         &partial.meeting,
@@ -638,17 +1058,80 @@ async fn finalize_meeting(
     )
     .await?;
 
-    meetings
-        .upsert_notes(&notes)
-        .await
-        .map_err(|e| e.to_string())?;
+    let notes = persist_notes(
+        meetings,
+        meeting_id,
+        &parsed,
+        MEETING_NOTES_PROMPT_VERSION,
+        &binding,
+    )
+    .await?;
+
+    // The title step, and the one place a calendar title may be applied.
+    //
+    // The ordering is not incidental. `build_meeting_notes_request` embeds the
+    // meeting title verbatim in the prompt, so a calendar title written to the
+    // row *before* the notes call above would be transmitted to whatever
+    // hosted provider is bound — exactly the leak the privacy rule forbids.
+    // Applying it here, after synthesis has already run against
+    // "Untitled Meeting", prevents that structurally rather than by
+    // convention.
+    if let Some(event_title) = calendar_title(opts, &partial.meeting).await {
+        return meetings
+            .set_title_with_source(meeting_id, &event_title, TitleSource::Calendar)
+            .await
+            .map_err(|e| e.to_string());
+    }
 
     let title = synthesize_meeting_title(engines, bindings, &notes.summary).await?;
 
     meetings
-        .set_title(meeting_id, &title)
+        .set_title_with_source(meeting_id, &title, TitleSource::Llm)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// The title of the calendar event this recording happened during, if there is
+/// one worth using.
+///
+/// Every failure — feature off, no calendar on this build, permission denied,
+/// EventKit error, timeout, empty calendar, no match above the threshold —
+/// returns `None`, which sends the caller to the LLM title path that runs
+/// today. Nothing here can propagate with `?`: `finalize_meeting`'s errors
+/// reach [`ActiveMeeting::fail`], and a calendar failure must never mark a
+/// meeting as an error when the existing title path would have succeeded.
+///
+/// The window read is `[start − 10 min, start + 10 min]` and nothing wider.
+/// Reading the day or the calendar would pull in events that have no bearing
+/// on this recording, which is both a worse match and more of someone's
+/// calendar than this feature needs.
+async fn calendar_title(opts: &MeetingStopOptions, meeting: &Meeting) -> Option<String> {
+    if !opts.calendar_titles {
+        return None;
+    }
+    let calendar = opts.calendar.clone()?;
+    let started_at = meeting.started_at.clone();
+    let ended_at = meeting.ended_at.clone();
+
+    // The lookup is blocking — EventKit's first access on a machine with a
+    // large calendar store can take a moment — so it runs on the blocking pool
+    // and the stop only *waits* for it for a bounded time. A timeout cannot
+    // cancel a blocking FFI call; what it does is stop a slow calendar hanging
+    // the stop path, which is the failure that matters.
+    let lookup =
+        tokio::task::spawn_blocking(move || calendar.title_for(&started_at, ended_at.as_deref()));
+
+    match tokio::time::timeout(CALENDAR_READ_TIMEOUT, lookup).await {
+        Ok(Ok(title)) => title,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "meeting: calendar lookup panicked, using the generated title");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("meeting: calendar lookup timed out, using the generated title");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1004,6 +1487,7 @@ mod tests {
             stt_engine_id: None,
             llm_engine_id: None,
             error: None,
+            title_source: TitleSource::Llm,
         };
 
         let notes = synthesize_meeting_notes(&reg, &bindings, &meeting, &[], &[])
@@ -1087,6 +1571,7 @@ mod tests {
         let settings = MeetingSettings {
             segment_duration_secs: 30,
             prefer_system_audio: false,
+            ..MeetingSettings::default()
         };
 
         let mut ctx = MeetingRunContext {
@@ -1195,6 +1680,7 @@ mod tests {
         let settings = MeetingSettings {
             segment_duration_secs: 30,
             prefer_system_audio: false,
+            ..MeetingSettings::default()
         };
 
         let mut ctx = MeetingRunContext {
@@ -1307,6 +1793,7 @@ mod tests {
         let settings = MeetingSettings {
             segment_duration_secs: 30,
             prefer_system_audio: false,
+            ..MeetingSettings::default()
         };
 
         let mut ctx = MeetingRunContext {
@@ -1393,6 +1880,7 @@ mod tests {
         let settings = MeetingSettings {
             segment_duration_secs: 30,
             prefer_system_audio: true,
+            ..MeetingSettings::default()
         };
         let mut ctx = MeetingRunContext {
             engines: &reg,
@@ -1458,6 +1946,7 @@ mod tests {
         let settings = MeetingSettings {
             segment_duration_secs: 30,
             prefer_system_audio: false,
+            ..MeetingSettings::default()
         };
         let mut ctx = MeetingRunContext {
             engines: &reg,
@@ -1499,6 +1988,7 @@ mod tests {
         let settings = MeetingSettings {
             segment_duration_secs: 30,
             prefer_system_audio: true,
+            ..MeetingSettings::default()
         };
         let mut ctx = MeetingRunContext {
             engines: &reg,
@@ -1528,5 +2018,585 @@ mod tests {
         assert!(transcript.contains("You: mine"), "{transcript}");
         assert!(transcript.contains("Priya: theirs"), "{transcript}");
         assert!(!transcript.contains("Speaker:"), "{transcript}");
+    }
+}
+
+#[cfg(test)]
+mod item_16_17_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use kea_core::store::actions::ActionRepo;
+    use kea_core::store::bindings::{Binding, BindingRepo};
+    use kea_core::store::db::{open_pool, run_config_migrations, run_data_migrations};
+    use kea_core::store::meetings::{
+        ActionItemStatus, MeetingRepo, MeetingStatus, NewMeeting, NewSegment,
+    };
+    use kea_engines::traits::{EngineCaps, EngineError, LlmEngine, LlmRequest, LlmResponse};
+    use kea_engines::EngineRegistry;
+    use std::sync::{Arc, Mutex};
+
+    const VALID_NOTES: &str = r#"{"summary":"kickoff summary","decisions":"","action_items":"follow up","follow_ups":"","open_questions":""}"#;
+
+    /// An LLM that records every prompt it is handed and replies from a
+    /// script, falling back to valid notes / a title once the script runs out.
+    ///
+    /// The prompt log is what makes the privacy rule testable: a calendar
+    /// title must never appear in anything this engine was asked.
+    struct RecordingLlm {
+        replies: Mutex<std::collections::VecDeque<String>>,
+        prompts: Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    impl RecordingLlm {
+        fn new(replies: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                replies: Mutex::new(replies.iter().map(|s| s.to_string()).collect()),
+                prompts: Mutex::new(Vec::new()),
+                fail: false,
+            })
+        }
+
+        fn failing() -> Arc<Self> {
+            Arc::new(Self {
+                replies: Mutex::new(Default::default()),
+                prompts: Mutex::new(Vec::new()),
+                fail: true,
+            })
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmEngine for RecordingLlm {
+        fn id(&self) -> &str {
+            "fake-llm"
+        }
+
+        fn capabilities(&self) -> EngineCaps {
+            EngineCaps { models: vec![] }
+        }
+
+        async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, EngineError> {
+            self.prompts.lock().unwrap().push(req.prompt.clone());
+            if self.fail {
+                return Err(EngineError::Other("provider is down".into()));
+            }
+            if let Some(text) = self.replies.lock().unwrap().pop_front() {
+                return Ok(LlmResponse { text });
+            }
+            if req.prompt.contains("<summary>") {
+                return Ok(LlmResponse {
+                    text: "Sprint Planning".into(),
+                });
+            }
+            Ok(LlmResponse {
+                text: VALID_NOTES.into(),
+            })
+        }
+    }
+
+    /// A calendar that always offers the same title, and never anything else.
+    struct FixedTitle(&'static str);
+
+    impl MeetingTitleSource for FixedTitle {
+        fn title_for(&self, _started_at: &str, _ended_at: Option<&str>) -> Option<String> {
+            Some(self.0.to_string())
+        }
+    }
+
+    /// Permission denied, EventKit error, empty calendar, no match — every one
+    /// of them reaches the caller as this.
+    struct NoTitle;
+
+    impl MeetingTitleSource for NoTitle {
+        fn title_for(&self, _started_at: &str, _ended_at: Option<&str>) -> Option<String> {
+            None
+        }
+    }
+
+    async fn world(
+        llm: Arc<dyn LlmEngine>,
+    ) -> (EngineRegistry, BindingRepo, ActionRepo, MeetingRepo) {
+        let mut reg = EngineRegistry::default();
+        reg.register_llm(llm);
+
+        let config_pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&config_pool).await.unwrap();
+        let data_pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&data_pool).await.unwrap();
+
+        let bindings = BindingRepo::new(config_pool);
+        bindings
+            .set(
+                "meetings",
+                "llm",
+                Binding {
+                    engine_id: "fake-llm".into(),
+                    model: None,
+                    provider_ref: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        (
+            reg,
+            bindings,
+            ActionRepo::new(data_pool.clone()),
+            MeetingRepo::new(data_pool),
+        )
+    }
+
+    async fn recording_meeting(meetings: &MeetingRepo, id: &str, texts: &[&str]) {
+        meetings
+            .create(&NewMeeting {
+                id: id.into(),
+                title: "Untitled Meeting".into(),
+                capture_mode: CaptureMode::MicOnly,
+                stt_engine_id: None,
+                llm_engine_id: None,
+            })
+            .await
+            .unwrap();
+        for (index, text) in texts.iter().enumerate() {
+            meetings
+                .append_segment(
+                    id,
+                    &NewSegment {
+                        sequence: index as i32,
+                        start_offset_ms: index as i64 * 30_000,
+                        end_offset_ms: index as i64 * 30_000 + 30_000,
+                        text: (*text).into(),
+                        speaker: Some(SpeakerChannel::Local),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    fn meeting_row(id: &str, started_at: &str) -> Meeting {
+        Meeting {
+            id: id.into(),
+            title: "Untitled Meeting".into(),
+            started_at: started_at.into(),
+            ended_at: None,
+            status: MeetingStatus::Recording,
+            capture_mode: CaptureMode::MicOnly,
+            stt_engine_id: None,
+            llm_engine_id: None,
+            error: None,
+            title_source: TitleSource::Llm,
+        }
+    }
+
+    // --- 16b: reliable JSON out of a provider that promises nothing ---
+
+    #[tokio::test]
+    async fn a_notes_reply_that_is_not_json_is_repaired_in_one_round_trip() {
+        let llm = RecordingLlm::new(&["I'd be happy to help! Here are your notes:"]);
+        let (reg, bindings, _, _) = world(llm.clone()).await;
+
+        let notes = synthesize_meeting_notes(
+            &reg,
+            &bindings,
+            &meeting_row("m1", "2026-09-19 10:00:00"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(notes.summary, "kickoff summary");
+        let prompts = llm.prompts();
+        assert_eq!(prompts.len(), 2, "exactly one repair round trip");
+        assert!(prompts[1].contains("was not valid JSON"));
+        assert!(prompts[1].contains("I'd be happy to help!"));
+    }
+
+    /// The user already paid to transcribe this meeting. A provider that
+    /// cannot produce JSON twice must not cost them the transcript.
+    #[tokio::test]
+    async fn two_unparsable_replies_keep_the_text_instead_of_failing_the_meeting() {
+        let llm = RecordingLlm::new(&["no can do", "still no can do"]);
+        let (reg, bindings, _, _) = world(llm.clone()).await;
+
+        let notes = synthesize_meeting_notes(
+            &reg,
+            &bindings,
+            &meeting_row("m1", "2026-09-19 10:00:00"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(notes.summary, "still no can do");
+        assert_eq!(notes.decisions, "");
+        assert_eq!(llm.prompts().len(), 2, "one repair, never a loop");
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_errors_is_still_an_error() {
+        let llm = RecordingLlm::failing();
+        let (reg, bindings, _, _) = world(llm).await;
+        assert!(synthesize_meeting_notes(
+            &reg,
+            &bindings,
+            &meeting_row("m1", "2026-09-19 10:00:00"),
+            &[],
+            &[]
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn structured_action_items_become_rows_and_the_prose_column_follows() {
+        let llm = RecordingLlm::new(&[
+            r#"{"summary":"s","decisions":"","action_items":"whatever the model wrote","follow_ups":"","open_questions":"","action_item_rows":[{"text":"Send the deck","owner":"Priya","due_hint":"by Friday"},{"text":"Book the room"}]}"#,
+        ]);
+        let (reg, bindings, _, meetings) = world(llm).await;
+        recording_meeting(&meetings, "m1", &["hello"]).await;
+
+        let detail = meetings.get("m1").await.unwrap().unwrap();
+        let (parsed, binding) =
+            synthesize_notes_parsed(&reg, &bindings, &detail.meeting, &detail.segments, &[])
+                .await
+                .unwrap();
+        let notes = persist_notes(
+            &meetings,
+            "m1",
+            &parsed,
+            MEETING_NOTES_PROMPT_VERSION,
+            &binding,
+        )
+        .await
+        .unwrap();
+
+        let rows = meetings.action_items("m1").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "Send the deck");
+        assert_eq!(rows[0].owner.as_deref(), Some("Priya"));
+        assert_eq!(rows[0].status, ActionItemStatus::Open);
+        // The column is a derived view of the rows, not what the model wrote.
+        assert_eq!(
+            notes.action_items,
+            "Send the deck — Priya (by Friday)\nBook the room"
+        );
+    }
+
+    // --- 16a: interim passes ---
+
+    #[tokio::test]
+    async fn an_interim_pass_folds_only_the_new_segments() {
+        let llm = RecordingLlm::new(&[
+            r#"{"summary":"first half","decisions":"","action_items":"","follow_ups":"","open_questions":""}"#,
+            r#"{"summary":"first and second half","decisions":"","action_items":"","follow_ups":"","open_questions":""}"#,
+        ]);
+        let (reg, bindings, _, meetings) = world(llm.clone()).await;
+        recording_meeting(&meetings, "m1", &["opening remarks"]).await;
+
+        let first = run_interim_notes_pass(&reg, &bindings, &meetings, "m1", 0)
+            .await
+            .unwrap();
+        assert_eq!(first.next_sequence, 1);
+        assert_eq!(
+            first.notes.as_ref().unwrap().prompt_version,
+            MEETING_INTERIM_PROMPT_VERSION
+        );
+
+        meetings
+            .append_segment(
+                "m1",
+                &NewSegment {
+                    sequence: 1,
+                    start_offset_ms: 30_000,
+                    end_offset_ms: 60_000,
+                    text: "closing remarks".into(),
+                    speaker: Some(SpeakerChannel::Local),
+                },
+            )
+            .await
+            .unwrap();
+
+        let second = run_interim_notes_pass(&reg, &bindings, &meetings, "m1", first.next_sequence)
+            .await
+            .unwrap();
+        assert_eq!(second.next_sequence, 2);
+        assert_eq!(
+            second.notes.as_ref().unwrap().summary,
+            "first and second half"
+        );
+
+        let prompts = llm.prompts();
+        assert_eq!(prompts.len(), 2);
+        // The cost argument, asserted: the second pass re-sends the previous
+        // notes, never the segments the first pass already folded in.
+        assert!(prompts[1].contains("closing remarks"));
+        assert!(!prompts[1].contains("opening remarks"));
+        assert!(prompts[1].contains("first half"));
+    }
+
+    /// Nothing new means nothing to pay for.
+    #[tokio::test]
+    async fn an_interim_pass_with_no_new_segments_asks_nothing() {
+        let llm = RecordingLlm::new(&[]);
+        let (reg, bindings, _, meetings) = world(llm.clone()).await;
+        recording_meeting(&meetings, "m1", &["only segment"]).await;
+
+        let pass = run_interim_notes_pass(&reg, &bindings, &meetings, "m1", 1)
+            .await
+            .unwrap();
+        assert_eq!(pass.next_sequence, 1);
+        assert!(llm.prompts().is_empty());
+    }
+
+    /// The inverse of `stop_with_failing_stt_still_stops_capture_and_finalizes_action`:
+    /// a failed *interim* pass must leave the meeting recording and the ledger
+    /// row open. It has no `ActiveMeeting`, so it cannot call `fail` at all.
+    #[tokio::test]
+    async fn an_interim_failure_leaves_the_meeting_recording_and_the_action_row_open() {
+        let llm = RecordingLlm::failing();
+        let (reg, bindings, actions, meetings) = world(llm).await;
+        recording_meeting(&meetings, "m1", &["hello"]).await;
+        let action_id = actions
+            .record(NewAction {
+                feature_id: "meetings".into(),
+                command: "toggle_meeting".into(),
+                engine_id: "fake-stt".into(),
+                model: None,
+                provider_ref: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(run_interim_notes_pass(&reg, &bindings, &meetings, "m1", 0)
+            .await
+            .is_err());
+
+        let detail = meetings.get("m1").await.unwrap().unwrap();
+        assert_eq!(detail.meeting.status, MeetingStatus::Recording);
+        assert!(detail.meeting.error.is_none());
+        assert!(detail.notes.is_none());
+
+        let row = actions.get(action_id).await.unwrap().unwrap();
+        assert_eq!(row.status, ActionStatus::Started);
+    }
+
+    /// An interim pass never renames the meeting: it can run long before the
+    /// title step, and after item 17 the title may be a calendar title that
+    /// must not reach an engine.
+    #[tokio::test]
+    async fn an_interim_pass_never_touches_the_title() {
+        let llm = RecordingLlm::new(&[]);
+        let (reg, bindings, _, meetings) = world(llm.clone()).await;
+        recording_meeting(&meetings, "m1", &["hello"]).await;
+        meetings
+            .set_title_with_source("m1", "Q3 Roadmap Review", TitleSource::Calendar)
+            .await
+            .unwrap();
+
+        run_interim_notes_pass(&reg, &bindings, &meetings, "m1", 0)
+            .await
+            .unwrap();
+
+        let detail = meetings.get("m1").await.unwrap().unwrap();
+        assert_eq!(detail.meeting.title, "Q3 Roadmap Review");
+        assert_eq!(detail.meeting.title_source, TitleSource::Calendar);
+        for prompt in llm.prompts() {
+            assert!(!prompt.contains("Q3 Roadmap Review"));
+        }
+    }
+
+    #[test]
+    fn the_schedule_waits_a_window_then_fires_and_resets() {
+        let mut schedule = InterimSchedule::new(InterimCadence {
+            every_segments: 2,
+            every_minutes: 5,
+            max_passes: 2,
+        });
+        assert_eq!(schedule.next_sequence(), 0);
+        assert!(!schedule.is_due(), "nothing recorded yet");
+
+        schedule.note_segment();
+        schedule.note_segment();
+        // The 90-second floor has not passed, so the segment trigger waits.
+        assert!(!schedule.is_due());
+
+        schedule.record_success(2);
+        assert_eq!(schedule.next_sequence(), 2);
+        assert!(!schedule.is_due());
+    }
+
+    /// A pass that failed did not fold its segments in, so the counter must
+    /// not be reset — those segments still need to reach the next pass.
+    #[tokio::test]
+    async fn consecutive_failures_disable_the_schedule_for_the_rest_of_the_meeting() {
+        let mut schedule = InterimSchedule::new(InterimCadence::default());
+        schedule.note_segment();
+        for _ in 0..MAX_CONSECUTIVE_INTERIM_FAILURES {
+            assert!(!schedule.is_disabled());
+            schedule.record_failure();
+        }
+        assert!(schedule.is_disabled());
+        assert!(!schedule.is_due());
+
+        // …and a success in between clears the streak.
+        let mut schedule = InterimSchedule::new(InterimCadence::default());
+        schedule.record_failure();
+        schedule.record_success(1);
+        schedule.record_failure();
+        assert!(!schedule.is_disabled());
+    }
+
+    // --- 17: calendar titles ---
+
+    async fn stop_with(
+        opts: MeetingStopOptions,
+        llm: Arc<RecordingLlm>,
+    ) -> (MeetingDetail, Arc<RecordingLlm>) {
+        let (reg, bindings, actions, meetings) = world(llm.clone()).await;
+        recording_meeting(&meetings, "m1", &["hello", "world"]).await;
+        let action_id = actions
+            .record(NewAction {
+                feature_id: "meetings".into(),
+                command: "toggle_meeting".into(),
+                engine_id: "fake-stt".into(),
+                model: None,
+                provider_ref: None,
+            })
+            .await
+            .unwrap();
+        let session = ActiveMeeting {
+            meeting_id: "m1".into(),
+            action_id,
+        };
+
+        // An empty tail: the drain contributed no audio, which is the normal
+        // case for a meeting that ended on a segment boundary.
+        let drain = Ok(SpeechSegment {
+            pcm: PcmFrame {
+                samples: vec![],
+                sample_rate_hz: 16_000,
+            },
+            has_speech: false,
+            mic: None,
+            system: None,
+        });
+
+        let detail = run_meeting_stop_with(
+            &reg,
+            &bindings,
+            &actions,
+            &meetings,
+            &session,
+            drain,
+            &[],
+            opts,
+        )
+        .await
+        .unwrap();
+        (detail, llm)
+    }
+
+    #[tokio::test]
+    async fn a_matched_calendar_event_names_the_meeting_and_skips_the_title_call() {
+        let (detail, llm) = stop_with(
+            MeetingStopOptions {
+                calendar: Some(Arc::new(FixedTitle("Q3 Roadmap Review"))),
+                calendar_titles: true,
+            },
+            RecordingLlm::new(&[]),
+        )
+        .await;
+
+        assert_eq!(detail.meeting.title, "Q3 Roadmap Review");
+        assert_eq!(detail.meeting.title_source, TitleSource::Calendar);
+        assert_eq!(detail.meeting.status, MeetingStatus::Completed);
+        // Skipping the title call removes a network round trip from the stop
+        // path, which is the slowest part of the app.
+        assert_eq!(llm.prompts().len(), 1, "notes only, no title call");
+    }
+
+    /// The leak test. `build_meeting_notes_request` embeds the meeting title
+    /// verbatim, so applying a calendar title before synthesis would transmit
+    /// it to whatever hosted provider is bound.
+    #[tokio::test]
+    async fn a_calendar_title_never_reaches_a_prompt() {
+        let (_detail, llm) = stop_with(
+            MeetingStopOptions {
+                calendar: Some(Arc::new(FixedTitle("1:1 — performance review"))),
+                calendar_titles: true,
+            },
+            RecordingLlm::new(&[]),
+        )
+        .await;
+
+        for prompt in llm.prompts() {
+            assert!(
+                !prompt.contains("performance review"),
+                "calendar title leaked into a prompt: {prompt}"
+            );
+        }
+    }
+
+    /// The contract: with the feature off, with no match, and by default, a
+    /// stop produces exactly what it produced before item 17 existed.
+    #[tokio::test]
+    async fn every_failure_mode_degrades_to_todays_behaviour() {
+        for opts in [
+            // Feature off, calendar present — the lookup never happens.
+            MeetingStopOptions {
+                calendar: Some(Arc::new(FixedTitle("Q3 Roadmap Review"))),
+                calendar_titles: false,
+            },
+            // Feature on, but permission denied / no match / EventKit error.
+            MeetingStopOptions {
+                calendar: Some(Arc::new(NoTitle)),
+                calendar_titles: true,
+            },
+            // No calendar on this build at all.
+            MeetingStopOptions {
+                calendar: None,
+                calendar_titles: true,
+            },
+            MeetingStopOptions::default(),
+        ] {
+            let (detail, llm) = stop_with(opts, RecordingLlm::new(&[])).await;
+            assert_eq!(detail.meeting.title, "Sprint Planning");
+            assert_eq!(detail.meeting.title_source, TitleSource::Llm);
+            assert_eq!(detail.meeting.status, MeetingStatus::Completed);
+            assert_eq!(detail.segments.len(), 2);
+            assert_eq!(detail.notes.as_ref().unwrap().summary, "kickoff summary");
+            assert_eq!(llm.prompts().len(), 2, "notes and title, as today");
+        }
+    }
+
+    /// The stop path must survive a calendar implementation that panics rather
+    /// than turning it into a failed meeting.
+    #[tokio::test]
+    async fn a_panicking_calendar_falls_back_instead_of_failing_the_meeting() {
+        struct Panics;
+        impl MeetingTitleSource for Panics {
+            fn title_for(&self, _: &str, _: Option<&str>) -> Option<String> {
+                panic!("EventKit blew up");
+            }
+        }
+
+        let (detail, _) = stop_with(
+            MeetingStopOptions {
+                calendar: Some(Arc::new(Panics)),
+                calendar_titles: true,
+            },
+            RecordingLlm::new(&[]),
+        )
+        .await;
+        assert_eq!(detail.meeting.title, "Sprint Planning");
+        assert_eq!(detail.meeting.status, MeetingStatus::Completed);
     }
 }

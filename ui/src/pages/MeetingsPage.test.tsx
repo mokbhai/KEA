@@ -22,7 +22,14 @@ const whisperBinding = {
 const meetingHandlers = {
   list_meetings: () => [],
   get_meeting_state: () => ({ state: "idle", active_meeting_id: null }),
-  get_meeting_settings: () => ({ segment_duration_secs: 30, prefer_system_audio: true }),
+  get_meeting_settings: () => ({
+    segment_duration_secs: 30,
+    prefer_system_audio: true,
+    interim_notes: false,
+    interim_every_segments: 8,
+    interim_every_minutes: 5,
+    calendar_titles: false,
+  }),
   set_meeting_settings: () => undefined,
   get_system_audio_capability: () => "mic_only",
   get_permission_status: () => "Granted",
@@ -38,9 +45,12 @@ const meetingHandlers = {
       stt_engine_id: "whisper",
       llm_engine_id: "openai",
       error: null,
+      title_source: "llm",
     },
     segments: [],
     notes: null,
+    speakers: [],
+    action_items: [],
   }),
   get_meeting: () => ({
     meeting: {
@@ -53,9 +63,12 @@ const meetingHandlers = {
       stt_engine_id: "whisper",
       llm_engine_id: "openai",
       error: null,
+      title_source: "llm",
     },
     segments: [],
     notes: null,
+    speakers: [],
+    action_items: [],
   }),
 };
 
@@ -292,6 +305,124 @@ describe("MeetingsPage", () => {
     expect(await screen.findByText("shall we start")).toBeTruthy();
     expect(screen.getByText("You")).toBeTruthy();
     expect(screen.getByText("Others")).toBeTruthy();
+  });
+
+  // --- item 16a: notes while the meeting runs ---
+
+  const interimNotes = {
+    meeting_id: "meeting-1",
+    summary: "The launch slips a week.",
+    decisions: "",
+    action_items: "Priya sends the deck",
+    follow_ups: "",
+    open_questions: "",
+    prompt_version: "meeting-interim-v1",
+    engine_id: "openai",
+    model: "gpt-4o-mini",
+  };
+
+  it("shows interim notes as they arrive, labelled as unfinished", async () => {
+    mockWorld({ bindings: readyBindings });
+    render(<MeetingsPage />);
+    await screen.findByRole("heading", { level: 1, name: "Meetings" });
+
+    // Nothing to show until a pass has run.
+    expect(screen.queryByRole("heading", { name: "Notes so far" })).toBeNull();
+
+    await act(async () => {
+      emitTauriEvent("meeting:state", { state: "recording" });
+      emitTauriEvent("meeting:notes", interimNotes);
+    });
+
+    expect(await screen.findByRole("heading", { name: "Notes so far" })).toBeTruthy();
+    expect(screen.getByText("The launch slips a week.")).toBeTruthy();
+    // A stale summary read as a final one is how this feature misleads.
+    expect(
+      screen.getByText(/The full notes are written when you stop/),
+    ).toBeTruthy();
+  });
+
+  // Last meeting's notes are not this meeting's notes.
+  it("clears interim notes when a new meeting starts recording", async () => {
+    mockWorld({ bindings: readyBindings });
+    render(<MeetingsPage />);
+    await screen.findByRole("heading", { level: 1, name: "Meetings" });
+
+    await act(async () => {
+      emitTauriEvent("meeting:state", { state: "recording" });
+      emitTauriEvent("meeting:notes", interimNotes);
+    });
+    expect(await screen.findByRole("heading", { name: "Notes so far" })).toBeTruthy();
+
+    await act(async () => {
+      emitTauriEvent("meeting:state", { state: "idle" });
+      emitTauriEvent("meeting:state", { state: "recording" });
+    });
+    await waitFor(() =>
+      expect(screen.queryByRole("heading", { name: "Notes so far" })).toBeNull(),
+    );
+  });
+
+  // The toggle spends the user's tokens on a schedule, so the cadence and the
+  // cost are next to it rather than buried.
+  it("offers interim notes off by default, with the cost spelled out", async () => {
+    mockWorld({ bindings: readyBindings });
+    render(<MeetingsPage />);
+
+    const toggle = await screen.findByRole("switch", {
+      name: "Notes while the meeting runs",
+    });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(screen.getByText(/AI calls an hour, billed to your notes provider/)).toBeTruthy();
+
+    await userEvent.click(toggle);
+    await waitFor(() => expect(invokeCalls("set_meeting_settings")).toHaveLength(1));
+    const saved = invokeCalls("set_meeting_settings")[0] as {
+      settings: Record<string, unknown>;
+    };
+    expect(saved.settings.interim_notes).toBe(true);
+    // The fields this page does not know about must survive the write.
+    expect(saved.settings.segment_duration_secs).toBe(30);
+  });
+
+  // --- item 17: calendar titles ---
+
+  it("asks for calendar access when the calendar toggle goes on", async () => {
+    mockWorld({
+      bindings: readyBindings,
+      extra: {
+        get_permission_status: () => "Denied",
+        request_permission: () => "Granted",
+      },
+    });
+    render(<MeetingsPage />);
+
+    const toggle = await screen.findByRole("switch", {
+      name: "Name meetings from your calendar",
+    });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    // The privacy promise sits next to the toggle, not in a settings page.
+    expect(screen.getByText(/never sent to an AI provider/)).toBeTruthy();
+
+    await userEvent.click(toggle);
+
+    await waitFor(() => expect(invokeCalls("request_permission")).toHaveLength(1));
+    expect(invokeCalls("request_permission")[0]).toEqual({ kind: "calendar" });
+    const saved = invokeCalls("set_meeting_settings")[0] as {
+      settings: Record<string, unknown>;
+    };
+    expect(saved.settings.calendar_titles).toBe(true);
+  });
+
+  // Reading the status must never prompt; the toggle is what prompts.
+  it("does not ask for calendar access on mount", async () => {
+    mockWorld({ bindings: readyBindings, extra: { get_permission_status: () => "Denied" } });
+    render(<MeetingsPage />);
+    await screen.findByRole("heading", { level: 1, name: "Meetings" });
+    expect(invokeCalls("request_permission")).toHaveLength(0);
+    expect(
+      invokeCalls("get_permission_status").some((args) => args?.kind === "calendar"),
+    ).toBe(true);
   });
 
   // Attribution only produces a verdict when both channels were recorded.

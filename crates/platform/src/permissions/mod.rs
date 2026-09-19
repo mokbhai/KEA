@@ -1,11 +1,15 @@
-//! OS permission status and request helpers (Screen Recording, Microphone, Accessibility).
+//! OS permission status and request helpers (Screen Recording, Microphone,
+//! Accessibility, Calendar).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+// `pub(crate)` so `calendar::macos` can ask this module for the EventKit
+// authorization status instead of sending the same `EKEventStore` message from
+// a second place. TCC is this module's concern; reading events is that one's.
 #[cfg(target_os = "macos")]
-mod macos;
+pub(crate) mod macos;
 #[cfg(not(target_os = "macos"))]
 mod stub;
 
@@ -14,6 +18,10 @@ pub enum PermKind {
     Microphone,
     ScreenRecording,
     Accessibility,
+    /// Read access to the user's calendar events, for naming a meeting after
+    /// the event it happened during. Read-only, and off unless the user turns
+    /// the feature on.
+    Calendar,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,5 +73,7 @@ mod tests {
     fn perm_kind_serializes() {
         let json = serde_json::to_string(&PermKind::ScreenRecording).unwrap();
         assert_eq!(json, r#""ScreenRecording""#);
+        let json = serde_json::to_string(&PermKind::Calendar).unwrap();
+        assert_eq!(json, r#""Calendar""#);
     }
 }

@@ -15,6 +15,18 @@
 //!    `Authorized` → [`PermStatus::Granted`],
 //!    `Denied` / `Restricted` → [`PermStatus::Denied`].
 //!
+//! # Manual verification — Calendar
+//! 1. Call `request(Calendar)`; macOS shows a permission dialog (requires
+//!    `NSCalendarsFullAccessUsageDescription` on macOS 14+ and
+//!    `NSCalendarsUsageDescription` on older systems in `Info.plist`, without
+//!    which the process is killed, exactly as for the microphone below).
+//! 2. Grant or deny access in the system prompt.
+//! 3. `status(Calendar)` reflects the EKAuthorizationStatus:
+//!    `NotDetermined` → [`PermStatus::Unknown`],
+//!    `FullAccess` → [`PermStatus::Granted`],
+//!    everything else — including macOS 14's `WriteOnly` — → [`PermStatus::Denied`],
+//!    because reading events needs full access and nothing less will do.
+//!
 //! # Manual verification — Accessibility
 //! 1. Call `request(Accessibility)`; macOS shows the trust dialog, which offers
 //!    to open System Settings when the process is not yet trusted.
@@ -28,8 +40,9 @@ use async_trait::async_trait;
 use core_graphics::access::ScreenCaptureAccess;
 
 use block2::RcBlock;
-use objc2::runtime::Bool;
-use objc2::{class, msg_send};
+use objc2::rc::Retained;
+use objc2::runtime::{AnyObject, Bool};
+use objc2::{class, msg_send, sel};
 use objc2_foundation::ns_string;
 
 /// AVAuthorizationStatus enum values (from AVFoundation; not a public re-export).
@@ -61,6 +74,50 @@ pub(crate) fn microphone_auth_status() -> i64 {
     }
 }
 
+/// `EKEntityTypeEvent`. Reminders are entity type 1 and are never requested.
+pub(crate) const EK_ENTITY_TYPE_EVENT: i64 = 0;
+
+/// `EKAuthorizationStatus`, as of macOS 14.
+///
+/// Its own constants, and its own mapper below, rather than reusing
+/// [`av_auth_status_to_perm`]. The two enums coincide on 0–3 today *by
+/// accident*, and macOS 14 added a fifth EventKit value — `writeOnly` — that
+/// AVFoundation has no counterpart for. A shared mapper would classify
+/// write-only through a coincidence of integers, and write-only is exactly the
+/// case that must not read as granted.
+const EK_AUTH_NOT_DETERMINED: i64 = 0;
+const EK_AUTH_RESTRICTED: i64 = 1;
+const EK_AUTH_DENIED: i64 = 2;
+/// `authorized` before macOS 14, `fullAccess` from macOS 14. Same raw value.
+pub(crate) const EK_AUTH_FULL_ACCESS: i64 = 3;
+/// macOS 14+. Enough to add an event, never enough to read one.
+const EK_AUTH_WRITE_ONLY: i64 = 4;
+
+/// Map an `EKAuthorizationStatus` (`NSInteger`) to [`PermStatus`].
+///
+/// Unit-testable without TCC interaction.
+pub(crate) fn ek_auth_status_to_perm(status: i64) -> PermStatus {
+    match status {
+        EK_AUTH_NOT_DETERMINED => PermStatus::Unknown,
+        EK_AUTH_FULL_ACCESS => PermStatus::Granted,
+        // Write-only can create events and cannot read them, which is the only
+        // thing KEA wants, so it is a denial for this purpose.
+        EK_AUTH_WRITE_ONLY | EK_AUTH_DENIED | EK_AUTH_RESTRICTED => PermStatus::Denied,
+        _ => PermStatus::Denied, // future EventKit values: fail closed
+    }
+}
+
+/// The raw `EKAuthorizationStatus` for events.
+///
+/// `pub(crate)` so `calendar::macos` can refuse to read before it has a grant
+/// without sending this message from a second place.
+pub(crate) fn event_auth_status() -> i64 {
+    unsafe {
+        let cls = class!(EKEventStore);
+        msg_send![cls, authorizationStatusForEntityType: EK_ENTITY_TYPE_EVENT]
+    }
+}
+
 pub struct MacPermissions;
 
 impl MacPermissions {
@@ -89,6 +146,56 @@ impl MacPermissions {
         } else {
             PermStatus::Denied
         }
+    }
+
+    fn calendar_status() -> PermStatus {
+        ek_auth_status_to_perm(event_auth_status())
+    }
+
+    /// Ask for *full* calendar access.
+    ///
+    /// macOS 14 split calendar access in two and added
+    /// `requestFullAccessToEventsWithCompletion:`; on older systems only
+    /// `requestAccessToEntityType:completion:` exists. The choice is made with
+    /// `respondsToSelector:` rather than a version string, because the
+    /// selector is the thing that actually has to be there — a deployment
+    /// target below 14 compiles either way and a version check would be a
+    /// second source of truth about the same fact.
+    async fn request_calendar() -> Result<PermStatus, PermError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Same reason as `request_microphone`: ObjC blocks are Fn, not FnOnce.
+        let tx = std::sync::Mutex::new(Some(tx));
+
+        {
+            let block = RcBlock::new(move |_granted: Bool, _error: *mut AnyObject| {
+                if let Some(tx) = tx.lock().ok().and_then(|mut guard| guard.take()) {
+                    let _ = tx.send(ek_auth_status_to_perm(event_auth_status()));
+                }
+            });
+
+            unsafe {
+                let store: *mut AnyObject = msg_send![class!(EKEventStore), alloc];
+                let store: *mut AnyObject = msg_send![store, init];
+                let Some(store) = Retained::from_raw(store) else {
+                    return Err(PermError::Other("EKEventStore could not be created".into()));
+                };
+
+                let modern = sel!(requestFullAccessToEventsWithCompletion:);
+                let responds: Bool = msg_send![&*store, respondsToSelector: modern];
+                if responds.is_true() {
+                    let () = msg_send![&*store, requestFullAccessToEventsWithCompletion: &*block];
+                } else {
+                    let () = msg_send![
+                        &*store,
+                        requestAccessToEntityType: EK_ENTITY_TYPE_EVENT,
+                        completion: &*block
+                    ];
+                }
+            }
+        }
+
+        rx.await
+            .map_err(|_| PermError::Other("calendar request completion handler dropped".into()))
     }
 
     async fn request_microphone() -> Result<PermStatus, PermError> {
@@ -125,6 +232,7 @@ impl Permissions for MacPermissions {
             PermKind::ScreenRecording => Self::screen_recording_status(),
             PermKind::Microphone => Self::microphone_status(),
             PermKind::Accessibility => Self::accessibility_status(),
+            PermKind::Calendar => Self::calendar_status(),
         }
     }
 
@@ -148,6 +256,7 @@ impl Permissions for MacPermissions {
                 let _ = macos_ax::prompt_ax_trust();
                 Ok(Self::accessibility_status())
             }
+            PermKind::Calendar => Self::request_calendar().await,
         }
     }
 }
@@ -183,6 +292,48 @@ mod tests {
             av_auth_status_to_perm(AV_AUTH_RESTRICTED),
             PermStatus::Denied
         );
+    }
+
+    #[test]
+    fn ek_auth_status_maps_not_determined_to_unknown() {
+        assert_eq!(
+            ek_auth_status_to_perm(EK_AUTH_NOT_DETERMINED),
+            PermStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn ek_auth_status_maps_full_access_to_granted() {
+        assert_eq!(
+            ek_auth_status_to_perm(EK_AUTH_FULL_ACCESS),
+            PermStatus::Granted
+        );
+    }
+
+    #[test]
+    fn ek_auth_status_maps_denied_and_restricted_to_denied() {
+        assert_eq!(ek_auth_status_to_perm(EK_AUTH_DENIED), PermStatus::Denied);
+        assert_eq!(
+            ek_auth_status_to_perm(EK_AUTH_RESTRICTED),
+            PermStatus::Denied
+        );
+    }
+
+    /// The value that makes a shared AVFoundation mapper wrong: write-only can
+    /// add an event and cannot read one, so it is not a grant for this
+    /// feature.
+    #[test]
+    fn ek_auth_status_maps_write_only_to_denied() {
+        assert_eq!(
+            ek_auth_status_to_perm(EK_AUTH_WRITE_ONLY),
+            PermStatus::Denied
+        );
+    }
+
+    #[test]
+    fn an_unknown_future_ek_value_fails_closed() {
+        assert_eq!(ek_auth_status_to_perm(99), PermStatus::Denied);
+        assert_eq!(ek_auth_status_to_perm(-1), PermStatus::Denied);
     }
 
     #[test]

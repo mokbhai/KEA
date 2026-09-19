@@ -76,6 +76,7 @@ tauri-install: tauri-build
 	/usr/bin/tccutil reset Accessibility "$(BUNDLE_ID)" >/dev/null 2>&1 || true; \
 	/usr/bin/tccutil reset ScreenCapture "$(BUNDLE_ID)" >/dev/null 2>&1 || true; \
 	/usr/bin/tccutil reset Microphone "$(BUNDLE_ID)" >/dev/null 2>&1 || true; \
+	/usr/bin/tccutil reset Calendar "$(BUNDLE_ID)" >/dev/null 2>&1 || true; \
 	echo "Installed $$APP_PATH to $(APP_INSTALL_PATH)"
 
 test: tauri-test

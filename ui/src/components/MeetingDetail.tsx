@@ -1,20 +1,14 @@
 import { useState } from "react";
-import type { MeetingDetail as MeetingDetailData, MeetingSegment } from "../api";
+import type {
+  ActionItemStatus,
+  MeetingActionItem,
+  MeetingDetail as MeetingDetailData,
+  TitleSource,
+} from "../api";
 import TranscriptPanel, {
   speakerDisplayName,
   type MeetingSpeakerRow,
 } from "./TranscriptPanel";
-
-/**
- * What the backend actually sends today. `api.ts` has yet to declare
- * `speaker_key` on a segment or `speakers` on a detail, so they are widened in
- * here rather than read off an out-of-date shared type.
- */
-type AttributedSegment = MeetingSegment & { speaker_key?: string | null };
-type DetailWithSpeakers = Omit<MeetingDetailData, "segments"> & {
-  segments: AttributedSegment[];
-  speakers?: MeetingSpeakerRow[];
-};
 
 /**
  * Which physical source a speaker key stands for.
@@ -36,6 +30,22 @@ type Props = {
    * legend read-only — the names still show, they just cannot be changed.
    */
   onRenameSpeaker?: (speakerKey: string, displayName: string) => void | Promise<void>;
+  /**
+   * Rename the meeting itself. Omitted renders the title as plain text.
+   *
+   * This matters more than renaming a speaker: a calendar title is sometimes
+   * right about the event and wrong about what the recording contains, and the
+   * user needs a one-click way to fix it without deleting anything.
+   */
+  onRenameTitle?: (title: string) => void | Promise<void>;
+  /** Tick an action item off, or put it back. */
+  onSetActionItemStatus?: (id: number, status: ActionItemStatus) => void | Promise<void>;
+  /** Add what the model missed. */
+  onAddActionItem?: (text: string) => void | Promise<void>;
+  /** Put the meeting on the clipboard as Markdown. */
+  onCopyMarkdown?: () => void | Promise<void>;
+  /** Write the meeting to a file and reveal it. */
+  onSaveMarkdown?: () => void | Promise<void>;
   busy?: boolean;
 };
 
@@ -46,6 +56,204 @@ function NotesSection({ label, content }: { label: string; content: string }) {
       <h4 style={{ margin: "0 0 6px", fontSize: 14 }}>{label}</h4>
       <p style={{ margin: 0, whiteSpace: "pre-wrap", color: "var(--text)" }}>{content}</p>
     </section>
+  );
+}
+
+/**
+ * The meeting title, with where it came from and a way to fix it.
+ *
+ * The chip is only shown for a calendar title: "from Calendar" answers the
+ * question a surprising title raises, while a chip on every title would be
+ * noise.
+ */
+function MeetingTitle({
+  title,
+  source,
+  onRename,
+  busy,
+}: {
+  title: string;
+  source?: TitleSource;
+  onRename?: Props["onRenameTitle"];
+  busy: boolean;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+
+  const commit = () => {
+    const next = (draft ?? title).trim();
+    setDraft(null);
+    // An empty title is a slip mid-edit, and a title unchanged is not a write.
+    if (!next || next === title) return;
+    void onRename?.(next);
+  };
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+      {onRename ? (
+        <input
+          className="kea-input"
+          aria-label="Meeting title"
+          value={draft ?? title}
+          disabled={busy}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+          }}
+          style={{ fontSize: 20, fontWeight: 600, flex: 1, minWidth: 0 }}
+        />
+      ) : (
+        <h2 style={{ margin: 0 }}>{title}</h2>
+      )}
+      {source === "calendar" && (
+        <span
+          className="kea-muted"
+          style={{
+            padding: "2px 8px",
+            borderRadius: 999,
+            border: "1px solid var(--border)",
+            background: "var(--surface-2)",
+            fontSize: 11,
+            whiteSpace: "nowrap",
+          }}
+        >
+          from Calendar
+        </span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Action items as a checklist.
+ *
+ * Falls back to the prose the model wrote for a meeting recorded before the
+ * rows existed — the column is still populated on every write, so both
+ * renderings stay correct forever.
+ */
+function ActionItems({
+  items,
+  prose,
+  onSetStatus,
+  onAdd,
+  busy,
+}: {
+  items: MeetingActionItem[];
+  prose: string;
+  onSetStatus?: Props["onSetActionItemStatus"];
+  onAdd?: Props["onAddActionItem"];
+  busy: boolean;
+}) {
+  const [draft, setDraft] = useState("");
+
+  if (items.length === 0) {
+    // No rows and no prose: the meeting genuinely had no action items, and an
+    // empty heading reads as something broken.
+    if (!prose.trim() && !onAdd) return null;
+    return (
+      <section style={{ marginBottom: 16 }}>
+        <h4 style={{ margin: "0 0 6px", fontSize: 14 }}>Action items</h4>
+        {prose.trim() ? (
+          <p style={{ margin: 0, whiteSpace: "pre-wrap", color: "var(--text)" }}>{prose}</p>
+        ) : (
+          <p className="kea-muted" style={{ margin: 0 }}>
+            Nobody agreed to do anything.
+          </p>
+        )}
+        {onAdd && <AddItemRow draft={draft} setDraft={setDraft} onAdd={onAdd} busy={busy} />}
+      </section>
+    );
+  }
+
+  return (
+    <section style={{ marginBottom: 16 }}>
+      <h4 style={{ margin: "0 0 6px", fontSize: 14 }}>Action items</h4>
+      <ul style={{ margin: 0, padding: 0, listStyle: "none" }}>
+        {items.map((item) => {
+          const done = item.status === "done";
+          const dropped = item.status === "dropped";
+          return (
+            <li
+              key={item.id}
+              style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 4 }}
+            >
+              <input
+                type="checkbox"
+                aria-label={item.text}
+                checked={done}
+                disabled={busy || !onSetStatus}
+                onChange={(e) =>
+                  void onSetStatus?.(item.id, e.target.checked ? "done" : "open")
+                }
+              />
+              <span
+                style={{
+                  color: done || dropped ? "var(--text-muted)" : "var(--text)",
+                  textDecoration: done || dropped ? "line-through" : undefined,
+                }}
+              >
+                {item.text}
+              </span>
+              {item.owner && (
+                <span className="kea-muted" style={{ fontSize: 12 }}>
+                  — {item.owner}
+                </span>
+              )}
+              {item.due_hint && (
+                <span className="kea-muted" style={{ fontSize: 12 }}>
+                  ({item.due_hint})
+                </span>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+      {onAdd && <AddItemRow draft={draft} setDraft={setDraft} onAdd={onAdd} busy={busy} />}
+    </section>
+  );
+}
+
+function AddItemRow({
+  draft,
+  setDraft,
+  onAdd,
+  busy,
+}: {
+  draft: string;
+  setDraft: (value: string) => void;
+  onAdd: NonNullable<Props["onAddActionItem"]>;
+  busy: boolean;
+}) {
+  const submit = () => {
+    const text = draft.trim();
+    if (!text) return;
+    setDraft("");
+    void onAdd(text);
+  };
+
+  return (
+    <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+      <input
+        className="kea-input"
+        aria-label="New action item"
+        placeholder="Add what the notes missed"
+        value={draft}
+        disabled={busy}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") submit();
+        }}
+        style={{ flex: 1, minWidth: 0 }}
+      />
+      <button
+        type="button"
+        className="kea-btn"
+        onClick={submit}
+        disabled={busy || !draft.trim()}
+      >
+        Add item
+      </button>
+    </div>
   );
 }
 
@@ -137,14 +345,26 @@ export default function MeetingDetail({
   detail,
   onDelete,
   onRenameSpeaker,
+  onRenameTitle,
+  onSetActionItemStatus,
+  onAddActionItem,
+  onCopyMarkdown,
+  onSaveMarkdown,
   busy = false,
 }: Props) {
-  const { meeting, segments, notes, speakers = [] } = detail as DetailWithSpeakers;
+  const { meeting, segments, notes, speakers, action_items: actionItems } = detail;
+
+  const canExport = Boolean(onCopyMarkdown || onSaveMarkdown);
 
   return (
     <div>
       <header style={{ marginBottom: 16 }}>
-        <h2 style={{ margin: "0 0 4px" }}>{meeting.title}</h2>
+        <MeetingTitle
+          title={meeting.title}
+          source={meeting.title_source}
+          onRename={onRenameTitle}
+          busy={busy}
+        />
         <p className="kea-muted" style={{ margin: 0 }}>
           {meeting.started_at}
           {meeting.ended_at ? ` — ${meeting.ended_at}` : ""}
@@ -160,14 +380,20 @@ export default function MeetingDetail({
         )}
       </header>
 
-      {notes && (
+      {(notes || actionItems.length > 0) && (
         <section className="kea-card" style={{ marginBottom: 16 }}>
           <h3 style={{ margin: "0 0 12px" }}>Notes</h3>
-          <NotesSection label="Summary" content={notes.summary} />
-          <NotesSection label="Decisions" content={notes.decisions} />
-          <NotesSection label="Action items" content={notes.action_items} />
-          <NotesSection label="Follow-ups" content={notes.follow_ups} />
-          <NotesSection label="Open questions" content={notes.open_questions} />
+          <NotesSection label="Summary" content={notes?.summary ?? ""} />
+          <NotesSection label="Decisions" content={notes?.decisions ?? ""} />
+          <ActionItems
+            items={actionItems}
+            prose={notes?.action_items ?? ""}
+            onSetStatus={onSetActionItemStatus}
+            onAdd={onAddActionItem}
+            busy={busy}
+          />
+          <NotesSection label="Follow-ups" content={notes?.follow_ups ?? ""} />
+          <NotesSection label="Open questions" content={notes?.open_questions ?? ""} />
         </section>
       )}
 
@@ -187,15 +413,47 @@ export default function MeetingDetail({
         />
       </section>
 
-      <button
-        type="button"
-        className="kea-btn"
-        onClick={() => onDelete(meeting.id)}
-        disabled={busy}
-        style={{ color: "var(--danger)", borderColor: "var(--danger)" }}
-      >
-        Delete meeting
-      </button>
+      {/*
+        Export sits apart from delete on purpose: the two are adjacent in
+        intent ("I am done with this meeting") and opposite in consequence, and
+        a mis-click must not be the destructive one.
+      */}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        {canExport && (
+          <div style={{ display: "flex", gap: 8 }}>
+            {onCopyMarkdown && (
+              <button
+                type="button"
+                className="kea-btn"
+                onClick={() => void onCopyMarkdown()}
+                disabled={busy}
+              >
+                Copy Markdown
+              </button>
+            )}
+            {onSaveMarkdown && (
+              <button
+                type="button"
+                className="kea-btn"
+                onClick={() => void onSaveMarkdown()}
+                disabled={busy}
+              >
+                Save as Markdown
+              </button>
+            )}
+          </div>
+        )}
+        <div style={{ flex: 1 }} />
+        <button
+          type="button"
+          className="kea-btn"
+          onClick={() => onDelete(meeting.id)}
+          disabled={busy}
+          style={{ color: "var(--danger)", borderColor: "var(--danger)" }}
+        >
+          Delete meeting
+        </button>
+      </div>
     </div>
   );
 }

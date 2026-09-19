@@ -22,7 +22,9 @@ use kea_core::store::app_profiles::AppProfileRepo;
 use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_core::store::conversations::{ConversationRepo, ConversationSummary, Message};
 use kea_core::store::hotkeys::{HotkeyBindingRepo, HotkeyBindingRow};
-use kea_core::store::meetings::{Meeting, MeetingDetail};
+use kea_core::store::meetings::{
+    ActionItemStatus, Meeting, MeetingDetail, NewActionItem, TitleSource,
+};
 use kea_core::store::settings::SettingsRepo;
 use kea_core::store::vocabulary::{VocabularyEntry, VocabularyRepo};
 use kea_core::transcript::{
@@ -35,14 +37,17 @@ use kea_engines::traits::SttOpts;
 use kea_engines::{EngineRegistry, TtsOpts};
 use kea_features::demo::{run_ping, DemoFeature};
 use kea_features::dictation::{run_dictation_with_commands, spawn_partials, DictationRunOpts};
+use kea_features::meeting::{
+    run_interim_notes_pass, run_meeting_stop_with, InterimSchedule, MeetingStopOptions,
+};
 use kea_features::rewrite::{complete_rewrite, OCR_COMMAND, PALETTE_COMMAND};
 use kea_features::run_rewrite_with_storage;
 use kea_features::tts::run_tts_with_player;
 use kea_features::ProfileOverrides;
 use kea_features::{
-    drain_and_stop_meeting, run_meeting_poll_segment, run_meeting_start, run_meeting_stop,
-    ActionGuard, ActiveMeeting, CapKind, ContentStorageOpts, DictationFeature, FeatureRegistry,
-    MeetingFeature, MeetingRunContext, RewriteFeature, TranscribeFeature, TtsFeature,
+    drain_and_stop_meeting, run_meeting_poll_segment, run_meeting_start, ActionGuard,
+    ActiveMeeting, CapKind, ContentStorageOpts, DictationFeature, FeatureRegistry, MeetingFeature,
+    MeetingRunContext, RewriteFeature, TranscribeFeature, TtsFeature,
 };
 use kea_infer::{
     temp_file_for, DownloadTransport, InferError, ModelDownloader, ModelKind, ModelRegistry,
@@ -68,8 +73,9 @@ use crate::palette::{
 use crate::events::{
     dictation_state_wire, emit_device_fallback, emit_dictation_error, emit_dictation_level,
     emit_dictation_partial, emit_dictation_preview, emit_dictation_state, emit_meeting_error,
-    emit_meeting_level, emit_meeting_segment, emit_meeting_state, emit_model_download_complete,
-    emit_model_download_error, emit_model_download_progress, emit_palette_close, emit_palette_open,
+    emit_meeting_level, emit_meeting_notes, emit_meeting_notes_error, emit_meeting_segment,
+    emit_meeting_state, emit_model_download_complete, emit_model_download_error,
+    emit_model_download_progress, emit_palette_close, emit_palette_open,
     emit_transcribe_file_complete, emit_transcribe_file_error, emit_transcribe_file_progress,
     emit_transcribe_file_segment, emit_tts_state, meeting_state_wire, MeetingSegmentPayload,
     PartialThrottle, TranscribeFileProgressPayload, TranscribeFileSegmentPayload, TtsState,
@@ -299,6 +305,12 @@ pub struct ActiveMeetingSession {
     pub session: ActiveMeeting,
     pub sequence: i32,
     pub elapsed_ms: i64,
+    /// When the next interim notes pass is due, and how many have run.
+    ///
+    /// Beside the poll cursor rather than on `AppState`, because every counter
+    /// in it is about *this* meeting: taking the session out of the slot at
+    /// stop is what retires the schedule, with nothing to reset by hand.
+    pub interim: InterimSchedule,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -382,10 +394,11 @@ pub fn system_audio_capability_dto(cap: SystemAudioCapability) -> String {
 /// The permission kinds the UI can ask about, paired with the snake_case names
 /// the IPC layer speaks. One table, so the parser and the status list cannot
 /// drift apart.
-const PERM_KINDS: [(&str, PermKind); 3] = [
+const PERM_KINDS: [(&str, PermKind); 4] = [
     ("microphone", PermKind::Microphone),
     ("screen_recording", PermKind::ScreenRecording),
     ("accessibility", PermKind::Accessibility),
+    ("calendar", PermKind::Calendar),
 ];
 
 fn parse_perm_kind(kind: &str) -> Result<PermKind, String> {
@@ -823,13 +836,30 @@ pub async fn capture_app_context_now(state: &AppState) -> Option<kea_platform::A
     ctx.bundle_id.is_some().then_some(ctx)
 }
 
-/// The default rewrite input with `profile`'s mode and preset applied.
+/// Force `input` onto `mode`, re-deriving the parameter that mode reads.
 ///
 /// The re-derive is the part worth being careful about: a mode's parameter
-/// comes from a key chosen BY that mode, so a profile that forces Translate
+/// comes from a key chosen BY that mode, so anything that forces Translate
 /// must also pick up `rewrite.translate.target`. Applying the mode without
 /// re-reading the parameter would hand Translate the Ask instruction, or
 /// nothing at all.
+///
+/// Shared by the app-profile path and the `kea://`/HTTP override so the two
+/// cannot answer that differently.
+pub async fn set_rewrite_mode(
+    input: &mut RewriteInput,
+    mode: RewriteMode,
+    config_pool: &SqlitePool,
+) {
+    if mode == input.mode {
+        return;
+    }
+    input.mode = mode;
+    input.custom_instruction =
+        mode_parameter_value(&SettingsRepo::new(config_pool.clone()), mode).await;
+}
+
+/// The default rewrite input with `profile`'s mode and preset applied.
 pub async fn rewrite_input_for_profile(
     config_pool: &SqlitePool,
     profile: Option<&AppProfile>,
@@ -839,16 +869,80 @@ pub async fn rewrite_input_for_profile(
         return input;
     };
     if let Some(mode) = profile.mode() {
-        if mode != input.mode {
-            input.mode = mode;
-            input.custom_instruction =
-                mode_parameter_value(&SettingsRepo::new(config_pool.clone()), mode).await;
-        }
+        set_rewrite_mode(&mut input, mode, config_pool).await;
     }
     if profile.preset_id.is_some() {
         input.preset_id = profile.preset_id.clone();
     }
     input
+}
+
+/// What a caller outside the app asked for, on top of the saved settings and
+/// whatever app profile applies.
+///
+/// `None` everywhere means "no opinion", which is exactly what the hotkey
+/// passes — so the shortcut and the two scripting surfaces run the same
+/// function instead of the shortcut keeping its own copy of it.
+#[derive(Debug, Clone, Default)]
+pub struct RewriteOverride {
+    pub mode: Option<RewriteMode>,
+    pub preset_id: Option<String>,
+    pub instruction: Option<String>,
+}
+
+impl RewriteOverride {
+    pub async fn apply(&self, input: &mut RewriteInput, config_pool: &SqlitePool) {
+        if let Some(mode) = self.mode {
+            set_rewrite_mode(input, mode, config_pool).await;
+        }
+        if self.preset_id.is_some() {
+            input.preset_id = self.preset_id.clone();
+        }
+        // After the mode, not before: `set_rewrite_mode` re-derives the
+        // parameter from settings, and an instruction the caller spelled out
+        // has to survive that.
+        if self.instruction.is_some() {
+            input.custom_instruction = self.instruction.clone();
+        }
+    }
+}
+
+/// Capture the frontmost app's selection, rewrite it, and write it back.
+///
+/// The body of the rewrite shortcut, shared with `kea://rewrite` and
+/// `POST /v1/rewrite`. The caller owns the busy guard (`selection_busy`) and
+/// whatever progress it reports; this owns the *order*, which is the part that
+/// matters — the app context is probed FIRST, before anything that could
+/// change which app is frontmost, because by the time the rewrite returns the
+/// user may well have switched away.
+pub async fn run_selection_rewrite(
+    state: &Arc<AppState>,
+    over: &RewriteOverride,
+) -> Result<String, String> {
+    let ctx = capture_app_context_now(state).await;
+    let profile = profile_for(&state.config_pool, ctx.as_ref()).await;
+    let mut input = rewrite_input_for_profile(&state.config_pool, profile.as_ref()).await;
+    over.apply(&mut input, &state.config_pool).await;
+    execute_rewrite(
+        state,
+        input,
+        &ProfileOverrides::from_profile(profile.as_ref()),
+    )
+    .await
+}
+
+/// The frontmost app's selection, as text.
+///
+/// A synthetic ⌘C, so every caller must already hold `selection_busy`.
+pub async fn capture_selection_text() -> Result<String, String> {
+    let text = new_text_io()
+        .capture_selection()
+        .await
+        .map_err(|e| e.to_string())?;
+    if text.trim().is_empty() {
+        return Err("nothing is selected".into());
+    }
+    Ok(text)
 }
 
 pub async fn default_rewrite_input(config_pool: &SqlitePool) -> RewriteInput {
@@ -913,7 +1007,7 @@ fn bool_setting(value: Option<&serde_json::Value>, default: bool) -> bool {
 }
 
 /// [`bool_setting`] against the store, defaulting on any read error too.
-async fn read_bool_setting(config_pool: &SqlitePool, key: &str, default: bool) -> bool {
+pub async fn read_bool_setting(config_pool: &SqlitePool, key: &str, default: bool) -> bool {
     match SettingsRepo::new(config_pool.clone())
         .get::<serde_json::Value>(key)
         .await
@@ -1695,7 +1789,7 @@ fn onnx_storage_for(state: &AppState, kind: ModelKind) -> Result<&ModelStorage, 
     }
 }
 
-fn open_path_in_file_manager(path: &Path) -> Result<(), String> {
+fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
@@ -1820,6 +1914,92 @@ fn spawn_meeting_level_poll(state: &Arc<AppState>, app: &AppHandle) {
 /// how promptly a pause is noticed.
 const SEGMENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Apply `update` to the interim schedule of `meeting_id`, if that meeting is
+/// still the one recording.
+///
+/// The guard against a stop that raced the pass: by the time an LLM answers,
+/// the slot may be empty or hold a different meeting, and recording a success
+/// against that one would skip segments nobody has folded in.
+fn update_interim_schedule(
+    state: &AppState,
+    meeting_id: &str,
+    update: impl FnOnce(&mut InterimSchedule),
+) {
+    if let Ok(mut guard) = state.active_meeting.lock() {
+        if let Some(active) = guard.as_mut() {
+            if active.session.meeting_id == meeting_id {
+                update(&mut active.interim);
+            }
+        }
+    }
+}
+
+/// Fold the segments since `from_sequence` into the meeting's notes, off the
+/// poll.
+///
+/// Spawned rather than awaited: the pass calls an LLM, and the segment poll has
+/// to keep cutting and transcribing audio while it runs. It holds no audio lock
+/// for the same reason — tens of seconds of provider latency must not block
+/// dictation, the next segment, or the stop.
+///
+/// A trigger that arrives while a pass is in flight is *dropped*. Queuing would
+/// turn a provider slower than the cadence into an unbounded backlog that keeps
+/// billing after the meeting has ended; the next window asks again.
+///
+/// Nothing on this path can fail the meeting: `run_interim_notes_pass` takes no
+/// `ActiveMeeting` and so cannot call `ActiveMeeting::fail`. A failed pass
+/// leaves the meeting Recording with its ledger row open, and the full pass at
+/// stop still writes the notes the user keeps.
+fn spawn_interim_notes_pass(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    meeting_id: String,
+    from_sequence: i32,
+) {
+    // The same owner the hotkey handlers use to drop a press that arrives
+    // mid-run, for the same reason and with the same release-on-Drop.
+    let Some(guard) = try_acquire_busy(&state.interim_notes_in_flight) else {
+        tracing::debug!(meeting_id = %meeting_id, "interim notes: a pass is already running");
+        return;
+    };
+    let state = state.clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // Moved into the task so the flag is released when it ends — including
+        // if it panics — rather than when this function returns.
+        let _guard = guard;
+        let bindings = BindingRepo::new(state.config_pool.clone());
+        let result = run_interim_notes_pass(
+            &state.engines,
+            &bindings,
+            &state.meeting_repo,
+            &meeting_id,
+            from_sequence,
+        )
+        .await;
+
+        match result {
+            Ok(pass) => {
+                let next_sequence = pass.next_sequence;
+                update_interim_schedule(&state, &meeting_id, |schedule| {
+                    schedule.record_success(next_sequence)
+                });
+                if let Some(notes) = pass.notes {
+                    emit_meeting_notes(&app, &notes);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(meeting_id = %meeting_id, error = %e, "interim notes pass failed");
+                // `record_failure` deliberately leaves the segment counter
+                // alone: those segments still have not been folded in, and
+                // clearing it would drop them from the notes for good.
+                update_interim_schedule(&state, &meeting_id, InterimSchedule::record_failure);
+                emit_meeting_notes_error(&app, &e);
+            }
+        }
+    });
+}
+
 /// `vocabulary` is read once by the caller when the meeting starts and shared
 /// across every tick, rather than re-read here per segment: a transcript whose
 /// spelling changed halfway through because the user edited their vocabulary
@@ -1889,11 +2069,32 @@ fn spawn_segment_poll(
                         .await
                 };
 
+                // Whether this tick actually produced a segment, read before
+                // the match below consumes the result: the interim cadence
+                // counts segments, not ticks, and this loop runs once a second
+                // whether anybody spoke or not.
+                let transcribed = matches!(poll_result, Ok(Some(_)));
+
+                // The poll cursor and the interim schedule advance under one
+                // lock, held for arithmetic only — the pass itself is spawned
+                // after it is dropped, so a slow provider never holds the lock
+                // the stop needs to take the session out.
+                let mut interim_from = None;
                 if let Ok(mut guard) = state.active_meeting.lock() {
                     if let Some(active) = guard.as_mut() {
                         if active.session.meeting_id == meeting_id {
                             active.sequence = sequence;
                             active.elapsed_ms = elapsed_ms;
+                            if transcribed {
+                                active.interim.note_segment();
+                            }
+                            // The setting is read every tick rather than
+                            // captured at start, so turning interim notes off
+                            // mid-meeting stops the next pass rather than the
+                            // one after a restart.
+                            if settings.interim_notes && active.interim.is_due() {
+                                interim_from = Some(active.interim.next_sequence());
+                            }
                         }
                     }
                 }
@@ -1914,6 +2115,10 @@ fn spawn_segment_poll(
                     }
                     Ok(None) => {}
                     Err(e) => emit_meeting_error(&app, &e),
+                }
+
+                if let Some(from_sequence) = interim_from {
+                    spawn_interim_notes_pass(&state, &app, meeting_id, from_sequence);
                 }
                 ControlFlow::Continue(())
             }
@@ -1985,6 +2190,11 @@ pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Resu
             session,
             sequence: 0,
             elapsed_ms: 0,
+            // Built whether or not interim notes are on: the poll consults the
+            // setting on every tick, so turning it on mid-meeting starts the
+            // cadence from here rather than from a schedule that was never
+            // created.
+            interim: InterimSchedule::new(settings.interim_cadence()),
         });
     }
 
@@ -2042,7 +2252,20 @@ pub async fn stop_meeting_inner(
 
     let vocabulary = load_vocabulary(&state.config_pool).await;
 
-    let detail = run_meeting_stop(
+    // Read here rather than carried from the start: the calendar toggle is a
+    // settings row, and honouring the value it had when the meeting started
+    // would mean a user who turned it off mid-meeting still got a calendar
+    // title. A settings read that fails falls back to the defaults, which have
+    // calendar titles off — the stop must not fail over a config read.
+    let settings = MeetingSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
+        .get()
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "meeting stop: could not read meeting settings");
+            MeetingSettings::default()
+        });
+
+    let detail = run_meeting_stop_with(
         &state.engines,
         &bindings,
         &actions,
@@ -2050,6 +2273,10 @@ pub async fn stop_meeting_inner(
         &session.session,
         drain_result,
         &vocabulary,
+        MeetingStopOptions {
+            calendar: state.calendar.clone(),
+            calendar_titles: settings.calendar_titles,
+        },
     )
     .await;
 
@@ -3330,6 +3557,21 @@ pub async fn preview_rewrite(
     preset_id: Option<String>,
     custom_instruction: Option<String>,
 ) -> Result<String, String> {
+    preview_rewrite_inner(state.inner(), text, mode, preset_id, custom_instruction).await
+}
+
+/// [`preview_rewrite`] without the Tauri boundary.
+///
+/// Shared with `kea://rewrite?text=…` and `POST /v1/rewrite` with a `text`
+/// field: both want a rewrite that leaves the user's document, History and
+/// conversations alone, which is exactly what this already is.
+pub async fn preview_rewrite_inner(
+    state: &Arc<AppState>,
+    text: String,
+    mode: RewriteMode,
+    preset_id: Option<String>,
+    custom_instruction: Option<String>,
+) -> Result<String, String> {
     if text.trim().is_empty() {
         return Err("type some text to rewrite first".into());
     }
@@ -3706,6 +3948,123 @@ pub async fn delete_meeting(state: State<'_, Arc<AppState>>, id: String) -> Resu
         .map_err(|e| e.to_string())
 }
 
+/// Reads one meeting for a command that is about to render or rewrite it.
+///
+/// Every command below starts this way, and each of them wants the same "not
+/// found is an error, not an empty answer" answer that `get_meeting` gives.
+async fn meeting_detail(state: &AppState, id: &str) -> Result<MeetingDetail, String> {
+    state
+        .meeting_repo
+        .get(id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("meeting {id} not found"))
+}
+
+/// The meeting rendered as Markdown, for the clipboard.
+#[tauri::command]
+pub async fn meeting_markdown(
+    state: State<'_, Arc<AppState>>,
+    meeting_id: String,
+) -> Result<String, String> {
+    let detail = meeting_detail(&state, &meeting_id).await?;
+    Ok(kea_core::meetings::meeting_to_markdown(
+        &detail,
+        &detail.speakers,
+        &detail.action_items,
+    ))
+}
+
+/// Writes the same Markdown into `~/Downloads` and returns where it landed,
+/// so the caller can reveal it.
+///
+/// Downloads rather than a save dialog for the same reason `export_transcript`
+/// falls back there: a native picker is a plugin plus an ACL entry, and the
+/// path comes back either way.
+#[tauri::command]
+pub async fn export_meeting_markdown(
+    state: State<'_, Arc<AppState>>,
+    meeting_id: String,
+) -> Result<String, String> {
+    let detail = meeting_detail(&state, &meeting_id).await?;
+    let body =
+        kea_core::meetings::meeting_to_markdown(&detail, &detail.speakers, &detail.action_items);
+    let dir = dirs_download_dir()
+        .ok_or_else(|| "cannot find a writable directory to export into".to_string())?;
+    let target = dir.join(kea_core::meetings::markdown_file_name(
+        &detail.meeting.title,
+        &detail.meeting.started_at,
+    ));
+    std::fs::write(&target, body)
+        .map_err(|e| format!("could not write {}: {e}", target.display()))?;
+    Ok(target.to_string_lossy().into_owned())
+}
+
+/// Tick an action item off, or put it back.
+#[tauri::command]
+pub async fn set_meeting_action_item_status(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    status: String,
+) -> Result<(), String> {
+    let status = ActionItemStatus::from_str(&status)
+        .ok_or_else(|| format!("unknown action item status: {status}"))?;
+    state
+        .meeting_repo
+        .set_action_item_status(id, status)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Add what the synthesis pass missed.
+#[tauri::command]
+pub async fn add_meeting_action_item(
+    state: State<'_, Arc<AppState>>,
+    meeting_id: String,
+    text: String,
+) -> Result<(), String> {
+    state
+        .meeting_repo
+        .add_action_item(
+            &meeting_id,
+            &NewActionItem {
+                text,
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|_id| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Rename a meeting from the UI.
+///
+/// [`TitleSource::User`] is the load-bearing part: it is what stops a later
+/// synthesis pass — or a calendar match on a re-run — from overwriting a name
+/// a human typed.
+#[tauri::command]
+pub async fn set_meeting_title(
+    state: State<'_, Arc<AppState>>,
+    meeting_id: String,
+    title: String,
+) -> Result<(), String> {
+    state
+        .meeting_repo
+        .set_title_with_source(&meeting_id, &title, TitleSource::User)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Show a file KEA just wrote in the system file manager.
+///
+/// Takes the path an export command returned rather than letting the frontend
+/// compose one: the webview is KEA's own, but the only paths it is ever handed
+/// are ones KEA wrote.
+#[tauri::command]
+pub fn open_path_in_file_manager(path: String) -> Result<(), String> {
+    reveal_in_file_manager(Path::new(&path))
+}
+
 #[tauri::command]
 pub async fn start_meeting(
     state: State<'_, Arc<AppState>>,
@@ -3848,7 +4207,7 @@ pub fn tail_logs(
 #[tauri::command]
 pub fn open_log_folder(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     std::fs::create_dir_all(&state.log_dir).map_err(|e| e.to_string())?;
-    open_path_in_file_manager(&state.log_dir)
+    reveal_in_file_manager(&state.log_dir)
 }
 
 #[tauri::command]
@@ -4330,7 +4689,21 @@ pub async fn transcribe_file(
     app: AppHandle,
     path: String,
 ) -> Result<String, String> {
-    let state = state.inner().clone();
+    transcribe_file_run(state.inner(), &app, &path).await
+}
+
+/// [`transcribe_file`] without the Tauri boundary, for `kea://transcribe` and
+/// `POST /v1/transcribe`.
+///
+/// It claims `file_transcribe_busy` here rather than leaving that to each
+/// caller: the flag is what makes "one job at a time" true, and a second
+/// entry point that forgot it would run two decodes over the same CPU.
+pub async fn transcribe_file_run(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    path: &str,
+) -> Result<String, String> {
+    let state = state.clone();
     // One job at a time, and emphatically *not* the capture gate: this never
     // opens a device, and taking that lock would block dictation for the
     // length of a podcast.
@@ -4346,13 +4719,13 @@ pub async fn transcribe_file(
     };
 
     let job_id = new_job_id();
-    match transcribe_file_inner(&state, &app, &job_id, &path).await {
+    match transcribe_file_inner(&state, app, &job_id, path).await {
         Ok((transcript_id, cancelled)) => {
-            emit_transcribe_file_complete(&app, &job_id, &transcript_id, cancelled);
+            emit_transcribe_file_complete(app, &job_id, &transcript_id, cancelled);
             Ok(transcript_id)
         }
         Err(e) => {
-            emit_transcribe_file_error(&app, &job_id, &e);
+            emit_transcribe_file_error(app, &job_id, &e);
             Err(e)
         }
     }
@@ -5504,7 +5877,7 @@ async fn run_palette_inner(
         Ok(outcome) => {
             guard.succeed().await;
             if let Some(message) = &outcome.message {
-                notify_palette(app, message);
+                notify_user(app, message);
             }
             Ok(outcome)
         }
@@ -5514,10 +5887,11 @@ async fn run_palette_inner(
 
 /// Tells the user something about a run whose window has already gone.
 ///
-/// A notification rather than an in-app banner: by the time a downgrade is
-/// known the palette is hidden and the settings window is very likely closed,
-/// so a banner would be a message nobody ever sees.
-pub fn notify_palette(app: &AppHandle, message: &str) {
+/// A notification rather than an in-app banner: the palette, the screen
+/// capture and a `kea://` URL are all invoked from someone else's app, so by
+/// the time there is something to say the settings window is very likely
+/// closed and a banner would be a message nobody ever sees.
+pub fn notify_user(app: &AppHandle, message: &str) {
     if let Err(e) = app
         .notification()
         .builder()
@@ -5525,7 +5899,7 @@ pub fn notify_palette(app: &AppHandle, message: &str) {
         .body(message)
         .show()
     {
-        tracing::warn!(error = %e, message, "could not show the palette notification");
+        tracing::warn!(error = %e, message, "could not show the notification");
     }
 }
 
@@ -7210,17 +7584,54 @@ mod tests {
             parse_perm_kind("accessibility"),
             Ok(PermKind::Accessibility)
         );
+        assert_eq!(parse_perm_kind("calendar"), Ok(PermKind::Calendar));
         assert!(parse_perm_kind("camera").is_err());
     }
 
     #[test]
-    fn all_permission_statuses_lists_three_kinds() {
+    fn all_permission_statuses_lists_every_kind() {
         let permissions = kea_platform::new_permissions();
         let items = all_permission_statuses(permissions.as_ref());
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), PERM_KINDS.len());
         assert!(items.iter().any(|i| i.kind == "microphone"));
         assert!(items.iter().any(|i| i.kind == "screen_recording"));
         assert!(items.iter().any(|i| i.kind == "accessibility"));
+        assert!(items.iter().any(|i| i.kind == "calendar"));
+    }
+
+    /// The table is the only place a kind is spelled, so the two commands and
+    /// the status list cannot disagree about what exists. Pinning the length
+    /// here is what catches a row added to `PERM_KINDS` without the matching
+    /// `"calendar"`-style entry in `ui/src/api.ts` and `PermissionPanel`.
+    #[test]
+    fn every_perm_kind_round_trips_through_its_wire_name() {
+        assert_eq!(PERM_KINDS.len(), 4);
+        for (name, kind) in PERM_KINDS {
+            assert_eq!(parse_perm_kind(name), Ok(kind), "{name}");
+        }
+    }
+
+    /// The three strings `ActionItemStatus` is spelled as in `ui/src/api.ts`.
+    /// `set_meeting_action_item_status` rejects anything else, so a union
+    /// widened on one side only is a visible error rather than a silent no-op.
+    #[test]
+    fn the_action_item_statuses_the_ui_sends_all_parse() {
+        for status in ["open", "done", "dropped"] {
+            assert!(ActionItemStatus::from_str(status).is_some(), "{status}");
+        }
+        assert!(ActionItemStatus::from_str("closed").is_none());
+    }
+
+    /// A second trigger arriving mid-pass is dropped, not queued: a provider
+    /// slower than the cadence would otherwise build an unbounded backlog that
+    /// keeps billing after the meeting has ended.
+    #[test]
+    fn a_second_interim_trigger_is_dropped_while_one_is_in_flight() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = try_acquire_busy(&flag).expect("the first pass claims the slot");
+        assert!(try_acquire_busy(&flag).is_none());
+        drop(first);
+        assert!(try_acquire_busy(&flag).is_some(), "the slot is released");
     }
 
     #[tokio::test]

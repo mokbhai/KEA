@@ -1,3 +1,4 @@
+use kea_core::store::meetings::MeetingNotes;
 use kea_infer::DownloadProgress;
 use kea_platform::audio::DeviceFallback;
 use kea_platform::{DictationState, MeetingState};
@@ -351,6 +352,30 @@ pub fn emit_meeting_error(app: &AppHandle, message: &str) {
     );
 }
 
+/// Notes written part-way through a recording.
+///
+/// The stored row itself rather than a payload struct of its own: the notes
+/// panel renders the same shape whether it came from `get_meeting` or from
+/// here, so a second spelling would only be a second thing to keep in step.
+pub fn emit_meeting_notes(app: &AppHandle, notes: &MeetingNotes) {
+    let _ = app.emit("meeting:notes", notes.clone());
+}
+
+/// An interim notes pass that did not produce notes.
+///
+/// Its own event rather than `meeting:error`, because the two mean different
+/// things to the user: `meeting:error` says the recording is in trouble, while
+/// this says an optional extra did not happen and the meeting is still
+/// recording. The final pass at stop still produces the notes they keep.
+pub fn emit_meeting_notes_error(app: &AppHandle, message: &str) {
+    let _ = app.emit(
+        "meeting:notes_error",
+        RewriteEventPayload {
+            message: message.to_string(),
+        },
+    );
+}
+
 /// Progress for one file-transcription job.
 ///
 /// Keyed by `job_id`, not by path — the same reason `model:download:*` keys
@@ -649,6 +674,39 @@ mod tests {
         })
         .unwrap();
         assert!(json.contains(r#""speaker_key":null"#), "{json}");
+    }
+
+    /// The interim event carries the stored row verbatim, because the notes
+    /// panel is written against `MeetingNotes` and nothing else. A payload
+    /// wrapper here would have to be unwrapped in the UI for no gain.
+    #[test]
+    fn meeting_notes_payload_is_the_stored_row() {
+        let json = serde_json::to_string(&MeetingNotes {
+            meeting_id: "m1".into(),
+            summary: "we talked".into(),
+            decisions: "ship it".into(),
+            action_items: "- send the deck".into(),
+            follow_ups: String::new(),
+            open_questions: String::new(),
+            prompt_version: "interim-v1".into(),
+            engine_id: Some("openai".into()),
+            model: Some("gpt-4o-mini".into()),
+        })
+        .unwrap();
+        assert!(json.contains(r#""meeting_id":"m1""#), "{json}");
+        assert!(json.contains(r#""summary":"we talked""#), "{json}");
+        assert!(json.contains(r#""prompt_version":"interim-v1""#), "{json}");
+    }
+
+    /// The same `{ message }` shape as `meeting:error`, so the UI's error
+    /// rendering is one code path rather than two.
+    #[test]
+    fn meeting_notes_error_payload_is_a_message() {
+        let json = serde_json::to_string(&RewriteEventPayload {
+            message: "provider refused".into(),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"message":"provider refused"}"#);
     }
 
     #[test]

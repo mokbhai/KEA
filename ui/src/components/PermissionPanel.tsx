@@ -4,6 +4,7 @@ import {
   openAccessibilitySettings,
   requestPermission,
   type PermStatus,
+  type PermissionKind,
   type PermissionStatusItem,
 } from "../api";
 import { toMessage } from "../lib/format";
@@ -27,6 +28,8 @@ function permissionLabel(kind: string): string {
       return "Screen Recording";
     case "accessibility":
       return "Accessibility";
+    case "calendar":
+      return "Calendar";
     default:
       return kind;
   }
@@ -54,9 +57,7 @@ export default function PermissionPanel() {
     void refreshPerms();
   }, [refreshPerms]);
 
-  const onRequestPermission = async (
-    kind: "microphone" | "screen_recording" | "accessibility",
-  ) => {
+  const onRequestPermission = async (kind: PermissionKind) => {
     setPermsBusy(true);
     setPermsStatus(null);
     try {

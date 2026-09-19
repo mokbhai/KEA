@@ -2561,6 +2561,11 @@ dependencies = [
  "arboard",
  "async-trait",
  "futures-util",
+ "getrandom 0.3.4",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "kea-core",
  "kea-engines",
  "kea-features",
@@ -2581,6 +2586,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

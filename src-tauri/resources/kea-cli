@@ -1,0 +1,161 @@
+#!/bin/sh
+# KEA command-line shim.
+#
+# Two transports, because KEA has two scripting surfaces and they answer
+# different questions:
+#
+#   * `open -g "kea://…"`      — fire-and-forget. Always available.
+#   * `curl --unix-socket …`   — request/response. Needs the local API on.
+#
+# `-g` is load-bearing on the fire-and-forget half: opening a URL activates the
+# handler app, and every selection verb depends on the user's app being
+# frontmost. `-g` leaves KEA in the background so the selection survives.
+#
+# Installed by KEA's "Install command-line tool" button, which symlinks this
+# file out of the app bundle into /usr/local/bin/kea. It lives inside the
+# bundle so it is covered by the same (ad-hoc, under `make install`) code
+# signature as the app; `make install` deliberately does not write to
+# /usr/local/bin, because that target needs no password today and this would
+# give it one.
+
+set -eu
+
+APP_SUPPORT="${HOME}/Library/Application Support/ai.kea.desktop"
+SOCKET="${KEA_API_SOCKET:-${APP_SUPPORT}/kea-api.sock}"
+TOKEN_FILE="${KEA_API_TOKEN_FILE:-${APP_SUPPORT}/api-token}"
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: kea <command> [options]
+
+Fire-and-forget (no local API needed):
+  kea rewrite [--mode MODE] [--preset ID] [--instruction TEXT]
+  kea dictation start|stop|toggle
+  kea read-aloud
+  kea open PAGE                  (general, rewrite, dictation, models, …)
+
+Request/response (needs the local API, enabled on KEA's General page):
+  kea rewrite --text TEXT [--mode MODE]     prints the rewritten text
+  kea rewrite --insert [--mode MODE]        rewrites the selection in place
+  kea dictate-stop                          prints the transcript
+  kea transcribe PATH                       transcribes an audio/video file
+  kea status                                prints version and lifecycle state
+
+MODE is one of: improve, fix_grammar, professional, concise, friendly,
+audio_refinement, ask_kea, translate.
+
+Environment:
+  KEA_API_SOCKET       override the socket path
+  KEA_API_TOKEN_FILE   override the token file path
+USAGE
+  exit 64
+}
+
+# URL-encode one argument. `od` rather than a shell loop over characters: this
+# has to be byte-correct for non-ASCII instructions, and `printf %s | od` is
+# the portable way to get at the bytes.
+urlencode() {
+  printf %s "$1" | od -An -tx1 -v | tr -d '\n ' | sed 's/../%&/g'
+}
+
+open_url() {
+  # No `open -W`: the whole point is not to wait, and not to take focus.
+  open -g "$1"
+}
+
+api() {
+  method="$1"; path="$2"; shift 2
+  if [ ! -S "$SOCKET" ]; then
+    echo "kea: the local API is not running. Turn it on in KEA > General." >&2
+    exit 69
+  fi
+  if [ ! -r "$TOKEN_FILE" ]; then
+    echo "kea: cannot read $TOKEN_FILE. Turn the local API off and on again in KEA > General." >&2
+    exit 77
+  fi
+  token=$(cat "$TOKEN_FILE")
+  # --fail-with-body so a 409 or 429 still prints KEA's explanation, and the
+  # exit status still says it failed.
+  curl --silent --show-error --fail-with-body \
+    --unix-socket "$SOCKET" \
+    -X "$method" \
+    -H "x-kea-token: ${token}" \
+    -H "content-type: application/json" \
+    "$@" \
+    "http://localhost${path}"
+}
+
+json_string() {
+  # Quote a value for a JSON body. Only the two characters that can break out
+  # of a JSON string need escaping here; control characters in a shell
+  # argument are already vanishingly unlikely and would be rejected by the
+  # server's parser rather than misread.
+  printf '"%s"' "$(printf %s "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+}
+
+[ $# -ge 1 ] || usage
+command="$1"; shift
+
+case "$command" in
+  rewrite)
+    mode=""; preset=""; instruction=""; text=""; insert=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --mode) mode="$2"; shift 2 ;;
+        --preset) preset="$2"; shift 2 ;;
+        --instruction) instruction="$2"; shift 2 ;;
+        --text) text="$2"; shift 2 ;;
+        --insert) insert=1; shift ;;
+        *) usage ;;
+      esac
+    done
+
+    if [ -n "$text" ] || [ "$insert" -eq 1 ]; then
+      body="{"
+      [ -n "$text" ] && body="${body}\"text\":$(json_string "$text"),"
+      [ -n "$mode" ] && body="${body}\"mode\":$(json_string "$mode"),"
+      [ -n "$preset" ] && body="${body}\"preset_id\":$(json_string "$preset"),"
+      [ -n "$instruction" ] && body="${body}\"instruction\":$(json_string "$instruction"),"
+      body="${body}\"insert\":$( [ "$insert" -eq 1 ] && echo true || echo false )}"
+      api POST /v1/rewrite --data "$body"
+      echo
+    else
+      url="kea://rewrite"; sep="?"
+      [ -n "$mode" ] && { url="${url}${sep}mode=$(urlencode "$mode")"; sep="&"; }
+      [ -n "$preset" ] && { url="${url}${sep}preset=$(urlencode "$preset")"; sep="&"; }
+      [ -n "$instruction" ] && { url="${url}${sep}instruction=$(urlencode "$instruction")"; sep="&"; }
+      open_url "$url"
+    fi
+    ;;
+  dictation)
+    [ $# -eq 1 ] || usage
+    open_url "kea://dictation/$1"
+    ;;
+  dictate-stop)
+    api POST /v1/dictation/stop --data '{}'
+    echo
+    ;;
+  read-aloud)
+    open_url "kea://read-aloud"
+    ;;
+  transcribe)
+    [ $# -eq 1 ] || usage
+    api POST /v1/transcribe --data "{\"path\":$(json_string "$1")}"
+    echo
+    ;;
+  open)
+    [ $# -eq 1 ] || usage
+    # The one verb that is meant to take focus, so no -g.
+    open "kea://open/$1"
+    ;;
+  status)
+    api GET /v1/status
+    echo
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage
+    ;;
+esac
