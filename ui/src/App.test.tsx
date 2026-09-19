@@ -44,6 +44,7 @@ function mockShellWorld() {
         set_setting: () => undefined,
         list_presets: () => [],
         get_prompt_override: () => null,
+        list_app_profiles: () => [],
       },
     }),
   );
@@ -209,6 +210,17 @@ describe("AppShell", () => {
       await screen.findByRole("heading", { level: 1, name: "AI Providers" }),
     ).toBeTruthy();
     expect(document.activeElement).not.toBe(menuButton);
+  });
+
+  it("routes to the App profiles page from the nav", async () => {
+    narrow = false;
+    await renderShell();
+
+    await userEvent.click(screen.getByRole("button", { name: /App profiles/ }));
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "App profiles" }),
+    ).toBeTruthy();
   });
 
   it("closes the drawer after navigating from it", async () => {

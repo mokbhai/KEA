@@ -8,6 +8,7 @@ const KEY_ACTIVE_MODEL: &str = "dictation.active_model";
 const KEY_HOLD_TO_TALK: &str = "dictation.hold_to_talk";
 const KEY_INPUT_DEVICE: &str = "dictation.input_device";
 const KEY_PREROLL: &str = "dictation.preroll";
+const KEY_LANGUAGE: &str = "dictation.language";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DictationSettings {
@@ -38,6 +39,20 @@ pub struct DictationSettings {
     /// the mic never open without a deliberate recording.
     #[serde(default = "preroll_default")]
     pub preroll: bool,
+    /// BCP-47 tag to decode as, or `None` to let the model detect it.
+    ///
+    /// **Whisper only.** The ONNX transducer has no language setting, and the
+    /// design review closed a defect where one was accepted from this setting
+    /// and silently dropped on the way down (see the comment on
+    /// `kea_engines::stt::parakeet`). So this is plumbed to exactly one engine,
+    /// and the UI gates the control on the bound engine rather than on the
+    /// model alone — a control that looks honoured and is not is worse than no
+    /// control.
+    ///
+    /// `None` is not a missing value to paper over: it is auto-detect, which is
+    /// what whisper does when `set_language` is never called.
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 /// A config written before the preroll existed has no row, and a payload from
@@ -62,6 +77,7 @@ impl DictationSettingsRepo {
             hold_to_talk: self.settings.get(KEY_HOLD_TO_TALK).await?.unwrap_or(false),
             input_device: self.settings.get_optional(KEY_INPUT_DEVICE).await?,
             preroll: self.settings.get(KEY_PREROLL).await?.unwrap_or(true),
+            language: self.settings.get_optional(KEY_LANGUAGE).await?,
         })
     }
 
@@ -78,6 +94,7 @@ impl DictationSettingsRepo {
         self.settings
             .set(KEY_INPUT_DEVICE, &cfg.input_device)
             .await?;
+        self.settings.set(KEY_LANGUAGE, &cfg.language).await?;
         self.settings.set(KEY_PREROLL, &cfg.preroll).await?;
         Ok(())
     }
@@ -99,6 +116,7 @@ mod tests {
             hold_to_talk: true,
             input_device: Some("Yeti".into()),
             preroll: false,
+            language: None,
         };
         repo.set(&cfg).await.unwrap();
         assert_eq!(repo.get().await.unwrap(), cfg);
@@ -117,6 +135,7 @@ mod tests {
             hold_to_talk: false,
             input_device: None,
             preroll: true,
+            language: None,
         })
         .await
         .unwrap();
@@ -126,6 +145,7 @@ mod tests {
             hold_to_talk: false,
             input_device: None,
             preroll: true,
+            language: None,
         })
         .await
         .unwrap();
@@ -174,6 +194,7 @@ mod tests {
             hold_to_talk: false,
             input_device: Some("Yeti".into()),
             preroll: true,
+            language: None,
         };
         repo.set(&cfg).await.unwrap();
         assert_eq!(
@@ -200,6 +221,7 @@ mod tests {
             hold_to_talk: false,
             input_device: None,
             preroll: false,
+            language: None,
         })
         .await
         .unwrap();

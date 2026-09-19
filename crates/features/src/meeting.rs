@@ -133,6 +133,10 @@ pub async fn transcribe_meeting_segment(
 
     let stt_opts = SttOpts {
         model: binding.model.clone(),
+        // Deliberately not `dictation.language`. Meetings have no language
+        // setting of their own, and silently borrowing dictation's would mean a
+        // user who pinned dictation to one language finds their meetings
+        // decoded as it too, with nothing in the meetings UI to explain why.
         language: None,
         provider_ref: binding.provider_ref.clone(),
         vocabulary: hint_terms(vocabulary),

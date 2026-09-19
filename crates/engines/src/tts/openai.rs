@@ -163,10 +163,9 @@ mod tests {
             .synthesize(
                 "hello",
                 TtsOpts {
-                    model: None,
-                    voice: None,
                     format: Some("wav".into()),
                     provider_ref: Some("openai".into()),
+                    ..Default::default()
                 },
             )
             .await

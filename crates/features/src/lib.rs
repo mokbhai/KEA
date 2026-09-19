@@ -6,7 +6,7 @@ pub mod registry;
 pub mod rewrite;
 pub mod tts;
 pub use dictation::{run_dictation, run_dictation_with_storage, DictationFeature};
-pub use feature::{ActionGuard, CapKind, CapSlot, Command, Feature};
+pub use feature::{ActionGuard, CapKind, CapSlot, Command, Feature, ProfileOverrides};
 pub use meeting::{
     drain_and_stop_meeting, run_meeting_poll_segment, run_meeting_start, run_meeting_stop,
     synthesize_meeting_notes, synthesize_meeting_title, transcribe_meeting_segment,

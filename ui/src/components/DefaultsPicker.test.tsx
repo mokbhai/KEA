@@ -479,4 +479,43 @@ describe("DefaultsPicker", () => {
       settings: { active_voice: "nova", active_model: "vits-piper-en-us-amy-low" },
     });
   });
+  it("offers the system synthesizer, which has nothing to download", async () => {
+    // A local engine with no catalog used to be skipped entirely: registered
+    // in Rust, bindable nowhere.
+    onInvoke({
+      list_tts_engines: () => [
+        { id: "system-tts", models: [] },
+        { id: "openai-tts", models: [] },
+      ],
+      list_providers: () => [{ provider_ref: "openai", name: "OpenAI", built_in: true }],
+      get_binding: () => null,
+      has_credential: () => true,
+      list_onnx_models: () => [],
+      list_installed_onnx_models: () => [],
+      set_binding: () => undefined,
+      get_tts_settings: () => ({ active_voice: "nova", active_model: null }),
+      set_tts_settings: () => undefined,
+    });
+    render(<Harness capability="tts" />);
+
+    const row = await screen.findByRole("button", { name: /^System voice/ });
+    expect(row.hasAttribute("disabled")).toBe(false);
+    expect(screen.getByText("ready ✓")).toBeTruthy();
+
+    await userEvent.click(row);
+
+    await waitFor(() => expect(invokeCalls("set_binding")).toHaveLength(1));
+    // The binding names the engine only — which voice it speaks with is a
+    // Read-aloud setting.
+    expect(invokeCalls("set_binding")[0]).toEqual({
+      feature: "default",
+      slot: "tts",
+      engine: "system-tts",
+      model: null,
+      providerRef: null,
+    });
+    // And nothing was written to the voice settings, since the pick carried
+    // no voice of its own.
+    expect(invokeCalls("set_tts_settings")).toHaveLength(0);
+  });
 });

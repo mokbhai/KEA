@@ -1,10 +1,14 @@
 import { useEffect, useState } from "react";
 import {
   getTtsSettings,
+  listOnnxVoices,
+  listSystemVoices,
   previewVoice,
   runReadAloud,
   setTtsSettings,
   triggerTts,
+  MAX_TTS_SPEED,
+  MIN_TTS_SPEED,
   type TtsSettings,
 } from "../api";
 import FeatureAiCard from "../components/FeatureAiCard";
@@ -16,12 +20,69 @@ import Spinner from "../components/Spinner";
 import { useFeatureAi } from "../hooks/useFeatureAi";
 import { useOptimisticSetting } from "../hooks/useOptimisticSetting";
 import { OPENAI_TTS_VOICES } from "../lib/capabilityDefaults";
+import { engineSpec } from "../lib/engines";
 import type { SlotSpec } from "../lib/featureSlot";
 import { toMessage } from "../lib/format";
 import type { Navigate } from "../lib/nav";
 
 const TTS_FEATURE = "tts";
 const TTS_COMMAND = "read_selection";
+
+/** One row of the Voice dropdown. `value` is what gets stored. */
+type VoiceChoice = { value: string; label: string };
+
+/** How the Voice row is filled, and what to say about it, for one engine. */
+type VoiceSource = {
+  hint: string;
+  load: () => Promise<VoiceChoice[]>;
+};
+
+/**
+ * Which voices a bound engine offers.
+ *
+ * The dropdown used to be cloud-only — "local voices bring their own" — which
+ * was true when every local voice was a single-speaker Piper bundle. Kokoro
+ * and Kitten ship dozens of speakers in one model and the system synthesizer
+ * has whatever macOS has installed, so the row is per-engine now. Returning
+ * `null` means this engine has nothing to choose between, and the row is
+ * hidden rather than shown empty.
+ */
+function voiceSourceFor(engineId: string | undefined, model: string | null): VoiceSource | null {
+  if (!engineId) return null;
+
+  if (engineId === "system-tts") {
+    return {
+      hint: "Installed through System Settings — add more there.",
+      load: async () =>
+        (await listSystemVoices()).map((voice) => ({
+          value: voice.id,
+          label:
+            voice.quality === "default"
+              ? `${voice.name} (${voice.language})`
+              : `${voice.name} (${voice.language}, ${voice.quality})`,
+        })),
+    };
+  }
+
+  if (engineSpec(engineId)?.cloudOption?.cloudVoices) {
+    return {
+      hint: "The voices this cloud provider offers.",
+      load: async () => OPENAI_TTS_VOICES.map((voice) => ({ value: voice, label: voice })),
+    };
+  }
+
+  // A local ONNX voice: multi-speaker bundles have a speaker table, the
+  // single-speaker Piper ones have none and the row disappears.
+  if (!model) return null;
+  return {
+    hint: "The speakers this local voice bundle ships.",
+    load: async () =>
+      (await listOnnxVoices(model)).map((voice) => ({
+        value: voice.name,
+        label: `${voice.name} (${voice.language})`,
+      })),
+  };
+}
 
 const SLOTS: SlotSpec[] = [
   { feature: "tts", slot: "tts", capability: "tts", label: "Text to speech" },
@@ -34,7 +95,7 @@ type Props = {
 export default function ReadAloudPage({ onNavigate }: Props) {
   const ai = useFeatureAi(SLOTS);
   const tts = useOptimisticSetting<TtsSettings>({
-    initial: { active_voice: null, active_model: null },
+    initial: { active_voice: null, active_model: null, speed: 1 },
     persist: setTtsSettings,
   });
   const settings = tts.value;
@@ -54,6 +115,37 @@ export default function ReadAloudPage({ onNavigate }: Props) {
   }, [setSettings, setSettingsError]);
 
   const effective = ai.statuses?.[0]?.effective ?? null;
+  const engineId = effective?.engine_id;
+  const boundModel = effective?.model ?? settings.active_model;
+  const [voices, setVoices] = useState<VoiceChoice[]>([]);
+  // A rate is only absent when talking to a backend older than the setting;
+  // the natural pace is what that used to mean.
+  const speed = settings.speed ?? 1;
+
+  const voiceSource = voiceSourceFor(engineId, boundModel);
+  const voiceHint = voiceSource?.hint;
+
+  useEffect(() => {
+    if (!voiceSource) {
+      setVoices([]);
+      return;
+    }
+    let live = true;
+    voiceSource
+      .load()
+      // An engine with no voice list is not a failure worth a banner: the
+      // dropdown simply offers the default.
+      .catch(() => [])
+      .then((loaded) => {
+        if (live) setVoices(loaded);
+      });
+    return () => {
+      live = false;
+    };
+    // `voiceSource` is rebuilt every render; what actually changes it is the
+    // engine and the model it is bound to.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engineId, boundModel]);
 
   const playSample = async () => {
     setBusy(true);
@@ -126,24 +218,51 @@ export default function ReadAloudPage({ onNavigate }: Props) {
                 hint="Reads the selected text out loud."
                 checkRegistration
               />
-              <Row label="Voice" hint="Used by the cloud voices; local voices bring their own.">
-                {tts.savedKey === "voice" && <span className="kea-saved">Saved ✓</span>}
-                <select
-                  className="kea-select"
-                  aria-label="Voice"
-                  value={settings.active_voice ?? ""}
+              {voices.length > 0 && voiceHint && (
+                <Row label="Voice" hint={voiceHint}>
+                  {tts.savedKey === "voice" && <span className="kea-saved">Saved ✓</span>}
+                  <select
+                    className="kea-select"
+                    aria-label="Voice"
+                    value={settings.active_voice ?? ""}
+                    disabled={anyBusy}
+                    onChange={(e) =>
+                      void tts.save({ active_voice: e.target.value || null }, "voice")
+                    }
+                  >
+                    <option value="">Default</option>
+                    {voices.map((voice) => (
+                      <option key={voice.value} value={voice.value}>
+                        {voice.label}
+                      </option>
+                    ))}
+                  </select>
+                </Row>
+              )}
+              <Row label="Speed" hint="How fast the text is read. 1× is the voice's own pace.">
+                {tts.savedKey === "speed" && <span className="kea-saved">Saved ✓</span>}
+                <input
+                  type="range"
+                  aria-label="Speed"
+                  min={MIN_TTS_SPEED}
+                  max={MAX_TTS_SPEED}
+                  step={0.05}
+                  value={speed}
                   disabled={anyBusy}
-                  onChange={(e) =>
-                    void tts.save({ active_voice: e.target.value || null }, "voice")
+                  // Dragging emits a change per pixel, so the write waits for
+                  // the drag to end; the number beside it moves immediately.
+                  onChange={(e) => setSettings({ ...settings, speed: Number(e.target.value) })}
+                  onPointerUp={(e) =>
+                    void tts.save({ speed: Number(e.currentTarget.value) }, "speed")
                   }
-                >
-                  <option value="">Default</option>
-                  {OPENAI_TTS_VOICES.map((voice) => (
-                    <option key={voice} value={voice}>
-                      {voice}
-                    </option>
-                  ))}
-                </select>
+                  onKeyUp={(e) =>
+                    void tts.save({ speed: Number(e.currentTarget.value) }, "speed")
+                  }
+                  onBlur={(e) => void tts.save({ speed: Number(e.currentTarget.value) }, "speed")}
+                />
+                <span className="kea-muted" style={{ minWidth: "3.5ch" }}>
+                  {speed.toFixed(2)}×
+                </span>
               </Row>
             </RowGroup>
 

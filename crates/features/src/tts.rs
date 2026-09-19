@@ -108,6 +108,7 @@ async fn synthesize(
         voice: settings.active_voice.clone(),
         format: None,
         provider_ref: binding.provider_ref.clone(),
+        speed: Some(settings.speed),
     };
 
     let pcm = engine

@@ -31,6 +31,9 @@ pub use traits::*;
 #[cfg(feature = "tts-local")]
 pub use tts::register_sherpa_tts_engine;
 
+#[cfg(feature = "tts-system")]
+pub use tts::{register_system_tts_engine, SystemTtsEngine, SYSTEM_TTS_ENGINE_ID};
+
 use std::sync::Arc;
 
 pub fn register_phase1_engines(

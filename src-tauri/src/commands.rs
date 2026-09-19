@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use kea_core::app_context::{resolve_profile, AppProfile, ProfileQuery};
 use kea_core::dictation::{apply_vocabulary, DictationSettings, DictationSettingsRepo};
 use kea_core::log::{current_log_path, tail_log_file};
 use kea_core::meetings::{MeetingSettings, MeetingSettingsRepo};
@@ -17,6 +18,7 @@ use kea_core::rewrite::{
     RewriteInput, RewriteMode, RewritePreset,
 };
 use kea_core::store::actions::{ActionDetail, ActionRepo, ActionRow};
+use kea_core::store::app_profiles::AppProfileRepo;
 use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_core::store::conversations::{ConversationRepo, ConversationSummary, Message};
 use kea_core::store::hotkeys::{HotkeyBindingRepo, HotkeyBindingRow};
@@ -28,6 +30,7 @@ use kea_engines::{EngineRegistry, TtsOpts};
 use kea_features::demo::{run_ping, DemoFeature};
 use kea_features::run_rewrite_with_storage;
 use kea_features::tts::run_tts_with_player;
+use kea_features::ProfileOverrides;
 use kea_features::{
     drain_and_stop_meeting, run_dictation_with_storage, run_meeting_poll_segment,
     run_meeting_start, run_meeting_stop, ActiveMeeting, CapKind, ContentStorageOpts,
@@ -756,6 +759,60 @@ fn system_language_tag() -> String {
         .unwrap_or_else(|| "en".to_string())
 }
 
+/// The value of whatever parameter `mode` takes, read from that mode's own key.
+///
+/// Dispatches through the descriptor rather than naming a mode: `AskKea` takes
+/// an instruction and `Translate` a target language, and each stores it under
+/// its own settings key. A `matches!(mode, ..)` here is the shape that made
+/// adding Translate mean editing four unrelated conditionals.
+async fn mode_parameter_value(settings: &SettingsRepo, mode: RewriteMode) -> Option<String> {
+    let parameter = mode.parameter()?;
+    settings
+        .get_optional::<String>(parameter.setting_key())
+        .await
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+}
+
+/// Probes the frontmost app right now, honouring the opt-in capture flags.
+///
+/// Returns `None` when nothing could be identified, which is the same thing as
+/// "no profile applies" to every caller.
+pub async fn capture_app_context_now(state: &AppState) -> Option<kea_platform::AppContext> {
+    let opts = capture_opts(&state.config_pool).await;
+    let ctx = kea_platform::new_app_context_probe().capture(opts);
+    ctx.bundle_id.is_some().then_some(ctx)
+}
+
+/// The default rewrite input with `profile`'s mode and preset applied.
+///
+/// The re-derive is the part worth being careful about: a mode's parameter
+/// comes from a key chosen BY that mode, so a profile that forces Translate
+/// must also pick up `rewrite.translate.target`. Applying the mode without
+/// re-reading the parameter would hand Translate the Ask instruction, or
+/// nothing at all.
+pub async fn rewrite_input_for_profile(
+    config_pool: &SqlitePool,
+    profile: Option<&AppProfile>,
+) -> RewriteInput {
+    let mut input = default_rewrite_input(config_pool).await;
+    let Some(profile) = profile else {
+        return input;
+    };
+    if let Some(mode) = profile.mode() {
+        if mode != input.mode {
+            input.mode = mode;
+            input.custom_instruction =
+                mode_parameter_value(&SettingsRepo::new(config_pool.clone()), mode).await;
+        }
+    }
+    if profile.preset_id.is_some() {
+        input.preset_id = profile.preset_id.clone();
+    }
+    input
+}
+
 pub async fn default_rewrite_input(config_pool: &SqlitePool) -> RewriteInput {
     let settings = SettingsRepo::new(config_pool.clone());
     let mode = settings
@@ -770,20 +827,7 @@ pub async fn default_rewrite_input(config_pool: &SqlitePool) -> RewriteInput {
         .await
         .ok()
         .flatten();
-    // Dispatch through the descriptor rather than naming a mode: `AskKea` takes
-    // an instruction and `Translate` a target language, and each stores it under
-    // its own settings key. A `matches!(mode, ..)` here is the shape that made
-    // adding Translate mean editing four unrelated conditionals.
-    let custom_instruction = if let Some(parameter) = mode.parameter() {
-        settings
-            .get_optional::<String>(parameter.setting_key())
-            .await
-            .ok()
-            .flatten()
-            .filter(|s| !s.is_empty())
-    } else {
-        None
-    };
+    let custom_instruction = mode_parameter_value(&settings, mode).await;
     // Translate is the one mode whose parameter is not optional — without a
     // target the prompt cannot be rendered at all — so it falls back rather
     // than failing the run.
@@ -806,27 +850,46 @@ pub async fn default_rewrite_input(config_pool: &SqlitePool) -> RewriteInput {
     }
 }
 
-async fn store_conversations_enabled(config_pool: &SqlitePool) -> bool {
-    let settings = SettingsRepo::new(config_pool.clone());
-    // The generic set_setting command stores values as JSON strings (the UI
-    // writes "true"/"false"), while other callers may store a JSON bool —
-    // accept both so a user's opt-out is never silently ignored.
-    match settings
-        .get::<serde_json::Value>("history.store_conversations")
+/// Reads a boolean setting that may have been written in either encoding.
+///
+/// The generic `set_setting` command takes a `String` and JSON-encodes it, so
+/// the UI's toggles land as the JSON string `"true"`/`"false"`, while typed
+/// callers write a JSON bool. A reader that assumes one shape does not fail
+/// loudly — it fails to deserialize, falls back to its default, and the toggle
+/// is silently inert. That is exactly what happened to the two app-context
+/// capture flags, so this is the one place that knows about both shapes.
+fn bool_setting(value: Option<&serde_json::Value>, default: bool) -> bool {
+    match value {
+        Some(serde_json::Value::Bool(v)) => *v,
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => default,
+        },
+        Some(other) => {
+            tracing::warn!(value = %other, "unexpected boolean setting shape, using the default");
+            default
+        }
+        None => default,
+    }
+}
+
+/// [`bool_setting`] against the store, defaulting on any read error too.
+async fn read_bool_setting(config_pool: &SqlitePool, key: &str, default: bool) -> bool {
+    match SettingsRepo::new(config_pool.clone())
+        .get::<serde_json::Value>(key)
         .await
     {
-        Ok(Some(serde_json::Value::Bool(v))) => v,
-        Ok(Some(serde_json::Value::String(s))) => s != "false",
-        Ok(Some(other)) => {
-            tracing::warn!(value = %other, "unexpected history.store_conversations value, defaulting to true");
-            true
-        }
-        Ok(None) => true, // default on
+        Ok(value) => bool_setting(value.as_ref(), default),
         Err(e) => {
-            tracing::warn!(%e, "failed to read history.store_conversations, defaulting to true");
-            true
+            tracing::warn!(%e, key, "failed to read a boolean setting, using the default");
+            default
         }
     }
+}
+
+async fn store_conversations_enabled(config_pool: &SqlitePool) -> bool {
+    read_bool_setting(config_pool, "history.store_conversations", true).await
 }
 
 /// Settings key for the dictation cue sounds toggle.
@@ -880,7 +943,11 @@ pub fn spawn_dictation_cue(state: &Arc<AppState>, cue: Cue) {
     });
 }
 
-pub async fn execute_rewrite(state: &AppState, input: RewriteInput) -> Result<String, String> {
+pub async fn execute_rewrite(
+    state: &AppState,
+    input: RewriteInput,
+    profile: &ProfileOverrides,
+) -> Result<String, String> {
     let bindings = BindingRepo::new(state.config_pool.clone());
     let actions = ActionRepo::new(state.data_pool.clone());
     let presets = PresetRepo::new(state.config_pool.clone());
@@ -900,6 +967,7 @@ pub async fn execute_rewrite(state: &AppState, input: RewriteInput) -> Result<St
         &overrides,
         textio.as_ref(),
         input,
+        profile,
         storage,
     )
     .await
@@ -1937,6 +2005,13 @@ async fn start_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(
     // does not stay lit over a recording it is not part of.
     stop_input_preview_inner(state, app).await;
 
+    // Probed before the microphone opens and before any KEA window can take
+    // focus, so the answer is the app the user is actually dictating into.
+    let app_context = capture_app_context_now(state).await;
+    if let Ok(mut slot) = state.dictation_app_context.lock() {
+        *slot = app_context;
+    }
+
     // Reject before touching the audio lock so a press during meeting
     // synthesis can't park on the lock and start once it's released.
     if state.meeting_processing.load(Ordering::SeqCst) {
@@ -2116,6 +2191,13 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
     };
 
     let vocabulary = load_vocabulary(&state.config_pool).await;
+    let app_context = state
+        .dictation_app_context
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    let profile = profile_for(&state.config_pool, app_context.as_ref()).await;
+    let profile = ProfileOverrides::from_profile(profile.as_ref());
 
     let result = run_dictation_with_storage(
         &state.engines,
@@ -2127,6 +2209,7 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
         textio.as_ref(),
         &settings,
         &vocabulary,
+        &profile,
         storage,
     )
     .await;
@@ -2421,6 +2504,113 @@ async fn load_vocabulary(config_pool: &SqlitePool) -> Vec<VocabularyEntry> {
             Vec::new()
         }
     }
+}
+
+/// Reads the two opt-in capture flags.
+///
+/// Both default to OFF and are read with `get` rather than `get_optional`: they
+/// are plain bools with a default, and an absent row means "not opted in".
+async fn capture_opts(config_pool: &SqlitePool) -> kea_platform::CaptureOpts {
+    kea_platform::CaptureOpts {
+        window_title: read_bool_setting(
+            config_pool,
+            kea_platform::CaptureOpts::SETTING_WINDOW_TITLE,
+            false,
+        )
+        .await,
+        url: read_bool_setting(config_pool, kea_platform::CaptureOpts::SETTING_URL, false).await,
+    }
+}
+
+/// The profile that applies to `ctx`, if any.
+///
+/// Fails open like the vocabulary read: a profile is a refinement, and a broken
+/// profiles table must not be the reason a rewrite refuses to run.
+pub async fn profile_for(
+    config_pool: &SqlitePool,
+    ctx: Option<&kea_platform::AppContext>,
+) -> Option<AppProfile> {
+    let ctx = ctx?;
+    let profiles = match AppProfileRepo::new(config_pool.clone())
+        .list_enabled()
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("app profiles unavailable, using global settings: {e}");
+            return None;
+        }
+    };
+    resolve_profile(
+        ProfileQuery {
+            bundle_id: ctx.bundle_id.as_deref(),
+            url: ctx.url.as_deref(),
+        },
+        &profiles,
+    )
+    .cloned()
+}
+
+#[tauri::command]
+pub async fn list_app_profiles(state: State<'_, Arc<AppState>>) -> Result<Vec<AppProfile>, String> {
+    AppProfileRepo::new(state.config_pool.clone())
+        .list()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn upsert_app_profile(
+    state: State<'_, Arc<AppState>>,
+    profile: AppProfile,
+) -> Result<(), String> {
+    AppProfileRepo::new(state.config_pool.clone())
+        .upsert(&profile)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_app_profile(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
+    AppProfileRepo::new(state.config_pool.clone())
+        .delete(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// KEA's own bundle id, so a capture can tell "the user is in KEA" from "the
+/// user is in the app they wanted". Must match `tauri.conf.json`'s identifier.
+const OWN_BUNDLE_ID: &str = "ai.kea.desktop";
+
+/// How long [`capture_app_context`] waits before reading the frontmost app.
+const CAPTURE_SWITCH_GRACE: Duration = Duration::from_secs(3);
+
+/// Identifies the app the user wants a profile for, for the Profiles page.
+///
+/// The trap: pressing a button in KEA's settings window makes KEA frontmost, so
+/// reading the frontmost app at click time always answers "KEA". There is no
+/// reliable "previously frontmost" to ask for either — `NSWorkspace`'s running
+/// list is not ordered by recency, and the accurate answer needs an activation
+/// observer running since launch.
+///
+/// So the capture is deliberately delayed: the button tells the user to switch
+/// to the app they mean, and the probe runs a few seconds later. It reads as a
+/// quirk and it is one, but it is honest and it works on the first try, which a
+/// silently-wrong bundle id does not.
+///
+/// Returns `None` when the answer is still KEA — the user did not switch — so
+/// the page can say so instead of writing a profile that matches itself.
+#[tauri::command]
+pub async fn capture_app_context(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<kea_platform::AppContext>, String> {
+    let opts = capture_opts(&state.config_pool).await;
+    tokio::time::sleep(CAPTURE_SWITCH_GRACE).await;
+    let ctx = kea_platform::new_app_context_probe().capture(opts);
+    if ctx.bundle_id.as_deref() == Some(OWN_BUNDLE_ID) || ctx.bundle_id.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ctx))
 }
 
 #[tauri::command]
@@ -2797,6 +2987,9 @@ pub async fn trigger_rewrite(
     preset_id: Option<String>,
     custom_instruction: Option<String>,
 ) -> Result<String, String> {
+    // No profile here on purpose: this is the UI asking for one specific mode
+    // against the selection, and the frontmost app at that moment is KEA's own
+    // window. A per-app rule has nothing to match and nothing to override.
     execute_rewrite(
         &state,
         RewriteInput {
@@ -2805,6 +2998,7 @@ pub async fn trigger_rewrite(
             preset_id,
             custom_instruction,
         },
+        &ProfileOverrides::default(),
     )
     .await
 }
@@ -3456,6 +3650,13 @@ pub async fn preview_voice(
         .engines
         .tts(&engine)
         .ok_or_else(|| format!("no tts engine '{engine}'"))?;
+    // The saved rate, not the default: a preview at a different speed than
+    // the real read-aloud run is not a preview of anything.
+    let speed = TtsSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
+        .get()
+        .await
+        .map(|settings| settings.speed)
+        .unwrap_or(1.0);
     let pcm = tts
         .synthesize(
             PREVIEW_SENTENCE,
@@ -3469,6 +3670,7 @@ pub async fn preview_voice(
                 // otherwise read the wrong key and fail as "missing api key"
                 // while the real read-aloud run succeeded.
                 provider_ref,
+                speed: Some(speed),
             },
         )
         .await
@@ -3486,6 +3688,25 @@ pub async fn preview_voice(
 #[tauri::command]
 pub fn list_onnx_models(kind: String) -> Result<Vec<OnnxModelEntry>, String> {
     onnx_catalog_for_kind(parse_model_kind(&kind)?)
+}
+
+/// The speakers inside one multi-speaker voice bundle.
+///
+/// Its own command rather than a field on `EngineCaps`: voices belong to a
+/// *model*, not to the engine that loads it, and `EngineCaps` is a one-field
+/// struct with construction sites all over the workspace. Empty for a
+/// single-speaker model, which is not an error — it is what "this voice has
+/// no sub-voices" looks like.
+#[tauri::command]
+pub fn list_onnx_voices(model_id: String) -> Vec<kea_infer::OnnxVoice> {
+    ModelRegistry::voices(&model_id)
+}
+
+/// The voices the operating system itself offers. Empty where there is no
+/// system synthesizer, so the caller needs no platform check of its own.
+#[tauri::command]
+pub fn list_system_voices() -> Vec<kea_platform::SystemVoice> {
+    kea_platform::new_system_tts().voices()
 }
 
 #[tauri::command]
@@ -4110,6 +4331,7 @@ mod tests {
                 hold_to_talk: false,
                 input_device: None,
                 preroll: true,
+                language: None,
             })
             .await
             .unwrap();
@@ -4117,6 +4339,7 @@ mod tests {
         tts.set(&TtsSettings {
             active_voice: Some("alloy".into()),
             active_model: Some("vits-piper-en-us-amy-low".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -4318,6 +4541,54 @@ mod tests {
             .unwrap();
         let action = action_for(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID);
         assert_eq!(resolve_accelerator(&pool, &action).await, "Alt+K");
+    }
+
+    /// The regression this helper exists for: the generic `set_setting` command
+    /// writes a JSON *string*, so a reader expecting a JSON bool silently falls
+    /// back to its default and the toggle never does anything. Both app-context
+    /// capture flags shipped that way for exactly one batch.
+    #[test]
+    fn a_bool_setting_reads_both_encodings() {
+        use serde_json::json;
+        for (value, want) in [
+            (json!(true), true),
+            (json!(false), false),
+            (json!("true"), true),
+            (json!("false"), false),
+        ] {
+            assert_eq!(bool_setting(Some(&value), !want), want, "value {value}");
+        }
+    }
+
+    #[test]
+    fn an_absent_or_unreadable_bool_setting_takes_the_default() {
+        use serde_json::json;
+        assert!(bool_setting(None, true));
+        assert!(!bool_setting(None, false));
+        // A shape nobody writes must not flip a default-on setting off.
+        assert!(bool_setting(Some(&json!(42)), true));
+        assert!(!bool_setting(Some(&json!("yes")), false));
+    }
+
+    #[tokio::test]
+    async fn capture_flags_default_off_and_honour_a_string_true() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+
+        let opts = capture_opts(&pool).await;
+        assert!(!opts.window_title, "capture must be opt-in");
+        assert!(!opts.url, "URL capture must be opt-in");
+
+        // Exactly what the UI's toggle sends through `set_setting`.
+        SettingsRepo::new(pool.clone())
+            .set(kea_platform::CaptureOpts::SETTING_URL, &"true".to_string())
+            .await
+            .unwrap();
+
+        assert!(
+            capture_opts(&pool).await.url,
+            "the toggle the UI actually writes has to turn the flag on"
+        );
     }
 
     #[tokio::test]
@@ -4936,6 +5207,33 @@ mod tests {
             TTS_COMMAND_ID,
             &format!("{EXPECTED_MODIFIERS}+T"),
         );
+    }
+
+    /// The picker needs names, not indices — and a model with no published
+    /// speaker table returns nothing rather than inventing one.
+    #[test]
+    fn list_onnx_voices_names_the_speakers_of_a_multi_speaker_bundle() {
+        let kokoro = list_onnx_voices("kokoro-en-v0.19".into());
+        assert!(!kokoro.is_empty());
+        assert_eq!(kokoro[0].sid, 0);
+        assert!(kokoro.iter().any(|v| v.name == "bm_lewis"));
+        assert!(list_onnx_voices("vits-piper-en-us-lessac-medium".into()).is_empty());
+        assert!(list_onnx_voices("not-a-model".into()).is_empty());
+    }
+
+    /// Retiring a model by deleting its catalog row would make an
+    /// already-downloaded copy undeletable, because this is the check
+    /// `delete_model` runs first. A retired entry has to keep passing it.
+    #[test]
+    fn a_retired_model_can_still_be_deleted() {
+        let retired = ModelRegistry::find_whisper("ggml-medium.en").expect("still catalogued");
+        assert!(retired.deprecated);
+        assert!(validate_model_id_for_delete(ModelKind::Whisper, "ggml-medium.en").is_ok());
+        // ...and the IPC listing still carries it, flagged, so the Models page
+        // can show an installed copy with a Remove button.
+        assert!(list_whisper_models()
+            .iter()
+            .any(|m| m.id == "ggml-medium.en" && m.deprecated));
     }
 
     #[test]

@@ -52,9 +52,15 @@ const TTS_CATALOG = [
 type WorldOptions = {
   hasKey?: boolean;
   existingBindings?: Record<string, unknown>;
+  /** Handlers merged last, for a test that needs a different build. */
+  extra?: Parameters<typeof onInvoke>[0];
 };
 
-function mockWizardWorld({ hasKey = true, existingBindings = {} }: WorldOptions = {}) {
+function mockWizardWorld({
+  hasKey = true,
+  existingBindings = {},
+  extra = {},
+}: WorldOptions = {}) {
   const bindings = new Map(Object.entries(existingBindings));
   onInvoke({
     get_all_permission_statuses: () => [
@@ -105,6 +111,7 @@ function mockWizardWorld({ hasKey = true, existingBindings = {} }: WorldOptions 
       source: "default",
     }),
     set_hotkey: () => undefined,
+    ...extra,
   });
 }
 
@@ -366,6 +373,37 @@ describe("Onboarding wizard", () => {
       // Onboarding only ever offers OpenAI, so it names no provider and the
       // backend falls back to the engine's built-in "openai" ref.
       providerRef: null,
+    });
+  });
+  it("offers the system synthesizer as a local voice", async () => {
+    // It has no catalog, so it used to be filtered out of the wizard twice
+    // over: once when the options were built, once by a "sherpa-tts" filter.
+    mockWizardWorld({
+      hasKey: false,
+      extra: {
+        list_tts_engines: () => [
+          { id: "sherpa-tts", models: [] },
+          { id: "system-tts", models: [] },
+        ],
+      },
+    });
+    const user = userEvent.setup();
+    render(<Onboarding onFinish={() => {}} />);
+    await goToStep(3, user);
+
+    const voiceSelect = await screen.findByRole("combobox", { name: "Voice" });
+    const option = screen.getByRole("option", { name: "System voice" });
+    await user.selectOptions(voiceSelect, option);
+
+    // Nothing to download, so it can be previewed straight away.
+    expect(
+      screen.getByRole("button", { name: "Preview voice" }).hasAttribute("disabled"),
+    ).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Preview voice" }));
+    await waitFor(() => expect(invokeCalls("preview_voice")).toHaveLength(1));
+    expect(invokeCalls("preview_voice")[0]).toMatchObject({
+      engine: "system-tts",
+      model: null,
     });
   });
 });

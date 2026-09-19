@@ -12,12 +12,15 @@ pub use download::{
 };
 pub use error::InferError;
 pub use registry::{
-    ModelEntry, ModelKind, ModelRegistry, OnnxModelEntry, OnnxModelKind, WhisperModelEntry,
+    ModelEntry, ModelKind, ModelRegistry, OnnxModelEntry, OnnxModelKind, OnnxVoice,
+    WhisperModelEntry,
 };
 pub use sherpa_stt::SherpaSttInference;
-pub use sherpa_tts::SherpaTtsInference;
+pub use sherpa_tts::{find_tts_bundle, SherpaTtsInference, TtsBundle};
 pub use storage::ModelStorage;
-pub use types::{AudioPcm, WhisperOpts};
+pub use types::{
+    clamp_tts_speed, AudioPcm, TtsSynthOpts, WhisperOpts, MAX_TTS_SPEED, MIN_TTS_SPEED,
+};
 pub use whisper::WhisperInference;
 
 #[cfg(feature = "whisper")]

@@ -595,6 +595,7 @@ mod tests {
             size_bytes: payload.len() as u64,
             sha256: hash,
             kind: crate::registry::OnnxModelKind::Parakeet,
+            deprecated: false,
         };
 
         let dl = ModelDownloader::new(Arc::new(FakeTransport::new(payload.clone())), storage);
@@ -636,6 +637,7 @@ mod tests {
             size_bytes: payload.len() as u64,
             sha256: hash,
             kind: crate::registry::OnnxModelKind::Parakeet,
+            deprecated: false,
         };
 
         let dl = ModelDownloader::new(Arc::new(FakeTransport::new(payload.clone())), storage);
@@ -706,6 +708,7 @@ mod tests {
             size_bytes: payload.len() as u64,
             sha256: hash,
             kind: crate::registry::OnnxModelKind::Parakeet,
+            deprecated: false,
         };
 
         let dl = ModelDownloader::new(Arc::new(FakeTransport::new(payload.clone())), storage);
@@ -745,6 +748,7 @@ mod tests {
             size_bytes: 100,
             sha256: "a".repeat(64),
             kind: crate::registry::OnnxModelKind::Parakeet,
+            deprecated: false,
         };
 
         let dl = ModelDownloader::new(
@@ -797,6 +801,7 @@ mod tests {
             size_bytes: payload.len() as u64,
             sha256: hash,
             kind: crate::registry::OnnxModelKind::Parakeet,
+            deprecated: false,
         };
 
         let dl = ModelDownloader::new(Arc::new(FakeTransport::new(payload.clone())), storage);
@@ -830,6 +835,7 @@ mod tests {
             size_bytes: u64::MAX,
             sha256: "a".repeat(64),
             kind: crate::registry::OnnxModelKind::Parakeet,
+            deprecated: false,
         };
 
         let dl = ModelDownloader::new(Arc::new(FakeTransport::new(vec![0u8; 8])), storage);
@@ -861,6 +867,7 @@ mod tests {
             size_bytes: 16,
             sha256: hash.clone(),
             kind: crate::registry::OnnxModelKind::Parakeet,
+            deprecated: false,
         };
 
         let dl = ModelDownloader::new(Arc::new(FakeTransport::new(payload.clone())), storage);

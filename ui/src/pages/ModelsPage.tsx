@@ -159,12 +159,16 @@ export default function ModelsPage() {
                   progress && progress.bytes_total > 0
                     ? Math.round((progress.bytes_received / progress.bytes_total) * 100)
                     : null;
+                // A retired model only reaches this list while it is still
+                // installed (see `loadCatalog`), so the note is advice on what
+                // to do next, not an explanation of why it is offered.
+                const hint = [
+                  model.language,
+                  formatBytes(model.size_bytes),
+                  ...(model.deprecated ? ["no longer recommended — a newer model is smaller and better"] : []),
+                ].join(" · ");
                 return (
-                  <Row
-                    key={model.id}
-                    label={model.display_name}
-                    hint={`${model.language} · ${formatBytes(model.size_bytes)}`}
-                  >
+                  <Row key={model.id} label={model.display_name} hint={hint}>
                     {progress ? (
                       <>
                         <span className="kea-muted">

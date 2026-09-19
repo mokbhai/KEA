@@ -125,9 +125,19 @@ pub trait SttEngine: Send + Sync {
 #[derive(Debug, Clone, Default)]
 pub struct TtsOpts {
     pub model: Option<String>,
+    /// The speaker to use, by *name*.
+    ///
+    /// A name for every engine, including the local multi-speaker bundles
+    /// that address speakers by integer id — the id is resolved from the name
+    /// at synthesis time so the stored setting stays readable and survives a
+    /// bundle that renumbers its table.
     pub voice: Option<String>,
     pub format: Option<String>,
     pub provider_ref: Option<String>,
+    /// Rate multiplier, 1.0 being the voice's natural pace. `None` means the
+    /// caller has no opinion, which is not the same as 1.0 for an engine that
+    /// has its own default.
+    pub speed: Option<f32>,
 }
 
 #[async_trait]

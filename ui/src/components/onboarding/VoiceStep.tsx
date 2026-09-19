@@ -10,6 +10,7 @@ import {
   OPENAI_TTS_VOICES,
   type CapabilityOption,
 } from "../../lib/capabilityDefaults";
+import { runsLocally } from "../../lib/engines";
 import { toMessage } from "../../lib/format";
 import LoadingBlock from "../LoadingBlock";
 import type { AiChoice } from "./ConnectStep";
@@ -68,7 +69,10 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
           sttOpts.find((o) => o.engine === "whisper") ??
           null;
         const cloud = sttOpts.find((o) => o.engine === "openai-stt") ?? null;
-        const voices = ttsOpts.filter((o) => o.engine === "sherpa-tts");
+        // Every voice that runs on this Mac, asked of the engine table rather
+        // than named: the system synthesizer is a local voice with no catalog,
+        // and a hard-coded "sherpa-tts" here left it unofferable.
+        const voices = ttsOpts.filter((o) => runsLocally(o.engine));
         const cloudTts = ttsOpts.find((o) => o.engine === "openai-tts") ?? null;
         const hasKey = keyByRef.get("openai") ?? false;
         const preferCloud = hasKey && aiChoice !== "local" && aiChoice !== "custom";
@@ -97,8 +101,12 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
               : "local",
         );
         const boundLocalVoice =
-          ttsBinding?.engine_id === "sherpa-tts"
-            ? voices.find((v) => (v.model ?? null) === (ttsBinding.model ?? null)) ?? null
+          ttsBinding && runsLocally(ttsBinding.engine_id)
+            ? voices.find(
+                (v) =>
+                  v.engine === ttsBinding.engine_id &&
+                  (v.model ?? null) === (ttsBinding.model ?? null),
+              ) ?? null
             : null;
         setLocalVoiceId((boundLocalVoice ?? voices[0])?.id ?? null);
         if (ttsBinding?.engine_id === "openai-tts") {
@@ -244,6 +252,10 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
       setError(toMessage(e));
     }
   };
+
+  /** Nothing left to fetch: the bundle is on disk, or there never was one. */
+  const isReady = (option: CapabilityOption | null | undefined) =>
+    !!option && (option.installed === true || !option.downloadKind);
 
   const progressFor = (option: CapabilityOption | null | undefined) => {
     if (!option?.model) return null;
@@ -396,7 +408,11 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
             >
               {ttsVoices.map((v) => (
                 <option key={v.id} value={v.id}>
-                  {v.label} — {v.installed ? "installed" : sizeLabel(v)}
+                  {/* A voice with no bundle has no size and no install state
+                      to report — the label is the whole truth about it. */}
+                  {!v.downloadKind
+                    ? v.label
+                    : `${v.label} — ${v.installed ? "installed" : sizeLabel(v)}`}
                 </option>
               ))}
             </select>
@@ -408,7 +424,7 @@ export default function VoiceStep({ setCommit, aiChoice }: Props) {
             className="kea-btn"
             aria-label="Preview voice"
             onClick={() => void preview()}
-            disabled={ttsMode === "local" && !selectedLocalVoice?.installed}
+            disabled={ttsMode === "local" && !isReady(selectedLocalVoice)}
           >
             ▶
           </button>

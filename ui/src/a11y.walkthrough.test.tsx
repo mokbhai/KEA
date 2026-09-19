@@ -11,6 +11,7 @@ import HistoryPage from "./pages/HistoryPage";
 import LogsPage from "./pages/LogsPage";
 import MeetingsPage from "./pages/MeetingsPage";
 import ModelsPage from "./pages/ModelsPage";
+import ProfilesPage from "./pages/ProfilesPage";
 import ReadAloudPage from "./pages/ReadAloudPage";
 import RewritePage from "./pages/RewritePage";
 import { ThemeProvider } from "./theme";
@@ -40,6 +41,23 @@ const CONVERSATION = {
   model: "gpt-4o-mini",
   provider_ref: "openai",
   created_at: "2026-07-17T10:00:00Z",
+};
+
+const PROFILE = {
+  id: "profile-slack",
+  name: "Slack",
+  enabled: true,
+  priority: 1,
+  match_bundle_id: "com.tinyspeck.slackmacgap",
+  match_url_glob: null,
+  rewrite_mode: "friendly",
+  preset_id: null,
+  llm_engine_id: null,
+  llm_model: null,
+  llm_provider_ref: null,
+  post_process: null,
+  insertion_mode: null,
+  created_at: "2026-09-19T10:00:00Z",
 };
 
 const MEETING = {
@@ -104,6 +122,10 @@ function mockWholeApp() {
           started_at: "2026-07-17T10:00:00Z",
           finished_at: "2026-07-17T10:00:01Z",
         }),
+        list_app_profiles: () => [PROFILE],
+        upsert_app_profile: () => undefined,
+        delete_app_profile: () => undefined,
+        capture_app_context: () => null,
         tail_logs: () => "INFO ready",
         open_log_folder: () => undefined,
       },
@@ -180,6 +202,7 @@ const PAGES: [string, () => JSX.Element, RegExp[]][] = [
   ["AI Providers", () => <AiProvidersPage />, []],
   ["Models", () => <ModelsPage />, []],
   ["General", () => <GeneralPage onRunSetup={() => {}} />, []],
+  ["App profiles", () => <ProfilesPage />, [/^Edit Slack$/]],
   ["History", () => <HistoryPage />, [/^Show action 7$/]],
   ["Logs", () => <LogsPage />, []],
 ];
@@ -215,6 +238,16 @@ describe("keyboard-only walkthrough", () => {
       await screen.findByRole("button", { name: "Show conversation 3" }),
     ).toBeTruthy();
     expect(screen.getByRole("button", { name: "Delete conversation 3" })).toBeTruthy();
+
+    expect(hiddenFromKeyboard().map(describeControl)).toEqual([]);
+    expect((await tabSweep()).map(describeControl)).toEqual([]);
+  });
+
+  it("reaches every control in the profile editor", async () => {
+    render(<ProfilesPage />);
+    await userEvent.click(await screen.findByRole("button", { name: "Edit Slack" }));
+    // The Advanced disclosure is opened by hand, as the note above says.
+    expect(screen.getByRole("combobox", { name: "AI clean-up" })).toBeTruthy();
 
     expect(hiddenFromKeyboard().map(describeControl)).toEqual([]);
     expect((await tabSweep()).map(describeControl)).toEqual([]);

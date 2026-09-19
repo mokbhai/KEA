@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod appctx;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "macos")]
@@ -14,6 +15,8 @@ pub mod macos_keys;
 pub mod macos_pasteboard;
 #[cfg(not(target_os = "macos"))]
 pub mod stub;
+
+pub use appctx::{new_app_context_probe, AppContext, AppContextProbe, CaptureOpts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ReplaceMode {

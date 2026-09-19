@@ -72,6 +72,13 @@ pub struct AppState {
     /// The counter guards against stale emits: a newer run's id is larger.
     pub dictation_run_counter: AtomicU64,
     pub dictation_current_run: Mutex<Option<u64>>,
+    /// The app that was frontmost when the current dictation run started.
+    ///
+    /// Captured at the start rather than read at the end: by the time a
+    /// transcript is ready the user may have switched apps, and a profile
+    /// resolved against the wrong app would rewrite into it with the wrong
+    /// settings. Cleared with the run.
+    pub dictation_app_context: Mutex<Option<kea_platform::AppContext>>,
     /// True while a voice preview is synthesizing or playing. Playback pins a
     /// blocking-pool thread and mixes with anything already playing, so a
     /// second preview is refused rather than overlaid.
@@ -195,6 +202,10 @@ fn main() {
             commands::list_presets,
             commands::upsert_preset,
             commands::delete_preset,
+            commands::list_app_profiles,
+            commands::upsert_app_profile,
+            commands::delete_app_profile,
+            commands::capture_app_context,
             commands::list_vocabulary,
             commands::upsert_vocabulary_entry,
             commands::delete_vocabulary_entry,
@@ -248,6 +259,8 @@ fn main() {
             commands::trigger_tts,
             commands::read_selection,
             commands::list_onnx_models,
+            commands::list_onnx_voices,
+            commands::list_system_voices,
             commands::list_installed_onnx_models,
             commands::download_onnx_model,
             commands::cancel_model_download,
@@ -408,6 +421,16 @@ fn build_engines(
         );
     }
 
+    // The OS synthesizer needs nothing downloaded, so it is registered
+    // wherever there is one to register — and only there: off macOS the
+    // platform layer has only a stub, and an engine in the picker that can
+    // exclusively refuse is worse than no engine at all.
+    #[cfg(all(feature = "tts-system", target_os = "macos"))]
+    {
+        use kea_engines::register_system_tts_engine;
+        register_system_tts_engine(&mut engines, Arc::from(kea_platform::new_system_tts()));
+    }
+
     (engines, storages)
 }
 
@@ -476,6 +499,7 @@ fn build_state(
         active_downloads: Mutex::new(HashMap::new()),
         dictation_run_counter: AtomicU64::new(0),
         dictation_current_run: Mutex::new(None),
+        dictation_app_context: Mutex::new(None),
         preview_playing: AtomicBool::new(false),
         meeting_processing: AtomicBool::new(false),
         dictation_busy: Arc::new(AtomicBool::new(false)),
@@ -498,6 +522,7 @@ fn spawn_macos_rewrite_service(
 ) {
     use crate::commands::{default_rewrite_input, execute_rewrite};
     use crate::events::{emit_rewrite_error, emit_rewrite_progress};
+    use kea_features::ProfileOverrides;
 
     let (svc_tx, mut svc_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     kea_platform::macos_services::register_rewrite_service(svc_tx);
@@ -509,7 +534,10 @@ fn spawn_macos_rewrite_service(
             emit_rewrite_progress(&app, "Rewriting selection...");
             let mut input = default_rewrite_input(&config_pool).await;
             input.source_text = source_text;
-            match execute_rewrite(&state, input).await {
+            // No profile: the Services menu hands us the text directly, so
+            // there is no guarantee the sending app is still frontmost by the
+            // time this runs, and a wrong profile is worse than none.
+            match execute_rewrite(&state, input, &ProfileOverrides::default()).await {
                 Ok(_) => emit_rewrite_progress(&app, "Done"),
                 Err(error) => emit_rewrite_error(&app, &error),
             }

@@ -10,9 +10,14 @@ whisper-metal = ["whisper", "kea-infer/whisper-metal"]
 whisper-coreml = ["whisper", "kea-infer/whisper-coreml"]
 parakeet = ["kea-infer/sherpa"]
 tts-local = ["kea-infer/sherpa"]
+# The OS synthesizer. A feature rather than an unconditional dependency
+# because it is the only thing in this crate that needs the platform layer,
+# and off macOS it would register an engine that can only refuse.
+tts-system = ["dep:kea-platform"]
 
 [dependencies]
 kea-infer = { path = "../infer" }
+kea-platform = { path = "../platform", optional = true }
 reqwest = { workspace = true, features = ["multipart"] }
 tokio.workspace = true
 async-trait.workspace = true

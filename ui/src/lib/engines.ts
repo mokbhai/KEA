@@ -64,6 +64,18 @@ export type EngineCatalog = {
   listInstalled: () => Promise<string[]>;
 };
 
+/**
+ * The single option a *local* engine with no catalog contributes to a picker.
+ * There is nothing to download and no key to enter, so the row is fixed and
+ * always ready — whatever it speaks or listens with is a feature setting, not
+ * part of the binding.
+ */
+export type LocalOption = {
+  label: string;
+  /** The second line under the label, e.g. "on this Mac · your voices". */
+  detail: string;
+};
+
 /** The single option a cloud speech engine contributes to a picker. */
 export type CloudOption = {
   label: string;
@@ -85,6 +97,7 @@ export type EngineId =
   | "parakeet"
   | "openai-stt"
   | "sherpa-tts"
+  | "system-tts"
   | "openai-tts";
 
 export type EngineSpec = {
@@ -94,6 +107,15 @@ export type EngineSpec = {
   runsLocally: boolean;
   /** Local engines only. */
   catalog?: EngineCatalog;
+  /** The one row a local engine with no catalog offers. */
+  localOption?: LocalOption;
+  /**
+   * Whether the engine actually applies the dictation language setting. The
+   * ONNX transducer has no language parameter, so a language passed to it can
+   * only be dropped (crates/engines/src/stt/parakeet.rs) — which is why this
+   * is asked of the engine rather than assumed of the capability.
+   */
+  acceptsLanguage?: boolean;
   /** Whose key a cloud engine uses when the binding names no provider. */
   credentialRef?: string;
   /** The cloud engine that also serves providers other than `credentialRef`. */
@@ -130,6 +152,17 @@ const localSummary = (binding: Binding, ctx: BindingContext) => {
   return `${name} — on this Mac`;
 };
 
+/**
+ * "Samantha — on this Mac". A system voice is named by an identifier
+ * ("com.apple.voice.compact.en-US.Samantha") whose last component is the only
+ * part a person recognises; the full string belongs in a tooltip, not a
+ * sentence.
+ */
+const systemVoiceSummary = (binding: Binding) => {
+  const name = binding.model?.split(".").pop();
+  return `${name ? name : "System voice"} — on this Mac`;
+};
+
 const onnxCatalog = (kind: "parakeet" | "tts", title: string): EngineCatalog => ({
   kind,
   title,
@@ -161,6 +194,7 @@ export const ENGINES: Record<EngineId, EngineSpec> = {
     capability: "stt",
     runsLocally: true,
     ownsActiveModel: true,
+    acceptsLanguage: true,
     catalog: {
       kind: "whisper",
       title: "Speech to text — Whisper",
@@ -193,6 +227,19 @@ export const ENGINES: Record<EngineId, EngineSpec> = {
     catalog: onnxCatalog("tts", "Text to speech — Local voices"),
     describe: localSummary,
   },
+  "system-tts": {
+    id: "system-tts",
+    capability: "tts",
+    runsLocally: true,
+    // The one local engine with no catalog: its voices are whatever the user
+    // has installed through System Settings, so there is nothing to download
+    // and nothing for the Models page to show.
+    localOption: {
+      label: "System voice",
+      detail: "on this Mac · the voices macOS ships",
+    },
+    describe: systemVoiceSummary,
+  },
   "openai-tts": {
     id: "openai-tts",
     capability: "tts",
@@ -217,6 +264,10 @@ export const enginesFor = (capability: Capability): EngineSpec[] =>
 export const runsLocally = (engineId: string): boolean =>
   engineSpec(engineId)?.runsLocally ?? false;
 
+/** Whether a dictation language can be chosen for this engine at all. */
+export const acceptsLanguage = (engineId: string): boolean =>
+  engineSpec(engineId)?.acceptsLanguage === true;
+
 /** An engine whose models live on disk, so `catalog` is always there. */
 export type LocalEngineSpec = EngineSpec & { catalog: EngineCatalog };
 
@@ -235,7 +286,15 @@ export async function loadCatalog(
     spec.catalog.list(),
     spec.catalog.listInstalled(),
   ]);
-  return { models, installed };
+  // A retired model stays visible while it is still on disk — otherwise the
+  // gigabyte someone already downloaded has no Remove button anywhere. It is
+  // only no longer *offered*, which is the whole difference between retiring
+  // an entry and deleting it.
+  const onDisk = new Set(installed);
+  return {
+    models: models.filter((m) => !m.deprecated || onDisk.has(m.id)),
+    installed,
+  };
 }
 
 /**

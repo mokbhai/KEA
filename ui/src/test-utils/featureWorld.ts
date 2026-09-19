@@ -14,7 +14,10 @@ export const WHISPER_CATALOG = [
   {
     id: "whisper-base",
     display_name: "Whisper Base",
-    language: "Multilingual",
+    // An English-only build, like the real ggml-base.en: the dictation
+    // Language row is gated on the catalog saying "multilingual", so the
+    // shared world must not hand every page a model that unlocks it.
+    language: "en-US",
     url: "",
     size_bytes: 148 * 1024 * 1024,
     sha256: "",
@@ -75,6 +78,7 @@ export function featureHandlers({
       hold_to_talk: false,
       input_device: null,
       preroll: true,
+      language: null,
     }),
     set_dictation_settings: () => undefined,
     list_input_devices: () => [

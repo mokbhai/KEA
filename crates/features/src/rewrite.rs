@@ -6,9 +6,9 @@ use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_core::store::conversations::{ConversationRepo, MessageRole, NewConversation, NewMessage};
 use kea_engines::traits::LlmRequest;
 use kea_engines::EngineRegistry;
-use kea_platform::TextIo;
+use kea_platform::{ReplaceMode, TextIo};
 
-use crate::feature::{ActionGuard, CapKind, CapSlot, Command, Feature};
+use crate::feature::{ActionGuard, CapKind, CapSlot, Command, Feature, ProfileOverrides};
 
 /// Optional conversation persistence for History (gated by `store_content`).
 #[derive(Clone, Copy, Default)]
@@ -126,6 +126,7 @@ fn default_rewrite_accelerator() -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_rewrite(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
@@ -134,6 +135,7 @@ pub async fn run_rewrite(
     overrides: &PromptOverrideRepo,
     textio: &dyn TextIo,
     input: RewriteInput,
+    profile: &ProfileOverrides,
 ) -> Result<String, String> {
     run_rewrite_with_storage(
         engines,
@@ -143,6 +145,7 @@ pub async fn run_rewrite(
         overrides,
         textio,
         input,
+        profile,
         ContentStorageOpts::default(),
     )
     .await
@@ -157,6 +160,7 @@ pub async fn run_rewrite_with_storage(
     overrides: &PromptOverrideRepo,
     textio: &dyn TextIo,
     mut input: RewriteInput,
+    profile: &ProfileOverrides,
     storage: ContentStorageOpts<'_>,
 ) -> Result<String, String> {
     if input.source_text.is_empty() {
@@ -166,11 +170,16 @@ pub async fn run_rewrite_with_storage(
             .map_err(|e| e.to_string())?;
     }
 
-    let resolver = SlotResolver::new(engines, bindings);
-    let binding = resolver
-        .require_llm("rewrite")
-        .await
-        .map_err(|e| e.to_string())?;
+    // A profile substitutes for the resolver rather than patching its result:
+    // `llm_binding()` is None unless an engine id is set, so a half-filled
+    // profile inherits the global binding instead of half-applying one.
+    let binding = match profile.llm_binding.clone() {
+        Some(binding) => binding,
+        None => SlotResolver::new(engines, bindings)
+            .require_llm("rewrite")
+            .await
+            .map_err(|e| e.to_string())?,
+    };
     let engine_id = binding.engine_id.clone();
 
     let mut llm_req = build_llm_request(&input, presets, overrides)
@@ -197,7 +206,14 @@ pub async fn run_rewrite_with_storage(
     // From here the ledger row exists, so every exit closes it.
     let guard = ActionGuard::new(actions, action_id, "rewrite");
     let result = run_rewrite_inner(
-        engines, textio, storage, &binding, &input, llm_req, action_id,
+        engines,
+        textio,
+        storage,
+        &binding,
+        &input,
+        llm_req,
+        action_id,
+        profile.replace_mode(),
     )
     .await;
     match result {
@@ -209,6 +225,7 @@ pub async fn run_rewrite_with_storage(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_rewrite_inner(
     engines: &EngineRegistry,
     textio: &dyn TextIo,
@@ -217,6 +234,7 @@ async fn run_rewrite_inner(
     input: &RewriteInput,
     llm_req: LlmRequest,
     action_id: i64,
+    replace_mode: ReplaceMode,
 ) -> Result<String, String> {
     let engine_id = &binding.engine_id;
     let engine = engines
@@ -226,7 +244,7 @@ async fn run_rewrite_inner(
     let response = engine.complete(llm_req).await.map_err(|e| e.to_string())?;
 
     textio
-        .replace(&response.text)
+        .replace_with_mode(&response.text, replace_mode)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -324,6 +342,7 @@ mod tests {
                 preset_id: None,
                 custom_instruction: None,
             },
+            &ProfileOverrides::default(),
         )
         .await
         .unwrap();
@@ -379,6 +398,7 @@ mod tests {
                 preset_id: None,
                 custom_instruction: Some("de".into()),
             },
+            &ProfileOverrides::default(),
         )
         .await
         .unwrap();
@@ -425,6 +445,7 @@ mod tests {
                 preset_id: None,
                 custom_instruction: None,
             },
+            &ProfileOverrides::default(),
             ContentStorageOpts::enabled(&conversations),
         )
         .await
@@ -477,6 +498,7 @@ mod tests {
                 preset_id: None,
                 custom_instruction: None,
             },
+            &ProfileOverrides::default(),
             ContentStorageOpts::disabled(),
         )
         .await
@@ -521,6 +543,7 @@ mod tests {
                 preset_id: None,
                 custom_instruction: None,
             },
+            &ProfileOverrides::default(),
             ContentStorageOpts::enabled(&conversations),
         )
         .await
@@ -728,6 +751,7 @@ mod custom_provider_tests {
                 preset_id: None,
                 custom_instruction: None,
             },
+            &ProfileOverrides::default(),
         )
         .await
         .expect("rewrite should reach the custom provider");

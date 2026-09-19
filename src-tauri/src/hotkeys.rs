@@ -20,17 +20,18 @@ use tokio::sync::mpsc;
 
 use crate::commands::trigger_tts_inner;
 use crate::commands::{
-    apply_dictation_settings, default_rewrite_input, dictation_gate, dictation_hotkey_action,
-    execute_rewrite, hold_dictation_action, lock_cancel_action, meeting_hotkey_action,
-    record_hotkey_reg_status, register_hotkey, resolve_accelerator, run_dictation_action,
-    start_meeting_inner, stop_meeting_inner, try_acquire_busy, HotkeyAction, MeetingHotkeyAction,
-    DICTATION_ACTION_ID, HOTKEY_ACTIONS, LOCK_CANCEL_ACTION_ID, MEETINGS_ACTION_ID,
-    REWRITE_ACTION_ID, TTS_ACTION_ID,
+    apply_dictation_settings, dictation_gate, dictation_hotkey_action, execute_rewrite,
+    hold_dictation_action, lock_cancel_action, meeting_hotkey_action, record_hotkey_reg_status,
+    register_hotkey, resolve_accelerator, run_dictation_action, start_meeting_inner,
+    stop_meeting_inner, try_acquire_busy, HotkeyAction, MeetingHotkeyAction, DICTATION_ACTION_ID,
+    HOTKEY_ACTIONS, LOCK_CANCEL_ACTION_ID, MEETINGS_ACTION_ID, REWRITE_ACTION_ID, TTS_ACTION_ID,
 };
+use crate::commands::{capture_app_context_now, profile_for, rewrite_input_for_profile};
 use crate::events::{
     emit_meeting_error, emit_rewrite_error, emit_rewrite_progress, emit_tts_error,
 };
 use crate::AppState;
+use kea_features::ProfileOverrides;
 
 /// What one hotkey press runs. Boxed because the handlers are `async fn` bodies
 /// of different shapes held in one table.
@@ -205,8 +206,19 @@ pub fn spawn_saved_dictation_settings(
 fn handle_rewrite<'a>(state: &'a Arc<AppState>, app: &'a AppHandle) -> HandlerFuture<'a> {
     Box::pin(async move {
         emit_rewrite_progress(app, "Capturing selection...");
-        let input = default_rewrite_input(&state.config_pool).await;
-        match execute_rewrite(state, input).await {
+        // Probed FIRST, before anything that could change which app is
+        // frontmost. By the time the rewrite returns the user may well have
+        // switched away, so a later probe would answer about the wrong app.
+        let ctx = capture_app_context_now(state).await;
+        let profile = profile_for(&state.config_pool, ctx.as_ref()).await;
+        let input = rewrite_input_for_profile(&state.config_pool, profile.as_ref()).await;
+        match execute_rewrite(
+            state,
+            input,
+            &ProfileOverrides::from_profile(profile.as_ref()),
+        )
+        .await
+        {
             Ok(_) => emit_rewrite_progress(app, "Done"),
             Err(error) => emit_rewrite_error(app, &error),
         }

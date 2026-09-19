@@ -157,28 +157,131 @@ pub fn focus_summary() -> String {
 /// the thing being diagnosed. `NSWorkspace.frontmostApplication` needs no
 /// permission and answers whenever there is a GUI session.
 pub fn frontmost_app_name() -> String {
-    // SAFETY: `sharedWorkspace` and `frontmostApplication` return shared,
-    // autoreleased objects that outlive the call, and `localizedName` is a
-    // plain property read on the result. The class lookups return `None`
-    // rather than a dangling pointer when AppKit is not loaded.
     unsafe {
-        let Some(class) = objc2::runtime::AnyClass::get(c"NSWorkspace") else {
-            return "<no AppKit>".into();
+        let app = match frontmost_running_app() {
+            Ok(app) => app,
+            // The `Err` is already the diagnostic string; see
+            // `frontmost_running_app` for why each one is distinct.
+            Err(why) => return why.into(),
         };
-        let workspace: *mut objc2::runtime::AnyObject = objc2::msg_send![class, sharedWorkspace];
-        if workspace.is_null() {
-            return "<no workspace>".into();
-        }
-        let app: *mut objc2::runtime::AnyObject = objc2::msg_send![workspace, frontmostApplication];
-        if app.is_null() {
-            return "<no frontmost app>".into();
-        }
-        let name: *mut objc2_foundation::NSString = objc2::msg_send![app, localizedName];
-        if name.is_null() {
-            return "<unnamed app>".into();
-        }
-        (*name).to_string()
+        ns_string(objc2::msg_send![app, localizedName]).unwrap_or_else(|| "<unnamed app>".into())
     }
+}
+
+/// The frontmost `NSRunningApplication`, or the reason there is not one.
+///
+/// The three failures stay distinct because they are three different bug
+/// reports: no AppKit at all, a workspace that would not vend itself, and a
+/// GUI session with nothing frontmost.
+///
+/// # Safety
+/// The returned pointer is autoreleased and borrowed, not owned — do not
+/// release it, and do not hold it across an autorelease pool drain.
+unsafe fn frontmost_running_app() -> Result<*mut objc2::runtime::AnyObject, &'static str> {
+    // SAFETY: `sharedWorkspace` and `frontmostApplication` return shared,
+    // autoreleased objects that outlive the call. The class lookup returns
+    // `None` rather than a dangling pointer when AppKit is not loaded.
+    let Some(class) = objc2::runtime::AnyClass::get(c"NSWorkspace") else {
+        return Err("<no AppKit>");
+    };
+    let workspace: *mut objc2::runtime::AnyObject = objc2::msg_send![class, sharedWorkspace];
+    if workspace.is_null() {
+        return Err("<no workspace>");
+    }
+    let app: *mut objc2::runtime::AnyObject = objc2::msg_send![workspace, frontmostApplication];
+    if app.is_null() {
+        return Err("<no frontmost app>");
+    }
+    Ok(app)
+}
+
+/// Copies a borrowed `NSString` property into a `String`, or `None` if null.
+///
+/// # Safety
+/// `ptr` must be null or a valid `NSString` the caller does not own.
+unsafe fn ns_string(ptr: *mut objc2_foundation::NSString) -> Option<String> {
+    if ptr.is_null() {
+        None
+    } else {
+        Some((*ptr).to_string())
+    }
+}
+
+/// Identity of the app that is about to receive text.
+///
+/// This is the *matchable* half of a per-app profile lookup, and it is read
+/// from `NSRunningApplication` rather than AX for the reason spelled out on
+/// [`frontmost_app_name`]: it must keep answering with Accessibility revoked,
+/// or a bundle-id rule would silently stop firing exactly when Accessibility
+/// is the thing that broke.
+pub(crate) struct FrontmostApp {
+    /// For `AXUIElementCreateApplication`. From `processIdentifier`, not AX.
+    pub(crate) pid: i32,
+    /// `NSRunningApplication.bundleIdentifier`, e.g. `com.tinyspeck.slackmacgap`.
+    /// `None` for the handful of processes that have none (some helper tools).
+    pub(crate) bundle_id: Option<String>,
+    /// `NSRunningApplication.localizedName` — display only, never a match key.
+    pub(crate) name: Option<String>,
+}
+
+pub(crate) fn frontmost_app() -> Option<FrontmostApp> {
+    // SAFETY: `app` is borrowed for the duration of these property reads; each
+    // selector is a plain getter on `NSRunningApplication`.
+    unsafe {
+        let app = frontmost_running_app().ok()?;
+        Some(FrontmostApp {
+            pid: objc2::msg_send![app, processIdentifier],
+            bundle_id: ns_string(objc2::msg_send![app, bundleIdentifier]),
+            name: ns_string(objc2::msg_send![app, localizedName]),
+        })
+    }
+}
+
+/// How long an AX read into another process may block before it gives up.
+///
+/// An AX attribute read is a synchronous round trip into the target app's run
+/// loop, and the caller here is the dictation hotkey. A beachballed Slack
+/// would otherwise hold that thread for the system default, which is generous.
+/// Confirmed against the SDK header: `AXError AXUIElementSetMessagingTimeout
+/// (AXUIElementRef element, float timeoutInSeconds)` — seconds, per element,
+/// and set on a non-system-wide element it applies to that element only.
+const AX_MESSAGING_TIMEOUT_SECS: f32 = 0.25;
+
+/// Caps how long messages sent *to this element* may block.
+///
+/// Per the SDK header, the timeout is set on one object and is explicitly
+/// **not** shared with other objects — not even ones copied out of it. So
+/// every element a caller is about to read from needs its own call; setting it
+/// once on the application element and assuming the focused window inherits it
+/// is the mistake that leaves the second read on the system default.
+///
+/// The system-wide element is deliberately not used for this: its timeout is
+/// process-global, and quietly changing the global for every other AX caller
+/// in KEA (the insertion path included) is not this function's business.
+///
+/// A failure only means the default timeout stays in force, so it is ignored.
+pub(crate) fn set_ax_timeout(element: &AxRef) {
+    // SAFETY: `element` owns a live AX reference for the duration of the call.
+    unsafe {
+        let _ = AXUIElementSetMessagingTimeout(element.as_ptr(), AX_MESSAGING_TIMEOUT_SECS);
+    }
+}
+
+/// The AX element for a process, with the messaging timeout already set.
+pub(crate) fn app_ax_element(pid: i32) -> Option<AxRef> {
+    // SAFETY: `AXUIElementCreateApplication` follows the CF create rule, so
+    // the +1 reference is handed straight to `AxRef`, which releases it once.
+    let element = unsafe { AxRef::new(AXUIElementCreateApplication(pid))? };
+    set_ax_timeout(&element);
+    Some(element)
+}
+
+/// The process-wide AX root.
+///
+/// # Safety
+/// Returns an owned reference; `AxRef` releases it.
+pub(crate) unsafe fn system_wide_element() -> Option<AxRef> {
+    AxRef::new(AXUIElementCreateSystemWide())
 }
 
 /// The AX role of whatever has keyboard focus, e.g. `AXTextArea`.
@@ -192,7 +295,7 @@ fn focused_element_role() -> String {
     // SAFETY: every raw element below is owned (the AX "Copy" functions follow
     // the Core Foundation create rule) and released exactly once by `AxRef`.
     unsafe {
-        let Some(system) = AxRef::new(AXUIElementCreateSystemWide()) else {
+        let Some(system) = system_wide_element() else {
             return "unknown (no system-wide AX element)".to_string();
         };
         let Some(focused) = system.copy_attr("AXFocusedUIElement") else {
@@ -210,11 +313,15 @@ fn focused_element_role() -> String {
 /// returns a +1 reference the caller must release. `focus_summary` runs on
 /// every dictation and every rewrite, so leaking two elements a run is a real
 /// leak in a process that stays open all day, not a rounding error.
-struct AxRef(*mut c_void);
+///
+/// `pub(crate)` for the app-context probe next door: it walks two more AX
+/// attributes on every dictation, and a second hand-rolled `CFRelease` path is
+/// precisely how the leak the design review found got introduced.
+pub(crate) struct AxRef(*mut c_void);
 
 impl AxRef {
     /// Takes ownership of a +1 reference, or `None` if it is null.
-    unsafe fn new(raw: *mut c_void) -> Option<Self> {
+    pub(crate) unsafe fn new(raw: *mut c_void) -> Option<Self> {
         if raw.is_null() {
             None
         } else {
@@ -222,8 +329,14 @@ impl AxRef {
         }
     }
 
+    /// The borrowed raw reference, for the AX calls that take an element and
+    /// are not attribute reads. Ownership stays with this `AxRef`.
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
+        self.0
+    }
+
     /// Reads one AX attribute as an owned value, or `None` on any AX error.
-    unsafe fn copy_attr(&self, attribute: &str) -> Option<Self> {
+    pub(crate) unsafe fn copy_attr(&self, attribute: &str) -> Option<Self> {
         let attr = core_foundation::string::CFString::new(attribute);
         let mut out: *const c_void = ptr::null();
         let err = AXUIElementCopyAttributeValue(self.0, attr.as_concrete_TypeRef(), &mut out);
@@ -235,7 +348,7 @@ impl AxRef {
 
     /// Reads one AX attribute as a `String`, or `None` when it is absent or is
     /// not a `CFString` (AXTitle is occasionally a number or an AXValue).
-    unsafe fn copy_string_attr(&self, attribute: &str) -> Option<String> {
+    pub(crate) unsafe fn copy_string_attr(&self, attribute: &str) -> Option<String> {
         let value = self.copy_attr(attribute)?;
         let cf_type = value.0 as core_foundation_sys::base::CFTypeRef;
         if core_foundation::base::CFGetTypeID(cf_type)
@@ -295,7 +408,7 @@ fn insert_via_accessibility_impl(text: &str) -> Result<(), String> {
     // and `AxRef` releases each exactly once. This runs on every dictation, so
     // doing it by hand here is how the references used to leak.
     unsafe {
-        let Some(system) = AxRef::new(AXUIElementCreateSystemWide()) else {
+        let Some(system) = system_wide_element() else {
             return Err("AXUIElementCreateSystemWide failed".into());
         };
         let Some(focused) = system.copy_attr("AXFocusedUIElement") else {
@@ -310,6 +423,8 @@ const K_AX_ERROR_SUCCESS: i32 = 0;
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXUIElementCreateSystemWide() -> *mut c_void;
+    fn AXUIElementCreateApplication(pid: i32) -> *mut c_void;
+    fn AXUIElementSetMessagingTimeout(element: *mut c_void, timeout_in_seconds: f32) -> i32;
     fn AXUIElementCopyAttributeValue(
         element: *mut c_void,
         attribute: core_foundation_sys::string::CFStringRef,

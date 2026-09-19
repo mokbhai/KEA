@@ -25,9 +25,12 @@ impl SttEngine for WhisperSttEngine {
         "whisper"
     }
 
+    /// What the picker may offer — retired entries excluded. They still
+    /// *load*: `transcribe` below checks the file on disk, not this list, so
+    /// a binding made before a model was retired keeps working.
     fn capabilities(&self) -> EngineCaps {
         EngineCaps {
-            models: ModelRegistry::whisper_catalog()
+            models: ModelRegistry::offered(kea_infer::ModelKind::Whisper)
                 .into_iter()
                 .map(|m| m.id)
                 .collect(),
@@ -119,6 +122,34 @@ mod tests {
             .await
             .unwrap();
         assert!(out.text.contains("16000"));
+    }
+
+    /// A retired model is not offered, but a binding that already names one
+    /// still has to transcribe — the check that matters is the file on disk.
+    #[tokio::test]
+    async fn a_retired_model_is_unlisted_but_still_loadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(ModelStorage::new(dir.path().to_path_buf()));
+        std::fs::write(storage.path_for("ggml-medium.en"), b"x").unwrap();
+        let engine = WhisperSttEngine::new(Arc::new(FakeWhisperInference), storage);
+
+        assert!(!engine
+            .capabilities()
+            .models
+            .contains(&"ggml-medium.en".to_string()));
+        assert!(engine
+            .transcribe(
+                AudioPcm {
+                    samples: vec![0.0; 16_000],
+                    sample_rate_hz: 16_000,
+                },
+                SttOpts {
+                    model: Some("ggml-medium.en".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

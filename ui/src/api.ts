@@ -234,6 +234,75 @@ export const deleteVocabularyEntry = (id: string) =>
 export const previewVocabulary = (text: string) =>
   invoke<string>("preview_vocabulary", { text });
 
+/**
+ * One "when I am typing into X, do Y" rule, mirroring
+ * `kea_core::app_context::AppProfile`.
+ *
+ * Every override is nullable and `null` means **inherit the global setting**,
+ * not "off". `post_process` in particular is a tri-state: collapsing it to a
+ * checkbox would turn AI clean-up off for every app that never opted in.
+ */
+export type AppProfile = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  /** Higher wins between two rules that match equally specifically. */
+  priority: number;
+  /** Exact bundle id, matched case-insensitively; null matches any app. */
+  match_bundle_id: string | null;
+  /** `*` glob over host[/path], e.g. "*.slack.com/*"; null matches any page. */
+  match_url_glob: string | null;
+  /** A {@link RewriteMode} tag, or null to inherit. */
+  rewrite_mode: string | null;
+  preset_id: string | null;
+  llm_engine_id: string | null;
+  llm_model: string | null;
+  llm_provider_ref: string | null;
+  /** true forces clean-up on, false forces it off, null inherits. */
+  post_process: boolean | null;
+  /** {@link INSERTION_MODES} value, or null to inherit. */
+  insertion_mode: string | null;
+  created_at: string;
+};
+
+/**
+ * Where a profile puts the finished text, mirroring
+ * `kea_core::app_context::InsertionMode::as_str`.
+ */
+export const INSERTION_MODES: { value: string; label: string }[] = [
+  { value: "ax", label: "Type it into the app (Accessibility)" },
+  { value: "paste", label: "Paste it (⌘V)" },
+];
+
+/** What KEA could see about the app in front when it was asked. */
+export type AppContext = {
+  bundle_id: string | null;
+  app_name: string | null;
+  window_title: string | null;
+  url: string | null;
+};
+
+/** Settings keys mirroring `CaptureOpts::SETTING_*`. Both default to off. */
+export const CAPTURE_WINDOW_TITLE_SETTING = "profiles.capture_window_title";
+export const CAPTURE_URL_SETTING = "profiles.capture_url";
+
+export const listAppProfiles = () => invoke<AppProfile[]>("list_app_profiles");
+
+export const upsertAppProfile = (profile: AppProfile) =>
+  invoke<void>("upsert_app_profile", { profile });
+
+export const deleteAppProfile = (id: string) =>
+  invoke<void>("delete_app_profile", { id });
+
+/**
+ * Identifies the app the user wants a rule for.
+ *
+ * Takes a few seconds on purpose: clicking a button in KEA makes KEA the
+ * frontmost app, so the backend waits for the user to switch back before it
+ * looks. `null` means it could not identify anything other than KEA itself.
+ */
+export const captureAppContext = () => invoke<AppContext | null>("capture_app_context");
+
 export const getPromptOverride = (mode: RewriteMode) =>
   invoke<string | null>("get_prompt_override", { mode });
 
@@ -330,7 +399,36 @@ export type DictationSettings = {
   input_device: string | null;
   /** Open the mic as ⌥⇧ is pressed so the first word is not clipped. */
   preroll: boolean;
+  /** BCP-47 tag, or null to let the model detect it. Whisper only. */
+  language: string | null;
 };
+
+/**
+ * The languages the dictation picker offers, on top of auto-detect.
+ *
+ * Plain ISO-639-1 subtags, not full locales: the tag is handed to whisper.cpp
+ * as-is (crates/infer/src/whisper.rs `set_language`), and it knows "pt", not
+ * "pt-BR". A short list rather than whisper's ninety-nine — the model detects
+ * the rest on its own, which is what the default is for.
+ */
+export const DICTATION_LANGUAGES: { tag: string; label: string }[] = [
+  { tag: "en", label: "English" },
+  { tag: "ar", label: "Arabic" },
+  { tag: "zh", label: "Chinese" },
+  { tag: "nl", label: "Dutch" },
+  { tag: "fr", label: "French" },
+  { tag: "de", label: "German" },
+  { tag: "hi", label: "Hindi" },
+  { tag: "it", label: "Italian" },
+  { tag: "ja", label: "Japanese" },
+  { tag: "ko", label: "Korean" },
+  { tag: "pl", label: "Polish" },
+  { tag: "pt", label: "Portuguese" },
+  { tag: "ru", label: "Russian" },
+  { tag: "es", label: "Spanish" },
+  { tag: "tr", label: "Turkish" },
+  { tag: "uk", label: "Ukrainian" },
+];
 
 export type InputDevice = {
   /** The device name, which is the only handle the audio layer has. */
@@ -352,6 +450,12 @@ export type WhisperModel = {
   url: string;
   size_bytes: number;
   sha256: string;
+  /**
+   * Still resolvable, no longer offered. The catalog keeps retired models so
+   * an already-downloaded one can still be removed; the picker hides them
+   * unless they are installed.
+   */
+  deprecated: boolean;
 };
 
 export type ModelDownloadProgress = {
@@ -662,11 +766,22 @@ export const openLogFolder = () => invoke<void>("open_log_folder");
 export type TtsState = "idle" | "reading";
 
 export type TtsSettings = {
+  /** The chosen speaker, by name — never by index. */
   active_voice: string | null;
   active_model: string | null;
+  /** Rate multiplier; 1 is the voice's natural pace. */
+  speed: number;
 };
 
-export type OnnxModelKind = "Parakeet" | "TtsVits";
+/** Slowest and fastest the read-aloud rate may be set to. */
+export const MIN_TTS_SPEED = 0.5;
+export const MAX_TTS_SPEED = 2;
+
+/**
+ * Which sherpa model config a bundle loads through. Not a vendor list: it is
+ * the set of bundle shapes the app knows how to fill.
+ */
+export type OnnxModelKind = "Parakeet" | "TtsVits" | "TtsKokoro" | "TtsKitten";
 
 export type OnnxModel = {
   id: string;
@@ -676,6 +791,26 @@ export type OnnxModel = {
   size_bytes: number;
   sha256: string;
   kind: OnnxModelKind;
+  /** See {@link WhisperModel.deprecated}. */
+  deprecated: boolean;
+};
+
+/** One speaker inside a multi-speaker local bundle (Kokoro, Kitten). */
+export type OnnxVoice = {
+  /** The index the bundle addresses this speaker by. */
+  sid: number;
+  name: string;
+  language: string;
+};
+
+/** One voice the operating system itself offers. */
+export type SystemVoice = {
+  /** The identifier to ask for this voice again; names are not unique. */
+  id: string;
+  name: string;
+  language: string;
+  /** "default", "enhanced" or "premium". */
+  quality: string;
 };
 
 export type OnnxModelKindParam = "parakeet" | "tts";
@@ -693,6 +828,16 @@ export const triggerTts = () => invoke<void>("trigger_tts");
 
 export const listOnnxModels = (kind: OnnxModelKindParam) =>
   invoke<OnnxModel[]>("list_onnx_models", { kind });
+
+/**
+ * The speakers inside one local voice bundle. Empty for a single-speaker
+ * model, which is the normal case for the Piper voices.
+ */
+export const listOnnxVoices = (model_id: string) =>
+  invoke<OnnxVoice[]>("list_onnx_voices", { modelId: model_id });
+
+/** Empty where the platform has no system synthesizer. */
+export const listSystemVoices = () => invoke<SystemVoice[]>("list_system_voices");
 
 export const listInstalledOnnxModels = (kind: OnnxModelKindParam) =>
   invoke<string[]>("list_installed_onnx_models", { kind });

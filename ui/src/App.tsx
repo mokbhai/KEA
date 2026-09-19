@@ -17,6 +17,7 @@ import HistoryPage from "./pages/HistoryPage";
 import LogsPage from "./pages/LogsPage";
 import MeetingsPage from "./pages/MeetingsPage";
 import ModelsPage from "./pages/ModelsPage";
+import ProfilesPage from "./pages/ProfilesPage";
 import ReadAloudPage from "./pages/ReadAloudPage";
 import RewritePage from "./pages/RewritePage";
 import VocabularyPage from "./pages/VocabularyPage";
@@ -259,6 +260,8 @@ function AppShell() {
         return <ModelsPage />;
       case "vocabulary":
         return <VocabularyPage />;
+      case "profiles":
+        return <ProfilesPage />;
       case "general":
         return <GeneralPage onRunSetup={runSetup} />;
       case "history":
@@ -340,6 +343,7 @@ function AppShell() {
             {navItem("ai-providers", "AI Providers", "🤖")}
             {navItem("models", "Models", "📦")}
             {navItem("vocabulary", "Vocabulary", "📖")}
+            {navItem("profiles", "App profiles", "🧩")}
             {navItem("general", "General", "⚙️")}
             {navItem("logs", "Logs", "🛠")}
           </nav>

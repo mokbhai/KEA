@@ -1,6 +1,62 @@
 use std::fmt::Display;
 
+use kea_core::app_context::{AppProfile, InsertionMode};
 use kea_core::store::actions::{ActionRepo, ActionStatus};
+use kea_core::store::bindings::Binding;
+use kea_platform::ReplaceMode;
+
+/// What a matched app profile changes about one run.
+///
+/// A struct rather than three more parameters, and `Default` means "inherit
+/// everything" — which is exactly the no-profile case, so a caller that has no
+/// profile passes `&ProfileOverrides::default()` and every branch below reads
+/// the same way as before.
+///
+/// `mode` and `preset_id` are deliberately NOT here: those are applied to the
+/// `RewriteInput` at the app layer, before the request is built, because the
+/// mode determines which settings key supplies the mode's parameter.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileOverrides {
+    /// Substituted for `SlotResolver::require_llm`, not merged with it.
+    pub llm_binding: Option<Binding>,
+    /// How text is put back into the app.
+    pub insertion: Option<ReplaceMode>,
+    /// Tri-state. `Some(false)` is the point of the feature — no LLM cleanup
+    /// pass into a shell prompt — so it must not collapse into `None`.
+    pub post_process: Option<bool>,
+}
+
+impl ProfileOverrides {
+    /// Reads a resolved profile into the shape the features consume.
+    ///
+    /// The `InsertionMode` -> `ReplaceMode` mapping lives here because
+    /// `kea_core` deliberately does not depend on `kea_platform`: the domain
+    /// type says what the user asked for, the platform type says how text gets
+    /// inserted, and only this crate sees both.
+    pub fn from_profile(profile: Option<&AppProfile>) -> Self {
+        let Some(profile) = profile else {
+            return Self::default();
+        };
+        Self {
+            llm_binding: profile.llm_binding(),
+            insertion: profile.insertion().map(|m| match m {
+                InsertionMode::Accessibility => ReplaceMode::Accessibility,
+                InsertionMode::ClipboardPaste => ReplaceMode::ClipboardPaste,
+            }),
+            post_process: profile.post_process,
+        }
+    }
+
+    /// The insertion mode to use, defaulting to today's behaviour.
+    pub fn replace_mode(&self) -> ReplaceMode {
+        self.insertion.unwrap_or(ReplaceMode::ClipboardPaste)
+    }
+
+    /// Whether to run the LLM cleanup pass, given the global setting.
+    pub fn post_process_or(&self, global: bool) -> bool {
+        self.post_process.unwrap_or(global)
+    }
+}
 
 pub use kea_core::resolve::CapKind;
 

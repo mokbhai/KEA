@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  DICTATION_LANGUAGES,
   getDictationSettings,
   getDictationStateApi,
   getEffectiveHotkey,
@@ -26,6 +27,7 @@ import { Row, RowGroup } from "../components/SettingsRow";
 import Toggle from "../components/Toggle";
 import { useFeatureAi } from "../hooks/useFeatureAi";
 import { useOptimisticSetting } from "../hooks/useOptimisticSetting";
+import { acceptsLanguage, engineSpec } from "../lib/engines";
 import type { SlotSpec } from "../lib/featureSlot";
 import { toMessage } from "../lib/format";
 import type { Navigate } from "../lib/nav";
@@ -39,6 +41,19 @@ const DICTATION_COMMAND = "push_to_talk";
  * collide with a real one.
  */
 const SYSTEM_DEFAULT = "";
+
+/**
+ * The `<select>` value standing for "let the model work it out", which is the
+ * `null` language. Same reasoning as SYSTEM_DEFAULT: a real tag can never be
+ * the empty string.
+ */
+const AUTO_DETECT = "";
+
+/**
+ * The catalog language of a model that is not tied to one language — the only
+ * kind a language can be chosen for (crates/infer/src/registry.rs).
+ */
+const MULTILINGUAL = "multilingual";
 
 const STATE_LABELS: Record<DictationState, string> = {
   idle: "Idle",
@@ -87,6 +102,7 @@ export default function DictationPage({ onNavigate }: Props) {
       hold_to_talk: false,
       input_device: null,
       preroll: true,
+      language: null,
     },
     persist: setDictationSettings,
     reread: getDictationSettings,
@@ -96,6 +112,7 @@ export default function DictationPage({ onNavigate }: Props) {
     hold_to_talk: holdToTalk,
     input_device: inputDevice,
     preroll,
+    language,
   } = settings.value;
   const { setValue: setSettingsValue, setError: setSettingsError } = settings;
   const ai = useFeatureAi(postProcess ? SLOTS_WITH_CLEANUP : SLOTS_PLAIN);
@@ -109,7 +126,18 @@ export default function DictationPage({ onNavigate }: Props) {
   const [devices, setDevices] = useState<InputDevice[]>([]);
   const [previewing, setPreviewing] = useState(false);
   const [fallbackNotice, setFallbackNotice] = useState<string | null>(null);
+  const [catalogLanguages, setCatalogLanguages] = useState<Map<string, string>>(
+    () => new Map(),
+  );
   const listening = dictationState !== "idle";
+
+  // What the backend will actually transcribe with: the speech-to-text slot's
+  // effective binding, and the model it carries — or the saved fallback it
+  // reads when the binding carries none (dictation.rs).
+  const stt = ai.statuses?.find((s) => s.spec.capability === "stt")?.effective ?? null;
+  const sttCatalog =
+    stt && acceptsLanguage(stt.engine_id) ? engineSpec(stt.engine_id)?.catalog : undefined;
+  const sttModel = stt?.model ?? settings.value.active_model;
   // One flag for the page: a save and a run both lock the whole panel, as
   // they did when this was a single `busy`.
   const anyBusy = busy || settings.busy;
@@ -160,6 +188,42 @@ export default function DictationPage({ onNavigate }: Props) {
     const metered = dictationState === "listening" || dictationState === "locked";
     if (!metered && !previewing) setLevel(0);
   }, [dictationState, previewing]);
+
+  // Only a language-capable engine's catalog is worth fetching, and only its
+  // `language` column is used — a model pinned to one language has nothing to
+  // choose.
+  useEffect(() => {
+    if (!sttCatalog) return;
+    let cancelled = false;
+    sttCatalog
+      .list()
+      .then((models) => {
+        if (cancelled) return;
+        setCatalogLanguages(new Map(models.map((m) => [m.id, m.language])));
+      })
+      // Deliberately silent: a catalog we could not read is no reason to
+      // offer a setting the engine might drop, so the row stays hidden.
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [sttCatalog]);
+
+  /**
+   * Whether to offer a language at all.
+   *
+   * Gated on the *engine* first, not just the model. The ONNX transducer
+   * accepted a language and silently dropped it until the design review took
+   * the parameter away from it (crates/engines/src/stt/parakeet.rs); a
+   * control that writes a setting nothing reads is that same defect wearing a
+   * dropdown. The model gate is second: the English-only Whisper builds have
+   * nothing to choose between.
+   */
+  const showLanguage =
+    !!stt &&
+    acceptsLanguage(stt.engine_id) &&
+    !!sttModel &&
+    catalogLanguages.get(sttModel)?.toLowerCase() === MULTILINGUAL;
 
   // Stopping is best-effort on unmount: the backend also stops the preview on
   // window blur and after 30s, so a navigation cannot strand an open mic.
@@ -290,6 +354,46 @@ export default function DictationPage({ onNavigate }: Props) {
                 onSaved={setAccelerator}
                 checkRegistration
               />
+              {/* Hidden rather than explained when it does not apply: a
+                  paragraph about a control that is not on screen is noise. */}
+              {showLanguage && (
+                <Row
+                  label="Language"
+                  hint="Naming the language you speak beats letting the model guess it — a guess can turn on one stray word and take the rest of the sentence with it."
+                >
+                  {settings.savedKey === "language" && (
+                    <span className="kea-saved">Saved ✓</span>
+                  )}
+                  <select
+                    className="kea-select"
+                    aria-label="Dictation language"
+                    value={language ?? AUTO_DETECT}
+                    disabled={anyBusy}
+                    onChange={(e) =>
+                      void settings.save(
+                        {
+                          language:
+                            e.target.value === AUTO_DETECT ? null : e.target.value,
+                        },
+                        "language",
+                      )
+                    }
+                  >
+                    <option value={AUTO_DETECT}>Auto-detect</option>
+                    {DICTATION_LANGUAGES.map((l) => (
+                      <option key={l.tag} value={l.tag}>
+                        {l.label}
+                      </option>
+                    ))}
+                    {/* A tag this build does not list — saved by a newer one,
+                        or a full locale — still has to show as the selection,
+                        or the dropdown would read as auto-detect. */}
+                    {language && !DICTATION_LANGUAGES.some((l) => l.tag === language) && (
+                      <option value={language}>{language}</option>
+                    )}
+                  </select>
+                </Row>
+              )}
               <Row
                 label="Hold to talk"
                 hint="Hold ⌥⇧ anywhere to record, then let go and KEA types what you said. A quick tap does nothing, and neither does holding ⌥⇧ for one of your own shortcuts."

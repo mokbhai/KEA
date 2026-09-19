@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod app_profiles;
 pub mod bindings;
 pub mod conversations;
 pub mod db;

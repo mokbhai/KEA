@@ -17,8 +17,20 @@ const WHISPER_CATALOG = [
     url: "",
     size_bytes: 148 * MB,
     sha256: "",
+    deprecated: false,
   },
 ];
+
+/** A model that is still resolvable but is no longer worth downloading. */
+const RETIRED = {
+  id: "whisper-medium",
+  display_name: "Whisper Medium",
+  language: "en-US",
+  url: "",
+  size_bytes: 1530 * MB,
+  sha256: "",
+  deprecated: true,
+};
 
 function mockModelsWorld() {
   onInvoke({
@@ -71,6 +83,47 @@ describe("ModelsPage", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Remove" }));
 
     expect(invokeCalls("delete_model")).toHaveLength(0);
+  });
+
+  /// Retiring a model must not strand whoever already downloaded it: the row
+  /// stays, with its Remove button, for exactly as long as the files are on
+  /// disk. This is the difference between flagging an entry and deleting it.
+  it("still lists a retired model that is installed", async () => {
+    onInvoke({
+      list_whisper_models: () => [...WHISPER_CATALOG, RETIRED],
+      list_installed_whisper_models: () => ["whisper-medium"],
+      list_onnx_models: () => [],
+      list_installed_onnx_models: () => [],
+      get_binding: () => null,
+      delete_model: () => undefined,
+    });
+    render(<ModelsPage />);
+
+    expect(await screen.findByText("Whisper Medium")).toBeTruthy();
+    expect(screen.getByText(/no longer recommended/)).toBeTruthy();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await userEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(invokeCalls("delete_model")).toHaveLength(1));
+    expect(invokeCalls("delete_model")[0]).toEqual({
+      kind: "whisper",
+      modelId: "whisper-medium",
+    });
+  });
+
+  /// ...and stops offering it to anyone who has not. A gigabyte and a half
+  /// for a worse result than a smaller model is a bug in the catalog.
+  it("does not offer a retired model that is not installed", async () => {
+    onInvoke({
+      list_whisper_models: () => [...WHISPER_CATALOG, RETIRED],
+      list_installed_whisper_models: () => [],
+      list_onnx_models: () => [],
+      list_installed_onnx_models: () => [],
+      get_binding: () => null,
+    });
+    render(<ModelsPage />);
+
+    expect(await screen.findByText("Whisper Base")).toBeTruthy();
+    expect(screen.queryByText("Whisper Medium")).toBeNull();
   });
 
   it("lets the user stop a download that has stopped moving", async () => {

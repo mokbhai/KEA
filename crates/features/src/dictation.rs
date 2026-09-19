@@ -11,7 +11,7 @@ use kea_platform::audio::util::resample_linear;
 use kea_platform::TextIo;
 use kea_platform::{AudioIo, PcmFrame};
 
-use crate::feature::{ActionGuard, CapKind, CapSlot, Command, Feature};
+use crate::feature::{ActionGuard, CapKind, CapSlot, Command, Feature, ProfileOverrides};
 use crate::rewrite::{maybe_record_conversation, ContentStorageOpts};
 
 const WHISPER_SAMPLE_RATE_HZ: u32 = 16_000;
@@ -73,6 +73,7 @@ pub async fn run_dictation(
     textio: &dyn TextIo,
     settings: &DictationSettings,
     vocabulary: &[VocabularyEntry],
+    profile: &ProfileOverrides,
 ) -> Result<String, String> {
     run_dictation_with_storage(
         engines,
@@ -84,6 +85,7 @@ pub async fn run_dictation(
         textio,
         settings,
         vocabulary,
+        profile,
         ContentStorageOpts::default(),
     )
     .await
@@ -100,6 +102,7 @@ pub async fn run_dictation_with_storage(
     textio: &dyn TextIo,
     settings: &DictationSettings,
     vocabulary: &[VocabularyEntry],
+    profile: &ProfileOverrides,
     storage: ContentStorageOpts<'_>,
 ) -> Result<String, String> {
     let _frame_rx = audio.start_mic().await.map_err(|e| e.to_string())?;
@@ -125,8 +128,8 @@ pub async fn run_dictation_with_storage(
     // From here the ledger row exists, so every exit closes it.
     let guard = ActionGuard::new(actions, action_id, "dictation");
     let result = run_dictation_inner(
-        engines, &resolver, presets, overrides, textio, settings, vocabulary, storage, &binding,
-        action_id, pcm,
+        engines, &resolver, presets, overrides, textio, settings, vocabulary, profile, storage,
+        &binding, action_id, pcm,
     )
     .await;
     match result {
@@ -147,6 +150,7 @@ async fn run_dictation_inner(
     textio: &dyn TextIo,
     settings: &DictationSettings,
     vocabulary: &[VocabularyEntry],
+    profile: &ProfileOverrides,
     storage: ContentStorageOpts<'_>,
     binding: &Binding,
     action_id: i64,
@@ -162,7 +166,9 @@ async fn run_dictation_inner(
             .model
             .clone()
             .or_else(|| settings.active_model.clone()),
-        language: None,
+        // Whisper honours this; the ONNX transducer has no language setting and
+        // the engine drops the field rather than pretending to use it.
+        language: settings.language.clone(),
         provider_ref: binding.provider_ref.clone(),
         vocabulary: hint_terms(vocabulary),
     };
@@ -184,7 +190,9 @@ async fn run_dictation_inner(
         "dictation: transcribed"
     );
 
-    if settings.post_process {
+    // Tri-state: a profile may force the cleanup pass off for one app (a shell
+    // prompt, a code editor) without changing the global setting.
+    if profile.post_process_or(settings.post_process) {
         let transcript_text = final_text.clone();
         // Dictation borrows rewrite's slot, so its failures name what the
         // binding was wanted for.
@@ -249,7 +257,13 @@ async fn run_dictation_inner(
         "dictation: inserting into the focused app"
     );
     let insert_started = std::time::Instant::now();
-    if let Err(e) = textio.insert_at_cursor(&final_text).await {
+    // `insert_at_cursor` hardcodes ClipboardPaste; going through
+    // `replace_with_mode` is what lets a profile pick Accessibility insertion
+    // for an app where the clipboard round-trip is disruptive.
+    if let Err(e) = textio
+        .replace_with_mode(&final_text, profile.replace_mode())
+        .await
+    {
         tracing::error!(
             action_id = %action_id,
             error = %e,
@@ -389,6 +403,19 @@ mod tests {
 
     struct FakeTextIo {
         inserted: Mutex<Option<String>>,
+        /// The mode the insertion actually went out with, so a test can assert
+        /// a profile's choice reached the platform rather than only that some
+        /// text arrived.
+        mode: Mutex<Option<ReplaceMode>>,
+    }
+
+    impl FakeTextIo {
+        fn new() -> Self {
+            Self {
+                inserted: Mutex::new(None),
+                mode: Mutex::new(None),
+            }
+        }
     }
 
     #[async_trait]
@@ -397,16 +424,17 @@ mod tests {
             Ok(String::new())
         }
 
+        /// Only the required method is implemented. `insert_at_cursor`'s
+        /// default routes through here, so a production path that switches
+        /// between the two cannot quietly stop being observed — which is what
+        /// happened when insertion moved to `replace_with_mode`.
         async fn replace_with_mode(
             &self,
-            _text: &str,
-            _mode: ReplaceMode,
+            text: &str,
+            mode: ReplaceMode,
         ) -> Result<(), TextIoError> {
-            Ok(())
-        }
-
-        async fn insert_at_cursor(&self, text: &str) -> Result<(), TextIoError> {
             *self.inserted.lock().unwrap() = Some(text.to_string());
+            *self.mode.lock().unwrap() = Some(mode);
             Ok(())
         }
     }
@@ -434,6 +462,102 @@ mod tests {
         assert_eq!(f.commands()[0].id, "push_to_talk");
     }
 
+    /// A profile's insertion mode has to reach the platform call, not just be
+    /// stored. Getting this wrong is invisible: the text still lands, via the
+    /// clipboard, and only the disruption the user was trying to avoid comes
+    /// back.
+    #[tokio::test]
+    async fn a_profile_chooses_the_insertion_mode() {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: "hello".into(),
+        }));
+        let textio = Arc::new(FakeTextIo::new());
+        let (bindings, actions, presets, overrides) = test_repos().await;
+        let settings = DictationSettings {
+            post_process: false,
+            active_model: None,
+            hold_to_talk: false,
+            input_device: None,
+            preroll: true,
+            language: None,
+        };
+        let mut audio = FakeAudioIo::with_pcm(PcmFrame {
+            samples: vec![0.0; 1600],
+            sample_rate_hz: 16_000,
+        });
+
+        run_dictation(
+            &reg,
+            &bindings,
+            &actions,
+            &presets,
+            &overrides,
+            &mut audio,
+            textio.as_ref(),
+            &settings,
+            &[],
+            &ProfileOverrides {
+                insertion: Some(ReplaceMode::Accessibility),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *textio.mode.lock().unwrap(),
+            Some(ReplaceMode::Accessibility)
+        );
+    }
+
+    /// The tri-state. `Some(false)` must beat a global `true` — that is the
+    /// whole point of turning cleanup off for a shell prompt — and it must not
+    /// be confused with `None`, which inherits.
+    #[tokio::test]
+    async fn a_profile_can_force_post_processing_off() {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: "raw text".into(),
+        }));
+        // No LLM engine is registered, so if the refinement pass ran at all the
+        // run would fail to resolve one rather than quietly skipping it.
+        let textio = Arc::new(FakeTextIo::new());
+        let (bindings, actions, presets, overrides) = test_repos().await;
+        let settings = DictationSettings {
+            post_process: true,
+            active_model: None,
+            hold_to_talk: false,
+            input_device: None,
+            preroll: true,
+            language: None,
+        };
+        let mut audio = FakeAudioIo::with_pcm(PcmFrame {
+            samples: vec![0.0; 1600],
+            sample_rate_hz: 16_000,
+        });
+
+        let out = run_dictation(
+            &reg,
+            &bindings,
+            &actions,
+            &presets,
+            &overrides,
+            &mut audio,
+            textio.as_ref(),
+            &settings,
+            &[],
+            &ProfileOverrides {
+                post_process: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "raw text");
+    }
+
     /// The end-to-end shape of the feature: the engine mishears, and what the
     /// user's text field receives is nonetheless the stored spelling.
     #[tokio::test]
@@ -443,9 +567,7 @@ mod tests {
             text: "i pushed it to kitty claw today".into(),
         }));
 
-        let textio = Arc::new(FakeTextIo {
-            inserted: Mutex::new(None),
-        });
+        let textio = Arc::new(FakeTextIo::new());
 
         let (bindings, actions, presets, overrides) = test_repos().await;
         let settings = DictationSettings {
@@ -454,6 +576,7 @@ mod tests {
             hold_to_talk: false,
             input_device: None,
             preroll: true,
+            language: None,
         };
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
             samples: vec![0.0; 1600],
@@ -470,6 +593,7 @@ mod tests {
             textio.as_ref(),
             &settings,
             &[vocab("KittyClaw", Some("kitty claw"), true)],
+            &ProfileOverrides::default(),
         )
         .await
         .unwrap();
@@ -494,9 +618,7 @@ mod tests {
             seen: seen.clone(),
         }));
 
-        let textio = Arc::new(FakeTextIo {
-            inserted: Mutex::new(None),
-        });
+        let textio = Arc::new(FakeTextIo::new());
         let (bindings, actions, presets, overrides) = test_repos().await;
         let settings = DictationSettings {
             post_process: false,
@@ -504,6 +626,7 @@ mod tests {
             hold_to_talk: false,
             input_device: None,
             preroll: true,
+            language: None,
         };
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
             samples: vec![0.0; 1600],
@@ -523,6 +646,7 @@ mod tests {
                 vocab("KittyClaw", Some("kitty claw"), true),
                 vocab("Disabled", None, false),
             ],
+            &ProfileOverrides::default(),
         )
         .await
         .unwrap();
@@ -542,9 +666,7 @@ mod tests {
             text: "hello world".into(),
         }));
 
-        let textio = Arc::new(FakeTextIo {
-            inserted: Mutex::new(None),
-        });
+        let textio = Arc::new(FakeTextIo::new());
 
         let (bindings, actions, presets, overrides) = test_repos().await;
         let settings = DictationSettings {
@@ -553,6 +675,7 @@ mod tests {
             hold_to_talk: false,
             input_device: None,
             preroll: true,
+            language: None,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
@@ -570,6 +693,7 @@ mod tests {
             textio.as_ref(),
             &settings,
             &[],
+            &ProfileOverrides::default(),
         )
         .await
         .unwrap();
@@ -596,9 +720,7 @@ mod tests {
         }));
         reg.register_llm(Arc::new(NoopLlmEngine));
 
-        let textio = Arc::new(FakeTextIo {
-            inserted: Mutex::new(None),
-        });
+        let textio = Arc::new(FakeTextIo::new());
 
         let (bindings, actions, presets, overrides) = test_repos().await;
         let settings = DictationSettings {
@@ -607,6 +729,7 @@ mod tests {
             hold_to_talk: false,
             input_device: None,
             preroll: true,
+            language: None,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
@@ -624,6 +747,7 @@ mod tests {
             textio.as_ref(),
             &settings,
             &[],
+            &ProfileOverrides::default(),
         )
         .await
         .unwrap();
@@ -649,9 +773,7 @@ mod tests {
         }));
         reg.register_llm(Arc::new(NoopLlmEngine));
 
-        let textio = Arc::new(FakeTextIo {
-            inserted: Mutex::new(None),
-        });
+        let textio = Arc::new(FakeTextIo::new());
 
         let config_pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&config_pool).await.unwrap();
@@ -670,6 +792,7 @@ mod tests {
             hold_to_talk: false,
             input_device: None,
             preroll: true,
+            language: None,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
@@ -687,6 +810,7 @@ mod tests {
             textio.as_ref(),
             &settings,
             &[],
+            &ProfileOverrides::default(),
             ContentStorageOpts::enabled(&conversations),
         )
         .await
@@ -756,9 +880,7 @@ mod tests {
         }));
         reg.register_llm(Arc::new(NoopLlmEngine));
 
-        let textio = Arc::new(FakeTextIo {
-            inserted: Mutex::new(None),
-        });
+        let textio = Arc::new(FakeTextIo::new());
 
         let config_pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&config_pool).await.unwrap();
@@ -777,6 +899,7 @@ mod tests {
             hold_to_talk: false,
             input_device: None,
             preroll: true,
+            language: None,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
@@ -794,6 +917,7 @@ mod tests {
             textio.as_ref(),
             &settings,
             &[],
+            &ProfileOverrides::default(),
             ContentStorageOpts::disabled(),
         )
         .await

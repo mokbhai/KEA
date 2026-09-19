@@ -141,6 +141,30 @@ export async function buildCapabilityOptions(
       loaded.models.forEach((m) => opts.push(localOption(m, spec.id, kind, installed)));
       return;
     }
+    if (spec.runsLocally && !spec.catalog) {
+      // A local engine with no catalog has nothing to download and no key to
+      // enter, so it is one fixed, always-ready row. Before this it had
+      // neither a catalog nor a cloudOption and fell through the bottom of
+      // this loop — registered in Rust, and bindable nowhere in the UI.
+      // Labelled by its id if it declared no row of its own: a picker entry
+      // named "system-tts" is ugly, an engine that silently disappears is
+      // the bug this arm exists to close.
+      const fixed = spec.localOption;
+      opts.push({
+        id: spec.id,
+        label: fixed?.label ?? spec.id,
+        detail: fixed?.detail ?? "on this Mac",
+        status: "ready ✓",
+        ready: true,
+        engine: spec.id,
+        // The binding names the engine only. What it speaks with is the
+        // feature's own setting (Read-aloud's voice), not part of the choice
+        // made here.
+        model: null,
+        providerRef: null,
+      });
+      return;
+    }
     const cloud = spec.cloudOption;
     const ref = spec.credentialRef;
     // A cloud engine is only offerable once its provider exists.

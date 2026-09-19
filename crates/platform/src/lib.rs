@@ -6,6 +6,7 @@ pub mod hotkeys;
 pub mod macos_services;
 pub mod permissions;
 pub mod textio;
+pub mod tts;
 
 pub use audio::{
     accumulate_frames, chunk_pcm_by_duration, cue_pcm, mix_frames, new_audio_io, resample_linear,
@@ -17,7 +18,11 @@ pub use hotkeys::{
     parse_accelerator, spawn_hold_to_talk, ActionId, HotkeyBinding, HotkeyError, Hotkeys,
 };
 pub use permissions::{new_permissions, PermError, PermKind, PermStatus, Permissions};
-pub use textio::{ClipboardPlan, ReplaceMode, TextIo, TextIoError};
+pub use textio::{
+    new_app_context_probe, AppContext, AppContextProbe, CaptureOpts, ClipboardPlan, ReplaceMode,
+    TextIo, TextIoError,
+};
+pub use tts::{new_system_tts, SystemTtsError, SystemTtsInference, SystemVoice};
 
 /// Construct the active platform [`Hotkeys`] implementation for this OS.
 pub fn new_hotkeys() -> Box<dyn Hotkeys> {

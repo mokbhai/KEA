@@ -7,7 +7,7 @@ import {
   onInvoke,
   resetTauriMocks,
 } from "../test-utils/tauri";
-import { featureHandlers } from "../test-utils/featureWorld";
+import { featureHandlers, WHISPER_CATALOG } from "../test-utils/featureWorld";
 import DictationPage from "./DictationPage";
 
 vi.mock("@tauri-apps/api/core", async () => (await import("../test-utils/tauri")).coreModule);
@@ -18,6 +18,31 @@ const whisperBinding = {
   model: "whisper-base",
   provider_ref: null,
 };
+
+/** The one whisper build a language can be chosen for. */
+const TURBO = {
+  id: "whisper-turbo",
+  display_name: "Whisper Large v3 Turbo",
+  language: "multilingual",
+  url: "",
+  size_bytes: 574_041_195,
+  sha256: "",
+  deprecated: false,
+};
+
+/** A world whose speech-to-text is `engine` on a catalog including TURBO. */
+function multilingualWorld(engine: string, model: string | null = TURBO.id) {
+  return {
+    bindings: { "default/stt": { engine_id: engine, model, provider_ref: null } },
+    engines: { stt: [engine] },
+    installedWhisper: ["whisper-base", TURBO.id],
+    installedOnnx: [TURBO.id],
+    extra: {
+      list_whisper_models: () => [...WHISPER_CATALOG, TURBO],
+      list_onnx_models: () => [TURBO],
+    },
+  };
+}
 
 function mockWorld(options: Parameters<typeof featureHandlers>[0] = {}) {
   onInvoke(
@@ -126,6 +151,7 @@ describe("DictationPage", () => {
           hold_to_talk: false,
           input_device: null,
           preroll: true,
+          language: null,
         }),
       },
     });
@@ -148,6 +174,7 @@ describe("DictationPage", () => {
           hold_to_talk: false,
           input_device: null,
           preroll: true,
+          language: null,
         }),
       },
     });
@@ -225,6 +252,7 @@ describe("DictationPage", () => {
         hold_to_talk: false,
         input_device: null,
         preroll: true,
+        language: null,
       },
     });
   });
@@ -245,6 +273,7 @@ describe("DictationPage", () => {
         hold_to_talk: true,
         input_device: null,
         preroll: true,
+        language: null,
       },
     });
   });
@@ -272,6 +301,7 @@ describe("DictationPage", () => {
         hold_to_talk: false,
         input_device: "Yeti",
         preroll: true,
+        language: null,
       },
     });
   });
@@ -288,6 +318,7 @@ describe("DictationPage", () => {
           hold_to_talk: false,
           input_device: "Road Caster",
           preroll: true,
+          language: null,
         }),
       },
     });
@@ -351,6 +382,7 @@ describe("DictationPage", () => {
         hold_to_talk: false,
         input_device: null,
         preroll: false,
+        language: null,
       },
     });
   });
@@ -378,6 +410,7 @@ describe("DictationPage", () => {
           hold_to_talk: true,
           input_device: null,
           preroll: true,
+          language: null,
         }),
       },
     });
@@ -388,5 +421,130 @@ describe("DictationPage", () => {
         screen.getByRole("switch", { name: "Hold to talk" }).getAttribute("aria-checked"),
       ).toBe("true"),
     );
+  });
+  it("offers a language for a multilingual Whisper model and saves the tag", async () => {
+    mockWorld(multilingualWorld("whisper"));
+    render(<DictationPage />);
+
+    const picker = (await screen.findByRole("combobox", {
+      name: "Dictation language",
+    })) as HTMLSelectElement;
+    // Auto-detect is the default, and it is the empty option.
+    expect(picker.value).toBe("");
+
+    await userEvent.selectOptions(picker, "de");
+
+    await waitFor(() => expect(invokeCalls("set_dictation_settings")).toHaveLength(1));
+    expect(invokeCalls("set_dictation_settings")[0]).toEqual({
+      settings: {
+        post_process: false,
+        active_model: null,
+        hold_to_talk: false,
+        input_device: null,
+        preroll: true,
+        language: "de",
+      },
+    });
+  });
+
+  it("goes back to auto-detect", async () => {
+    mockWorld({
+      ...multilingualWorld("whisper"),
+      extra: {
+        ...multilingualWorld("whisper").extra,
+        get_dictation_settings: () => ({
+          post_process: false,
+          active_model: null,
+          hold_to_talk: false,
+          input_device: null,
+          preroll: true,
+          language: "de",
+        }),
+      },
+    });
+    render(<DictationPage />);
+
+    const picker = (await screen.findByRole("combobox", {
+      name: "Dictation language",
+    })) as HTMLSelectElement;
+    await waitFor(() => expect(picker.value).toBe("de"));
+
+    await userEvent.selectOptions(picker, "");
+
+    await waitFor(() => expect(invokeCalls("set_dictation_settings")).toHaveLength(1));
+    expect(
+      (invokeCalls("set_dictation_settings")[0] as { settings: { language: unknown } })
+        .settings.language,
+    ).toBeNull();
+  });
+
+  it("hides the language row for an English-only Whisper model", async () => {
+    mockWorld({ bindings: { "default/stt": whisperBinding } });
+    render(<DictationPage />);
+    await screen.findByRole("switch", { name: "Hold to talk" });
+
+    expect(screen.queryByRole("combobox", { name: "Dictation language" })).toBeNull();
+    // Nothing is said about it either: an explanation for a control that is
+    // not on screen is noise.
+    expect(screen.queryByText(/language/i)).toBeNull();
+  });
+
+  it("hides the language row for an engine that would drop it", async () => {
+    // Parakeet's transducer has no language setting: offering one would
+    // re-open the defect the design review closed.
+    mockWorld(multilingualWorld("parakeet"));
+    render(<DictationPage />);
+    await screen.findByRole("switch", { name: "Hold to talk" });
+
+    expect(screen.queryByRole("combobox", { name: "Dictation language" })).toBeNull();
+  });
+
+  it("offers a language for the saved fallback model when the binding names none", async () => {
+    // dictation.rs falls back to settings.active_model, so that is the model
+    // the gate has to be read against.
+    const world = multilingualWorld("whisper", null);
+    mockWorld({
+      ...world,
+      extra: {
+        ...world.extra,
+        get_dictation_settings: () => ({
+          post_process: false,
+          active_model: TURBO.id,
+          hold_to_talk: false,
+          input_device: null,
+          preroll: true,
+          language: null,
+        }),
+      },
+    });
+    render(<DictationPage />);
+
+    expect(
+      await screen.findByRole("combobox", { name: "Dictation language" }),
+    ).toBeTruthy();
+  });
+
+  it("keeps showing a saved tag this build does not list", async () => {
+    const world = multilingualWorld("whisper");
+    mockWorld({
+      ...world,
+      extra: {
+        ...world.extra,
+        get_dictation_settings: () => ({
+          post_process: false,
+          active_model: null,
+          hold_to_talk: false,
+          input_device: null,
+          preroll: true,
+          language: "cy",
+        }),
+      },
+    });
+    render(<DictationPage />);
+
+    const picker = (await screen.findByRole("combobox", {
+      name: "Dictation language",
+    })) as HTMLSelectElement;
+    await waitFor(() => expect(picker.value).toBe("cy"));
   });
 });

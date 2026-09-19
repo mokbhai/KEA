@@ -1,3 +1,4 @@
+pub mod app_context;
 pub mod dictation;
 pub mod error;
 pub mod log;

@@ -14,6 +14,7 @@ export type Page =
   | "ai-providers"
   | "models"
   | "vocabulary"
+  | "profiles"
   | "general"
   | "history"
   | "logs";
