@@ -1,7 +1,12 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { invokeCalls, onInvoke, resetTauriMocks } from "../test-utils/tauri";
+import {
+  emitTauriEvent,
+  invokeCalls,
+  onInvoke,
+  resetTauriMocks,
+} from "../test-utils/tauri";
 import { featureHandlers } from "../test-utils/featureWorld";
 import DictationPage from "./DictationPage";
 
@@ -119,6 +124,8 @@ describe("DictationPage", () => {
           post_process: false,
           active_model: "whisper-base",
           hold_to_talk: false,
+          input_device: null,
+          preroll: true,
         }),
       },
     });
@@ -139,6 +146,8 @@ describe("DictationPage", () => {
           post_process: true,
           active_model: null,
           hold_to_talk: false,
+          input_device: null,
+          preroll: true,
         }),
       },
     });
@@ -210,7 +219,13 @@ describe("DictationPage", () => {
 
     await waitFor(() => expect(invokeCalls("set_dictation_settings")).toHaveLength(1));
     expect(invokeCalls("set_dictation_settings")[0]).toEqual({
-      settings: { post_process: true, active_model: null, hold_to_talk: false },
+      settings: {
+        post_process: true,
+        active_model: null,
+        hold_to_talk: false,
+        input_device: null,
+        preroll: true,
+      },
     });
   });
 
@@ -224,8 +239,132 @@ describe("DictationPage", () => {
 
     await waitFor(() => expect(invokeCalls("set_dictation_settings")).toHaveLength(1));
     expect(invokeCalls("set_dictation_settings")[0]).toEqual({
-      settings: { post_process: false, active_model: null, hold_to_talk: true },
+      settings: {
+        post_process: false,
+        active_model: null,
+        hold_to_talk: true,
+        input_device: null,
+        preroll: true,
+      },
     });
+  });
+
+  it("lists the input devices and saves the one picked", async () => {
+    mockWorld({ bindings: { "default/stt": whisperBinding } });
+    render(<DictationPage />);
+
+    const picker = (await screen.findByRole("combobox", {
+      name: "Input device",
+    })) as HTMLSelectElement;
+    await waitFor(() =>
+      expect(screen.getByRole("option", { name: "Yeti" })).toBeTruthy(),
+    );
+    // Empty is the "System default" option: nothing is saved yet.
+    expect(picker.value).toBe("");
+
+    await userEvent.selectOptions(picker, "Yeti");
+
+    await waitFor(() => expect(invokeCalls("set_dictation_settings")).toHaveLength(1));
+    expect(invokeCalls("set_dictation_settings")[0]).toEqual({
+      settings: {
+        post_process: false,
+        active_model: null,
+        hold_to_talk: false,
+        input_device: "Yeti",
+        preroll: true,
+      },
+    });
+  });
+
+  it("keeps showing a saved device that is not plugged in", async () => {
+    // Otherwise the dropdown would fall back to "System default" and look
+    // like the user had chosen it.
+    mockWorld({
+      extra: {
+        get_dictation_state: () => "idle",
+        get_dictation_settings: () => ({
+          post_process: false,
+          active_model: null,
+          hold_to_talk: false,
+          input_device: "Road Caster",
+          preroll: true,
+        }),
+      },
+    });
+    render(<DictationPage />);
+
+    const picker = (await screen.findByRole("combobox", {
+      name: "Input device",
+    })) as HTMLSelectElement;
+    await waitFor(() => expect(picker.value).toBe("Road Caster"));
+    expect(screen.getByRole("option", { name: /Road Caster \(not connected\)/ })).toBeTruthy();
+  });
+
+  it("drives the microphone test and follows the backend when it stops itself", async () => {
+    mockWorld({ bindings: { "default/stt": whisperBinding } });
+    render(<DictationPage />);
+
+    const toggle = await screen.findByRole("switch", { name: "Test microphone" });
+    await userEvent.click(toggle);
+    await waitFor(() => expect(invokeCalls("start_input_preview")).toHaveLength(1));
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    // The preview times out, or a hotkey takes the microphone: the toggle has
+    // to follow, because nobody clicked it off.
+    await act(async () => {
+      emitTauriEvent("dictation:preview", { active: false });
+    });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("says which microphone it fell back to", async () => {
+    mockWorld({ bindings: { "default/stt": whisperBinding } });
+    render(<DictationPage />);
+    await screen.findByRole("combobox", { name: "Input device" });
+
+    await act(async () => {
+      emitTauriEvent("dictation:device_fallback", {
+        requested: "Yeti",
+        using: "MacBook Air Microphone",
+      });
+    });
+
+    expect(
+      screen.getByText(/Yeti isn't connected — recording from MacBook Air Microphone/),
+    ).toBeTruthy();
+  });
+
+  it("saves the first-word preroll toggle", async () => {
+    mockWorld({ bindings: { "default/stt": whisperBinding } });
+    render(<DictationPage />);
+
+    const toggle = await screen.findByRole("switch", { name: "Catch the first word" });
+    // The preroll is the one dictation setting that starts on.
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    await userEvent.click(toggle);
+
+    await waitFor(() => expect(invokeCalls("set_dictation_settings")).toHaveLength(1));
+    expect(invokeCalls("set_dictation_settings")[0]).toEqual({
+      settings: {
+        post_process: false,
+        active_model: null,
+        hold_to_talk: false,
+        input_device: null,
+        preroll: false,
+      },
+    });
+  });
+
+  it("names the locked state rather than calling it processing", async () => {
+    mockWorld({ bindings: { "default/stt": whisperBinding } });
+    render(<DictationPage />);
+    await screen.findByRole("heading", { level: 1, name: "Dictation" });
+
+    await act(async () => {
+      emitTauriEvent("dictation:state", { state: "locked" });
+    });
+
+    expect(screen.getByText("Locked")).toBeTruthy();
   });
 
   it("shows hold-to-talk already on when it is saved", async () => {
@@ -237,6 +376,8 @@ describe("DictationPage", () => {
           post_process: false,
           active_model: null,
           hold_to_talk: true,
+          input_device: null,
+          preroll: true,
         }),
       },
     });

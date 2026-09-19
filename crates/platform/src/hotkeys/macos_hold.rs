@@ -19,7 +19,9 @@
 //! 3. Release either key: the HUD switches to transcribing and the text lands.
 //! 4. Tap ⌥⇧ quickly, and separately hold ⌥⇧ and press ← a few times: neither
 //!    may start a recording.
-//! 5. Headless CI cannot install a tap or deliver key events; the decision
+//! 5. Tap ⌥⇧ twice quickly: the HUD shows a locked recording that survives the
+//!    keys coming up. Tap once more to transcribe, or press Escape to discard.
+//! 6. Headless CI cannot install a tap or deliver key events; the decision
 //!    logic is covered by [`super::hold`]'s tests.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,7 +38,7 @@ use core_graphics::event::{
 use tokio::sync::mpsc;
 
 use super::hold::{HoldAction, HoldModifiers, HoldToTalk};
-use super::HotkeyError;
+use super::{HoldControl, HotkeyError};
 
 // The tap's own mach port, so the callback can switch the tap back on.
 //
@@ -66,7 +68,9 @@ extern "C" {
 /// a `CFRunLoop` from another thread needs a source or timer installed purely to
 /// carry the request, and the tap is inert while disabled (it resets the state
 /// machine and returns before reading anything). It goes away when KEA quits.
-pub fn spawn(enabled: Arc<AtomicBool>) -> Result<mpsc::UnboundedReceiver<HoldAction>, HotkeyError> {
+pub fn spawn(
+    enabled: Arc<AtomicBool>,
+) -> Result<(HoldControl, mpsc::UnboundedReceiver<HoldAction>), HotkeyError> {
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     // The tap is created on the run-loop thread, so its success or failure has
@@ -93,8 +97,8 @@ pub fn spawn(enabled: Arc<AtomicBool>) -> Result<mpsc::UnboundedReceiver<HoldAct
         }
     }
 
-    spawn_deadline_thread(machine, wake_rx, events_tx);
-    Ok(events_rx)
+    spawn_deadline_thread(machine.clone(), wake_rx, events_tx);
+    Ok((HoldControl::new(machine), events_rx))
 }
 
 fn spawn_tap_thread(
@@ -177,9 +181,12 @@ fn on_event(
 
     if !enabled.load(Ordering::Relaxed) {
         // Turning the mode off mid-hold must end that hold, not strand the
-        // dictation run it started.
-        if machine.reset() == HoldAction::Stop {
-            let _ = events.send(HoldAction::Stop);
+        // dictation run it started — nor an armed stream, which `reset` cannot
+        // report alongside the abandoned recording.
+        let armed = machine.is_armed();
+        send(events, machine.reset());
+        if armed {
+            let _ = events.send(HoldAction::Disarm);
         }
         return;
     }
@@ -201,19 +208,26 @@ fn on_event(
     };
     drop(machine);
 
-    if action == HoldAction::Stop {
-        let _ = events.send(HoldAction::Stop);
-    }
-    // The arming deadline may have moved either way; let the timer recompute.
+    send(events, action);
+    // A deadline may have moved either way; let the timer recompute.
     let _ = wake.send(());
 }
 
-/// Waits out the minimum hold.
+/// Forward a decision, dropping the one that means "no decision".
+fn send(events: &mpsc::UnboundedSender<HoldAction>, action: HoldAction) -> bool {
+    if action == HoldAction::Nothing {
+        return true;
+    }
+    events.send(action).is_ok()
+}
+
+/// Waits out the machine's clock-driven decisions.
 ///
 /// A hold that is never interrupted produces no further events, so the start
-/// has to come from a clock. It sleeps exactly as long as the machine says is
-/// left rather than polling, and parks on the wake channel whenever nothing is
-/// armed — which is all of the time the user is not holding the chord.
+/// has to come from a clock — and so do the preroll arming and the hard cap on
+/// a locked recording. It sleeps exactly as long as the machine says is left
+/// rather than polling, and parks on the wake channel whenever nothing is
+/// pending — which is all of the time the user is not holding the chord.
 fn spawn_deadline_thread(
     machine: Arc<Mutex<HoldToTalk>>,
     wake: std::sync::mpsc::Receiver<()>,
@@ -225,7 +239,7 @@ fn spawn_deadline_thread(
             let remaining = machine
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .time_until_start(Instant::now());
+                .time_until_deadline(Instant::now());
 
             let keep_going = match remaining {
                 Some(remaining) => !matches!(
@@ -242,7 +256,7 @@ fn spawn_deadline_thread(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .poll(Instant::now());
-            if action == HoldAction::Start && events.send(HoldAction::Start).is_err() {
+            if !send(&events, action) {
                 return;
             }
         })

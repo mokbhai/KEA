@@ -452,6 +452,8 @@ mod tests {
             post_process: false,
             active_model: None,
             hold_to_talk: false,
+            input_device: None,
+            preroll: true,
         };
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
             samples: vec![0.0; 1600],
@@ -500,6 +502,8 @@ mod tests {
             post_process: false,
             active_model: None,
             hold_to_talk: false,
+            input_device: None,
+            preroll: true,
         };
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
             samples: vec![0.0; 1600],
@@ -547,6 +551,8 @@ mod tests {
             post_process: false,
             active_model: None,
             hold_to_talk: false,
+            input_device: None,
+            preroll: true,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
@@ -599,6 +605,8 @@ mod tests {
             post_process: true,
             active_model: None,
             hold_to_talk: false,
+            input_device: None,
+            preroll: true,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
@@ -660,6 +668,8 @@ mod tests {
             post_process: true,
             active_model: None,
             hold_to_talk: false,
+            input_device: None,
+            preroll: true,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
@@ -765,6 +775,8 @@ mod tests {
             post_process: true,
             active_model: None,
             hold_to_talk: false,
+            input_device: None,
+            preroll: true,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {

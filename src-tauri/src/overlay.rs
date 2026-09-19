@@ -178,9 +178,11 @@ pub fn reposition(window: &WebviewWindow) {
 
 /// True when a dictation state means the overlay should be on screen.
 pub fn visible_for_state(state: DictationState) -> bool {
+    // A locked recording is exactly the one the HUD matters most for: no key
+    // is held, so without it there is nothing on screen saying the mic is open.
     matches!(
         state,
-        DictationState::Listening | DictationState::Processing
+        DictationState::Listening | DictationState::Locked | DictationState::Processing
     )
 }
 

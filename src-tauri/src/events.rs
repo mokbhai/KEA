@@ -1,4 +1,5 @@
 use kea_infer::DownloadProgress;
+use kea_platform::audio::DeviceFallback;
 use kea_platform::{DictationState, MeetingState};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -41,6 +42,7 @@ pub fn dictation_state_wire(state: DictationState) -> &'static str {
     match state {
         DictationState::Idle => "idle",
         DictationState::Listening => "listening",
+        DictationState::Locked => "locked",
         DictationState::Processing => "processing",
     }
 }
@@ -99,6 +101,29 @@ pub fn emit_dictation_state(app: &AppHandle, state: DictationState) {
 
 pub fn emit_dictation_level(app: &AppHandle, level: f32) {
     let _ = app.emit("dictation:level", DictationLevelPayload { level });
+}
+
+/// Whether the microphone is open purely to show its level.
+///
+/// A separate event from `dictation:state` because a preview is not a
+/// dictation run: it records nothing, and the HUD must stay hidden for it.
+/// The UI needs it because the preview stops itself — on a timer, on window
+/// blur, and when a recording takes the device — and the toggle has to follow.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct DictationPreviewPayload {
+    pub active: bool,
+}
+
+pub fn emit_dictation_preview(app: &AppHandle, active: bool) {
+    let _ = app.emit("dictation:preview", DictationPreviewPayload { active });
+}
+
+/// The saved microphone was not there and capture opened the default instead.
+///
+/// Emitted once per stream open rather than per audio callback — see
+/// `AudioIo::take_device_fallback`.
+pub fn emit_device_fallback(app: &AppHandle, fallback: &DeviceFallback) {
+    let _ = app.emit("dictation:device_fallback", fallback.clone());
 }
 
 pub fn emit_dictation_error(app: &AppHandle, message: &str) {
@@ -315,6 +340,7 @@ mod tests {
     fn state_wire_values_are_the_lowercase_contract() {
         assert_eq!(dictation_state_wire(DictationState::Idle), "idle");
         assert_eq!(dictation_state_wire(DictationState::Listening), "listening");
+        assert_eq!(dictation_state_wire(DictationState::Locked), "locked");
         assert_eq!(
             dictation_state_wire(DictationState::Processing),
             "processing"
@@ -324,6 +350,27 @@ mod tests {
         assert_eq!(meeting_state_wire(MeetingState::Processing), "processing");
         assert_eq!(TtsState::Idle.wire(), "idle");
         assert_eq!(TtsState::Reading.wire(), "reading");
+    }
+
+    #[test]
+    fn dictation_preview_payload_serializes() {
+        let json = serde_json::to_string(&DictationPreviewPayload { active: true }).unwrap();
+        assert_eq!(json, r#"{"active":true}"#);
+    }
+
+    #[test]
+    fn device_fallback_serializes_both_names() {
+        // The UI says "your Yeti is gone, using the MacBook mic", so it needs
+        // both halves on the wire.
+        let json = serde_json::to_string(&DeviceFallback {
+            requested: "Yeti".into(),
+            using: Some("MacBook Air Microphone".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"requested":"Yeti","using":"MacBook Air Microphone"}"#
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
 
-use super::PcmFrame;
+use super::{DeviceFallback, InputDevice, PcmFrame};
 
 /// Delivery counters for a bounded capture channel, split by *why* a frame did
 /// not reach the streaming consumer.
@@ -260,6 +260,130 @@ pub fn accumulate_frames(frames: &[PcmFrame]) -> PcmFrame {
     }
 }
 
+/// A fixed-size ring of the most recent mono samples.
+///
+/// Backs the dictation preroll: capture is armed on the first modifier of the
+/// ⌥⇧ chord and writes here until the hold threshold passes, at which point the
+/// ring is drained ahead of the live audio. Everything older than the window
+/// simply falls out the back, so an armed-but-never-used chord costs a fixed
+/// amount of memory no matter how long the user rests on the key.
+///
+/// Deliberately not a `VecDeque`: the write path runs inside the cpal callback
+/// and must not allocate, and a pre-sized `Vec` with a write cursor never does.
+#[derive(Debug)]
+pub struct RingBuffer {
+    buf: Vec<f32>,
+    /// Where the next sample goes.
+    write: usize,
+    /// How many of `buf`'s slots hold real audio; saturates at capacity.
+    filled: usize,
+}
+
+impl RingBuffer {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: vec![0.0; capacity],
+            write: 0,
+            filled: 0,
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.filled
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.filled == 0
+    }
+
+    /// Append `samples`, dropping whatever no longer fits in the window.
+    pub fn push(&mut self, samples: &[f32]) {
+        let capacity = self.buf.len();
+        if capacity == 0 {
+            return;
+        }
+        // A buffer larger than the whole window would wrap over itself; only
+        // its tail could survive, so copy just that.
+        let tail = if samples.len() > capacity {
+            &samples[samples.len() - capacity..]
+        } else {
+            samples
+        };
+        for sample in tail {
+            self.buf[self.write] = *sample;
+            self.write = (self.write + 1) % capacity;
+        }
+        self.filled = (self.filled + tail.len()).min(capacity);
+    }
+
+    /// Take the window in recording order, oldest first, leaving the ring empty.
+    pub fn drain(&mut self) -> Vec<f32> {
+        let capacity = self.buf.len();
+        let mut out = Vec::with_capacity(self.filled);
+        if self.filled > 0 {
+            // Once full, the oldest sample is the one the cursor is about to
+            // overwrite; before that, the ring has never wrapped and the oldest
+            // sample is at zero.
+            let start = if self.filled == capacity {
+                self.write
+            } else {
+                0
+            };
+            for i in 0..self.filled {
+                out.push(self.buf[(start + i) % capacity]);
+            }
+        }
+        self.clear();
+        out
+    }
+
+    pub fn clear(&mut self) {
+        self.write = 0;
+        self.filled = 0;
+    }
+}
+
+/// Which input device capture should open, and whether the saved preference
+/// was honoured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceChoice {
+    /// Nothing saved: whatever the OS calls the default input.
+    Default,
+    /// The saved device is present.
+    Preferred(String),
+    /// The saved device is gone — unplugged, undocked, or a Bluetooth headset
+    /// that wandered off. Capture falls back to the default rather than
+    /// failing, and `fallback` is what the UI says about it.
+    Fallback(DeviceFallback),
+}
+
+/// Decide which input device to open, given the current enumeration and the
+/// saved preference.
+///
+/// Pure so the three cases are testable without a `cpal` host. Device names are
+/// the only handle `cpal` gives, and they are neither unique nor stable across
+/// reboots on every host, so this resolves leniently and never errors: a
+/// preference that no longer matches anything is a fallback, not a failure.
+pub fn choose_input_device(devices: &[InputDevice], preferred: Option<&str>) -> DeviceChoice {
+    let Some(preferred) = preferred else {
+        return DeviceChoice::Default;
+    };
+    if devices.iter().any(|d| d.id == preferred) {
+        return DeviceChoice::Preferred(preferred.to_string());
+    }
+    DeviceChoice::Fallback(DeviceFallback {
+        requested: preferred.to_string(),
+        using: devices
+            .iter()
+            .find(|d| d.is_default)
+            .map(|d| d.name.clone()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +393,114 @@ mod tests {
             samples: vec![0.1; n],
             sample_rate_hz: 16_000,
         }
+    }
+
+    fn device(name: &str, is_default: bool) -> InputDevice {
+        InputDevice {
+            id: name.to_string(),
+            name: name.to_string(),
+            is_default,
+        }
+    }
+
+    #[test]
+    fn no_preference_takes_the_default_device() {
+        let devices = [
+            device("MacBook Air Microphone", true),
+            device("Yeti", false),
+        ];
+        assert_eq!(choose_input_device(&devices, None), DeviceChoice::Default);
+    }
+
+    #[test]
+    fn a_present_preference_is_honoured() {
+        let devices = [
+            device("MacBook Air Microphone", true),
+            device("Yeti", false),
+        ];
+        assert_eq!(
+            choose_input_device(&devices, Some("Yeti")),
+            DeviceChoice::Preferred("Yeti".into())
+        );
+    }
+
+    #[test]
+    fn an_absent_preference_falls_back_and_names_both_devices() {
+        // The docking-station case: the Yeti the user picked is gone, and the
+        // UI has to be able to say which mic is recording instead.
+        let devices = [device("MacBook Air Microphone", true)];
+        assert_eq!(
+            choose_input_device(&devices, Some("Yeti")),
+            DeviceChoice::Fallback(DeviceFallback {
+                requested: "Yeti".into(),
+                using: Some("MacBook Air Microphone".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_fallback_with_no_devices_at_all_still_resolves() {
+        // Every input vanished. Resolution must still answer; opening the
+        // stream is what fails, with the error the caller already handles.
+        assert_eq!(
+            choose_input_device(&[], Some("Yeti")),
+            DeviceChoice::Fallback(DeviceFallback {
+                requested: "Yeti".into(),
+                using: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_partially_filled_ring_drains_in_recording_order() {
+        let mut ring = RingBuffer::with_capacity(8);
+        ring.push(&[1.0, 2.0, 3.0]);
+        assert_eq!(ring.len(), 3);
+        assert_eq!(ring.drain(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn a_wrapped_ring_keeps_only_the_most_recent_window() {
+        let mut ring = RingBuffer::with_capacity(4);
+        ring.push(&[1.0, 2.0, 3.0]);
+        ring.push(&[4.0, 5.0]);
+        assert_eq!(ring.len(), 4);
+        assert_eq!(
+            ring.drain(),
+            vec![2.0, 3.0, 4.0, 5.0],
+            "the oldest sample falls out the back, in order"
+        );
+    }
+
+    #[test]
+    fn a_single_buffer_larger_than_the_window_keeps_its_tail() {
+        // A device handing us a 1024-sample buffer into a shorter ring: only
+        // the newest samples can survive, and they must stay in order.
+        let mut ring = RingBuffer::with_capacity(3);
+        ring.push(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(ring.drain(), vec![3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn draining_clears_the_ring() {
+        let mut ring = RingBuffer::with_capacity(4);
+        ring.push(&[1.0, 2.0]);
+        assert_eq!(ring.drain(), vec![1.0, 2.0]);
+        assert!(ring.is_empty());
+        assert!(
+            ring.drain().is_empty(),
+            "a drained preroll must not be replayed into the next recording"
+        );
+    }
+
+    #[test]
+    fn a_zero_capacity_ring_swallows_everything() {
+        // What a device that reports a zero sample rate would produce. It must
+        // not panic in the audio callback.
+        let mut ring = RingBuffer::with_capacity(0);
+        ring.push(&[1.0, 2.0]);
+        assert!(ring.is_empty());
+        assert!(ring.drain().is_empty());
     }
 
     #[test]

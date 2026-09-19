@@ -344,6 +344,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_rewrite_translates_into_the_requested_language() {
+        // Same seam as the test above, one mode along: the target reaches the
+        // prompt (the noop engine echoes it back) and the result is written to
+        // the selection, so nothing between the descriptor and TextIo drops it.
+        let mut reg = EngineRegistry::default();
+        reg.register_llm(Arc::new(NoopLlmEngine));
+
+        let textio = Arc::new(FakeTextIo {
+            selection: "guten tag".into(),
+            replaced: Mutex::new(None),
+        });
+
+        let config_pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&config_pool).await.unwrap();
+        let data_pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&data_pool).await.unwrap();
+
+        let bindings = BindingRepo::new(config_pool.clone());
+        let actions = ActionRepo::new(data_pool);
+        let presets = PresetRepo::new(config_pool.clone());
+        let overrides = PromptOverrideRepo::new(config_pool);
+
+        let out = run_rewrite(
+            &reg,
+            &bindings,
+            &actions,
+            &presets,
+            &overrides,
+            textio.as_ref(),
+            RewriteInput {
+                source_text: String::new(),
+                mode: RewriteMode::Translate,
+                preset_id: None,
+                custom_instruction: Some("de".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("German"));
+        assert!(out.contains("guten tag"));
+        assert_eq!(
+            textio.replaced.lock().unwrap().as_deref(),
+            Some(out.as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn run_rewrite_records_conversation_when_storage_enabled() {
         let mut reg = EngineRegistry::default();
         reg.register_llm(Arc::new(NoopLlmEngine));

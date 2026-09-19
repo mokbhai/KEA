@@ -14,7 +14,7 @@ async function renderHud() {
   return view;
 }
 
-async function setState(state: "idle" | "listening" | "processing") {
+async function setState(state: "idle" | "listening" | "locked" | "processing") {
   await act(async () => {
     emitTauriEvent("dictation:state", { state });
   });
@@ -110,6 +110,52 @@ describe("DictationHud", () => {
 
     const meter = screen.getByRole("meter", { name: "Microphone level" });
     expect(meter.getAttribute("aria-valuenow")).toBe("0");
+  });
+
+  it("shows a locked recording as locked, with both ways out", async () => {
+    // A lock has no key holding it open, so the HUD is the only thing saying
+    // the microphone is on and how to turn it off.
+    await renderHud();
+    await setState("locked");
+
+    expect(screen.getByRole("status").textContent).toContain("Locked");
+    expect(screen.getByText(/Tap ⌥⇧ to finish · Esc to cancel/)).toBeTruthy();
+    // Still recording, so it still shows levels rather than the transcribing
+    // shimmer.
+    expect(screen.getByRole("meter", { name: "Microphone level" })).toBeTruthy();
+    expect(screen.queryByRole("progressbar")).toBeNull();
+  });
+
+  it("counts up while locked so a forgotten recording is visible", async () => {
+    vi.useFakeTimers();
+    try {
+      await renderHud();
+      await setState("locked");
+      expect(screen.getByRole("status").textContent).toContain("0:00");
+
+      await act(async () => {
+        vi.advanceTimersByTime(65_000);
+      });
+      expect(screen.getByRole("status").textContent).toContain("1:05");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the waveform running across a lock", async () => {
+    await renderHud();
+    await setState("locked");
+    await setLevel(0.7);
+
+    const meter = screen.getByRole("meter", { name: "Microphone level" });
+    await waitFor(() => expect(meter.getAttribute("aria-valuenow")).toBe("0.7"));
+  });
+
+  it("does not count elapsed time for an ordinary hold", async () => {
+    await renderHud();
+    await setState("listening");
+
+    expect(screen.getByRole("status").textContent).not.toContain("0:00");
   });
 
   it("falls back to a static meter when motion is reduced", async () => {

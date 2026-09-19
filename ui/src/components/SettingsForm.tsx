@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { REWRITE_MODES, type RewriteMode } from "../api";
+import { REWRITE_MODES, TRANSLATION_TARGETS, type RewriteMode } from "../api";
 import type { RewriteSettingsController } from "../hooks/useRewriteSettings";
 import LoadingBlock from "./LoadingBlock";
 import { Row, RowGroup } from "./SettingsRow";
@@ -20,7 +20,11 @@ export default function SettingsForm({ rewrite, leadingRows }: Props) {
   const [newPresetName, setNewPresetName] = useState("");
   const [newPresetInstruction, setNewPresetInstruction] = useState("");
   const { presets, promptOverride, loading, busy, status, removePreset } = rewrite;
-  const { mode, custom_instruction: customInstruction } = rewrite.settings;
+  const {
+    mode,
+    custom_instruction: customInstruction,
+    translate_target: translateTarget,
+  } = rewrite.settings;
   const presetId = rewrite.settings.preset_id ?? "";
 
   const savePromptOverride = () => void rewrite.savePromptOverride();
@@ -69,6 +73,30 @@ export default function SettingsForm({ rewrite, leadingRows }: Props) {
                 ))}
               </select>
             </Row>
+            {mode === "translate" && (
+              <Row
+                label="Translate into"
+                hint="The language the selection is rewritten in."
+              >
+                <select
+                  className="kea-select"
+                  aria-label="Target language"
+                  value={translateTarget}
+                  onChange={(e) => rewrite.chooseTranslateTarget(e.target.value)}
+                >
+                  {/* A tag inherited from the system may not be one we list;
+                      showing it keeps the picker from silently re-targeting. */}
+                  {!TRANSLATION_TARGETS.some((t) => t.tag === translateTarget) && (
+                    <option value={translateTarget}>{translateTarget}</option>
+                  )}
+                  {TRANSLATION_TARGETS.map((t) => (
+                    <option key={t.tag} value={t.tag}>
+                      {t.label}
+                    </option>
+                  ))}
+                </select>
+              </Row>
+            )}
             {mode === "ask_kea" && (
               <Row label="Instruction" hint="What Ask KEA should do with the selection.">
                 <textarea
@@ -99,6 +127,13 @@ export default function SettingsForm({ rewrite, leadingRows }: Props) {
                   placeholder="Override the built-in prompt for the selected style"
                 />
               </label>
+              {mode === "translate" && (
+                <p className="kea-muted" style={{ margin: 0, fontSize: "0.8125rem" }}>
+                  One prompt covers every language: keep{" "}
+                  <code>{"{{target_language}}"}</code> in it, which is replaced with
+                  the language you picked.
+                </p>
+              )}
               <div>
                 <button
                   type="button"

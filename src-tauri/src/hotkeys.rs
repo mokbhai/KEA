@@ -20,15 +20,15 @@ use tokio::sync::mpsc;
 
 use crate::commands::trigger_tts_inner;
 use crate::commands::{
-    default_rewrite_input, dictation_gate, dictation_hotkey_action, execute_rewrite,
-    meeting_hotkey_action, record_hotkey_reg_status, register_hotkey, resolve_accelerator,
-    start_dictation_inner, start_meeting_inner, stop_dictation_inner, stop_meeting_inner,
-    sync_hold_to_talk, try_acquire_busy, DictationHotkeyAction, HotkeyAction, MeetingHotkeyAction,
-    DICTATION_ACTION_ID, HOTKEY_ACTIONS, MEETINGS_ACTION_ID, REWRITE_ACTION_ID, TTS_ACTION_ID,
+    apply_dictation_settings, default_rewrite_input, dictation_gate, dictation_hotkey_action,
+    execute_rewrite, hold_dictation_action, lock_cancel_action, meeting_hotkey_action,
+    record_hotkey_reg_status, register_hotkey, resolve_accelerator, run_dictation_action,
+    start_meeting_inner, stop_meeting_inner, try_acquire_busy, HotkeyAction, MeetingHotkeyAction,
+    DICTATION_ACTION_ID, HOTKEY_ACTIONS, LOCK_CANCEL_ACTION_ID, MEETINGS_ACTION_ID,
+    REWRITE_ACTION_ID, TTS_ACTION_ID,
 };
 use crate::events::{
-    emit_dictation_error, emit_meeting_error, emit_rewrite_error, emit_rewrite_progress,
-    emit_tts_error,
+    emit_meeting_error, emit_rewrite_error, emit_rewrite_progress, emit_tts_error,
 };
 use crate::AppState;
 
@@ -130,6 +130,31 @@ pub fn spawn_dispatch_loop(state: Arc<AppState>, app: AppHandle, mut rx: mpsc::R
         let table = dispatch_table(&state);
 
         while let Some(action_id) = rx.recv().await {
+            // Escape has no [`HOTKEY_ACTIONS`] row — it is registered only
+            // while a locked recording is running, and never user-rebindable —
+            // but its press still arrives on this one accelerator stream, so
+            // it is matched here rather than in the table.
+            if action_id == LOCK_CANCEL_ACTION_ID {
+                // The same busy flag as every other dictation trigger: an
+                // Escape landing alongside the tap that stops the same lock
+                // must not run a cancel behind a stop.
+                let Some(guard) = try_acquire_busy(&state.dictation_busy) else {
+                    continue;
+                };
+                let state = state.clone();
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _busy = guard;
+                    // Asked of the hold machine rather than assumed: the press
+                    // can still arrive after the lock ended some other way.
+                    let event = lock_cancel_action(&state);
+                    let (meeting_active, in_flight, current) = dictation_gate(&state).await;
+                    let action = hold_dictation_action(event, current, meeting_active, in_flight);
+                    run_dictation_action(action, &state, &app).await;
+                });
+                continue;
+            }
+
             let Some(entry) = table.iter().find(|e| e.action.action_id == action_id) else {
                 continue;
             };
@@ -151,23 +176,27 @@ pub fn spawn_dispatch_loop(state: Arc<AppState>, app: AppHandle, mut rx: mpsc::R
     });
 }
 
-/// Re-arm ⌥⇧ hold-to-talk if the user left it on. Call after the dispatch loop
-/// is up: the listener drives the same dictation handlers, and a chord held
-/// through launch should find them ready.
-pub fn spawn_hold_to_talk_rearm(state: &Arc<AppState>, app: &AppHandle, config_pool: SqlitePool) {
+/// Put the saved dictation settings back into effect at launch: the ⌥⇧
+/// listener if the user left it on, the preroll flag, and the microphone they
+/// picked.
+///
+/// Call after the dispatch loop is up: the hold listener drives the same
+/// dictation handlers, and a chord held through launch should find them ready.
+pub fn spawn_saved_dictation_settings(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    config_pool: SqlitePool,
+) {
     let state = state.clone();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let settings = DictationSettingsRepo::new(SettingsRepo::new(config_pool))
+        match DictationSettingsRepo::new(SettingsRepo::new(config_pool))
             .get()
-            .await;
-        match settings {
-            Ok(settings) if settings.hold_to_talk => {
-                sync_hold_to_talk(&state, &app, true);
-            }
-            Ok(_) => {}
+            .await
+        {
+            Ok(settings) => apply_dictation_settings(&state, &app, &settings).await,
             Err(error) => {
-                tracing::warn!(%error, "could not read dictation settings to arm hold-to-talk")
+                tracing::warn!(%error, "could not read the saved dictation settings")
             }
         }
     });
@@ -187,20 +216,8 @@ fn handle_rewrite<'a>(state: &'a Arc<AppState>, app: &'a AppHandle) -> HandlerFu
 fn handle_dictation<'a>(state: &'a Arc<AppState>, app: &'a AppHandle) -> HandlerFuture<'a> {
     Box::pin(async move {
         let (meeting_active, in_flight, current) = dictation_gate(state).await;
-
-        match dictation_hotkey_action(current, meeting_active, in_flight) {
-            DictationHotkeyAction::Start => {
-                if let Err(error) = start_dictation_inner(state, app).await {
-                    emit_dictation_error(app, &error);
-                }
-            }
-            DictationHotkeyAction::Stop => {
-                if let Err(error) = stop_dictation_inner(state, app).await {
-                    emit_dictation_error(app, &error);
-                }
-            }
-            DictationHotkeyAction::Ignore => {}
-        }
+        let action = dictation_hotkey_action(current, meeting_active, in_flight);
+        run_dictation_action(action, state, app).await;
     })
 }
 
@@ -258,5 +275,19 @@ mod tests {
     #[test]
     fn unknown_action_ids_have_no_handler() {
         assert!(handler_for("nope:not_a_command").is_none());
+    }
+
+    #[test]
+    fn the_lock_cancel_key_is_not_a_table_row() {
+        // It is registered around a single locked recording, not owned by the
+        // user, and `every_hotkey_action_has_a_handler` would demand a table
+        // handler for it that the dispatch loop deliberately does not use.
+        assert!(
+            HOTKEY_ACTIONS
+                .iter()
+                .all(|a| a.action_id != LOCK_CANCEL_ACTION_ID),
+            "Escape must not become a rebindable hotkey"
+        );
+        assert!(handler_for(LOCK_CANCEL_ACTION_ID).is_none());
     }
 }

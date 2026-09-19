@@ -12,8 +12,24 @@ import LevelMeter from "./LevelMeter";
 const stateLabels: Record<DictationState, string> = {
   idle: "Idle",
   listening: "Listening…",
+  locked: "Locked",
   processing: "Transcribing…",
 };
+
+/**
+ * A locked recording has no key holding it open, so the only thing standing
+ * between it and an open microphone nobody remembers is this line. It says
+ * both ways out, because the gesture that ends it is not the one that started
+ * it.
+ */
+const LOCKED_HINT = "Tap ⌥⇧ to finish · Esc to cancel";
+
+/** m:ss, which is all a five-minute cap ever needs. */
+function formatElapsed(seconds: number): string {
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${mins}:${String(secs).padStart(2, "0")}`;
+}
 
 /* The state used to be carried by text colour alone; a dot carries it for
    anyone who can't tell the two colours apart, and the label carries it for
@@ -21,6 +37,9 @@ const stateLabels: Record<DictationState, string> = {
 const stateDots: Record<DictationState, string> = {
   idle: "kea-dot--muted",
   listening: "kea-dot--ok",
+  // Warn rather than ok: this one keeps recording after the keys come up, and
+  // the dot is the fastest way to tell the two apart across the room.
+  locked: "kea-dot--warn",
   processing: "kea-dot--accent",
 };
 
@@ -77,7 +96,9 @@ function TranscribingIndicator({ reducedMotion }: { reducedMotion: boolean }) {
 export default function DictationHud() {
   const [state, setState] = useState<DictationState>("idle");
   const [history, setHistory] = useState<number[]>(() => emptyLevelHistory());
+  const [elapsed, setElapsed] = useState(0);
   const reducedMotion = usePrefersReducedMotion();
+  const recording = state === "listening" || state === "locked";
 
   useEffect(() => {
     const unsubs = Promise.all([
@@ -95,7 +116,22 @@ export default function DictationHud() {
   useEffect(() => {
     // A run that ended must not leave its last waveform frozen on screen for
     // the next one to start from.
-    if (state !== "listening") setHistory(emptyLevelHistory());
+    if (!recording) setHistory(emptyLevelHistory());
+  }, [recording]);
+
+  useEffect(() => {
+    // Only the locked mode counts: a held recording lasts as long as the keys
+    // are down, and the user can feel that. A locked one has to be told.
+    if (state !== "locked") {
+      setElapsed(0);
+      return;
+    }
+    const started = Date.now();
+    const timer = setInterval(
+      () => setElapsed(Math.floor((Date.now() - started) / 1000)),
+      1000,
+    );
+    return () => clearInterval(timer);
   }, [state]);
 
   if (state === "idle") return null;
@@ -106,9 +142,12 @@ export default function DictationHud() {
           second inside one would be announced 20x a second. */}
       <div className="kea-hud__head" role="status">
         <span className={`kea-dot ${stateDots[state]}`} aria-hidden="true" />
-        <span>{stateLabels[state]}</span>
+        <span>
+          {stateLabels[state]}
+          {state === "locked" && ` · ${formatElapsed(elapsed)}`}
+        </span>
       </div>
-      {state === "listening" ? (
+      {recording ? (
         reducedMotion ? (
           <LevelMeter level={history[history.length - 1] ?? 0} />
         ) : (
@@ -116,6 +155,14 @@ export default function DictationHud() {
         )
       ) : (
         <TranscribingIndicator reducedMotion={reducedMotion} />
+      )}
+      {state === "locked" && (
+        <span
+          className="kea-muted"
+          style={{ fontSize: "0.75rem", whiteSpace: "nowrap" }}
+        >
+          {LOCKED_HINT}
+        </span>
       )}
     </div>
   );

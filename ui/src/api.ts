@@ -18,7 +18,8 @@ export type RewriteMode =
   | "concise"
   | "friendly"
   | "audio_refinement"
-  | "ask_kea";
+  | "ask_kea"
+  | "translate";
 
 export type RewritePreset = {
   id: string;
@@ -45,7 +46,102 @@ export const REWRITE_MODES: { value: RewriteMode; label: string }[] = [
   { value: "friendly", label: "Friendly" },
   { value: "audio_refinement", label: "Audio refinement" },
   { value: "ask_kea", label: "Ask KEA" },
+  { value: "translate", label: "Translate" },
 ];
+
+/**
+ * The extra value a mode's prompt template needs, mirroring
+ * `RewriteMode::parameter` in `kea_core::rewrite::mode`. Modes absent here take
+ * no parameter.
+ *
+ * Both parameters travel in one argument (`customInstruction` at the Tauri
+ * boundary); the backend routes it to the right template variable from this
+ * same descriptor, so the UI never has to know which variable that is.
+ */
+export const MODE_PARAMETER: Partial<
+  Record<RewriteMode, "instruction" | "target_language">
+> = {
+  ask_kea: "instruction",
+  translate: "target_language",
+};
+
+export type TranslationTarget = { tag: string; label: string };
+
+/**
+ * The languages the translate picker offers, mirroring `TRANSLATION_TARGETS` in
+ * `kea_core::rewrite::language` — which stays the source of truth, since it is
+ * what renders the prompt and what accepts tags this list omits.
+ */
+export const TRANSLATION_TARGETS: TranslationTarget[] = [
+  { tag: "en-US", label: "American English" },
+  { tag: "ar", label: "Arabic" },
+  { tag: "bn", label: "Bengali" },
+  { tag: "pt-BR", label: "Brazilian Portuguese" },
+  { tag: "en-GB", label: "British English" },
+  { tag: "bg", label: "Bulgarian" },
+  { tag: "fr-CA", label: "Canadian French" },
+  { tag: "cs", label: "Czech" },
+  { tag: "da", label: "Danish" },
+  { tag: "nl", label: "Dutch" },
+  { tag: "en", label: "English" },
+  { tag: "tl", label: "Filipino" },
+  { tag: "fi", label: "Finnish" },
+  { tag: "fr", label: "French" },
+  { tag: "de", label: "German" },
+  { tag: "el", label: "Greek" },
+  { tag: "he", label: "Hebrew" },
+  { tag: "hi", label: "Hindi" },
+  { tag: "hu", label: "Hungarian" },
+  { tag: "is", label: "Icelandic" },
+  { tag: "id", label: "Indonesian" },
+  { tag: "it", label: "Italian" },
+  { tag: "ja", label: "Japanese" },
+  { tag: "ko", label: "Korean" },
+  { tag: "es-419", label: "Latin American Spanish" },
+  { tag: "ms", label: "Malay" },
+  { tag: "nb", label: "Norwegian Bokmal" },
+  { tag: "fa", label: "Persian" },
+  { tag: "pl", label: "Polish" },
+  { tag: "pt", label: "Portuguese" },
+  { tag: "ro", label: "Romanian" },
+  { tag: "ru", label: "Russian" },
+  { tag: "zh-Hans", label: "Simplified Chinese" },
+  { tag: "sk", label: "Slovak" },
+  { tag: "es", label: "Spanish" },
+  { tag: "sv", label: "Swedish" },
+  { tag: "ta", label: "Tamil" },
+  { tag: "th", label: "Thai" },
+  { tag: "zh-Hant", label: "Traditional Chinese" },
+  { tag: "tr", label: "Turkish" },
+  { tag: "uk", label: "Ukrainian" },
+  { tag: "ur", label: "Urdu" },
+  { tag: "vi", label: "Vietnamese" },
+];
+
+/** The listed tag matching `locale` exactly or by its primary subtag. */
+export function matchTranslationTarget(locale: string): string | null {
+  const wanted = locale.toLowerCase();
+  const exact = TRANSLATION_TARGETS.find((t) => t.tag.toLowerCase() === wanted);
+  if (exact) return exact.tag;
+  const primary = wanted.split("-")[0];
+  return TRANSLATION_TARGETS.find((t) => t.tag.toLowerCase() === primary)?.tag ?? null;
+}
+
+/**
+ * The target to start from: the language this Mac is set to, since translating
+ * into your own language is what an unconfigured translate shortcut is for.
+ */
+export function systemTranslationTarget(): string {
+  return matchTranslationTarget(navigator.language || "en") ?? "en";
+}
+
+/** The picker label for a tag, falling back to the tag for anything unlisted. */
+export function translationTargetLabel(tag: string): string {
+  return TRANSLATION_TARGETS.find((t) => t.tag === tag)?.label ?? tag;
+}
+
+/** The hotkey command id that translates into `tag`. */
+export const translateCommand = (tag: string) => `translate.${tag}`;
 
 export const listLlmEngines = () => invoke<EngineInfo[]>("list_llm_engines");
 
@@ -168,33 +264,40 @@ export const getHotkeyRegistrationStatus = () =>
 export const setHotkey = (feature: string, command: string, accelerator: string) =>
   invoke<void>("set_hotkey", { feature, command, accelerator });
 
+/**
+ * Rewrites the current selection in the frontmost app and replaces it there.
+ *
+ * `parameter` is whatever the mode needs (see {@link MODE_PARAMETER}): Ask
+ * KEA's instruction, Translate's BCP-47 target tag, null for the rest.
+ */
 export const triggerRewrite = (
   mode: RewriteMode,
   preset_id?: string | null,
-  custom_instruction?: string | null,
+  parameter?: string | null,
 ) =>
   invoke<string>("trigger_rewrite", {
     mode,
     presetId: preset_id ?? null,
-    customInstruction: custom_instruction ?? null,
+    customInstruction: parameter ?? null,
   });
 
 /**
  * Rewrites `text` with the Rewrite feature's own AI binding and returns the
  * result. Nothing is captured from, or pasted into, the frontmost app — this
- * backs the "Try it" card, unlike {@link triggerRewrite}.
+ * backs the "Try it" card, unlike {@link triggerRewrite}. `parameter` carries
+ * the mode's value, as it does there.
  */
 export const previewRewrite = (
   text: string,
   mode: RewriteMode,
   preset_id?: string | null,
-  custom_instruction?: string | null,
+  parameter?: string | null,
 ) =>
   invoke<string>("preview_rewrite", {
     text,
     mode,
     presetId: preset_id ?? null,
-    customInstruction: custom_instruction ?? null,
+    customInstruction: parameter ?? null,
   });
 
 export const runDemo = (prompt: string) => invoke<string>("run_demo", { prompt });
@@ -211,13 +314,35 @@ export const onRewriteError = (handler: (message: string) => void): Promise<Unli
     handler(event.payload.message),
   );
 
-export type DictationState = "idle" | "listening" | "processing";
+/**
+ * `locked` is a recording started by a double tap of ⌥⇧: still listening, but
+ * with no key holding it open, which is why it is a state of its own rather
+ * than a flag on `listening`.
+ */
+export type DictationState = "idle" | "listening" | "locked" | "processing";
 
 export type DictationSettings = {
   post_process: boolean;
   active_model: string | null;
   /** Hold ⌥⇧ to record, release to transcribe and insert. */
   hold_to_talk: boolean;
+  /** Which microphone to record from, by name, or null for the system default. */
+  input_device: string | null;
+  /** Open the mic as ⌥⇧ is pressed so the first word is not clipped. */
+  preroll: boolean;
+};
+
+export type InputDevice = {
+  /** The device name, which is the only handle the audio layer has. */
+  id: string;
+  name: string;
+  is_default: boolean;
+};
+
+/** The saved microphone was gone, so recording fell back to the default. */
+export type DeviceFallback = {
+  requested: string;
+  using: string | null;
 };
 
 export type WhisperModel = {
@@ -251,6 +376,17 @@ export const getDictationSettings = () =>
 export const setDictationSettings = (settings: DictationSettings) =>
   invoke<void>("set_dictation_settings", { settings });
 
+export const listInputDevices = () => invoke<InputDevice[]>("list_input_devices");
+
+/**
+ * Open the microphone purely to show its level. Takes the same capture gate as
+ * a recording, so it is refused while one is running — and stops itself on a
+ * timer, on window blur, and when a hotkey starts a real recording.
+ */
+export const startInputPreview = () => invoke<void>("start_input_preview");
+
+export const stopInputPreview = () => invoke<void>("stop_input_preview");
+
 export const startDictation = () => invoke<void>("start_dictation");
 
 export const stopDictation = () => invoke<string>("stop_dictation");
@@ -264,6 +400,18 @@ export const onDictationState = (
 
 export const onDictationLevel = (handler: (level: number) => void): Promise<UnlistenFn> =>
   listen<{ level: number }>("dictation:level", (event) => handler(event.payload.level));
+
+export const onDictationPreview = (
+  handler: (active: boolean) => void,
+): Promise<UnlistenFn> =>
+  listen<{ active: boolean }>("dictation:preview", (event) =>
+    handler(event.payload.active),
+  );
+
+export const onDeviceFallback = (
+  handler: (fallback: DeviceFallback) => void,
+): Promise<UnlistenFn> =>
+  listen<DeviceFallback>("dictation:device_fallback", (event) => handler(event.payload));
 
 export const onDictationError = (handler: (message: string) => void): Promise<UnlistenFn> =>
   listen<RewriteEventPayload>("dictation:error", (event) =>

@@ -1,9 +1,16 @@
 import { useState } from "react";
-import { previewRewrite, triggerRewrite } from "../api";
+import {
+  TRANSLATION_TARGETS,
+  previewRewrite,
+  translateCommand,
+  translationTargetLabel,
+  triggerRewrite,
+} from "../api";
 import FeatureAiCard from "../components/FeatureAiCard";
 import FeatureBanner from "../components/FeatureBanner";
 import HotkeyRow from "../components/HotkeyRow";
 import SettingsForm from "../components/SettingsForm";
+import { RowGroup } from "../components/SettingsRow";
 import Spinner from "../components/Spinner";
 import { useFeatureAi } from "../hooks/useFeatureAi";
 import { useRewriteSettings } from "../hooks/useRewriteSettings";
@@ -25,8 +32,9 @@ type Props = {
 export default function RewritePage({ onRunSetup, onNavigate }: Props) {
   const ai = useFeatureAi(SLOTS);
   const rewrite = useRewriteSettings();
-  const { settings } = rewrite;
+  const { settings, translateTargets } = rewrite;
   const [sample, setSample] = useState(SAMPLE);
+  const [newTarget, setNewTarget] = useState("");
   const [result, setResult] = useState<string | null>(null);
   const [runStatus, setRunStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -40,7 +48,7 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
         sample,
         settings.mode,
         settings.preset_id,
-        settings.mode === "ask_kea" ? settings.custom_instruction || null : null,
+        rewrite.parameter,
       );
       setResult(text);
     } catch (e) {
@@ -60,7 +68,7 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
       const text = await triggerRewrite(
         settings.mode,
         settings.preset_id,
-        settings.mode === "ask_kea" ? settings.custom_instruction || null : null,
+        rewrite.parameter,
       );
       setRunStatus(
         text ? "Rewritten and replaced in the app you were last in." : "Rewrite completed.",
@@ -106,6 +114,76 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
             />
           }
         />
+      </section>
+
+      <section style={{ marginBottom: 24 }}>
+        <h2 style={{ margin: "0 0 12px" }}>Languages and shortcuts</h2>
+        <div className="kea-card">
+          <p className="kea-muted" style={{ margin: "0 0 12px" }}>
+            Each language here gets a shortcut of its own that translates the
+            selection straight into it, whatever style is chosen above. Nothing is
+            bound until you record a combo.
+          </p>
+          {translateTargets.length > 0 && (
+            <RowGroup aria-label="Translate shortcuts">
+              {translateTargets.map((tag) => (
+                <HotkeyRow
+                  key={tag}
+                  feature="rewrite"
+                  command={translateCommand(tag)}
+                  label={translationTargetLabel(tag)}
+                  hint={`Translates the selection into ${translationTargetLabel(tag)}.`}
+                  checkRegistration
+                />
+              ))}
+            </RowGroup>
+          )}
+          <div
+            style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}
+          >
+            <select
+              className="kea-select"
+              aria-label="Language to add"
+              value={newTarget}
+              onChange={(e) => setNewTarget(e.target.value)}
+            >
+              <option value="">Add a language…</option>
+              {TRANSLATION_TARGETS.filter((t) => !translateTargets.includes(t.tag)).map(
+                (t) => (
+                  <option key={t.tag} value={t.tag}>
+                    {t.label}
+                  </option>
+                ),
+              )}
+            </select>
+            <button
+              type="button"
+              className="kea-btn"
+              disabled={!newTarget || rewrite.busy}
+              onClick={() => {
+                void rewrite.addTranslateTarget(newTarget);
+                setNewTarget("");
+              }}
+            >
+              Add
+            </button>
+          </div>
+          {translateTargets.length > 0 && (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
+              {translateTargets.map((tag) => (
+                <button
+                  key={tag}
+                  type="button"
+                  className="kea-btn"
+                  disabled={rewrite.busy}
+                  onClick={() => void rewrite.removeTranslateTarget(tag)}
+                >
+                  Remove {translationTargetLabel(tag)}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       </section>
 
       <FeatureAiCard ai={ai} featureLabel="Rewrite" />

@@ -18,8 +18,14 @@ use super::loopback::find_loopback_input_device;
 use super::macos_sck::{
     new_system_audio_capture, sck_feature_enabled, screen_recording_granted, SystemAudioCapture,
 };
-use super::util::{accumulate_frames, downmix_to_mono, mix_frames, rms_level, FrameCounters};
-use super::{AudioIo, AudioIoError, DictationState, MeetingState, PcmFrame, SystemAudioCapability};
+use super::util::{
+    accumulate_frames, choose_input_device, downmix_to_mono, mix_frames, rms_level, DeviceChoice,
+    FrameCounters, RingBuffer,
+};
+use super::{
+    AudioIo, AudioIoError, DeviceFallback, DictationState, InputDevice, MeetingState, PcmFrame,
+    SystemAudioCapability,
+};
 use async_trait::async_trait;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat};
@@ -59,6 +65,16 @@ pub struct MacAudioIo {
     /// System-audio backend behind the [`SystemAudioCapture`] seam: SCK when the
     /// `system-audio-sck` feature is on, otherwise the refusing null object.
     system_audio: Box<dyn SystemAudioCapture>,
+    /// The device the user picked, by name, or `None` for the OS default.
+    preferred_input_device: Mutex<Option<String>>,
+    /// Set by the last resolution that could not find the preferred device,
+    /// and taken by the app to tell the user which mic it is actually using.
+    device_fallback: Mutex<Option<DeviceFallback>>,
+    /// The level-only stream behind "Test microphone". Holds the capture gate
+    /// exactly as a recording does — see [`MacAudioIo::capture_gate`].
+    preview_capture: Mutex<Option<CaptureWorker>>,
+    /// A stream opened ahead of the hold threshold, filling the preroll ring.
+    armed_capture: Mutex<Option<ArmedCapture>>,
 }
 
 impl Default for MacAudioIo {
@@ -92,8 +108,141 @@ impl MacAudioIo {
             dictation_frames: FrameCounters::new(),
             meeting_mic_frames: FrameCounters::new(),
             system_audio: new_system_audio_capture(),
+            preferred_input_device: Mutex::new(None),
+            device_fallback: Mutex::new(None),
+            preview_capture: Mutex::new(None),
+            armed_capture: Mutex::new(None),
         }
     }
+
+    /// The capture gate: this layer admits exactly one recorder.
+    ///
+    /// Dictation, meetings and the input preview all open a `cpal` stream on
+    /// the same input device, and two streams on one device is a second orange
+    /// microphone indicator and two sets of buffers nobody asked for. Every
+    /// entry point asks here first, so the conflict is refused with a sentence
+    /// the user can act on instead of discovered later.
+    fn capture_gate(&self, who: Capture) -> Result<(), AudioIoError> {
+        let holder = if *self
+            .dictation_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            != DictationState::Idle
+        {
+            Some(Capture::Dictation)
+        } else if *self.meeting_state.lock().unwrap_or_else(|p| p.into_inner())
+            != MeetingState::Idle
+        {
+            Some(Capture::Meeting)
+        } else if self
+            .preview_capture
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+        {
+            Some(Capture::Preview)
+        } else {
+            None
+        };
+
+        match holder {
+            None => Ok(()),
+            Some(holder) if holder == who => Err(AudioIoError::Other(format!(
+                "{} is already running",
+                who.label()
+            ))),
+            Some(holder) => Err(AudioIoError::Other(format!(
+                "{} is using the microphone",
+                holder.label()
+            ))),
+        }
+    }
+
+    /// The preferred device resolved against the current enumeration, with any
+    /// fallback recorded for the app to report.
+    fn open_input_device(&self, host: &cpal::Host) -> Result<Device, AudioIoError> {
+        let preferred = self
+            .preferred_input_device
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let (device, fallback) = resolve_input_device(host, preferred.as_deref())?;
+        // Recorded once here, at resolution, rather than from the callback:
+        // the user needs telling once per recording, not per audio buffer.
+        *self
+            .device_fallback
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = fallback;
+        if let Ok(config) = device.default_input_config() {
+            *self
+                .sample_rate_hz
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = config.sample_rate().0;
+        }
+        Ok(device)
+    }
+
+    /// Stop the preview stream if one is running, reporting whether there was.
+    fn stop_preview_worker(&self) -> bool {
+        let worker = self
+            .preview_capture
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        match worker {
+            Some(worker) => {
+                if let Err(err) = stop_worker(worker) {
+                    tracing::warn!("input preview did not stop cleanly: {err}");
+                }
+                *self.level.lock().unwrap_or_else(|p| p.into_inner()) = 0.0;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Who wants the one capture device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Capture {
+    Dictation,
+    Meeting,
+    Preview,
+}
+
+impl Capture {
+    fn label(self) -> &'static str {
+        match self {
+            Capture::Dictation => "dictation",
+            Capture::Meeting => "meeting capture",
+            Capture::Preview => "the microphone test",
+        }
+    }
+}
+
+/// Hand an armed stream over to a recording: drain the preroll ahead of the
+/// live audio, then point the callback at the dictation sink.
+///
+/// Both happen under one lock, so a buffer arriving mid-handover cannot land
+/// in front of the preroll it is supposed to follow.
+fn adopt_armed_capture(armed: ArmedCapture, sink: DictationSink) -> CaptureWorker {
+    {
+        let mut state = armed.state.lock().unwrap_or_else(|p| p.into_inner());
+        let preroll = state.ring.drain();
+        if !preroll.is_empty() {
+            let frame = PcmFrame {
+                samples: preroll,
+                sample_rate_hz: state.sample_rate_hz,
+            };
+            sink.counters.send(&sink.tx, frame.clone(), "dictation");
+            sink.buffered
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(frame);
+        }
+        state.recording = Some(sink);
+    }
+    armed.worker
 }
 
 fn detect_system_audio_capability() -> SystemAudioCapability {
@@ -109,11 +258,151 @@ fn detect_system_audio_capability() -> SystemAudioCapability {
     }
 }
 
+/// How much audio the preroll ring holds.
+///
+/// It has to cover the whole window between the stream going live and the hold
+/// threshold firing: [`crate::hotkeys::hold::ARM_DELAY`] on the first modifier,
+/// plus [`crate::hotkeys::hold::DEFAULT_MIN_HOLD`] (350ms) once the chord
+/// completes. 600ms clears that with room for a slow chord, and costs 38 KB at
+/// 16 kHz mono f32 — small enough that trimming it would buy nothing.
+const PREROLL_MS: u32 = 600;
+
+/// Every input device the host can enumerate, with the default marked.
+fn list_devices(host: &cpal::Host) -> Vec<InputDevice> {
+    let default_name = host.default_input_device().and_then(|d| d.name().ok());
+    host.input_devices()
+        .into_iter()
+        .flatten()
+        .filter_map(|device| {
+            let name = device.name().ok()?;
+            Some(InputDevice {
+                is_default: Some(&name) == default_name.as_ref(),
+                id: name.clone(),
+                name,
+            })
+        })
+        .collect()
+}
+
+/// Open the device the user asked for, or the default when they asked for
+/// nothing — or when what they asked for is gone.
+///
+/// Returns the fallback alongside the device so the caller can report it once,
+/// at resolution time, rather than from inside an audio callback.
+fn resolve_input_device(
+    host: &cpal::Host,
+    preferred: Option<&str>,
+) -> Result<(Device, Option<DeviceFallback>), AudioIoError> {
+    let choice = match preferred {
+        // The common case by far; skip enumerating the host for it.
+        None => DeviceChoice::Default,
+        Some(_) => choose_input_device(&list_devices(host), preferred),
+    };
+
+    let named = match &choice {
+        DeviceChoice::Preferred(name) => host
+            .input_devices()
+            .into_iter()
+            .flatten()
+            .find(|d| d.name().is_ok_and(|n| &n == name)),
+        _ => None,
+    };
+
+    let fallback = match choice {
+        DeviceChoice::Fallback(fallback) => {
+            tracing::warn!(
+                requested = %fallback.requested,
+                using = fallback.using.as_deref().unwrap_or("<the default input>"),
+                "the saved input device is not connected; recording from the default instead"
+            );
+            Some(fallback)
+        }
+        _ => None,
+    };
+
+    let device = match named {
+        Some(device) => device,
+        None => host
+            .default_input_device()
+            .ok_or_else(|| AudioIoError::Other("no input device".into()))?,
+    };
+    Ok((device, fallback))
+}
+
 fn default_input_sample_rate() -> Option<u32> {
     let host = cpal::default_host();
     let device = host.default_input_device()?;
     let config = device.default_input_config().ok()?;
     Some(config.sample_rate().0)
+}
+
+/// Where an armed stream sends audio once the hold has become a recording.
+struct DictationSink {
+    tx: tokio::sync::mpsc::Sender<PcmFrame>,
+    buffered: Arc<Mutex<Vec<PcmFrame>>>,
+    counters: FrameCounters,
+}
+
+/// The armed stream's shared state, written from the audio callback and
+/// switched over by `start_mic` when the threshold passes.
+struct ArmedState {
+    ring: RingBuffer,
+    /// The stream's own rate, learnt from the first callback. The preroll has
+    /// to be handed back at the rate it was captured at.
+    sample_rate_hz: u32,
+    /// `None` while merely armed; `Some` once this stream is the recording.
+    recording: Option<DictationSink>,
+}
+
+/// A capture stream opened before the recording it may become.
+///
+/// `start_mic` adopts this rather than opening its own: the probe in
+/// `examples/mic_arm_probe.rs` measures ~120-150ms from `build_input_stream` to
+/// the first buffer, so re-opening at the threshold would throw away exactly
+/// the audio arming was meant to keep.
+struct ArmedCapture {
+    state: Arc<Mutex<ArmedState>>,
+    worker: CaptureWorker,
+}
+
+fn run_armed_capture(
+    device: Device,
+    stop_rx: mpsc::Receiver<()>,
+    state: Arc<Mutex<ArmedState>>,
+    level: Arc<Mutex<f32>>,
+) -> Result<(), AudioIoError> {
+    run_input_stream(device, stop_rx, move |mono, sample_rate_hz| {
+        let mut armed = state.lock().unwrap_or_else(|p| p.into_inner());
+        armed.sample_rate_hz = sample_rate_hz;
+        match armed.recording.as_ref() {
+            // Adopted: this is an ordinary dictation capture now, and takes the
+            // same path every other frame does.
+            Some(sink) => push_dictation_frame(
+                mono,
+                sample_rate_hz,
+                &level,
+                &sink.tx,
+                &sink.buffered,
+                &sink.counters,
+            ),
+            None => {
+                *level.lock().unwrap_or_else(|p| p.into_inner()) = rms_level(&mono);
+                armed.ring.push(&mono);
+            }
+        }
+    })
+}
+
+/// Publish the input level and discard the audio: what "Test microphone" needs
+/// and the most a preview is ever allowed to do with the samples.
+fn run_preview_capture(
+    device: Device,
+    stop_rx: mpsc::Receiver<()>,
+    level: Arc<Mutex<f32>>,
+) -> Result<(), AudioIoError> {
+    run_input_stream(device, stop_rx, move |mono, _sample_rate_hz| {
+        *level.lock().unwrap_or_else(|p| p.into_inner()) = rms_level(&mono);
+    })
 }
 
 fn f32_passthrough(sample: f32) -> f32 {
@@ -353,17 +642,14 @@ fn stop_worker(worker: CaptureWorker) -> Result<(), AudioIoError> {
 #[async_trait]
 impl AudioIo for MacAudioIo {
     async fn start_mic(&mut self) -> Result<tokio::sync::mpsc::Receiver<PcmFrame>, AudioIoError> {
-        if *self
-            .dictation_state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            != DictationState::Idle
-        {
-            return Err(AudioIoError::Other("mic already active".into()));
+        // A running preview loses to a recording rather than blocking it: the
+        // user who pressed the hotkey has said what they want, and the preview
+        // is only ever a diagnostic. Done before the gate so the gate sees the
+        // device free.
+        if self.stop_preview_worker() {
+            tracing::debug!("input preview cancelled: dictation is starting");
         }
-        if *self.meeting_state.lock().unwrap_or_else(|p| p.into_inner()) != MeetingState::Idle {
-            return Err(AudioIoError::Other("meeting capture active".into()));
-        }
+        self.capture_gate(Capture::Dictation)?;
 
         self.dictation_buffered
             .lock()
@@ -371,32 +657,43 @@ impl AudioIo for MacAudioIo {
             .clear();
         *self.level.lock().unwrap_or_else(|p| p.into_inner()) = 0.0;
 
-        let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| AudioIoError::Other("no input device".into()))?;
-
         let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(64);
-        let (stop_tx, stop_rx) = mpsc::channel();
-        let buffered = Arc::clone(&self.dictation_buffered);
-        let level = Arc::clone(&self.level);
         let counters = self.dictation_frames.clone();
         counters.reset();
+        let buffered = Arc::clone(&self.dictation_buffered);
 
-        let join = thread::spawn(move || {
-            if let Err(err) =
-                run_capture_on_device(device, stop_rx, frame_tx, buffered, level, counters)
-            {
-                tracing::error!("mic capture failed: {err}");
+        let armed = self
+            .armed_capture
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+
+        let worker = match armed {
+            // The stream is already live and the preroll already holds the
+            // speech from before the threshold. Opening a second one here
+            // would throw that away and pay the open latency again.
+            Some(armed) => adopt_armed_capture(
+                armed,
+                DictationSink {
+                    tx: frame_tx,
+                    buffered,
+                    counters,
+                },
+            ),
+            None => {
+                let device = self.open_input_device(&cpal::default_host())?;
+                let (stop_tx, stop_rx) = mpsc::channel();
+                let level = Arc::clone(&self.level);
+                let join = thread::spawn(move || {
+                    if let Err(err) =
+                        run_capture_on_device(device, stop_rx, frame_tx, buffered, level, counters)
+                    {
+                        tracing::error!("mic capture failed: {err}");
+                    }
+                });
+                CaptureWorker { stop_tx, join }
             }
-        });
-
-        if let Some(rate) = default_input_sample_rate() {
-            *self
-                .sample_rate_hz
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = rate;
-        }
+        };
 
         *self
             .dictation_state
@@ -405,7 +702,7 @@ impl AudioIo for MacAudioIo {
         *self
             .dictation_capture
             .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(CaptureWorker { stop_tx, join });
+            .unwrap_or_else(|p| p.into_inner()) = Some(worker);
 
         Ok(frame_rx)
     }
@@ -469,17 +766,10 @@ impl AudioIo for MacAudioIo {
         &mut self,
         prefer_system_audio: bool,
     ) -> Result<tokio::sync::mpsc::Receiver<PcmFrame>, AudioIoError> {
-        if *self
-            .dictation_state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            != DictationState::Idle
-        {
-            return Err(AudioIoError::Other("dictation active".into()));
+        if self.stop_preview_worker() {
+            tracing::debug!("input preview cancelled: a meeting is starting");
         }
-        if *self.meeting_state.lock().unwrap_or_else(|p| p.into_inner()) != MeetingState::Idle {
-            return Err(AudioIoError::Other("meeting already active".into()));
-        }
+        self.capture_gate(Capture::Meeting)?;
 
         self.meeting_drain_frames
             .lock()
@@ -488,9 +778,7 @@ impl AudioIo for MacAudioIo {
         *self.level.lock().unwrap_or_else(|p| p.into_inner()) = 0.0;
 
         let host = cpal::default_host();
-        let mic_device = host
-            .default_input_device()
-            .ok_or_else(|| AudioIoError::Other("no input device".into()))?;
+        let mic_device = self.open_input_device(&host)?;
 
         let capability = self.system_audio_capability();
 
@@ -558,13 +846,6 @@ impl AudioIo for MacAudioIo {
         } else {
             None
         };
-
-        if let Some(rate) = default_input_sample_rate() {
-            *self
-                .sample_rate_hz
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = rate;
-        }
 
         *self.meeting_state.lock().unwrap_or_else(|p| p.into_inner()) = MeetingState::Recording;
         *self
@@ -669,6 +950,133 @@ impl AudioIo for MacAudioIo {
         }))
     }
 
+    fn list_input_devices(&self) -> Vec<InputDevice> {
+        list_devices(&cpal::default_host())
+    }
+
+    fn set_input_device(&mut self, preferred: Option<String>) {
+        *self
+            .preferred_input_device
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = preferred;
+    }
+
+    fn take_device_fallback(&mut self) -> Option<DeviceFallback> {
+        self.device_fallback
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+    }
+
+    fn preview_active(&self) -> bool {
+        self.preview_capture
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
+    async fn start_input_preview(&mut self) -> Result<(), AudioIoError> {
+        self.capture_gate(Capture::Preview)?;
+        // An armed stream is holding the device for a chord that has not
+        // become a recording. The preview is a deliberate user action, so it
+        // wins — the next chord re-arms.
+        self.disarm_capture();
+
+        let device = self.open_input_device(&cpal::default_host())?;
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let level = Arc::clone(&self.level);
+        *self.level.lock().unwrap_or_else(|p| p.into_inner()) = 0.0;
+        let join = thread::spawn(move || {
+            if let Err(err) = run_preview_capture(device, stop_rx, level) {
+                tracing::error!("input preview failed: {err}");
+            }
+        });
+        *self
+            .preview_capture
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(CaptureWorker { stop_tx, join });
+        Ok(())
+    }
+
+    async fn stop_input_preview(&mut self) -> Result<(), AudioIoError> {
+        self.stop_preview_worker();
+        Ok(())
+    }
+
+    fn arm_capture(&mut self) {
+        if self
+            .armed_capture
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+        {
+            return;
+        }
+        // Arming is an optimisation on a keypress, so a busy device is not an
+        // error here: the recording that follows will open its own stream and
+        // simply start ~150ms later, which is today's behaviour.
+        if let Err(err) = self.capture_gate(Capture::Dictation) {
+            tracing::debug!("not arming the preroll capture: {err}");
+            return;
+        }
+
+        let device = match self.open_input_device(&cpal::default_host()) {
+            Ok(device) => device,
+            Err(err) => {
+                tracing::debug!("not arming the preroll capture: {err}");
+                return;
+            }
+        };
+        let capacity = (*self
+            .sample_rate_hz
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) as usize)
+            * PREROLL_MS as usize
+            / 1000;
+
+        let state = Arc::new(Mutex::new(ArmedState {
+            ring: RingBuffer::with_capacity(capacity),
+            sample_rate_hz: 0,
+            recording: None,
+        }));
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let level = Arc::clone(&self.level);
+        let for_thread = Arc::clone(&state);
+        let join = thread::spawn(move || {
+            if let Err(err) = run_armed_capture(device, stop_rx, for_thread, level) {
+                tracing::error!("preroll capture failed: {err}");
+            }
+        });
+
+        *self.armed_capture.lock().unwrap_or_else(|p| p.into_inner()) = Some(ArmedCapture {
+            state,
+            worker: CaptureWorker { stop_tx, join },
+        });
+    }
+
+    fn disarm_capture(&mut self) {
+        let armed = self
+            .armed_capture
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        // The ring goes with the worker: audio captured for a chord that never
+        // became a recording is never transcribed and never stored.
+        if let Some(armed) = armed {
+            if let Err(err) = stop_worker(armed.worker) {
+                tracing::warn!("preroll capture did not stop cleanly: {err}");
+            }
+            *self.level.lock().unwrap_or_else(|p| p.into_inner()) = 0.0;
+        }
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed_capture
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
     async fn play(&self, pcm: PcmFrame) -> Result<(), AudioIoError> {
         tokio::task::spawn_blocking(move || crate::audio::playback::play_pcm_blocking(&pcm))
             .await
@@ -714,6 +1122,106 @@ mod tests {
         let frame = latest.lock().unwrap().clone().expect("frame published");
         assert_eq!(frame.samples.len(), 100);
         assert_eq!(frame.sample_rate_hz, 48_000);
+    }
+
+    /// A capture worker that holds its slot and nothing else. Lets the gate
+    /// tests put the preview in the "running" state without opening a stream —
+    /// these tests must never touch the real microphone.
+    fn idle_worker() -> CaptureWorker {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let _ = stop_rx.recv();
+        });
+        CaptureWorker { stop_tx, join }
+    }
+
+    #[test]
+    fn the_capture_gate_names_whoever_holds_the_device() {
+        let io = MacAudioIo::new_for_test();
+        assert!(io.capture_gate(Capture::Preview).is_ok());
+
+        *io.dictation_state.lock().unwrap() = DictationState::Listening;
+        let err = io.capture_gate(Capture::Preview).unwrap_err().to_string();
+        assert!(err.contains("dictation"), "{err}");
+        let err = io.capture_gate(Capture::Dictation).unwrap_err().to_string();
+        assert!(err.contains("already running"), "{err}");
+
+        *io.dictation_state.lock().unwrap() = DictationState::Idle;
+        *io.meeting_state.lock().unwrap() = MeetingState::Recording;
+        let err = io.capture_gate(Capture::Dictation).unwrap_err().to_string();
+        assert!(err.contains("meeting"), "{err}");
+    }
+
+    #[test]
+    fn a_running_preview_holds_the_gate_against_a_recording() {
+        let io = MacAudioIo::new_for_test();
+        *io.preview_capture.lock().unwrap() = Some(idle_worker());
+        assert!(io.preview_active());
+
+        let err = io.capture_gate(Capture::Dictation).unwrap_err().to_string();
+        assert!(err.contains("microphone test"), "{err}");
+
+        assert!(io.stop_preview_worker(), "the preview was running");
+        assert!(!io.preview_active());
+        assert!(io.capture_gate(Capture::Dictation).is_ok());
+        assert!(!io.stop_preview_worker(), "stopping twice is not an error");
+    }
+
+    #[tokio::test]
+    async fn a_dictation_start_cancels_the_preview_before_it_asks_the_gate() {
+        // A preview left running when the hotkey fires would be a second cpal
+        // stream on one input device. The meeting flag is forced on so the
+        // gate refuses *after* the cancel, which is how this asserts the
+        // ordering without opening a real stream.
+        let mut io = MacAudioIo::new_for_test();
+        *io.preview_capture.lock().unwrap() = Some(idle_worker());
+        *io.meeting_state.lock().unwrap() = MeetingState::Recording;
+
+        assert!(io.start_mic().await.is_err(), "the meeting still wins");
+        assert!(
+            !io.preview_active(),
+            "the preview must be released whether or not the recording starts"
+        );
+    }
+
+    #[test]
+    fn a_device_fallback_is_reported_once_per_resolution() {
+        // Resolution happens once per stream open; the audio callback runs
+        // hundreds of times a second, and must not produce a notification each.
+        let mut io = MacAudioIo::new_for_test();
+        *io.device_fallback.lock().unwrap() = Some(DeviceFallback {
+            requested: "Yeti".into(),
+            using: Some("MacBook Air Microphone".into()),
+        });
+        assert_eq!(
+            io.take_device_fallback().map(|f| f.requested),
+            Some("Yeti".into())
+        );
+        assert!(io.take_device_fallback().is_none());
+    }
+
+    #[test]
+    fn a_saved_device_is_remembered_for_the_next_stream_open() {
+        let mut io = MacAudioIo::new_for_test();
+        io.set_input_device(Some("Yeti".into()));
+        assert_eq!(
+            io.preferred_input_device.lock().unwrap().as_deref(),
+            Some("Yeti")
+        );
+        io.set_input_device(None);
+        assert!(io.preferred_input_device.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn arming_is_refused_while_something_else_holds_the_device() {
+        // Arming is an optimisation on a keypress: a busy device means no
+        // preroll, never a second stream and never an error the user sees.
+        let mut io = MacAudioIo::new_for_test();
+        *io.meeting_state.lock().unwrap() = MeetingState::Recording;
+        io.arm_capture();
+        assert!(!io.is_armed());
+        io.disarm_capture();
+        assert!(!io.is_armed(), "disarming what was never armed is a no-op");
     }
 
     #[tokio::test]

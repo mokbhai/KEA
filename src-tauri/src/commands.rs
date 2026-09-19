@@ -38,6 +38,7 @@ use kea_infer::{
     temp_file_for, DownloadTransport, InferError, ModelDownloader, ModelKind, ModelRegistry,
     ModelStorage, OnnxModelEntry, StreamedFile,
 };
+use kea_platform::audio::InputDevice;
 use kea_platform::{
     new_text_io, parse_accelerator, AudioIo, AudioIoError, Cue, DictationState, HoldAction,
     HotkeyBinding, Hotkeys, MeetingState, PcmFrame, PermKind, PermStatus, SystemAudioCapability,
@@ -50,10 +51,11 @@ use tauri_plugin_notification::NotificationExt;
 use tokio::sync::watch;
 
 use crate::events::{
-    dictation_state_wire, emit_dictation_error, emit_dictation_level, emit_dictation_state,
-    emit_meeting_error, emit_meeting_level, emit_meeting_segment, emit_meeting_state,
-    emit_model_download_complete, emit_model_download_error, emit_model_download_progress,
-    emit_tts_state, meeting_state_wire, MeetingSegmentPayload, TtsState,
+    dictation_state_wire, emit_device_fallback, emit_dictation_error, emit_dictation_level,
+    emit_dictation_preview, emit_dictation_state, emit_meeting_error, emit_meeting_level,
+    emit_meeting_segment, emit_meeting_state, emit_model_download_complete,
+    emit_model_download_error, emit_model_download_progress, emit_tts_state, meeting_state_wire,
+    MeetingSegmentPayload, TtsState,
 };
 use crate::{ActiveDownload, AppState};
 
@@ -114,6 +116,22 @@ pub const HOTKEY_ACTIONS: [HotkeyAction; 4] = [
         action_id: MEETINGS_ACTION_ID,
     },
 ];
+
+/// Escape, while — and only while — a locked recording is running.
+///
+/// Deliberately **not** a [`HOTKEY_ACTIONS`] row, although the doc above says
+/// that table is where hotkeys are added. Every reader of that table describes
+/// a shortcut the user owns: startup registration, rebinding, collision
+/// detection, the effective-hotkey lookup and the dispatch table. This one is
+/// registered and unregistered by [`set_dictation_lock`] around a single
+/// recording, because holding Escape globally for any longer would take it
+/// away from every other app on the Mac. Its press still arrives on the one
+/// accelerator stream, so `hotkeys::spawn_dispatch_loop` matches it by hand.
+pub const LOCK_CANCEL_ACTION_ID: &str = "dictation:cancel_lock";
+
+/// The accelerator behind [`LOCK_CANCEL_ACTION_ID`]. Not user-rebindable:
+/// "Escape cancels" is the platform convention, not a preference.
+const LOCK_CANCEL_ACCELERATOR: &str = "Escape";
 
 /// The descriptor for a `(feature, command)` pair, or `None` when the pair is
 /// not a global hotkey — a binding persisted for some other command, say.
@@ -717,6 +735,27 @@ pub async fn resolve_accelerator(config_pool: &SqlitePool, action: &HotkeyAction
     }
 }
 
+/// Best-effort system language as a BCP-47 primary subtag, for the one case the
+/// settings row cannot cover: a fresh install where the user has pressed the
+/// rewrite hotkey in Translate mode before ever opening the Rewrite page.
+///
+/// Best-effort really means it: a macOS app launched from Finder usually has no
+/// `LANG` at all, which is why the picker seeds itself from `navigator.language`
+/// in the UI and that value is what normally ends up in settings. This is the
+/// floor under that, not a replacement for it.
+fn system_language_tag() -> String {
+    std::env::var("LC_ALL")
+        .or_else(|_| std::env::var("LANG"))
+        .ok()
+        .and_then(|v| {
+            // "en_US.UTF-8" -> "en-US"; "C" and "POSIX" are not languages.
+            let base = v.split('.').next().unwrap_or("").replace('_', "-");
+            let primary = base.split('-').next().unwrap_or("");
+            (primary.len() == 2 || primary.len() == 3).then_some(base)
+        })
+        .unwrap_or_else(|| "en".to_string())
+}
+
 pub async fn default_rewrite_input(config_pool: &SqlitePool) -> RewriteInput {
     let settings = SettingsRepo::new(config_pool.clone());
     let mode = settings
@@ -731,15 +770,33 @@ pub async fn default_rewrite_input(config_pool: &SqlitePool) -> RewriteInput {
         .await
         .ok()
         .flatten();
-    let custom_instruction = if matches!(mode, RewriteMode::AskKea) {
+    // Dispatch through the descriptor rather than naming a mode: `AskKea` takes
+    // an instruction and `Translate` a target language, and each stores it under
+    // its own settings key. A `matches!(mode, ..)` here is the shape that made
+    // adding Translate mean editing four unrelated conditionals.
+    let custom_instruction = if let Some(parameter) = mode.parameter() {
         settings
-            .get::<String>("rewrite.custom_instruction")
+            .get_optional::<String>(parameter.setting_key())
             .await
             .ok()
             .flatten()
             .filter(|s| !s.is_empty())
     } else {
         None
+    };
+    // Translate is the one mode whose parameter is not optional — without a
+    // target the prompt cannot be rendered at all — so it falls back rather
+    // than failing the run.
+    let custom_instruction = match (mode, custom_instruction) {
+        (RewriteMode::Translate, None) => {
+            let tag = system_language_tag();
+            tracing::info!(
+                target_language = %tag,
+                "translate: no target language set, falling back to the system language"
+            );
+            Some(tag)
+        }
+        (_, other) => other,
     };
     RewriteInput {
         source_text: String::new(),
@@ -932,6 +989,13 @@ pub async fn dictation_gate(state: &Arc<AppState>) -> (bool, bool, DictationStat
         .map(|guard| guard.is_some())
         .unwrap_or(false);
     let current = state.audio.lock().await.state();
+    // The capture device cannot tell a locked run from a held one — both are
+    // an open microphone — so the lock is read from the app's own flag here,
+    // where the gating rules can see it.
+    let current = match (current, state.dictation_locked.load(Ordering::SeqCst)) {
+        (DictationState::Listening, true) => DictationState::Locked,
+        (current, _) => current,
+    };
     (meeting_active, in_flight, current)
 }
 
@@ -939,7 +1003,12 @@ pub async fn dictation_gate(state: &Arc<AppState>) -> (bool, bool, DictationStat
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DictationHotkeyAction {
     Start,
+    /// Start a run that outlives the keys, ended by the next tap, by Escape or
+    /// by the hard cap. Only the hold path ever asks for this.
+    StartLocked,
     Stop,
+    /// Stop without transcribing, throwing the audio away.
+    Cancel,
     Ignore,
 }
 
@@ -953,6 +1022,11 @@ pub fn dictation_hotkey_action(
     }
     match current {
         DictationState::Listening => DictationHotkeyAction::Stop,
+        // A locked run is stopped by the same toggle as a held one: the
+        // accelerator means "I am done talking" either way, and leaving it
+        // inert would make the lock the one state with no way out but the
+        // chord.
+        DictationState::Locked => DictationHotkeyAction::Stop,
         DictationState::Idle if in_flight => DictationHotkeyAction::Ignore,
         DictationState::Idle => DictationHotkeyAction::Start,
         DictationState::Processing => DictationHotkeyAction::Ignore,
@@ -968,6 +1042,8 @@ pub fn dictation_hotkey_action(
 /// that answer to the direction the edge asked for — so a hold that begins
 /// while a recording is already running cannot restart it, and a release that
 /// arrives after the run ended some other way cannot stop the next one.
+/// Matched on `event` without a wildcard on purpose: a new [`HoldAction`]
+/// variant must not be able to compile clean into a silent `Ignore`.
 pub fn hold_dictation_action(
     event: HoldAction,
     current: DictationState,
@@ -975,10 +1051,53 @@ pub fn hold_dictation_action(
     in_flight: bool,
 ) -> DictationHotkeyAction {
     let toggle = dictation_hotkey_action(current, meeting_active, in_flight);
-    match (event, toggle) {
-        (HoldAction::Start, DictationHotkeyAction::Start) => DictationHotkeyAction::Start,
-        (HoldAction::Stop, DictationHotkeyAction::Stop) => DictationHotkeyAction::Stop,
-        _ => DictationHotkeyAction::Ignore,
+    let narrow = |wanted, then| {
+        if toggle == wanted {
+            then
+        } else {
+            DictationHotkeyAction::Ignore
+        }
+    };
+
+    match event {
+        // Arming is about the microphone, never about the run: an armed
+        // stream records nothing until a `Start` follows, and the dictation
+        // toggle must not see either edge.
+        HoldAction::Nothing | HoldAction::Arm | HoldAction::Disarm => DictationHotkeyAction::Ignore,
+        HoldAction::Start => narrow(DictationHotkeyAction::Start, DictationHotkeyAction::Start),
+        HoldAction::StartLocked => narrow(
+            DictationHotkeyAction::Start,
+            DictationHotkeyAction::StartLocked,
+        ),
+        HoldAction::Stop | HoldAction::StopLocked => {
+            narrow(DictationHotkeyAction::Stop, DictationHotkeyAction::Stop)
+        }
+        HoldAction::CancelLocked => {
+            narrow(DictationHotkeyAction::Stop, DictationHotkeyAction::Cancel)
+        }
+    }
+}
+
+/// Carry out a decision from either hotkey path.
+///
+/// Shared so the accelerator and the hold chord cannot drift: they answer
+/// different questions (a toggle versus a directed edge) but they run the same
+/// five transitions, and a lock started by one has to be stoppable by the
+/// other.
+pub async fn run_dictation_action(
+    action: DictationHotkeyAction,
+    state: &Arc<AppState>,
+    app: &AppHandle,
+) {
+    let outcome = match action {
+        DictationHotkeyAction::Start => start_dictation_inner(state, app).await,
+        DictationHotkeyAction::StartLocked => start_locked_dictation_inner(state, app).await,
+        DictationHotkeyAction::Stop => stop_dictation_inner(state, app).await.map(|_| ()),
+        DictationHotkeyAction::Cancel => cancel_dictation_inner(state, app).await,
+        DictationHotkeyAction::Ignore => Ok(()),
+    };
+    if let Err(error) = outcome {
+        emit_dictation_error(app, &error);
     }
 }
 
@@ -1008,15 +1127,19 @@ pub fn sync_hold_to_talk(state: &Arc<AppState>, app: &AppHandle, enabled: bool) 
             return;
         }
 
-        let events = match kea_platform::spawn_hold_to_talk(state.hold_to_talk_enabled.clone()) {
-            Ok(events) => events,
-            Err(error) => {
-                tracing::warn!(%error, "hold-to-talk listener could not start");
-                emit_dictation_error(app, &error.to_string());
-                return;
-            }
-        };
+        let (control, events) =
+            match kea_platform::spawn_hold_to_talk(state.hold_to_talk_enabled.clone()) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    tracing::warn!(%error, "hold-to-talk listener could not start");
+                    emit_dictation_error(app, &error.to_string());
+                    return;
+                }
+            };
         *installed = true;
+        // Kept so a lock can be ended by something other than the keyboard
+        // tap — Escape, or a run that finished by another route.
+        *state.hold_control.lock().unwrap_or_else(|p| p.into_inner()) = Some(control);
         spawn_hold_to_talk_dispatch(state, app, events);
     }
 }
@@ -1030,6 +1153,14 @@ fn spawn_hold_to_talk_dispatch(
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(event) = events.recv().await {
+            // Arming opens and closes the microphone without starting a run,
+            // so it is handled before the busy flag: a modifier press must not
+            // contend with a recording for the flag that serialises runs.
+            if matches!(event, HoldAction::Arm | HoldAction::Disarm) {
+                apply_preroll_edge(&state, event).await;
+                continue;
+            }
+
             // Same busy flag as the accelerator path, so a chord and a
             // Cmd+Shift+D landing together cannot both start a run.
             let Some(_busy) = try_acquire_busy(&state.dictation_busy) else {
@@ -1038,22 +1169,84 @@ fn spawn_hold_to_talk_dispatch(
             };
 
             let (meeting_active, in_flight, current) = dictation_gate(&state).await;
-
-            match hold_dictation_action(event, current, meeting_active, in_flight) {
-                DictationHotkeyAction::Start => {
-                    if let Err(error) = start_dictation_inner(&state, &app).await {
-                        emit_dictation_error(&app, &error);
-                    }
-                }
-                DictationHotkeyAction::Stop => {
-                    if let Err(error) = stop_dictation_inner(&state, &app).await {
-                        emit_dictation_error(&app, &error);
-                    }
-                }
-                DictationHotkeyAction::Ignore => {}
-            }
+            let action = hold_dictation_action(event, current, meeting_active, in_flight);
+            run_dictation_action(action, &state, &app).await;
         }
     });
+}
+
+/// Open or close the preroll capture for a modifier edge.
+///
+/// Silently does nothing when the setting is off, which is the whole of the
+/// switch: with no armed stream the recording opens its own and simply starts
+/// ~150ms later, which is what every release before this one did.
+async fn apply_preroll_edge(state: &Arc<AppState>, event: HoldAction) {
+    let mut audio = state.audio.lock().await;
+    match event {
+        // Only the opening edge is gated by the setting.
+        HoldAction::Arm if state.preroll_enabled.load(Ordering::SeqCst) => audio.arm_capture(),
+        // The closing edge never is: a stream armed before the user switched
+        // the setting off still has to be closed, or it would hold the
+        // microphone open until KEA quits.
+        HoldAction::Disarm => audio.disarm_capture(),
+        _ => {}
+    }
+}
+
+/// Turn locked mode on or off.
+///
+/// One function owns both halves — the flag the state emits read from, and the
+/// Escape accelerator that only exists while a lock is running — because they
+/// must never disagree: a stale flag reports a run that ended, and a stale
+/// Escape registration swallows the key from every other app.
+fn set_dictation_lock(state: &Arc<AppState>, locked: bool) {
+    let was_locked = state.dictation_locked.swap(locked, Ordering::SeqCst);
+    if was_locked == locked {
+        return;
+    }
+
+    let mut hotkeys = state.hotkeys.lock().unwrap_or_else(|p| p.into_inner());
+    let binding = HotkeyBinding {
+        accelerator: LOCK_CANCEL_ACCELERATOR.to_string(),
+    };
+    let result = if locked {
+        hotkeys.register(binding, LOCK_CANCEL_ACTION_ID.into())
+    } else {
+        hotkeys.unregister(&binding)
+    };
+    if let Err(error) = result {
+        // Not fatal either way: without it Escape does not cancel, and the
+        // tap, the accelerator and the hard cap all still end the recording.
+        tracing::warn!(%error, locked, "could not update the lock-cancel Escape binding");
+    }
+}
+
+/// End a locked recording from outside the keyboard tap, so the hold machine
+/// does not keep a lock that no longer has a run behind it.
+fn release_hold_lock(state: &Arc<AppState>) {
+    let control = state
+        .hold_control
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    if let Some(control) = control {
+        control.reset();
+    }
+}
+
+/// What Escape should do, asked of the hold machine rather than assumed: the
+/// key is registered around a lock, and a race could still deliver the press
+/// after the recording ended some other way.
+pub fn lock_cancel_action(state: &Arc<AppState>) -> HoldAction {
+    let control = state
+        .hold_control
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    match control {
+        Some(control) => control.cancel_lock(),
+        None => HoldAction::Nothing,
+    }
 }
 
 /// Meeting hotkey toggle decision (pure, testable).
@@ -1566,6 +1759,10 @@ pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Resu
         }
     }
 
+    // As for dictation: a meeting takes the device off the preview, and this
+    // is the half of that the frontend hears about.
+    stop_input_preview_inner(state, app).await;
+
     {
         let audio = state.audio.lock().await;
         if audio.state() != DictationState::Idle {
@@ -1599,7 +1796,9 @@ pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Resu
             settings: &settings,
             vocabulary: &vocabulary,
         };
-        run_meeting_start(&mut ctx).await?
+        let session = run_meeting_start(&mut ctx).await?;
+        report_device_fallback(app, audio.as_mut());
+        session
     };
 
     let meeting_id = session.meeting_id.clone();
@@ -1696,7 +1895,48 @@ pub async fn start_dictation_inner(state: &Arc<AppState>, app: &AppHandle) -> Re
     result
 }
 
+/// Start a run that keeps recording with no keys held.
+///
+/// The lock is set before the microphone opens so the very first
+/// `dictation:state` already says `locked`: the HUD would otherwise flash
+/// "Listening" and correct itself, which reads as a glitch in exactly the mode
+/// whose whole job is to say "yes, this is still recording".
+pub async fn start_locked_dictation_inner(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+) -> Result<(), String> {
+    set_dictation_lock(state, true);
+    let result = start_dictation_inner(state, app).await;
+    if result.is_err() {
+        set_dictation_lock(state, false);
+        release_hold_lock(state);
+    }
+    result
+}
+
+/// The state a listening run publishes: the microphone is open either way, and
+/// only the app knows whether a key is holding it there.
+fn listening_state(state: &Arc<AppState>) -> DictationState {
+    if state.dictation_locked.load(Ordering::SeqCst) {
+        DictationState::Locked
+    } else {
+        DictationState::Listening
+    }
+}
+
+/// Report a microphone that was not the one the user picked.
+fn report_device_fallback(app: &AppHandle, audio: &mut dyn AudioIo) {
+    if let Some(fallback) = audio.take_device_fallback() {
+        emit_device_fallback(app, &fallback);
+    }
+}
+
 async fn start_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
+    // The preview loses to a recording. `start_mic` cancels it too, but this
+    // is the half that tells the frontend, so the "Test microphone" toggle
+    // does not stay lit over a recording it is not part of.
+    stop_input_preview_inner(state, app).await;
+
     // Reject before touching the audio lock so a press during meeting
     // synthesis can't park on the lock and start once it's released.
     if state.meeting_processing.load(Ordering::SeqCst) {
@@ -1726,11 +1966,40 @@ async fn start_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(
             emit_dictation_state(app, DictationState::Idle);
             return Err(e.to_string());
         }
+        report_device_fallback(app, audio.as_mut());
     }
 
-    emit_dictation_state(app, DictationState::Listening);
+    emit_dictation_state(app, listening_state(state));
     spawn_level_poll(state, app);
     Ok(())
+}
+
+/// Stop a run and throw its audio away. Reached only from Escape during a
+/// locked recording — every other route through the dictation state machine
+/// transcribes what it captured.
+pub async fn cancel_dictation_inner(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
+    stop_level_poll(state);
+    set_dictation_lock(state, false);
+    release_hold_lock(state);
+
+    let mut audio = state.audio.lock().await;
+    if audio.state() != DictationState::Listening {
+        // Re-sync only from idle: the HUD may still be showing a lock whose
+        // run ended some other way, but a run that is mid-transcription owns
+        // the state and must not be reported as finished.
+        let stale = audio.state() == DictationState::Idle;
+        drop(audio);
+        if stale {
+            emit_dictation_state(app, DictationState::Idle);
+        }
+        return Err("dictation is not listening".into());
+    }
+    let discarded = audio.stop_mic().await.map_err(|e| e.to_string());
+    drop(audio);
+
+    emit_dictation_state(app, DictationState::Idle);
+    spawn_dictation_cue(state, Cue::Cancel);
+    discarded.map(|_| ())
 }
 
 pub async fn stop_dictation_inner(
@@ -1757,6 +2026,11 @@ pub fn cue_for_dictation_outcome(result: &Result<String, String>) -> Cue {
 
 async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<String, String> {
     stop_level_poll(state);
+    // Whatever ended the run — the chord, the accelerator, the hard cap — the
+    // lock goes with it, and the hold machine is told so the next chord is
+    // judged fresh rather than read as the tap that stops a lock.
+    set_dictation_lock(state, false);
+    release_hold_lock(state);
 
     let pcm = {
         let mut audio = state.audio.lock().await;
@@ -2694,8 +2968,30 @@ pub async fn set_dictation_settings(
         .map_err(|e| e.to_string())?;
     // Only after the write succeeds: a listener armed against a setting that
     // did not persist would come back disarmed on the next launch.
-    sync_hold_to_talk(&state, &app, settings.hold_to_talk);
+    apply_dictation_settings(&state, &app, &settings).await;
     Ok(())
+}
+
+/// Push the settings that live outside the database into the running app: the
+/// hold listener, the preroll flag the hold dispatch reads, and the capture
+/// device.
+///
+/// Called on every write and once at startup, so "what is saved" and "what the
+/// next recording does" cannot drift apart.
+pub async fn apply_dictation_settings(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    settings: &DictationSettings,
+) {
+    state
+        .preroll_enabled
+        .store(settings.preroll, Ordering::SeqCst);
+    state
+        .audio
+        .lock()
+        .await
+        .set_input_device(settings.input_device.clone());
+    sync_hold_to_talk(state, app, settings.hold_to_talk);
 }
 
 #[tauri::command]
@@ -2718,6 +3014,90 @@ pub async fn set_dictation_stt_binding(
         )
         .await
         .map_err(|e| e.to_string())
+}
+
+/// How long the input preview may hold the microphone before stopping itself.
+///
+/// Checking a microphone takes seconds; a preview left running holds the
+/// device and keeps the macOS orange indicator lit for as long as the window
+/// is open, which looks exactly like the app recording behind the user's back.
+const INPUT_PREVIEW_MAX: Duration = Duration::from_secs(30);
+
+#[tauri::command]
+pub async fn list_input_devices(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<InputDevice>, String> {
+    Ok(state.audio.lock().await.list_input_devices())
+}
+
+#[tauri::command]
+pub async fn start_input_preview(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> Result<(), String> {
+    start_input_preview_inner(&state, &app).await
+}
+
+#[tauri::command]
+pub async fn stop_input_preview(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> Result<(), String> {
+    stop_input_preview_inner(&state, &app).await;
+    Ok(())
+}
+
+async fn start_input_preview_inner(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
+    {
+        let mut audio = state.audio.lock().await;
+        audio
+            .start_input_preview()
+            .await
+            .map_err(|e| e.to_string())?;
+        report_device_fallback(app, audio.as_mut());
+    }
+    emit_dictation_preview(app, true);
+    // The same meter loop dictation and meetings use: only one of the three
+    // can hold the device, so they can share the one slot.
+    spawn_level_poll(state, app);
+    spawn_preview_deadline(state, app);
+    Ok(())
+}
+
+/// Stop the preview if one is running, and tell the frontend either way it
+/// matters. Safe to call blind — the timer, window blur, a dictation start and
+/// the toggle itself all come through here.
+pub async fn stop_input_preview_inner(state: &Arc<AppState>, app: &AppHandle) {
+    {
+        let mut audio = state.audio.lock().await;
+        if !audio.preview_active() {
+            return;
+        }
+        if let Err(error) = audio.stop_input_preview().await {
+            tracing::warn!(%error, "input preview did not stop cleanly");
+        }
+    }
+    // Invalidates any deadline still counting down for the preview just
+    // stopped, so a later one is not cut short by an older timer.
+    state.preview_generation.fetch_add(1, Ordering::SeqCst);
+    stop_level_poll(state);
+    emit_dictation_level(app, 0.0);
+    emit_dictation_preview(app, false);
+}
+
+fn spawn_preview_deadline(state: &Arc<AppState>, app: &AppHandle) {
+    let generation = state.preview_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let state = state.clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(INPUT_PREVIEW_MAX).await;
+        // A newer preview (or any stop) bumped the counter, so this timer is
+        // about a preview that is already over.
+        if state.preview_generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        stop_input_preview_inner(&state, &app).await;
+    });
 }
 
 #[tauri::command]
@@ -2848,7 +3228,9 @@ pub async fn get_dictation_state(state: State<'_, Arc<AppState>>) -> Result<Stri
     let audio_state = audio.state();
     // Listening wins; idle with in-flight processing is reported as "processing"
     if audio_state == DictationState::Listening {
-        return Ok(dictation_state_wire(DictationState::Listening).into());
+        // A page that loads mid-lock has to be told it is a lock, or its badge
+        // would read "Listening" for a recording with no key holding it.
+        return Ok(dictation_state_wire(listening_state(&state)).into());
     }
     let in_flight = state
         .dictation_current_run
@@ -3726,6 +4108,8 @@ mod tests {
                 post_process: true,
                 active_model: Some("ggml-base.en".into()),
                 hold_to_talk: false,
+                input_device: None,
+                preroll: true,
             })
             .await
             .unwrap();
@@ -3934,6 +4318,77 @@ mod tests {
             .unwrap();
         let action = action_for(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID);
         assert_eq!(resolve_accelerator(&pool, &action).await, "Alt+K");
+    }
+
+    #[tokio::test]
+    async fn translate_falls_back_to_a_target_when_none_is_saved() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        SettingsRepo::new(pool.clone())
+            .set("rewrite.active_mode", &"translate".to_string())
+            .await
+            .unwrap();
+
+        let input = default_rewrite_input(&pool).await;
+
+        assert_eq!(input.mode, RewriteMode::Translate);
+        assert!(
+            input.custom_instruction.is_some(),
+            "translate cannot render its prompt without a target, so the default \
+             must supply one rather than leaving the run to fail"
+        );
+    }
+
+    /// The descriptor is what makes a mode's parameter reach the prompt. Ask
+    /// and Translate read different settings keys, and reading the wrong one
+    /// is silent: the prompt renders with an empty parameter.
+    #[tokio::test]
+    async fn each_mode_reads_its_own_parameter_key() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let settings = SettingsRepo::new(pool.clone());
+        settings
+            .set("rewrite.custom_instruction", &"make it rhyme".to_string())
+            .await
+            .unwrap();
+        settings
+            .set("rewrite.translate.target", &"fr".to_string())
+            .await
+            .unwrap();
+
+        settings
+            .set("rewrite.active_mode", &"ask_kea".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            default_rewrite_input(&pool)
+                .await
+                .custom_instruction
+                .as_deref(),
+            Some("make it rhyme")
+        );
+
+        settings
+            .set("rewrite.active_mode", &"translate".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            default_rewrite_input(&pool)
+                .await
+                .custom_instruction
+                .as_deref(),
+            Some("fr")
+        );
+
+        settings
+            .set("rewrite.active_mode", &"improve".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            default_rewrite_input(&pool).await.custom_instruction,
+            None,
+            "a mode with no parameter must not inherit another mode's"
+        );
     }
 
     #[test]
@@ -4266,6 +4721,102 @@ mod tests {
         assert_eq!(
             hold_dictation_action(HoldAction::Stop, DictationState::Processing, false, false),
             DictationHotkeyAction::Ignore
+        );
+    }
+
+    #[test]
+    fn arming_never_reaches_the_dictation_toggle() {
+        // The microphone opens and closes on these, but no run starts or
+        // stops — and the `_ => Ignore` shape of this mapping is exactly the
+        // kind that would silently swallow a mistake here.
+        for event in [HoldAction::Arm, HoldAction::Disarm] {
+            for current in [
+                DictationState::Idle,
+                DictationState::Listening,
+                DictationState::Locked,
+                DictationState::Processing,
+            ] {
+                assert_eq!(
+                    hold_dictation_action(event, current, false, false),
+                    DictationHotkeyAction::Ignore,
+                    "{event:?} in {current:?} must not touch the run"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_double_tap_starts_a_locked_run() {
+        assert_eq!(
+            hold_dictation_action(HoldAction::StartLocked, DictationState::Idle, false, false),
+            DictationHotkeyAction::StartLocked
+        );
+    }
+
+    #[test]
+    fn locking_inherits_the_rules_about_when_dictation_may_run() {
+        assert_eq!(
+            hold_dictation_action(HoldAction::StartLocked, DictationState::Idle, true, false),
+            DictationHotkeyAction::Ignore,
+            "a meeting owns the microphone; a double tap cannot take it"
+        );
+        assert_eq!(
+            hold_dictation_action(HoldAction::StartLocked, DictationState::Idle, false, true),
+            DictationHotkeyAction::Ignore,
+            "the previous transcript is still being inserted"
+        );
+        assert_eq!(
+            hold_dictation_action(
+                HoldAction::StartLocked,
+                DictationState::Listening,
+                false,
+                false
+            ),
+            DictationHotkeyAction::Ignore,
+            "a hold is already recording; locking on top of it would start a second run"
+        );
+    }
+
+    #[test]
+    fn a_locked_run_stops_and_cancels_only_while_it_is_running() {
+        assert_eq!(
+            hold_dictation_action(HoldAction::StopLocked, DictationState::Locked, false, false),
+            DictationHotkeyAction::Stop,
+            "the tap that ends a lock transcribes what it captured"
+        );
+        assert_eq!(
+            hold_dictation_action(
+                HoldAction::CancelLocked,
+                DictationState::Locked,
+                false,
+                false
+            ),
+            DictationHotkeyAction::Cancel,
+            "Escape throws the audio away"
+        );
+        // The hard cap and Escape can both arrive after the run ended some
+        // other way; neither may reach into the next one.
+        for event in [HoldAction::StopLocked, HoldAction::CancelLocked] {
+            assert_eq!(
+                hold_dictation_action(event, DictationState::Idle, false, false),
+                DictationHotkeyAction::Ignore,
+                "{event:?} with nothing running"
+            );
+        }
+    }
+
+    #[test]
+    fn the_accelerator_can_stop_a_locked_run() {
+        // Otherwise the lock would be the one state with no way out but the
+        // chord that started it.
+        assert_eq!(
+            dictation_hotkey_action(DictationState::Locked, false, false),
+            DictationHotkeyAction::Stop
+        );
+        assert_eq!(
+            dictation_hotkey_action(DictationState::Locked, true, false),
+            DictationHotkeyAction::Ignore,
+            "a meeting still silences the dictation hotkey"
         );
     }
 

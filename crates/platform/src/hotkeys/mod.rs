@@ -16,6 +16,48 @@ pub mod stub;
 
 pub type ActionId = String;
 
+/// A handle on the running hold machine, for the decisions that do not come
+/// from the keyboard tap.
+///
+/// Only one so far: a locked recording is cancelled with Escape, which is an
+/// ordinary accelerator rather than another thing for the event tap to watch
+/// (see [`hold`]). The machine still has to be told, or it would keep a lock
+/// that no longer has a recording behind it.
+///
+/// Deliberately does not carry the deadline thread's wake channel: a cancelled
+/// lock only removes work from that thread, and it re-reads the machine on its
+/// next tick either way.
+#[derive(Clone)]
+pub struct HoldControl {
+    machine: std::sync::Arc<std::sync::Mutex<hold::HoldToTalk>>,
+}
+
+impl HoldControl {
+    pub(crate) fn new(machine: std::sync::Arc<std::sync::Mutex<hold::HoldToTalk>>) -> Self {
+        Self { machine }
+    }
+
+    fn locked(&self) -> std::sync::MutexGuard<'_, hold::HoldToTalk> {
+        self.machine.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.locked().is_locked()
+    }
+
+    /// End a locked recording without transcribing it.
+    pub fn cancel_lock(&self) -> hold::HoldAction {
+        self.locked().cancel_lock()
+    }
+
+    /// Abandon whatever gesture is in progress, reporting the recording it had
+    /// to give up. Used when a run ended by some other route, so the next
+    /// chord is judged fresh.
+    pub fn reset(&self) -> hold::HoldAction {
+        self.locked().reset()
+    }
+}
+
 /// Starts the press-and-hold ⌥⇧ listener, if this OS has one.
 ///
 /// Separate from [`Hotkeys`] on purpose: that trait is about accelerators that
@@ -26,7 +68,13 @@ pub type ActionId = String;
 /// settings toggle can silence it without a restart.
 pub fn spawn_hold_to_talk(
     enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Result<tokio::sync::mpsc::UnboundedReceiver<hold::HoldAction>, HotkeyError> {
+) -> Result<
+    (
+        HoldControl,
+        tokio::sync::mpsc::UnboundedReceiver<hold::HoldAction>,
+    ),
+    HotkeyError,
+> {
     #[cfg(target_os = "macos")]
     {
         macos_hold::spawn(enabled)

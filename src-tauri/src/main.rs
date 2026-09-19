@@ -93,6 +93,21 @@ pub struct AppState {
     /// against installing a second one — while still allowing a retry after the
     /// first attempt failed for want of Accessibility permission.
     pub hold_to_talk_installed: Mutex<bool>,
+    /// A handle on the installed hold machine, so a lock can be ended by
+    /// something other than the keyboard tap: Escape, or a run that finished
+    /// by another route. `None` until the listener installs.
+    pub hold_control: Mutex<Option<kea_platform::hotkeys::HoldControl>>,
+    /// Whether to open the microphone early on the first modifier of the hold
+    /// chord. Read on every modifier edge, so the settings toggle takes effect
+    /// without a restart.
+    pub preroll_enabled: Arc<AtomicBool>,
+    /// Whether the running dictation is a double-tap lock rather than a hold.
+    /// The capture device cannot tell them apart; this is what makes the HUD,
+    /// the hotkey gate and Escape able to.
+    pub dictation_locked: AtomicBool,
+    /// Bumped whenever the input preview starts or stops, so a 30s auto-stop
+    /// timer can tell whether it is still about the preview it was armed for.
+    pub preview_generation: AtomicU64,
 }
 
 fn on_tray_menu_event(app: &tauri::AppHandle, e: tauri::menu::MenuEvent) {
@@ -135,9 +150,26 @@ fn main() {
     builder
         .setup(setup)
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+                // A microphone test the user walked away from holds the input
+                // device and keeps the macOS orange indicator lit, which looks
+                // exactly like the app recording behind their back. Losing the
+                // window is as clear a signal to stop as the 30s timer.
+                tauri::WindowEvent::Focused(false) if window.label() == "main" => {
+                    let app = window.app_handle().clone();
+                    if let Some(state) = app.try_state::<Arc<AppState>>() {
+                        let state = state.inner().clone();
+                        let for_task = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            commands::stop_input_preview_inner(&state, &for_task).await;
+                        });
+                    }
+                }
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -184,6 +216,9 @@ fn main() {
             commands::set_dictation_stt_binding,
             commands::start_dictation,
             commands::stop_dictation,
+            commands::list_input_devices,
+            commands::start_input_preview,
+            commands::stop_input_preview,
             commands::get_meeting_settings,
             commands::set_meeting_settings,
             commands::get_system_audio_capability,
@@ -446,6 +481,10 @@ fn build_state(
         dictation_busy: Arc::new(AtomicBool::new(false)),
         hold_to_talk_enabled: Arc::new(AtomicBool::new(false)),
         hold_to_talk_installed: Mutex::new(false),
+        hold_control: Mutex::new(None),
+        preroll_enabled: Arc::new(AtomicBool::new(true)),
+        dictation_locked: AtomicBool::new(false),
+        preview_generation: AtomicU64::new(0),
     })
 }
 
@@ -621,7 +660,7 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
 
     // Deliberately after the dispatcher is up: the hold-to-talk listener drives
     // the same dictation handlers.
-    hotkeys::spawn_hold_to_talk_rearm(&state, &app_handle, config_pool.clone());
+    hotkeys::spawn_saved_dictation_settings(&state, &app_handle, config_pool.clone());
 
     app.manage(state);
 

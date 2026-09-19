@@ -139,6 +139,97 @@ describe("RewritePage", () => {
     expect(invokeCalls("preview_rewrite")[0]).toMatchObject({ mode: "concise" });
   });
 
+  it("sends the target language as the run's parameter when translating", async () => {
+    mockWorld({
+      engines: { llm: ["openai"] },
+      bindings: { "default/llm": openAiBinding("openai", "gpt-4o-mini") },
+      extra: {
+        get_setting: (args) =>
+          ({
+            "rewrite.active_mode": "translate",
+            "rewrite.translate.target": "de",
+          })[args?.key as string] ?? null,
+        preview_rewrite: () => "Guten Tag.",
+      },
+    });
+    render(<RewritePage />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Rewrite this" }));
+
+    await waitFor(() => expect(invokeCalls("preview_rewrite")).toHaveLength(1));
+    // One argument carries whatever the mode needs, so translate's tag rides
+    // in the slot Ask KEA's instruction uses.
+    expect(invokeCalls("preview_rewrite")[0]).toMatchObject({
+      mode: "translate",
+      customInstruction: "de",
+    });
+  });
+
+  it("gives every enabled language its own shortcut row", async () => {
+    mockWorld({
+      engines: { llm: ["openai"] },
+      bindings: { "default/llm": openAiBinding("openai", "gpt-4o-mini") },
+      extra: {
+        get_setting: (args) =>
+          args?.key === "rewrite.translate.targets" ? '["fr","ja"]' : null,
+      },
+    });
+    render(<RewritePage />);
+
+    const shortcuts = await screen.findByRole("group", { name: "Translate shortcuts" });
+    expect(shortcuts.textContent).toContain("French");
+    expect(shortcuts.textContent).toContain("Japanese");
+  });
+
+  it("adds a language to the shortcut list", async () => {
+    mockWorld({
+      engines: { llm: ["openai"] },
+      bindings: { "default/llm": openAiBinding("openai", "gpt-4o-mini") },
+      extra: {
+        get_setting: (args) =>
+          args?.key === "rewrite.translate.targets" ? '["fr"]' : null,
+      },
+    });
+    render(<RewritePage />);
+
+    await userEvent.selectOptions(
+      await screen.findByLabelText("Language to add"),
+      "de",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Add" }));
+
+    await waitFor(() =>
+      expect(
+        invokeCalls("set_setting").filter(
+          (c) => c?.key === "rewrite.translate.targets",
+        ),
+      ).toHaveLength(1),
+    );
+    expect(
+      invokeCalls("set_setting").find((c) => c?.key === "rewrite.translate.targets"),
+    ).toEqual({ key: "rewrite.translate.targets", value: '["fr","de"]' });
+  });
+
+  it("removes a language from the shortcut list", async () => {
+    mockWorld({
+      engines: { llm: ["openai"] },
+      bindings: { "default/llm": openAiBinding("openai", "gpt-4o-mini") },
+      extra: {
+        get_setting: (args) =>
+          args?.key === "rewrite.translate.targets" ? '["fr","ja"]' : null,
+      },
+    });
+    render(<RewritePage />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Remove French" }));
+
+    await waitFor(() =>
+      expect(
+        invokeCalls("set_setting").find((c) => c?.key === "rewrite.translate.targets"),
+      ).toEqual({ key: "rewrite.translate.targets", value: '["ja"]' }),
+    );
+  });
+
   it("rewrites the sample text without pasting it anywhere", async () => {
     mockWorld({
       engines: { llm: ["openai"] },

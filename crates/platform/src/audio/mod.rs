@@ -19,8 +19,8 @@ pub mod util;
 
 pub use cues::{cue_pcm, Cue};
 pub use util::{
-    accumulate_frames, chunk_pcm_by_duration, downmix_to_mono, mix_frames, resample_linear,
-    rms_level, FrameCounters,
+    accumulate_frames, choose_input_device, chunk_pcm_by_duration, downmix_to_mono, mix_frames,
+    resample_linear, rms_level, DeviceChoice, FrameCounters, RingBuffer,
 };
 
 /// Mono PCM samples at a specific sample rate (alias: capture buffer unit).
@@ -42,10 +42,41 @@ pub struct SpeechSegment {
     pub has_speech: bool,
 }
 
+/// An input device the user can record from.
+///
+/// `id` is the device *name*, because a name is the only handle `cpal` offers.
+/// It is not unique (two identical USB mics) and not stable across reboots on
+/// every host, which is why selection resolves leniently — see
+/// [`choose_input_device`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputDevice {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// Reported when the saved input device was not there and capture opened the
+/// default instead. Surfaced to the user rather than logged: recording from
+/// the wrong microphone for a whole meeting because a dock was unplugged is
+/// the failure this exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceFallback {
+    pub requested: String,
+    /// The default device's name, or `None` when the host could not name it.
+    pub using: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DictationState {
     Idle,
     Listening,
+    /// Recording, started by a double tap of the hold chord and running until
+    /// the next tap rather than until a key is released.
+    ///
+    /// The capture device cannot tell the two apart, so no [`AudioIo`] ever
+    /// returns this: it is set by the app, which owns the lock, and published
+    /// on `dictation:state` so the HUD can say the mic is open on purpose.
+    Locked,
     Processing,
 }
 
@@ -133,6 +164,72 @@ pub trait AudioIo: Send + Sync {
     ) -> Result<Option<SpeechSegment>, AudioIoError> {
         let _ = cfg;
         Ok(None)
+    }
+
+    /// The input devices this host can record from.
+    fn list_input_devices(&self) -> Vec<InputDevice> {
+        Vec::new()
+    }
+
+    /// Set which device capture should open, by [`InputDevice::id`], or `None`
+    /// for the OS default. Applied at the next stream open, never mid-capture.
+    fn set_input_device(&mut self, preferred: Option<String>) {
+        let _ = (self, preferred);
+    }
+
+    /// Take the fallback recorded by the last device resolution, if the saved
+    /// device was missing.
+    ///
+    /// Taken rather than read so the report fires once per resolution — the
+    /// alternative is a notification per audio callback.
+    fn take_device_fallback(&mut self) -> Option<DeviceFallback> {
+        None
+    }
+
+    /// Whether the input preview holds the capture device.
+    fn preview_active(&self) -> bool {
+        false
+    }
+
+    /// Open the input device purely to publish levels, discarding the audio.
+    ///
+    /// Takes the same capture gate as [`start_mic`](Self::start_mic) and
+    /// [`start_meeting`](Self::start_meeting): the audio layer admits exactly
+    /// one recorder, and a preview left running when a hotkey fires would
+    /// otherwise open a second stream on the same device.
+    async fn start_input_preview(&mut self) -> Result<(), AudioIoError> {
+        let _ = self;
+        Err(AudioIoError::Other("input preview not implemented".into()))
+    }
+
+    /// Stop the preview. A no-op when none is running, so timers, window blur
+    /// and a dictation start can all call it without checking first.
+    async fn stop_input_preview(&mut self) -> Result<(), AudioIoError> {
+        let _ = self;
+        Ok(())
+    }
+
+    /// Open the capture stream early and hold the most recent audio in a
+    /// preroll ring, without starting a recording.
+    ///
+    /// Called when the first modifier of the hold chord has been down long
+    /// enough to mean it; [`start_mic`](Self::start_mic) then adopts the armed
+    /// stream and prepends the ring, which is the speech spoken before the
+    /// hold threshold passed. Silently does nothing when anything else already
+    /// holds the device — the preroll is an optimisation, never a failure.
+    fn arm_capture(&mut self) {
+        let _ = self;
+    }
+
+    /// Close an armed stream and drop its preroll. The chord was broken before
+    /// it became a recording, so the audio is never transcribed.
+    fn disarm_capture(&mut self) {
+        let _ = self;
+    }
+
+    /// Whether a stream is armed and filling the preroll ring.
+    fn is_armed(&self) -> bool {
+        false
     }
 
     /// Play mono PCM to the default output device. Default impl is a no-op so fakes and stubs compile.
