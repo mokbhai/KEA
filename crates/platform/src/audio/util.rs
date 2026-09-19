@@ -1,6 +1,117 @@
-//! Pure audio helpers (resample, RMS, frame accumulation).
+//! Pure audio helpers (resample, RMS, frame accumulation) plus the frame-sink
+//! bookkeeping shared by the capture callbacks.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::Sender;
 
 use super::PcmFrame;
+
+/// Delivery counters for a bounded capture channel, split by *why* a frame did
+/// not reach the streaming consumer.
+///
+/// `try_send` reports "the consumer is behind" (`Full`) and "there is no
+/// consumer" (`Closed`) as the same `Err`, and collapsing the two is a bug with
+/// a visible symptom: the production caller of `start_mic` drops the receiver
+/// (`src-tauri/src/commands.rs`, which discards the `Ok` value), so the channel
+/// is *closed* on every dictation run and the logs blamed a full channel for it.
+///
+/// The distinction is not cosmetic. A `Full` is real loss for whoever is
+/// streaming. A `Closed` loses nothing at all — the capture callback also writes
+/// every frame into the session buffer that `stop_mic` returns, so the recording
+/// is complete either way. Only the first is worth a warning.
+#[derive(Clone, Debug, Default)]
+pub struct FrameCounters {
+    full: Arc<AtomicU64>,
+    closed: Arc<AtomicU64>,
+}
+
+impl FrameCounters {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Zero both counters at the start of a capture session.
+    pub fn reset(&self) {
+        self.full.store(0, Ordering::Relaxed);
+        self.closed.store(0, Ordering::Relaxed);
+    }
+
+    /// `(full, closed)` since the last [`reset`](Self::reset) or
+    /// [`log_session`](Self::log_session).
+    pub fn totals(&self) -> (u64, u64) {
+        (
+            self.full.load(Ordering::Relaxed),
+            self.closed.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Offer `frame` to the streaming consumer, recording why it did not land.
+    ///
+    /// Returns whether the frame reached the channel. `false` is not an error at
+    /// this layer and callers are expected to ignore it: the session buffer is
+    /// written separately and is what the recording is actually built from.
+    ///
+    /// Runs inside the cpal callback, so it must not block — hence `try_send`
+    /// and relaxed counters rather than any form of waiting.
+    pub fn send(&self, tx: &Sender<PcmFrame>, frame: PcmFrame, label: &str) -> bool {
+        match tx.try_send(frame) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                let n = self.full.fetch_add(1, Ordering::Relaxed) + 1;
+                // Every 100th, so a sustained overrun stays visible without
+                // one log line per 10ms of audio.
+                if n.is_multiple_of(100) {
+                    tracing::warn!(
+                        full_drops = n,
+                        "{}: streaming consumer is behind; dropped {} mic frames so far \
+                         (the buffered recording is unaffected)",
+                        label,
+                        n
+                    );
+                }
+                false
+            }
+            Err(TrySendError::Closed(_)) => {
+                let n = self.closed.fetch_add(1, Ordering::Relaxed) + 1;
+                // Once per session rather than every 100 frames: with no
+                // receiver attached this is the steady state, not a fault.
+                if n == 1 {
+                    tracing::debug!(
+                        "{}: no streaming consumer attached; frames are buffered only",
+                        label
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    /// Drain and report the session totals. Only a `Full` count is a warning.
+    pub fn log_session(&self, label: &str) {
+        let full = self.full.swap(0, Ordering::Relaxed);
+        let closed = self.closed.swap(0, Ordering::Relaxed);
+        if full > 0 {
+            tracing::warn!(
+                full_drops = full,
+                "{}: dropped {} mic frames this session because the streaming consumer \
+                 fell behind",
+                label,
+                full
+            );
+        }
+        if closed > 0 {
+            tracing::debug!(
+                closed,
+                "{}: {} frames had no streaming consumer this session",
+                label,
+                closed
+            );
+        }
+    }
+}
 
 /// Linearly resample `frame` to `target_rate_hz`.
 pub fn resample_linear(frame: &PcmFrame, target_rate_hz: u32) -> PcmFrame {
@@ -152,6 +263,93 @@ pub fn accumulate_frames(frames: &[PcmFrame]) -> PcmFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame(n: usize) -> PcmFrame {
+        PcmFrame {
+            samples: vec![0.1; n],
+            sample_rate_hz: 16_000,
+        }
+    }
+
+    #[test]
+    fn send_to_a_live_consumer_counts_nothing() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let counters = FrameCounters::new();
+
+        assert!(counters.send(&tx, frame(8), "dictation"));
+        assert_eq!(counters.totals(), (0, 0));
+    }
+
+    /// The bug this type exists for: with no receiver, `try_send` fails with
+    /// `Closed`, which the old code counted and reported as a full channel.
+    /// Nothing is lost in this case — the caller still buffers the frame — so it
+    /// must not land in the `full` bucket that drives the warning.
+    #[test]
+    fn send_with_no_consumer_counts_closed_not_full() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        drop(rx);
+        let counters = FrameCounters::new();
+
+        for _ in 0..250 {
+            assert!(!counters.send(&tx, frame(8), "dictation"));
+        }
+
+        let (full, closed) = counters.totals();
+        assert_eq!(full, 0, "a closed channel is not a full one");
+        assert_eq!(closed, 250);
+    }
+
+    #[test]
+    fn send_to_a_backed_up_consumer_counts_full() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(2);
+        let counters = FrameCounters::new();
+
+        assert!(counters.send(&tx, frame(8), "meeting"));
+        assert!(counters.send(&tx, frame(8), "meeting"));
+        // Capacity is spent and the receiver is alive but never reading.
+        assert!(!counters.send(&tx, frame(8), "meeting"));
+
+        assert_eq!(counters.totals(), (1, 0));
+    }
+
+    #[test]
+    fn reset_clears_both_counters() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let counters = FrameCounters::new();
+        counters.send(&tx, frame(4), "dictation");
+        assert_eq!(counters.totals().1, 1);
+
+        counters.reset();
+        assert_eq!(counters.totals(), (0, 0));
+    }
+
+    #[test]
+    fn log_session_drains_the_counters() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let counters = FrameCounters::new();
+        counters.send(&tx, frame(4), "dictation");
+
+        counters.log_session("dictation");
+        assert_eq!(
+            counters.totals(),
+            (0, 0),
+            "a session summary consumes what it reported"
+        );
+    }
+
+    #[test]
+    fn counters_are_shared_across_clones() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let counters = FrameCounters::new();
+        // The capture thread gets a clone; `stop_mic` reads the original.
+        let on_capture_thread = counters.clone();
+        on_capture_thread.send(&tx, frame(4), "dictation");
+
+        assert_eq!(counters.totals(), (0, 1));
+    }
 
     #[test]
     fn resample_halves_sample_count_when_halving_rate() {

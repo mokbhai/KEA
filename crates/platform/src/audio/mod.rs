@@ -20,7 +20,7 @@ pub mod util;
 pub use cues::{cue_pcm, Cue};
 pub use util::{
     accumulate_frames, chunk_pcm_by_duration, downmix_to_mono, mix_frames, resample_linear,
-    rms_level,
+    rms_level, FrameCounters,
 };
 
 /// Mono PCM samples at a specific sample rate (alias: capture buffer unit).

@@ -18,12 +18,11 @@ use super::loopback::find_loopback_input_device;
 use super::macos_sck::{
     new_system_audio_capture, sck_feature_enabled, screen_recording_granted, SystemAudioCapture,
 };
-use super::util::{accumulate_frames, downmix_to_mono, mix_frames, rms_level};
+use super::util::{accumulate_frames, downmix_to_mono, mix_frames, rms_level, FrameCounters};
 use super::{AudioIo, AudioIoError, DictationState, MeetingState, PcmFrame, SystemAudioCapability};
 use async_trait::async_trait;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -55,8 +54,8 @@ pub struct MacAudioIo {
     dictation_capture: Mutex<Option<CaptureWorker>>,
     meeting_capture: Mutex<Option<MeetingCaptureWorker>>,
     sample_rate_hz: Mutex<u32>,
-    dictation_drops: Arc<AtomicU64>,
-    meeting_mic_drops: Arc<AtomicU64>,
+    dictation_frames: FrameCounters,
+    meeting_mic_frames: FrameCounters,
     /// System-audio backend behind the [`SystemAudioCapture`] seam: SCK when the
     /// `system-audio-sck` feature is on, otherwise the refusing null object.
     system_audio: Box<dyn SystemAudioCapture>,
@@ -90,8 +89,8 @@ impl MacAudioIo {
             dictation_capture: Mutex::new(None),
             meeting_capture: Mutex::new(None),
             sample_rate_hz: Mutex::new(sample_rate_hz),
-            dictation_drops: Arc::new(AtomicU64::new(0)),
-            meeting_mic_drops: Arc::new(AtomicU64::new(0)),
+            dictation_frames: FrameCounters::new(),
+            meeting_mic_frames: FrameCounters::new(),
             system_audio: new_system_audio_capture(),
         }
     }
@@ -135,23 +134,16 @@ fn push_dictation_frame(
     level: &Arc<Mutex<f32>>,
     tx: &tokio::sync::mpsc::Sender<PcmFrame>,
     buffered: &Arc<Mutex<Vec<PcmFrame>>>,
-    drops: &AtomicU64,
+    counters: &FrameCounters,
 ) {
     let frame = PcmFrame {
         samples,
         sample_rate_hz,
     };
     *level.lock().unwrap_or_else(|p| p.into_inner()) = rms_level(&frame.samples);
-    if tx.try_send(frame.clone()).is_err() {
-        let n = drops.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_multiple_of(100) {
-            tracing::warn!(
-                drops = n,
-                "dictation: mic frame channel full; dropped {} audio frames so far",
-                n
-            );
-        }
-    }
+    // Ignored on purpose: a frame that does not reach a streaming consumer is
+    // still recorded, because the session buffer below takes every frame.
+    counters.send(tx, frame.clone(), "dictation");
     buffered
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -164,7 +156,7 @@ fn push_meeting_frame(
     tx: &tokio::sync::mpsc::Sender<PcmFrame>,
     drain_frames: &Arc<Mutex<Vec<PcmFrame>>>,
     latest_loopback: Option<&Arc<Mutex<Option<PcmFrame>>>>,
-    drops: &AtomicU64,
+    counters: &FrameCounters,
 ) {
     if let Some(lb) = latest_loopback {
         if let Some(ref sys) = *lb.lock().unwrap_or_else(|p| p.into_inner()) {
@@ -172,16 +164,7 @@ fn push_meeting_frame(
         }
     }
     *level.lock().unwrap_or_else(|p| p.into_inner()) = rms_level(&frame.samples);
-    if tx.try_send(frame.clone()).is_err() {
-        let n = drops.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_multiple_of(100) {
-            tracing::warn!(
-                drops = n,
-                "meeting: mic frame channel full; dropped {} audio frames so far",
-                n
-            );
-        }
-    }
+    counters.send(tx, frame.clone(), "meeting");
     drain_frames
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -205,7 +188,7 @@ fn run_capture_on_device(
     frame_tx: tokio::sync::mpsc::Sender<PcmFrame>,
     dictation_buffered: Arc<Mutex<Vec<PcmFrame>>>,
     level: Arc<Mutex<f32>>,
-    drops: Arc<AtomicU64>,
+    counters: FrameCounters,
 ) -> Result<(), AudioIoError> {
     run_input_stream(device, stop_rx, move |mono, sample_rate_hz| {
         push_dictation_frame(
@@ -214,7 +197,7 @@ fn run_capture_on_device(
             &level,
             &frame_tx,
             &dictation_buffered,
-            &drops,
+            &counters,
         );
     })
 }
@@ -226,7 +209,7 @@ fn run_meeting_mic_capture(
     drain_frames: Arc<Mutex<Vec<PcmFrame>>>,
     level: Arc<Mutex<f32>>,
     latest_loopback: Option<Arc<Mutex<Option<PcmFrame>>>>,
-    drops: Arc<AtomicU64>,
+    counters: FrameCounters,
 ) -> Result<(), AudioIoError> {
     run_input_stream(device, stop_rx, move |mono, sample_rate_hz| {
         let frame = PcmFrame {
@@ -239,7 +222,7 @@ fn run_meeting_mic_capture(
             &frame_tx,
             &drain_frames,
             latest_loopback.as_ref(),
-            &drops,
+            &counters,
         );
     })
 }
@@ -397,12 +380,12 @@ impl AudioIo for MacAudioIo {
         let (stop_tx, stop_rx) = mpsc::channel();
         let buffered = Arc::clone(&self.dictation_buffered);
         let level = Arc::clone(&self.level);
-        let drops = Arc::clone(&self.dictation_drops);
-        drops.store(0, Ordering::Relaxed);
+        let counters = self.dictation_frames.clone();
+        counters.reset();
 
         let join = thread::spawn(move || {
             if let Err(err) =
-                run_capture_on_device(device, stop_rx, frame_tx, buffered, level, drops)
+                run_capture_on_device(device, stop_rx, frame_tx, buffered, level, counters)
             {
                 tracing::error!("mic capture failed: {err}");
             }
@@ -446,14 +429,7 @@ impl AudioIo for MacAudioIo {
             stop_worker(worker)?;
         }
 
-        let drops = self.dictation_drops.swap(0, Ordering::Relaxed);
-        if drops > 0 {
-            tracing::warn!(
-                drops,
-                "dictation: {} mic frames dropped (channel full) during this session",
-                drops
-            );
-        }
+        self.dictation_frames.log_session("dictation");
 
         let frames = std::mem::take(
             &mut *self
@@ -541,8 +517,8 @@ impl AudioIo for MacAudioIo {
         let drain_frames = Arc::clone(&self.meeting_drain_frames);
         let level = Arc::clone(&self.level);
         let loopback_for_mic = latest_loopback.clone();
-        let drops = Arc::clone(&self.meeting_mic_drops);
-        drops.store(0, Ordering::Relaxed);
+        let counters = self.meeting_mic_frames.clone();
+        counters.reset();
 
         let mic_join = thread::spawn(move || {
             if let Err(err) = run_meeting_mic_capture(
@@ -552,7 +528,7 @@ impl AudioIo for MacAudioIo {
                 drain_frames,
                 level,
                 loopback_for_mic,
-                drops,
+                counters,
             ) {
                 tracing::error!("meeting mic capture failed: {err}");
             }
@@ -635,14 +611,7 @@ impl AudioIo for MacAudioIo {
         *self.meeting_state.lock().unwrap_or_else(|p| p.into_inner()) = MeetingState::Idle;
         *self.level.lock().unwrap_or_else(|p| p.into_inner()) = 0.0;
 
-        let drops = self.meeting_mic_drops.swap(0, Ordering::Relaxed);
-        if drops > 0 {
-            tracing::warn!(
-                drops,
-                "meeting: {} mic frames dropped (channel full) during this session",
-                drops
-            );
-        }
+        self.meeting_mic_frames.log_session("meeting");
 
         Ok(PcmFrame {
             samples: vec![],
