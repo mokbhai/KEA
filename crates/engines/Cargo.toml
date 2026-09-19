@@ -6,6 +6,8 @@ edition = "2021"
 [features]
 default = []
 whisper = ["kea-infer/whisper", "dep:whisper-rs"]
+whisper-metal = ["whisper", "kea-infer/whisper-metal"]
+whisper-coreml = ["whisper", "kea-infer/whisper-coreml"]
 parakeet = ["kea-infer/sherpa"]
 tts-local = ["kea-infer/sherpa"]
 

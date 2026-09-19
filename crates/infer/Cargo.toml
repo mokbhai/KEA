@@ -7,9 +7,16 @@ edition = "2021"
 default = []
 whisper = ["dep:whisper-rs"]
 sherpa = ["dep:sherpa-onnx"]
+# whisper.cpp GPU/accelerator backends. Deliberately NOT in `default`: `metal`
+# links macOS-only frameworks and the workspace is built for Linux and Windows
+# in CI, so the selection is made by the host (Makefile) or the runner
+# (release.yml) instead.
+whisper-metal = ["whisper", "whisper-rs/metal"]
+whisper-coreml = ["whisper", "whisper-rs/coreml"]
 
 [dependencies]
 async-trait.workspace = true
+tracing.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

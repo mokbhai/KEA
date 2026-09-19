@@ -10,6 +10,10 @@ edition = "2021"
 default = ["whisper", "parakeet", "tts-local"]
 updater = ["tauri-plugin-updater"]
 whisper = ["kea-engines/whisper", "kea-infer/whisper"]
+# macOS-only; selected by host in the Makefile and per-runner in release.yml,
+# never in `default` (which Linux and Windows share).
+whisper-metal = ["whisper", "kea-engines/whisper-metal"]
+whisper-coreml = ["whisper", "kea-engines/whisper-coreml"]
 parakeet = ["kea-engines/parakeet"]
 tts-local = ["kea-engines/tts-local"]
 sherpa = ["kea-infer/sherpa"]

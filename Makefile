@@ -11,6 +11,22 @@ APP_INSTALL_PATH = /Applications/$(APP_NAME).app
 # --features updater through here so the signing logic below still applies).
 TAURI_BUILD_FLAGS ?=
 
+# Cargo features chosen by the build HOST rather than baked into `default`.
+# whisper.cpp's Metal backend links macOS-only frameworks, and `default` is
+# shared with the Linux and Windows CI builds, so it cannot go there. The
+# release workflow makes the same choice per runner (.github/workflows/release.yml).
+# Override with `make build HOST_FEATURES=` to force a CPU build.
+ifeq ($(shell uname -s),Darwin)
+HOST_FEATURES ?= whisper-metal
+else
+HOST_FEATURES ?=
+endif
+ifeq ($(strip $(HOST_FEATURES)),)
+HOST_FEATURE_FLAGS =
+else
+HOST_FEATURE_FLAGS = --features $(HOST_FEATURES)
+endif
+
 all: build
 
 check-tauri:
@@ -35,16 +51,16 @@ build: tauri-build
 tauri-build: check-tauri
 	@if [ -n "$$TAURI_SIGNING_PRIVATE_KEY" ]; then \
 		echo "Signing key present - building signed updater artifacts."; \
-		$(TAURI_CLI) build $(TAURI_BUILD_FLAGS); \
+		$(TAURI_CLI) build $(HOST_FEATURE_FLAGS) $(TAURI_BUILD_FLAGS); \
 	else \
 		echo "No TAURI_SIGNING_PRIVATE_KEY - building with --no-sign (no updater signature)."; \
-		$(TAURI_CLI) build --no-sign $(TAURI_BUILD_FLAGS); \
+		$(TAURI_CLI) build --no-sign $(HOST_FEATURE_FLAGS) $(TAURI_BUILD_FLAGS); \
 	fi
 
 dev: tauri-dev
 
 tauri-dev: check-tauri
-	$(TAURI_CLI) dev
+	$(TAURI_CLI) dev $(HOST_FEATURE_FLAGS)
 
 install: tauri-install
 
