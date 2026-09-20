@@ -101,6 +101,13 @@ pub fn spawn(
     Ok((HoldControl::new(machine), events_rx))
 }
 
+/// Said in one place because it is said from two: the pre-flight trust check
+/// and the `CGEventTapCreate` failure path mean the same thing to a user.
+const ACCESSIBILITY_REQUIRED: &str =
+    "KEA needs Accessibility permission to watch for the hold-to-talk chord (⌥⇧). \
+Grant it in System Settings → Privacy & Security → Accessibility, then quit and \
+reopen KEA. Cmd+Shift+D keeps working without it.";
+
 fn spawn_tap_thread(
     machine: Arc<Mutex<HoldToTalk>>,
     enabled: Arc<AtomicBool>,
@@ -124,16 +131,28 @@ fn spawn_tap_thread(
                 },
             );
 
+            // Checked BEFORE the tap is trusted to report it, because it does
+            // not: `CGEventTapCreate` SUCCEEDS for an untrusted process. What
+            // fails is every subsequent keystroke — the system disables the tap
+            // with `TapDisabledByUserInput` and the chord silently does
+            // nothing, while `Cmd+Shift+D` keeps working because a Carbon
+            // hotkey needs no Accessibility.
+            //
+            // That asymmetry cost a long debugging session: the only symptom
+            // was a warning in a log file that read like noise. `make install`
+            // runs `tccutil reset Accessibility`, so this is not a rare state —
+            // it is the state after every install.
+            if !crate::textio::macos_ax::is_ax_trusted() {
+                let _ = started.send(Err(ACCESSIBILITY_REQUIRED.into()));
+                return;
+            }
+
             let tap = match tap {
                 Ok(tap) => tap,
                 Err(()) => {
                     // The only realistic cause: this process is not trusted for
                     // Accessibility. CGEventTapCreate says so by returning NULL.
-                    let _ = started.send(Err(
-                        "KEA needs Accessibility permission to watch for the hold-to-talk chord. \
-Grant it in System Settings → Privacy & Security → Accessibility, then try again."
-                            .into(),
-                    ));
+                    let _ = started.send(Err(ACCESSIBILITY_REQUIRED.into()));
                     return;
                 }
             };
@@ -197,10 +216,17 @@ fn on_event(
         //   `kea_platform::appnap`.
         // * UserInput — something called `CGEventTapEnable(false)`. Nothing in
         //   KEA ever does, so this means another process or the system did.
-        tracing::warn!(
-            reason,
-            "hold-to-talk: the system disabled the event tap; re-enabled it"
-        );
+        if reason == "user input" && !crate::textio::macos_ax::is_ax_trusted() {
+            // The signature of a revoked grant: the tap survives, every real
+            // keystroke kills it. ERROR rather than WARN because this one is
+            // actionable and the user is otherwise told nothing at all.
+            tracing::error!("{ACCESSIBILITY_REQUIRED}");
+        } else {
+            tracing::warn!(
+                reason,
+                "hold-to-talk: the system disabled the event tap; re-enabled it"
+            );
+        }
 
         // Drop any half-finished chord. The tap was deaf for an unknown
         // interval, so a press whose release happened while it was disabled
@@ -237,13 +263,20 @@ fn on_event(
     let action = match event_type {
         CGEventType::FlagsChanged => {
             let flags = event.get_flags();
-            machine.on_modifiers(
-                Instant::now(),
-                HoldModifiers {
-                    option: flags.contains(CGEventFlags::CGEventFlagAlternate),
-                    shift: flags.contains(CGEventFlags::CGEventFlagShift),
-                },
-            )
+            let mods = HoldModifiers {
+                option: flags.contains(CGEventFlags::CGEventFlagAlternate),
+                shift: flags.contains(CGEventFlags::CGEventFlagShift),
+            };
+            // Debug rather than warn: one line per modifier press is far too
+            // loud for normal running, but it is the only thing that answers
+            // "did the tap see it?" — which is the first question every time
+            // this feature is reported broken. `make dev` shows it.
+            tracing::debug!(
+                option = mods.option,
+                shift = mods.shift,
+                "hold-to-talk: flags"
+            );
+            machine.on_modifiers(Instant::now(), mods)
         }
         // Nothing is read off the event: only that a key went down at all.
         CGEventType::KeyDown => machine.on_other_key(),

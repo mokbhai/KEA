@@ -62,6 +62,19 @@ pub const fn floating_collection_behavior() -> usize {
 ///
 /// Every failure here is swallowed: a window at the wrong level is a cosmetic
 /// problem, and neither dictation nor the palette may stop working over it.
+///
+/// # MAIN THREAD ONLY
+///
+/// Unlike [`order_front_without_activating`], this does not marshal. Both of
+/// its call sites are window construction during `setup`, which is the main
+/// thread, and keeping it synchronous means the flags are set before the
+/// window can be shown.
+///
+/// Calling it from anywhere else is a crash, not a glitch: AppKit window calls
+/// off the main thread SIGTRAP, and that is exactly how the async version of
+/// the sibling function below was found. If you need this from an async path,
+/// call the sibling or wrap this in `run_on_main_thread` — do not simply move
+/// the call.
 #[cfg(target_os = "macos")]
 pub fn float_over_fullscreen(window: &WebviewWindow) {
     use objc2::msg_send;
@@ -106,22 +119,42 @@ pub fn float_over_fullscreen(window: &WebviewWindow) {
 /// from build time. They are cheap setters, they are idempotent, and the
 /// alternative is depending on the claim that nothing else ever touches them —
 /// a claim this file used to make in a comment and could not prove.
+///
+/// # Why this marshals to the main thread, at the cost of a crash
+///
+/// Ordering a window is an AppKit operation and AppKit is main-thread only.
+/// The first version of this function called `orderFrontRegardless` on
+/// whatever thread reached it, and the callers are async: `sync_visibility`
+/// runs from `emit_dictation_state`, which runs on a tokio worker. That
+/// SIGTRAPped inside `-[NSWindow _doOrderWindow:]` on the first ⌥⇧ press.
+///
+/// The reason it was not obvious is that the neighbouring code is safe for a
+/// reason that does not extend here: `window.show()` looks like the same kind
+/// of call, but Tauri marshals it internally. A raw `msg_send!` does not, so
+/// every AppKit selector sent from app code has to do it explicitly.
 #[cfg(target_os = "macos")]
 pub fn order_front_without_activating(window: &WebviewWindow) {
-    use objc2::msg_send;
-    use objc2::runtime::AnyObject;
+    let window = window.clone();
+    // Failure here means the main thread is gone, i.e. the app is shutting
+    // down. Nothing to do about that, and the HUD is cosmetic either way.
+    let _ = window.clone().run_on_main_thread(move || {
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
 
-    let ns_window = match window.ns_window() {
-        Ok(ptr) if !ptr.is_null() => ptr as *mut AnyObject,
-        _ => return,
-    };
+        let ns_window = match window.ns_window() {
+            Ok(ptr) if !ptr.is_null() => ptr as *mut AnyObject,
+            _ => return,
+        };
 
-    // SAFETY: a live NSWindow owned by tao, and three plain setters on it.
-    unsafe {
-        let _: () = msg_send![ns_window, setCollectionBehavior: floating_collection_behavior()];
-        let _: () = msg_send![ns_window, setLevel: STATUS_WINDOW_LEVEL];
-        let _: () = msg_send![ns_window, orderFrontRegardless];
-    }
+        // SAFETY: a live NSWindow owned by tao, three plain selectors on it,
+        // and we are on the main thread — which is the whole point of the
+        // closure this runs inside.
+        unsafe {
+            let _: () = msg_send![ns_window, setCollectionBehavior: floating_collection_behavior()];
+            let _: () = msg_send![ns_window, setLevel: STATUS_WINDOW_LEVEL];
+            let _: () = msg_send![ns_window, orderFrontRegardless];
+        }
+    });
 }
 
 #[cfg(not(target_os = "macos"))]

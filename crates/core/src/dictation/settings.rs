@@ -8,6 +8,7 @@ const KEY_ACTIVE_MODEL: &str = "dictation.active_model";
 const KEY_HOLD_TO_TALK: &str = "dictation.hold_to_talk";
 const KEY_INPUT_DEVICE: &str = "dictation.input_device";
 const KEY_PREROLL: &str = "dictation.preroll";
+const KEY_POST_PROCESS_MIN_CHARS: &str = "dictation.post_process_min_chars";
 const KEY_LANGUAGE: &str = "dictation.language";
 const KEY_VOICE_COMMANDS_ENABLED: &str = "dictation.voice_commands_enabled";
 const KEY_VOICE_COMMANDS: &str = "dictation.voice_commands";
@@ -41,6 +42,20 @@ pub struct DictationSettings {
     /// the mic never open without a deliberate recording.
     #[serde(default = "preroll_default")]
     pub preroll: bool,
+    /// Shortest transcript worth sending to the LLM for cleanup.
+    ///
+    /// The cleanup pass costs a round trip — measured at roughly five seconds
+    /// against a hosted model — and a short utterance has almost nothing for it
+    /// to fix: "yes", "on my way", "ship it" arrive from the recogniser already
+    /// correct. Paying five seconds to tidy nine characters is the wrong trade,
+    /// and it is the one the feature made on every single run before this.
+    ///
+    /// It also closes a worse failure. A model handed a silent or near-silent
+    /// clip does not return nothing, it returns something plausible: a real run
+    /// transcribed `chars=0` and post-processed it into 140 characters the user
+    /// never said. A floor means an empty transcript is never sent at all.
+    #[serde(default = "post_process_min_chars_default")]
+    pub post_process_min_chars: u32,
     /// BCP-47 tag to decode as, or `None` to let the model detect it.
     ///
     /// **Whisper only.** The ONNX transducer has no language setting, and the
@@ -61,6 +76,16 @@ pub struct DictationSettings {
 /// an older frontend has no field. Both mean "the default", which is on.
 fn preroll_default() -> bool {
     true
+}
+
+/// 100 characters — roughly a sentence and a half.
+///
+/// Below it a transcript is a phrase, and phrases come back clean; above it the
+/// user is dictating prose, which is where the cleanup earns its round trip.
+/// Configurable because the right answer depends on how someone dictates, and
+/// `0` restores the old always-clean-up behaviour for anyone who wants it.
+fn post_process_min_chars_default() -> u32 {
+    100
 }
 
 /// The two standalone keys behind the voice-command pass.
@@ -155,6 +180,11 @@ impl DictationSettingsRepo {
             hold_to_talk: self.settings.get(KEY_HOLD_TO_TALK).await?.unwrap_or(false),
             input_device: self.settings.get_optional(KEY_INPUT_DEVICE).await?,
             preroll: self.settings.get(KEY_PREROLL).await?.unwrap_or(true),
+            post_process_min_chars: self
+                .settings
+                .get(KEY_POST_PROCESS_MIN_CHARS)
+                .await?
+                .unwrap_or_else(post_process_min_chars_default),
             language: self.settings.get_optional(KEY_LANGUAGE).await?,
         })
     }
@@ -173,6 +203,9 @@ impl DictationSettingsRepo {
             .set(KEY_INPUT_DEVICE, &cfg.input_device)
             .await?;
         self.settings.set(KEY_LANGUAGE, &cfg.language).await?;
+        self.settings
+            .set(KEY_POST_PROCESS_MIN_CHARS, &cfg.post_process_min_chars)
+            .await?;
         self.settings.set(KEY_PREROLL, &cfg.preroll).await?;
         Ok(())
     }
@@ -229,6 +262,7 @@ mod tests {
             input_device: Some("Yeti".into()),
             preroll: false,
             language: None,
+            post_process_min_chars: 100,
         };
         repo.set(&cfg).await.unwrap();
         assert_eq!(repo.get().await.unwrap(), cfg);
@@ -248,6 +282,7 @@ mod tests {
             input_device: None,
             preroll: true,
             language: None,
+            post_process_min_chars: 100,
         })
         .await
         .unwrap();
@@ -258,6 +293,7 @@ mod tests {
             input_device: None,
             preroll: true,
             language: None,
+            post_process_min_chars: 100,
         })
         .await
         .unwrap();
@@ -307,6 +343,7 @@ mod tests {
             input_device: Some("Yeti".into()),
             preroll: true,
             language: None,
+            post_process_min_chars: 100,
         };
         repo.set(&cfg).await.unwrap();
         assert_eq!(
@@ -334,6 +371,7 @@ mod tests {
             input_device: None,
             preroll: false,
             language: None,
+            post_process_min_chars: 100,
         })
         .await
         .unwrap();

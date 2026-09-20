@@ -397,7 +397,29 @@ async fn run_dictation_inner(
 
     // Tri-state: a profile may force the cleanup pass off for one app (a shell
     // prompt, a code editor) without changing the global setting.
-    if profile.post_process_or(settings.post_process) {
+    //
+    // The length floor is checked here rather than inside the branch so the
+    // decision — and the reason — is one expression. `chars().count()` rather
+    // than `len()`: the threshold is about how much the user said, and a
+    // sentence of CJK or emoji is not three times longer than it reads.
+    let transcript_chars = final_text.trim().chars().count();
+    // Two separate reasons to skip, and the second is not a special case of the
+    // first: a threshold of 0 disables the length floor but must NOT re-enable
+    // sending silence to a model. A real run transcribed nothing and the
+    // cleanup pass returned 140 characters the user never said.
+    let long_enough = transcript_chars >= settings.post_process_min_chars as usize;
+    let long_enough = long_enough && transcript_chars > 0;
+    if profile.post_process_or(settings.post_process) && !long_enough {
+        // Said out loud, because a user who turned cleanup on and does not see
+        // it run deserves to know why rather than assume it is broken.
+        tracing::info!(
+            action_id = %action_id,
+            chars = transcript_chars,
+            minimum = settings.post_process_min_chars,
+            "dictation: skipped the cleanup pass, transcript below the minimum length"
+        );
+    }
+    if profile.post_process_or(settings.post_process) && long_enough {
         let transcript_text = final_text.clone();
         // Dictation borrows rewrite's slot, so its failures name what the
         // binding was wanted for.
@@ -856,6 +878,7 @@ mod tests {
             input_device: None,
             preroll: true,
             language: None,
+            post_process_min_chars: 100,
         }
     }
 
@@ -1072,6 +1095,7 @@ mod tests {
             input_device: None,
             preroll: true,
             language: None,
+            post_process_min_chars: 100,
         };
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
             samples: vec![0.0; 1600],
@@ -1102,6 +1126,97 @@ mod tests {
         );
     }
 
+    /// The cleanup pass costs a round trip — about five seconds against a
+    /// hosted model — and a short phrase arrives from the recogniser already
+    /// correct. Below the floor it must not run at all.
+    ///
+    /// No LLM engine is registered here, so if the pass ran the run would fail
+    /// to resolve one rather than quietly skipping it.
+    #[tokio::test]
+    async fn a_short_transcript_skips_the_cleanup_pass() {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: "ship it".into(),
+        }));
+        let textio = Arc::new(FakeTextIo::new());
+        let (bindings, actions, presets, overrides) = test_repos().await;
+        let settings = DictationSettings {
+            post_process: true,
+            active_model: None,
+            hold_to_talk: false,
+            input_device: None,
+            preroll: true,
+            language: None,
+            post_process_min_chars: 100,
+        };
+        let mut audio = FakeAudioIo::with_pcm(PcmFrame {
+            samples: vec![0.0; 1600],
+            sample_rate_hz: 16_000,
+        });
+
+        let out = run_dictation(
+            &reg,
+            &bindings,
+            &actions,
+            &presets,
+            &overrides,
+            &mut audio,
+            textio.as_ref(),
+            &settings,
+            &[],
+            &ProfileOverrides::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "ship it");
+    }
+
+    /// The failure the floor also closes, taken from a real log: a silent clip
+    /// transcribed to nothing and the cleanup pass turned it into 140
+    /// characters the user never said. An empty transcript must never reach an
+    /// LLM, whatever the threshold is set to.
+    #[tokio::test]
+    async fn an_empty_transcript_is_never_sent_for_cleanup() {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: String::new(),
+        }));
+        let textio = Arc::new(FakeTextIo::new());
+        let (bindings, actions, presets, overrides) = test_repos().await;
+        let settings = DictationSettings {
+            post_process: true,
+            active_model: None,
+            hold_to_talk: false,
+            input_device: None,
+            preroll: true,
+            language: None,
+            // Even with the floor disabled entirely.
+            post_process_min_chars: 0,
+        };
+        let mut audio = FakeAudioIo::with_pcm(PcmFrame {
+            samples: vec![0.0; 1600],
+            sample_rate_hz: 16_000,
+        });
+
+        let out = run_dictation(
+            &reg,
+            &bindings,
+            &actions,
+            &presets,
+            &overrides,
+            &mut audio,
+            textio.as_ref(),
+            &settings,
+            &[],
+            &ProfileOverrides::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "", "an empty transcript must come back empty");
+    }
+
     /// The tri-state. `Some(false)` must beat a global `true` — that is the
     /// whole point of turning cleanup off for a shell prompt — and it must not
     /// be confused with `None`, which inherits.
@@ -1122,6 +1237,7 @@ mod tests {
             input_device: None,
             preroll: true,
             language: None,
+            post_process_min_chars: 100,
         };
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
             samples: vec![0.0; 1600],
@@ -1168,6 +1284,7 @@ mod tests {
             input_device: None,
             preroll: true,
             language: None,
+            post_process_min_chars: 100,
         };
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
             samples: vec![0.0; 1600],
@@ -1325,6 +1442,7 @@ mod tests {
             let settings = DictationSettings {
                 active_model: Some(model.to_string()),
                 language: None,
+                post_process_min_chars: 100,
                 ..test_settings()
             };
             let mut audio = FakeAudioIo::with_pcm(frame(1600));
@@ -1384,6 +1502,7 @@ mod tests {
             input_device: None,
             preroll: true,
             language: None,
+            post_process_min_chars: 100,
         };
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
             samples: vec![0.0; 1600],
@@ -1433,6 +1552,7 @@ mod tests {
             input_device: None,
             preroll: true,
             language: None,
+            post_process_min_chars: 100,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
@@ -1487,6 +1607,8 @@ mod tests {
             input_device: None,
             preroll: true,
             language: None,
+            // Predates the length floor: these assert the pass RUNS.
+            post_process_min_chars: 0,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
@@ -1550,6 +1672,8 @@ mod tests {
             input_device: None,
             preroll: true,
             language: None,
+            // Predates the length floor: these assert the pass RUNS.
+            post_process_min_chars: 0,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
@@ -1657,6 +1781,8 @@ mod tests {
             input_device: None,
             preroll: true,
             language: None,
+            // Predates the length floor: these assert the pass RUNS.
+            post_process_min_chars: 0,
         };
 
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {

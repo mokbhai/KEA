@@ -64,6 +64,12 @@ tauri-dev: check-tauri
 
 install: tauri-install
 
+# Deliberately does NOT reset the TCC prompts. It used to, and that made every
+# install silently break hold-to-talk: `tccutil reset Accessibility` revokes the
+# grant, and an untrusted process still creates its CGEventTap successfully —
+# the system just kills it on every keystroke. The symptom is a chord that does
+# nothing while Cmd+Shift+D keeps working, which reads like a code bug and is
+# not one. `make reset-perms` exists for when clearing them is what you meant.
 tauri-install: tauri-build
 	@APP_PATH="$$(find "$(CURDIR)/target/release/bundle/macos" "$(CURDIR)/src-tauri/target/release/bundle/macos" -maxdepth 1 -name "$(APP_NAME).app" -type d 2>/dev/null | head -n 1)"; \
 	if [ -z "$$APP_PATH" ]; then \
@@ -73,11 +79,8 @@ tauri-install: tauri-build
 	rm -rf "$(APP_INSTALL_PATH)"; \
 	ditto "$$APP_PATH" "$(APP_INSTALL_PATH)"; \
 	codesign --force --deep --sign - "$(APP_INSTALL_PATH)"; \
-	/usr/bin/tccutil reset Accessibility "$(BUNDLE_ID)" >/dev/null 2>&1 || true; \
-	/usr/bin/tccutil reset ScreenCapture "$(BUNDLE_ID)" >/dev/null 2>&1 || true; \
-	/usr/bin/tccutil reset Microphone "$(BUNDLE_ID)" >/dev/null 2>&1 || true; \
-	/usr/bin/tccutil reset Calendar "$(BUNDLE_ID)" >/dev/null 2>&1 || true; \
-	echo "Installed $$APP_PATH to $(APP_INSTALL_PATH)"
+	echo "Installed $$APP_PATH to $(APP_INSTALL_PATH)"; \
+	echo "If the ⌥⇧ chord stops working, re-grant Accessibility (make reset-perms clears them deliberately)"
 
 test: tauri-test
 

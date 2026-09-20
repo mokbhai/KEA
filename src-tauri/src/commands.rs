@@ -1680,6 +1680,20 @@ pub fn sync_hold_to_talk(state: &Arc<AppState>, app: &AppHandle, enabled: bool) 
                 Err(error) => {
                     tracing::warn!(%error, "hold-to-talk listener could not start");
                     emit_dictation_error(app, &error.to_string());
+                    // Put the system's own dialog in front of the user rather
+                    // than only a message in the app. The grant is revoked by
+                    // anything that changes the binary — every rebuild and
+                    // install — so this is a routine state, not an exotic one,
+                    // and "go and find the Accessibility pane" is a poor answer
+                    // to a chord that silently stopped working.
+                    //
+                    // No-op when already trusted, so it cannot nag: macOS only
+                    // shows the dialog for an untrusted process, and reaching
+                    // here means untrusted.
+                    #[cfg(target_os = "macos")]
+                    {
+                        let _ = kea_platform::textio::macos_ax::prompt_ax_trust();
+                    }
                     return;
                 }
             };
@@ -7154,6 +7168,7 @@ mod tests {
                 input_device: None,
                 preroll: true,
                 language: None,
+                post_process_min_chars: 100,
             })
             .await
             .unwrap();
