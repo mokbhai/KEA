@@ -48,8 +48,18 @@ build: tauri-build
 # Only TAURI_SIGNING_PRIVATE_KEY is checked: the bundler's own guard names that
 # variable specifically, and setting TAURI_SIGNING_PRIVATE_KEY_PATH instead is
 # NOT enough to get past it. Its value may be either the key contents or a path.
+#
+# macOS Apple Code Signing:
+# APPLE_SIGNING_IDENTITY is resolved before invoking tauri build so the resulting
+# .app has a stable designated requirement. This preserves macOS TCC grants
+# (Accessibility) across rebuilds instead of revoking them on a cdhash signature.
 tauri-build: check-tauri
-	@if [ -n "$$TAURI_SIGNING_PRIVATE_KEY" ]; then \
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		export APPLE_SIGNING_IDENTITY=$$("$(CURDIR)/scripts/macos_identity.sh"); \
+		if [ $$? -ne 0 ]; then exit 1; fi; \
+		echo "macOS build will sign using identity: $$APPLE_SIGNING_IDENTITY"; \
+	fi; \
+	if [ -n "$$TAURI_SIGNING_PRIVATE_KEY" ]; then \
 		echo "Signing key present - building signed updater artifacts."; \
 		$(TAURI_CLI) build $(HOST_FEATURE_FLAGS) $(TAURI_BUILD_FLAGS); \
 	else \
@@ -78,9 +88,16 @@ tauri-install: tauri-build
 	fi; \
 	rm -rf "$(APP_INSTALL_PATH)"; \
 	ditto "$$APP_PATH" "$(APP_INSTALL_PATH)"; \
-	codesign --force --deep --sign - "$(APP_INSTALL_PATH)"; \
+	if [ "$$(uname -s)" = "Darwin" ]; then \
+		IDENTITY=$$("$(CURDIR)/scripts/macos_identity.sh"); \
+		if [ -n "$$IDENTITY" ]; then \
+			codesign --force --deep --sign "$$IDENTITY" "$(APP_INSTALL_PATH)"; \
+		else \
+			codesign --force --deep --sign - "$(APP_INSTALL_PATH)"; \
+		fi; \
+	fi; \
 	echo "Installed $$APP_PATH to $(APP_INSTALL_PATH)"; \
-	echo "If the ⌥⇧ chord stops working, re-grant Accessibility (make reset-perms clears them deliberately)"
+	echo "The first certificate-signed install may require one Accessibility re-grant; later installs preserve it."
 
 test: tauri-test
 

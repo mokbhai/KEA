@@ -195,6 +195,22 @@ unsafe fn frontmost_running_app() -> Result<*mut objc2::runtime::AnyObject, &'st
     Ok(app)
 }
 
+/// The pid of the frontmost GUI application. This deliberately uses
+/// `NSWorkspace`, not AX, so it tells the truth when Accessibility is a
+/// broken prerequisite.
+pub fn frontmost_pid() -> Option<i32> {
+    unsafe {
+        frontmost_running_app().ok().and_then(|app| {
+            let pid: i32 = objc2::msg_send![app, processIdentifier];
+            if pid > 0 {
+                Some(pid)
+            } else {
+                None
+            }
+        })
+    }
+}
+
 /// Copies a borrowed `NSString` property into a `String`, or `None` if null.
 ///
 /// # Safety
