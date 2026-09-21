@@ -7,6 +7,15 @@ edition = "2021"
 default = []
 system-audio-sck = ["dep:screencapturekit"]
 
+# The integration test launches the probe as a second process, so it is a
+# binary target rather than an example: Cargo then exposes its stable
+# `CARGO_BIN_EXE_chord-probe` path to the test.
+[[bin]]
+name = "chord-probe"
+path = "src/bin/chord_probe.rs"
+test = false
+bench = false
+
 [dependencies]
 async-trait.workspace = true
 serde.workspace = true

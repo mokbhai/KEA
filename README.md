@@ -43,7 +43,7 @@ make install
 open /Applications/KEA.app
 ```
 
-`make install` builds the Tauri app, copies `KEA.app` into `/Applications`, ad-hoc signs the copied app, and resets macOS TCC prompts for `ai.kea.desktop`.
+`make install` builds the Tauri app and atomically replaces `/Applications/KEA.app`. See [Development documentation](docs/DEVELOPMENT.md) for how it handles macOS local code signing and Accessibility permissions.
 
 ## Development
 

@@ -92,7 +92,7 @@ make install
 open /Applications/KEA.app
 ```
 
-`make install` builds the Tauri release bundle, finds `KEA.app` under the Tauri bundle output, copies it to `/Applications`, ad-hoc signs the installed copy, and resets Accessibility, Screen Capture, and Microphone permissions for `ai.kea.desktop`.
+`make install` builds the Tauri release bundle, finds `KEA.app` under the Tauri bundle output, signs a staged copy with an installed Apple Development identity, and atomically replaces `/Applications/KEA.app`. This gives the app a stable designated requirement so macOS can preserve Accessibility permission across rebuilds. Set `KEA_CODESIGN_IDENTITY` to choose a specific identity; the first certificate-signed install may need one re-grant. Use `make reset-perms` only when deliberately clearing the TCC grants.
 
 To inspect generated bundles:
 

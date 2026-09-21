@@ -46,6 +46,14 @@ cargo test -p kea-app
 cargo test rewrite
 ```
 
+The macOS global hold-to-talk integration test needs a logged-in GUI session and Accessibility access for the terminal/test binaries, so ordinary headless CI leaves it ignored. Focus another app before running it; the test asserts that the observer itself is not frontmost and that the real event tap receives `Arm`, `Start`, then `Stop` from a synthetic HID ⌥⇧ hold:
+
+```bash
+cargo test -p kea-platform --test macos_hold_global \
+  modifier_only_hold_triggers_while_observer_is_not_frontmost \
+  -- --ignored --exact --nocapture
+```
+
 ## Focused UI Checks
 
 ```bash

@@ -139,9 +139,7 @@ fn spawn_tap_thread(
             // hotkey needs no Accessibility.
             //
             // That asymmetry cost a long debugging session: the only symptom
-            // was a warning in a log file that read like noise. `make install`
-            // runs `tccutil reset Accessibility`, so this is not a rare state —
-            // it is the state after every install.
+            // was a warning in a log file that read like noise.
             if !crate::textio::macos_ax::is_ax_trusted() {
                 let _ = started.send(Err(ACCESSIBILITY_REQUIRED.into()));
                 return;
