@@ -320,7 +320,35 @@ async fn run_dictation_inner(
     // The second pass, and the only one whose output is ever inserted. Any
     // live partials the user watched came from a different decoder and are
     // discarded here.
-    let transcript = match engine.transcribe(pcm_to_audio(pcm), stt_opts).await {
+    //
+    // Resampled before the clock starts: the conversion is this crate's work,
+    // not the decoder's, and folding it in would inflate the cost of a pass we
+    // are deciding whether to keep.
+    let audio = pcm_to_audio(pcm);
+    // Counted here because `transcribe` consumes the buffer, and counted *after*
+    // the resample because `samples` is only comparable across utterances if it
+    // means "what the decoder was handed" — a 48kHz capture device would
+    // otherwise report three times the work for the same speech.
+    let decoded_samples = audio.samples.len();
+    let decode_started = std::time::Instant::now();
+    let decoded = engine.transcribe(audio, stt_opts).await;
+    // One line covering both outcomes, unlike the two-edged insertion log
+    // below: the decode reports its own success in a `Result`, so there is no
+    // silent failure for a "started" line to expose. The duration alone does
+    // not answer design.md's question of whether the second pass is worth
+    // skipping — a slow decode of a long utterance is not the same finding as a
+    // slow decode of a short one — so the sample count travels with it and the
+    // two divide into a rate.
+    tracing::info!(
+        action_id = %action_id,
+        engine = %engine_id,
+        samples = decoded_samples,
+        sample_rate_hz = WHISPER_SAMPLE_RATE_HZ,
+        elapsed_ms = decode_started.elapsed().as_millis() as u64,
+        ok = decoded.is_ok(),
+        "dictation: offline decode finished"
+    );
+    let transcript = match decoded {
         Ok(transcript) => transcript,
         Err(e) => {
             let message = e.to_string();
@@ -887,6 +915,222 @@ mod tests {
             samples: vec![0.25; samples],
             sample_rate_hz: 16_000,
         }
+    }
+
+    /// The fields of one `tracing` event, as strings.
+    type Fields = std::collections::HashMap<String, String>;
+
+    thread_local! {
+        /// Where [`CaptureLayer`] puts events for a test that asked for them.
+        /// `None` on every other thread, so the rest of the suite logs into
+        /// nothing as usual.
+        static CAPTURED: std::cell::RefCell<Option<Vec<Fields>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Routes every event into the *emitting* thread's buffer.
+    struct CaptureLayer;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            CAPTURED.with(|slot| {
+                if let Some(buffer) = slot.borrow_mut().as_mut() {
+                    let mut fields = Fields::new();
+                    event.record(&mut RecordFields(&mut fields));
+                    buffer.push(fields);
+                }
+            });
+        }
+    }
+
+    /// Collects this thread's log events until it drops.
+    ///
+    /// The decode instrumentation *is* a log line — an operator dividing
+    /// `elapsed_ms` by `samples` is the entire deliverable — so these tests read
+    /// the line itself. Asserting on a duration returned from the function
+    /// would keep passing on the day the log line is deleted, which is the only
+    /// way this can actually break.
+    struct CapturedLogs;
+
+    impl CapturedLogs {
+        fn install() -> Self {
+            use tracing_subscriber::layer::SubscriberExt;
+            // Process-wide and once, rather than the obvious
+            // `subscriber::set_default` per test. `tracing` caches each
+            // callsite's interest globally, and with only thread-local
+            // subscribers a sibling test reaching a callsite first gets it
+            // cached against the no-op global — after which this capture sees
+            // nothing, and the test fails only when the suite runs in parallel.
+            // That cost a debugging session already. A global subscriber makes
+            // every callsite permanently enabled; keeping the buffer
+            // thread-local is what still keeps one test's events out of
+            // another's.
+            static INSTALLED: std::sync::Once = std::sync::Once::new();
+            INSTALLED.call_once(|| {
+                let _ = tracing::subscriber::set_global_default(
+                    tracing_subscriber::registry().with(CaptureLayer),
+                );
+            });
+            CAPTURED.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+            Self
+        }
+
+        /// The single event whose message contains `needle`.
+        ///
+        /// Panics with what *was* logged when there is no match, because the
+        /// failure this guards against — the line disappearing — otherwise
+        /// surfaces as an unhelpful `None`. Panics on a second match too: a
+        /// duplicated line would double every measurement read out of the logs.
+        fn only(&self, needle: &str) -> Fields {
+            CAPTURED.with(|slot| {
+                let borrowed = slot.borrow();
+                let all = borrowed.as_ref().expect("the capture is installed");
+                let mut hits = all
+                    .iter()
+                    .filter(|f| f.get("message").is_some_and(|m| m.contains(needle)));
+                let hit = hits.next().cloned().unwrap_or_else(|| {
+                    panic!(
+                        "nothing logged mentioning {needle:?}; saw {:?}",
+                        all.iter()
+                            .filter_map(|f| f.get("message"))
+                            .collect::<Vec<_>>()
+                    )
+                });
+                assert!(
+                    hits.next().is_none(),
+                    "{needle:?} was logged more than once"
+                );
+                hit
+            })
+        }
+    }
+
+    impl Drop for CapturedLogs {
+        fn drop(&mut self) {
+            CAPTURED.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    struct RecordFields<'a>(&'a mut Fields);
+
+    impl tracing::field::Visit for RecordFields<'_> {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.insert(field.name().into(), value.to_string());
+        }
+
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.0.insert(field.name().into(), value.to_string());
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().into(), value.into());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().into(), format!("{value:?}"));
+        }
+    }
+
+    /// design.md asks what the offline re-decode actually costs, and a duration
+    /// on its own cannot answer it: 400ms is cheap for a paragraph and ruinous
+    /// for two words. The line carries the work alongside the time, counted in
+    /// what the decoder was handed rather than what the microphone produced —
+    /// otherwise a 48kHz device reports three times the work for the same
+    /// speech and the numbers stop comparing across machines.
+    #[tokio::test]
+    async fn the_offline_decode_reports_both_its_duration_and_the_samples_it_decoded() {
+        let logs = CapturedLogs::install();
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: "hello world".into(),
+        }));
+        let textio = Arc::new(FakeTextIo::new());
+        let (bindings, actions, presets, overrides) = test_repos().await;
+        // Half the decoder's rate, so the two counts cannot be confused.
+        let mut audio = FakeAudioIo::with_pcm(PcmFrame {
+            samples: vec![0.0; 800],
+            sample_rate_hz: 8_000,
+        });
+
+        run_dictation(
+            &reg,
+            &bindings,
+            &actions,
+            &presets,
+            &overrides,
+            &mut audio,
+            textio.as_ref(),
+            &test_settings(),
+            &[],
+            &ProfileOverrides::default(),
+        )
+        .await
+        .unwrap();
+
+        let decode = logs.only("offline decode");
+        assert_eq!(
+            decode.get("samples").map(String::as_str),
+            Some("1600"),
+            "800 samples at 8kHz are 1600 once resampled, and it is the resampled \
+             count the decoder did the work on"
+        );
+        assert_eq!(
+            decode.get("sample_rate_hz").map(String::as_str),
+            Some("16000"),
+            "the rate travels with the count so a reader can turn samples into seconds"
+        );
+        assert!(
+            decode
+                .get("elapsed_ms")
+                .is_some_and(|ms| ms.parse::<u64>().is_ok()),
+            "elapsed_ms must be a number to be divided by anything; got {:?}",
+            decode.get("elapsed_ms")
+        );
+        assert_eq!(decode.get("ok").map(String::as_str), Some("true"));
+    }
+
+    /// The decode most worth measuring is the one that fails: it is pure cost
+    /// against a run that inserts nothing, and it is the case a "skip the
+    /// second pass" decision would most like to price. Timing only the success
+    /// path would leave it invisible.
+    #[tokio::test]
+    async fn a_failed_offline_decode_is_timed_as_well() {
+        let logs = CapturedLogs::install();
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FailingStt));
+        let textio = Arc::new(FakeTextIo::new());
+        let (bindings, actions, presets, overrides) = test_repos().await;
+        let mut audio = FakeAudioIo::with_pcm(frame(1600));
+
+        let result = run_dictation(
+            &reg,
+            &bindings,
+            &actions,
+            &presets,
+            &overrides,
+            &mut audio,
+            textio.as_ref(),
+            &test_settings(),
+            &[],
+            &ProfileOverrides::default(),
+        )
+        .await;
+        assert!(result.is_err(), "FailingStt must fail the run");
+
+        let decode = logs.only("offline decode");
+        assert_eq!(
+            decode.get("ok").map(String::as_str),
+            Some("false"),
+            "the line has to say the decode failed, or a wasted second reads as a spent one"
+        );
+        assert_eq!(decode.get("samples").map(String::as_str), Some("1600"));
+        assert!(decode
+            .get("elapsed_ms")
+            .is_some_and(|ms| ms.parse::<u64>().is_ok()));
     }
 
     /// **The invariant the whole feature is built on.** The streaming pass is

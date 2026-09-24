@@ -888,6 +888,27 @@ pub struct AssistantAnswerPayload {
     /// Whether that content left the machine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sent_externally: Option<bool>,
+    /// Why the answer could not be read aloud, when speech was attempted and
+    /// failed.
+    ///
+    /// Carried on the answer rather than reported as `assistant:state` with a
+    /// `failed` state, because the request did not fail: the answer is on
+    /// screen and still worth reading. A failed state would replace it with an
+    /// error, which is the one thing the "speech is unavailable" requirement
+    /// forbids.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speech_error: Option<String>,
+}
+
+/// One live hypothesis for the request the user is speaking right now.
+///
+/// Its own event rather than a field on the state payload, mirroring
+/// `dictation:partial`: hypotheses arrive far more often than state changes,
+/// and folding them into the state event would make every one of them a
+/// redraw of the whole surface.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct AssistantPartialPayload {
+    pub text: String,
 }
 
 fn assistant_state_wire(state: &kea_core::assistant::SessionState) -> &'static str {
@@ -938,6 +959,7 @@ pub fn emit_assistant_answer(
     request: &str,
     text: &str,
     disclosure: Option<&kea_core::assistant::dispatch::Disclosure>,
+    speech_error: Option<&str>,
 ) {
     let _ = app.emit(
         "assistant:answer",
@@ -946,6 +968,21 @@ pub fn emit_assistant_answer(
             text: text.to_string(),
             read: disclosure.map(|d| d.read.clone()),
             sent_externally: disclosure.map(|d| d.sent_externally),
+            speech_error: speech_error.map(str::to_string),
+        },
+    );
+}
+
+/// A live hypothesis for the request being spoken.
+///
+/// Emitted for as long as the recogniser keeps producing them and never at
+/// all when none is installed, which is why the surface must treat their
+/// absence as normal rather than as a stall.
+pub fn emit_assistant_partial(app: &AppHandle, text: &str) {
+    let _ = app.emit(
+        "assistant:partial",
+        AssistantPartialPayload {
+            text: text.to_string(),
         },
     );
 }
@@ -994,10 +1031,37 @@ mod assistant_event_tests {
             text: "hello".into(),
             read: None,
             sent_externally: None,
+            speech_error: None,
         })
         .unwrap();
         assert!(!json.contains("read"));
         assert!(!json.contains("sent_externally"));
+    }
+
+    /// The answer survives the voice failing, so the payload has to carry
+    /// both at once — a frontend that saw only the error would have nothing
+    /// to show.
+    #[test]
+    fn an_answer_that_could_not_be_spoken_still_carries_its_text() {
+        let json = serde_json::to_string(&AssistantAnswerPayload {
+            request: "where is it".into(),
+            text: "Paris.".into(),
+            read: None,
+            sent_externally: None,
+            speech_error: Some("no tts engine is bound".into()),
+        })
+        .unwrap();
+        assert!(json.contains(r#""text":"Paris.""#));
+        assert!(json.contains("no tts engine is bound"));
+    }
+
+    #[test]
+    fn a_partial_carries_only_the_hypothesis() {
+        let json = serde_json::to_string(&AssistantPartialPayload {
+            text: "what time is".into(),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"text":"what time is"}"#);
     }
 
     #[test]
@@ -1007,6 +1071,7 @@ mod assistant_event_tests {
             text: "an error".into(),
             read: Some("a screenshot of the window you're looking at".into()),
             sent_externally: Some(true),
+            speech_error: None,
         })
         .unwrap();
         assert!(json.contains("screenshot"));

@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kea_core::app_context::{resolve_profile, AppProfile, ProfileQuery};
+use kea_core::assistant::{AssistantSettings, AssistantSettingsRepo};
 use kea_core::dictation::{apply_vocabulary, hint_terms, DictationSettings, DictationSettingsRepo};
 use kea_core::log::{current_log_path, tail_log_file};
 use kea_core::meetings::notion::{parse_page_id, NotionError};
@@ -1871,13 +1872,15 @@ pub fn meeting_hotkey_action(recording: bool, processing: bool) -> MeetingHotkey
 }
 
 /// Replays a pre-captured PCM buffer through [`run_dictation`]'s mic lifecycle.
-struct ReplayAudioIo {
+/// `pub(crate)` for the assistant's session tests, which drive capture against
+/// a canned buffer rather than a device.
+pub(crate) struct ReplayAudioIo {
     pcm: PcmFrame,
     state: DictationState,
 }
 
 impl ReplayAudioIo {
-    fn new(pcm: PcmFrame) -> Self {
+    pub(crate) fn new(pcm: PcmFrame) -> Self {
         Self {
             pcm,
             state: DictationState::Idle,
@@ -4789,6 +4792,27 @@ pub async fn set_tts_settings(
     settings: TtsSettings,
 ) -> Result<(), String> {
     TtsSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
+        .set(&settings)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_assistant_settings(
+    state: State<'_, Arc<AppState>>,
+) -> Result<AssistantSettings, String> {
+    AssistantSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
+        .get()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_assistant_settings(
+    state: State<'_, Arc<AppState>>,
+    settings: AssistantSettings,
+) -> Result<(), String> {
+    AssistantSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
         .set(&settings)
         .await
         .map_err(|e| e.to_string())

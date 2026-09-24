@@ -2,6 +2,7 @@
 
 mod api;
 mod assistant;
+mod assistant_handlers;
 mod commands;
 mod events;
 mod hotkeys;
@@ -402,6 +403,8 @@ fn main() {
             commands::set_tts_binding,
             commands::get_tts_settings,
             commands::set_tts_settings,
+            commands::get_assistant_settings,
+            commands::set_assistant_settings,
             commands::run_read_aloud,
             commands::trigger_tts,
             commands::read_selection,

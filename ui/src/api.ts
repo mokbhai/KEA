@@ -685,6 +685,27 @@ export const onAssistantAnswer = (
 ): Promise<UnlistenFn> =>
   listen<AssistantAnswer>("assistant:answer", (event) => handler(event.payload));
 
+/**
+ * The two output switches for an answer. Mirrors `AssistantSettings`.
+ *
+ * No engine bindings here: the assistant's AI and voice live in the bindings
+ * table and are read and written through the binding calls, so carrying them
+ * in this payload too would let the settings page save one engine while the
+ * session resolves another.
+ */
+export type AssistantSettings = {
+  /** Speak the answer aloud. Defaults to true. */
+  speak_answers: boolean;
+  /** Show the answer text in the session surface. Defaults to true. */
+  show_answers: boolean;
+};
+
+export const getAssistantSettings = () =>
+  invoke<AssistantSettings>("get_assistant_settings");
+
+export const setAssistantSettings = (settings: AssistantSettings) =>
+  invoke<void>("set_assistant_settings", { settings });
+
 export const onDictationPartial = (
   handler: (partial: DictationPartial) => void,
 ): Promise<UnlistenFn> =>

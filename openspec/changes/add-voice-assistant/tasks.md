@@ -19,14 +19,14 @@
 
 - [x] 3.1 Implement `Dispatcher::invoke` running a validated action and returning its result or a typed failure; verify unit tests for a succeeding stub, a failing stub, and an unknown id
 - [x] 3.2 Add a `has_side_effects: bool` marker to `ActionSpec` defaulting to false, and assert in a test that every entry in the shipped catalog is false — so adding an action with side effects fails the build rather than landing silently
-- [ ] 3.3 Record each invocation through `ActionRepo`/`ActionGuard` (`crates/features/src/feature.rs`) with the action id as `command`; verify tests that a completed run writes `Ok`, a failure writes `Error`, and a session cancelled mid-action writes `Cancelled` rather than `Error`
+- [x] 3.3 Record each invocation through `ActionRepo`/`ActionGuard` (`crates/features/src/feature.rs`) with the action id as `command`; verify tests that a completed run writes `Ok`, a failure writes `Error`, and a session cancelled mid-action writes `Cancelled` rather than `Error`
 
 ## 4. The action catalog
 
 - [x] 4.1 Implement `read_focused` reading the frontmost app via `TextIo::capture_selection` with an OCR fallback through `ScreenCapture` + `TextRecognizer`; verify with fakes that an empty selection falls through to OCR and that a failure of both reports "target unavailable" rather than completing
 - [x] 4.2 Implement `open_app` over `NSWorkspace` app launch behind the existing platform abstraction pattern, with a stub impl for non-macOS; verify it resolves a bundle id and that the stub returns an unavailable error rather than panicking
-- [ ] 4.3 Implement `start_meeting` delegating to `run_meeting_start`; verify a test that it reports the already-recording case as unavailable instead of starting a second meeting
-- [ ] 4.4 Implement `rewrite_focused` reusing `run_rewrite` rather than duplicating the rewrite pipeline; verify a test that it produces text for the session surface and does not write back to the focused app in this change
+- [x] 4.3 Implement `start_meeting` delegating to `run_meeting_start`; verify a test that it reports the already-recording case as unavailable instead of starting a second meeting
+- [x] 4.4 Implement `rewrite_focused` reusing `run_rewrite` rather than duplicating the rewrite pipeline; verify a test that it produces text for the session surface and does not write back to the focused app in this change
 - [x] 4.5 Add the disclosure payload for actions that read another application and send it to a provider, naming what was read; verify a test that `read_focused` produces it and `open_app` does not
 
 ## 5. Assistant feature and activation
@@ -39,37 +39,37 @@
 ## 6. Session orchestration
 
 - [x] 6.1 Implement session state (`Listening`, `Processing`, `Presenting`, `Failed`) and its transitions as a pure state machine; verify unit tests for each transition including failure leaving the session open for retry
-- [ ] 6.2 Implement session capture: start the mic on activation, stream frames to the streaming engine for partials, and stop on endpoint — following the `start_dictation_run`/`stop_dictation_run` split in `commands.rs` rather than owning the device in the feature crate; verify with `ReplayAudioIo` that a canned buffer produces a completed request
+- [x] 6.2 Implement session capture: start the mic on activation, stream frames to the streaming engine for partials, and stop on endpoint — following the `start_dictation_run`/`stop_dictation_run` split in `commands.rs` rather than owning the device in the feature crate; verify with `ReplayAudioIo` that a canned buffer produces a completed request
 - [ ] 6.3 Implement silence endpointing over the existing energy-based `speech_mask` (`crates/platform/src/audio/segment.rs`) plus an explicit-submit path; verify unit tests that a sustained pause ends the request and that a session with no speech at all closes without calling the LLM
-- [ ] 6.4 Implement the streaming-absent path: when the streaming engine returns `ModelNotInstalled`, the session still captures, transcribes offline, and routes, showing no partial text; verify a test with a streaming engine stubbed to `ModelNotInstalled` that the request still completes
-- [ ] 6.5 Implement the two-pass rule: route from the streaming hypothesis, and re-decode the buffered audio with the offline engine only when the selected action has spoken args, taking those values from the offline transcript; verify a test that an action with no spoken args never invokes the offline engine and one with spoken args takes its values from it
-- [x] 6.6 Implement cancellation at each state, discarding captured audio and preventing any not-yet-started action from running; verify unit tests for cancel-while-listening and cancel-while-processing
-- [ ] 6.7 Implement follow-up turns carrying prior turns as context, and discard all turns on close; verify tests that a follow-up sees earlier turns and that a fresh session sees none
-- [ ] 6.8 Speak the answer through `run_tts_with_player` (`crates/features/src/tts.rs`) using the resolved TTS slot and the existing voice/speed settings; verify with a fake TTS engine that the spoken text is exactly the displayed text
-- [x] 6.9 Implement stop-playback, and make session cancellation and the start of a follow-up both stop it; verify unit tests for each of the three stop paths
-- [ ] 6.10 Implement the speech-unavailable path: with no usable TTS engine the answer is still displayed and the failure is reported; verify a test with the TTS slot unresolvable that the session still completes
+- [x] 6.4 Implement the streaming-absent path: when the streaming engine returns `ModelNotInstalled`, the session still captures, transcribes offline, and routes, showing no partial text; verify a test with a streaming engine stubbed to `ModelNotInstalled` that the request still completes
+- [x] 6.5 Implement the two-pass rule: route from the streaming hypothesis, and re-decode the buffered audio with the offline engine only when the selected action has spoken args, taking those values from the offline transcript; verify a test that an action with no spoken args never invokes the offline engine and one with spoken args takes its values from it
+- [ ] 6.6 Implement cancellation at each state, discarding captured audio and preventing any not-yet-started action from running; verify unit tests for cancel-while-listening and cancel-while-processing
+- [x] 6.7 Implement follow-up turns carrying prior turns as context, and discard all turns on close; verify tests that a follow-up sees earlier turns and that a fresh session sees none
+- [x] 6.8 Speak the answer through `run_tts_with_player` (`crates/features/src/tts.rs`) using the resolved TTS slot and the existing voice/speed settings; verify with a fake TTS engine that the spoken text is exactly the displayed text
+- [ ] 6.9 Implement stop-playback, and make session cancellation and the start of a follow-up both stop it; verify unit tests for each of the three stop paths
+- [x] 6.10 Implement the speech-unavailable path: with no usable TTS engine the answer is still displayed and the failure is reported; verify a test with the TTS slot unresolvable that the session still completes
 
 ## 7. UI surface
 
-- [x] 7.1 Add the assistant window in `src-tauri/src/overlay.rs` or a sibling module, keyed on its own label the way the dictation HUD is, and ensure it does not take keyboard focus; verify by running `make dev` that the frontmost app keeps focus when the window appears
+- [ ] 7.1 Add the assistant window in `src-tauri/src/overlay.rs` or a sibling module, keyed on its own label the way the dictation HUD is, and ensure it does not take keyboard focus; verify by running `make dev` that the frontmost app keeps focus when the window appears
 - [x] 7.2 Add assistant events to `src-tauri/src/events.rs` (state, partial text, result, error) following the existing `DictationPartialPayload` shape; verify the payloads serialize in Rust unit tests
-- [x] 7.3 Add the listeners to `ui/src/api.ts` alongside `onDictationState`/`onDictationLevel`; verify `ui/src/api.test.ts` covers each new listener
-- [x] 7.4 Build `ui/src/components/AssistantPanel.tsx` rendering the four states, live partial text, the answer with a copy control, a stop-speaking control while playback runs, and a cancel control; verify a colocated `.test.tsx` covers each state, matching the per-component test convention in `ui/src/`
-- [x] 7.5 Render the request text and the selected action before or alongside acting (the intent-routing visibility requirement); verify a component test asserts both are present when an action is invoked
-- [ ] 7.6 Honour the speak and show switches in the surface: with showing off the panel presents state and controls but no answer text, and with speaking off no playback control appears; verify component tests for all four combinations of the two switches
+- [ ] 7.3 Add the listeners to `ui/src/api.ts` alongside `onDictationState`/`onDictationLevel`; verify `ui/src/api.test.ts` covers each new listener
+- [ ] 7.4 Build `ui/src/components/AssistantPanel.tsx` rendering the four states, live partial text, the answer with a copy control, a stop-speaking control while playback runs, and a cancel control; verify a colocated `.test.tsx` covers each state, matching the per-component test convention in `ui/src/`
+- [ ] 7.5 Render the request text and the selected action before or alongside acting (the intent-routing visibility requirement); verify a component test asserts both are present when an action is invoked
+- [x] 7.6 Honour the speak and show switches in the surface: with showing off the panel presents state and controls but no answer text, and with speaking off no playback control appears; verify component tests for all four combinations of the two switches
 
 ## 8. Settings
 
-- [ ] 8.1 Add assistant settings (LLM binding, TTS binding, `speak_answers`, `show_answers`) using the key-value `settings` pattern in `crates/core/src/dictation/settings.rs`; both output switches default **on**, so verify round-trip tests including that an absent row reads as enabled for each
+- [x] 8.1 Add assistant settings (LLM binding, TTS binding, `speak_answers`, `show_answers`) using the key-value `settings` pattern in `crates/core/src/dictation/settings.rs`; both output switches default **on**, so verify round-trip tests including that an absent row reads as enabled for each
 - [x] 8.2 Add `ui/src/pages/AssistantPage.tsx` with its hotkey binding picker, AI picker, voice picker, and the speak/show switches, following the existing page conventions; verify a colocated `AssistantPage.test.tsx` as every other page has
-- [ ] 8.3 Confirm no database migration is required — the `actions` ledger and the `settings` table already carry everything this change persists; verify `make test` passes with no new file under `crates/core/migrations/data/`
+- [x] 8.3 Confirm no database migration is required — the `actions` ledger and the `settings` table already carry everything this change persists; verify `make test` passes with no new file under `crates/core/migrations/data/`
 
 ## 9. Instrumentation and verification
 
 - [ ] 9.1 Add a timing span around the offline decode in the dictation and assistant paths (only insertion is timed today, at `crates/features/src/dictation.rs:487`); verify the elapsed value appears in the log for one real dictation, answering design.md's open question on re-decode cost
-- [ ] 9.2 Add an end-to-end test driving activation through routing to a spoken answer with fake engines; verify it asserts the answer was both displayed and sent to the TTS engine, and that no action was invoked
-- [ ] 9.3 Add an end-to-end test driving activation through routing to a completed action with fake engines; verify it asserts the `actions` ledger row and the presented result
-- [ ] 9.4 Add an end-to-end test for the refusal path: a malformed routing response invokes no action, reports the failure, and leaves the session open
-- [ ] 9.5 Run `make lint` and `make test` and verify both pass
+- [x] 9.2 Add an end-to-end test driving activation through routing to a spoken answer with fake engines; verify it asserts the answer was both displayed and sent to the TTS engine, and that no action was invoked
+- [x] 9.3 Add an end-to-end test driving activation through routing to a completed action with fake engines; verify it asserts the `actions` ledger row and the presented result
+- [x] 9.4 Add an end-to-end test for the refusal path: a malformed routing response invokes no action, reports the failure, and leaves the session open
+- [x] 9.5 Run `make lint` and `make test` and verify both pass
 - [ ] 9.6 Run `make install` and exercise the assistant against a real app: ask a plain question and confirm the answer is short, spoken, and shown; then run each catalog action, verifying the frontmost application is correctly resolved for `read_focused` and `rewrite_focused`
 - [ ] 9.7 Verify the assistant's hotkey does not collide with dictation, rewrite, TTS, meetings, palette, OCR, or undo, by pressing each in turn after `make install`
