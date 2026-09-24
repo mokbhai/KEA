@@ -238,6 +238,72 @@ pub fn set_assistant_cancellable(state: &Arc<AppState>, active: bool) {
     }
 }
 
+/// Copy the answer on screen, while — and only while — a session is open.
+///
+/// The third instance of the [`ASSISTANT_CANCEL_ACTION_ID`] rule, and the one
+/// that needs it most: unlike Escape this takes a key combination other
+/// applications bind to real commands, so holding it for longer than a session
+/// would quietly break them.
+///
+/// **Why a key at all.** The session surface lives in the overlay window,
+/// which is `focusable(false)` and `set_ignore_cursor_events(true)` so that
+/// activating the assistant cannot take the caret out of the app the user is
+/// asking about (`crate::overlay`). A button there would render and never be
+/// clickable. A keyboard binding is the only control that window can offer,
+/// which is why the surface advertises the key rather than drawing a control.
+pub const ASSISTANT_COPY_ACTION_ID: &str = "assistant:copy";
+
+/// The accelerator behind [`ASSISTANT_COPY_ACTION_ID`].
+///
+/// Not user-rebindable and deliberately *not* plain `Cmd+C`: a session runs
+/// while the user is looking at another application, and taking the system
+/// copy key away from it — even for the seconds a session lasts — would lose
+/// them a copy they meant for their own document.
+fn assistant_copy_accelerator() -> String {
+    kea_features::feature::platform_accelerator('C')
+}
+
+/// Register or release the assistant's copy binding.
+///
+/// Failure is logged, not propagated, for the same reason the Escape binding's
+/// is: the answer is still on screen and still spoken, and a session that
+/// cannot be copied from is worth more than one that refuses to start.
+pub fn set_assistant_copyable(state: &Arc<AppState>, active: bool) {
+    let mut hotkeys = state.hotkeys.lock().unwrap_or_else(|p| p.into_inner());
+    let binding = HotkeyBinding {
+        accelerator: assistant_copy_accelerator(),
+    };
+    let result = if active {
+        hotkeys.register(binding, ASSISTANT_COPY_ACTION_ID.into())
+    } else {
+        hotkeys.unregister(&binding)
+    };
+    if let Err(error) = result {
+        tracing::warn!(%error, active, "could not update the assistant copy binding");
+    }
+}
+
+/// Put the answer currently on screen on the clipboard.
+///
+/// Returns whether there was anything to copy, so the caller can tell "the
+/// user pressed it between turns" from "the clipboard refused" — the first is
+/// ordinary and silent, the second is worth a log line.
+///
+/// Takes the sink rather than reaching for the system clipboard directly, for
+/// the reason [`ClipboardSink`] exists: otherwise "a press with no answer on
+/// screen leaves the clipboard alone" could only be asserted by clobbering the
+/// clipboard of whoever is running the tests.
+pub fn copy_assistant_answer(
+    answer: &Mutex<Option<String>>,
+    sink: &dyn ClipboardSink,
+) -> Result<bool, String> {
+    let answer = answer.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    match answer {
+        Some(text) => sink.copy(&text).map(|()| true),
+        None => Ok(false),
+    }
+}
+
 /// The descriptor for a `(feature, command)` pair, or `None` when the pair is
 /// not a global hotkey — a binding persisted for some other command, say.
 pub fn hotkey_action(feature: &str, command: &str) -> Option<HotkeyAction> {
@@ -7361,6 +7427,29 @@ mod tests {
         }
     }
 
+    /// The copy binding is not a [`HOTKEY_ACTIONS`] row, so the collision test
+    /// below cannot see it — and it is registered *while a session runs*,
+    /// which is exactly when the user is most likely to reach for another
+    /// KEA shortcut. A clash would mean the copy key shadowed a real command
+    /// for the seconds a session lasts, intermittently and only sometimes.
+    #[test]
+    fn the_assistant_copy_key_parses_and_shadows_no_shortcut_of_ours() {
+        let copy = assistant_copy_accelerator();
+        assert!(
+            validate_accelerator(&copy).is_ok(),
+            "{copy:?} does not parse"
+        );
+        for action in HOTKEY_ACTIONS {
+            let accel = compiled_default_accelerator(action.feature, &action.command)
+                .unwrap_or_default();
+            assert!(
+                !same_accelerator(&accel, &copy),
+                "{} shares the assistant's copy key",
+                action.action_id()
+            );
+        }
+    }
+
     /// Two features sharing a default means `set_hotkey` refuses the second
     /// one the first time a user tries to rebind it, and startup silently
     /// registers whichever went first.
@@ -9017,6 +9106,39 @@ mod tests {
             *self.contents.lock().unwrap() = Some(text.to_string());
             Ok(())
         }
+    }
+
+    /// Task 7.4's copy control, at the point the hotkey reaches it.
+    #[test]
+    fn copying_puts_the_answer_on_screen_on_the_clipboard() {
+        let answer = Mutex::new(Some("Paris, on the Seine.".to_string()));
+        let clipboard = FakeClipboard::default();
+
+        let copied = copy_assistant_answer(&answer, &clipboard).expect("the clipboard accepts it");
+
+        assert!(copied, "there was an answer to copy");
+        assert_eq!(
+            clipboard.contents.lock().unwrap().as_deref(),
+            Some("Paris, on the Seine."),
+            "verbatim — a copy the user has to re-read to trust is not a copy"
+        );
+    }
+
+    /// The key is registered for the length of a session, which includes the
+    /// seconds before the first answer and every follow-up after one. Pressing
+    /// it then must leave whatever the user had copied for their own purposes
+    /// exactly where it was: silently replacing a clipboard is worse than a
+    /// key that appears to do nothing.
+    #[test]
+    fn copying_with_no_answer_on_screen_leaves_the_clipboard_untouched() {
+        let answer = Mutex::new(None);
+        let clipboard = FakeClipboard::default();
+
+        let copied =
+            copy_assistant_answer(&answer, &clipboard).expect("an empty press is not a failure");
+
+        assert!(!copied, "the caller is told nothing was copied");
+        assert_eq!(clipboard.contents.lock().unwrap().as_deref(), None);
     }
 
     async fn palette_test_pool() -> SqlitePool {

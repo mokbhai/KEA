@@ -230,6 +230,52 @@ pub struct AppState {
     /// Cleared when a session starts, not when it ends, so a press that lands
     /// microseconds after a session finishes cannot cancel the next one.
     pub assistant_cancel: Arc<AtomicBool>,
+    /// Set when the user has ended their request without waiting for the pause.
+    ///
+    /// Its own flag rather than a second meaning for `assistant_cancel`,
+    /// although both are raised by a key press while the microphone is open
+    /// and both end the capture: a cancel throws the audio away and closes the
+    /// session, a submit sends exactly that audio to be answered. One flag
+    /// carrying both would make every explicit submit indistinguishable from
+    /// the user changing their mind.
+    ///
+    /// Cleared at the top of each capture rather than at the end of one, for
+    /// the same reason `assistant_cancel` is: a press that lands as a turn
+    /// finishes must not end the *next* turn before the user has spoken.
+    pub assistant_submit: Arc<AtomicBool>,
+    /// The answer currently on screen, for the copy binding to put on the
+    /// clipboard.
+    ///
+    /// Held here rather than asked of the surface because the surface is a
+    /// webview in a click-through overlay: it cannot be clicked, cannot take
+    /// focus, and cannot answer a question from the Rust side. The copy
+    /// shortcut is dispatched on the hotkey thread, which has `AppState` and
+    /// nothing else.
+    ///
+    /// `None` between the moment a turn starts and the moment it answers, so a
+    /// copy pressed mid-question copies nothing rather than the previous
+    /// answer.
+    pub assistant_answer: Arc<std::sync::Mutex<Option<String>>>,
+    /// Set while an answer is being read aloud.
+    ///
+    /// Read by the hotkey dispatch, which is why it is here rather than on the
+    /// speaker: Escape has two meanings in a session and this flag is which
+    /// one. While an answer plays it silences the voice and leaves the answer
+    /// on screen; at any other point it cancels the session. One meaning for
+    /// both was the alternative and is what the surface used to promise while
+    /// the backend did something else — the user who pressed Escape to stop a
+    /// voice lost the answer they were reading.
+    pub assistant_speaking: Arc<AtomicBool>,
+    /// Set when an answer that is playing should stop.
+    ///
+    /// Separate from `assistant_cancel` because stopping an answer leaves the
+    /// session open with its answer on screen and cancelling closes it: one
+    /// flag for both would make the microphone-opening stop that begins every
+    /// follow-up cancel the follow-up as it started.
+    ///
+    /// On the state rather than inside the speaker so that the hotkey thread
+    /// and the playback thread can both reach it.
+    pub assistant_speech_stop: Arc<AtomicBool>,
 }
 
 fn on_tray_menu_event(app: &tauri::AppHandle, e: tauri::menu::MenuEvent) {
@@ -773,6 +819,10 @@ fn build_state(
         selection_busy: Arc::new(AtomicBool::new(false)),
         assistant_busy: Arc::new(AtomicBool::new(false)),
         assistant_cancel: Arc::new(AtomicBool::new(false)),
+        assistant_submit: Arc::new(AtomicBool::new(false)),
+        assistant_answer: Arc::new(std::sync::Mutex::new(None)),
+        assistant_speaking: Arc::new(AtomicBool::new(false)),
+        assistant_speech_stop: Arc::new(AtomicBool::new(false)),
         tts_busy: Arc::new(AtomicBool::new(false)),
         api_server: Mutex::new(None),
     })

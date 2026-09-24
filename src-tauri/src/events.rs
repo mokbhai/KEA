@@ -881,6 +881,20 @@ pub struct AssistantAnswerPayload {
     /// What the assistant heard. Shown so a misheard question is visible
     /// rather than inferred from a strange answer.
     pub request: String,
+    /// Which action the request was resolved to, when it was resolved to one.
+    ///
+    /// The action's **title**, not its id: `open_app` is the router's
+    /// vocabulary and "Open an application" is the user's, and this field
+    /// exists purely so the user can tell an answer from an invocation. An id
+    /// would push that translation into the frontend, which would then need
+    /// the registry — a second copy of the catalog, kept in step by hand.
+    ///
+    /// Absent, not null, when the request was answered rather than actioned:
+    /// answering is the ordinary outcome, and shipping `"action": null` on
+    /// most answers would make the surface interpret an absence it can simply
+    /// not be given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
     pub text: String,
     /// What was read from another application, when anything was.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -958,6 +972,7 @@ pub fn emit_assistant_answer(
     app: &AppHandle,
     request: &str,
     text: &str,
+    action: Option<&str>,
     disclosure: Option<&kea_core::assistant::dispatch::Disclosure>,
     speech_error: Option<&str>,
 ) {
@@ -965,6 +980,7 @@ pub fn emit_assistant_answer(
         "assistant:answer",
         AssistantAnswerPayload {
             request: request.to_string(),
+            action: action.map(str::to_string),
             text: text.to_string(),
             read: disclosure.map(|d| d.read.clone()),
             sent_externally: disclosure.map(|d| d.sent_externally),
@@ -1028,6 +1044,7 @@ mod assistant_event_tests {
     fn an_answer_with_no_disclosure_omits_both_disclosure_fields() {
         let json = serde_json::to_string(&AssistantAnswerPayload {
             request: "hi".into(),
+            action: None,
             text: "hello".into(),
             read: None,
             sent_externally: None,
@@ -1038,6 +1055,48 @@ mod assistant_event_tests {
         assert!(!json.contains("sent_externally"));
     }
 
+    /// Answering is the ordinary outcome, so it ships no key at all rather
+    /// than a null the surface would have to read as "not an action".
+    #[test]
+    fn a_request_that_was_answered_carries_no_action_at_all() {
+        let json = serde_json::to_string(&AssistantAnswerPayload {
+            request: "what is the capital of france".into(),
+            action: None,
+            text: "Paris.".into(),
+            read: None,
+            sent_externally: None,
+            speech_error: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"request":"what is the capital of france","text":"Paris."}"#
+        );
+    }
+
+    /// The visibility requirement in the intent-routing spec: when an action
+    /// is invoked, the user can see *which*. Pinned against the registry's own
+    /// title so a renamed action cannot leave this test agreeing with a string
+    /// nothing else uses — and pinned as the title rather than the id, because
+    /// "open_app" is not something a user asked for.
+    #[test]
+    fn a_request_that_was_actioned_names_the_action_in_the_users_words() {
+        let json = serde_json::to_string(&AssistantAnswerPayload {
+            request: "open safari".into(),
+            action: Some(kea_core::assistant::registry::OPEN_APP.title.to_string()),
+            text: "Opened it.".into(),
+            read: None,
+            sent_externally: None,
+            speech_error: None,
+        })
+        .unwrap();
+        assert!(json.contains(r#""action":"Open an application""#), "{json}");
+        assert!(
+            !json.contains("open_app"),
+            "the id is the router's vocabulary, not the user's: {json}"
+        );
+    }
+
     /// The answer survives the voice failing, so the payload has to carry
     /// both at once — a frontend that saw only the error would have nothing
     /// to show.
@@ -1045,6 +1104,7 @@ mod assistant_event_tests {
     fn an_answer_that_could_not_be_spoken_still_carries_its_text() {
         let json = serde_json::to_string(&AssistantAnswerPayload {
             request: "where is it".into(),
+            action: None,
             text: "Paris.".into(),
             read: None,
             sent_externally: None,
@@ -1068,6 +1128,7 @@ mod assistant_event_tests {
     fn an_answer_that_read_something_says_so_and_says_where_it_went() {
         let json = serde_json::to_string(&AssistantAnswerPayload {
             request: "what is this".into(),
+            action: None,
             text: "an error".into(),
             read: Some("a screenshot of the window you're looking at".into()),
             sent_externally: Some(true),

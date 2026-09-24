@@ -21,7 +21,7 @@
 //! below.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use kea_core::assistant::dispatch::{ActionOutcome, Dispatcher, RequestPlan};
@@ -121,10 +121,19 @@ pub trait Surface: Send + Sync + 'static {
     /// The finished answer. Re-emitted with `speech_error` set when speech was
     /// attempted and failed, so the text on screen is never taken down by the
     /// voice failing — see [`present`].
+    ///
+    /// `action` is the title of the action the request was routed to, and is
+    /// `None` when the request was answered instead. It travels with the
+    /// answer rather than on the state event because it is part of what the
+    /// user is being shown, not part of where the session has got to: the
+    /// routing spec requires that an invocation be distinguishable from an
+    /// answer, and without it the two are the same event with different words
+    /// in it.
     fn answer(
         &self,
         request: &str,
         text: &str,
+        action: Option<&str>,
         disclosure: Option<&Disclosure>,
         speech_error: Option<&str>,
     );
@@ -143,6 +152,21 @@ pub trait Speaker: Send + Sync {
     /// Synthesize and play `text`, returning once playback has finished or
     /// been stopped.
     async fn speak(&self, text: &str) -> Result<(), String>;
+
+    /// Silence an answer that is still playing.
+    ///
+    /// **Three things stop an answer, and they are one method rather than
+    /// three.** The user's stop control, cancelling the session (watched for
+    /// in [`present`], because nothing else is looking at the flag while
+    /// playback is awaited), and the next turn opening the microphone (see
+    /// [`capture_turn`]). Each arrives from a different world — a command, a
+    /// hotkey, this module's own loop — and the alternative, a stop path per
+    /// caller, would give playback three ways to be left running and three
+    /// places to get the "already finished" case wrong.
+    ///
+    /// Idempotent, and harmless when nothing is playing: every caller is
+    /// reacting to something the user did, not to a belief about the audio.
+    fn stop(&self);
 }
 
 /// The live recogniser a session shows partials from.
@@ -184,6 +208,23 @@ struct TurnDeps<'a> {
     actions: &'a ActionRepo,
     speaker: &'a dyn Speaker,
     settings: AssistantSettings,
+    /// Where the answer on screen is kept for the copy binding to find.
+    ///
+    /// The surface cannot be asked for it: it is a webview in a click-through,
+    /// non-focusable overlay, and the copy shortcut is handled on the hotkey
+    /// thread, which has `AppState` and no way to interrogate a window. So the
+    /// text is written here at the same moment it is shown, which is also what
+    /// makes "the copied text is the displayed text" a property a test can
+    /// state.
+    answer_store: &'a Arc<Mutex<Option<String>>>,
+    /// Raised while an answer is being read aloud, and lowered the moment it
+    /// stops however it stopped.
+    ///
+    /// Read by the hotkey dispatch, which is what gives Escape its second
+    /// meaning: silence the voice while one is playing, cancel the session
+    /// otherwise. Held outside this module because the press arrives on the
+    /// hotkey thread, which can reach `AppState` and nothing else.
+    speaking: &'a Arc<AtomicBool>,
 }
 
 // ===========================================================================
@@ -205,8 +246,9 @@ pub async fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), S
     // starts.
     state.assistant_cancel.store(false, Ordering::Relaxed);
     crate::commands::set_assistant_cancellable(state, true);
-    // Escape belongs to the rest of the Mac again the moment this returns, by
-    // every path including the early ones below.
+    crate::commands::set_assistant_copyable(state, true);
+    // Escape and the copy key belong to the rest of the Mac again the moment
+    // this returns, by every path including the early ones below.
     let _escape = EscapeGuard {
         state: state.clone(),
     };
@@ -239,9 +281,7 @@ pub async fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), S
         }
     };
 
-    let speaker = TtsSpeaker {
-        state: state.clone(),
-    };
+    let speaker = TtsSpeaker::new(state.clone());
     let actions = ActionRepo::new(state.data_pool.clone());
     let dispatcher = build_dispatcher(state, app);
     let deps = TurnDeps {
@@ -256,6 +296,8 @@ pub async fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), S
         actions: &actions,
         speaker: &speaker,
         settings: prepared.settings.clone(),
+        answer_store: &state.assistant_answer,
+        speaking: &state.assistant_speaking,
     };
 
     loop {
@@ -267,7 +309,16 @@ pub async fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), S
                 engine: engine.as_ref(),
                 opts: prepared.streaming_opts.clone(),
             });
-            capture_turn(&mut **audio, live, &state.assistant_cancel, &surface).await
+            capture_turn(
+                &mut **audio,
+                live,
+                &state.assistant_cancel,
+                &state.assistant_submit,
+                &state.assistant_answer,
+                &surface,
+                deps.speaker,
+            )
+            .await
         };
 
         let capture = match capture {
@@ -281,11 +332,10 @@ pub async fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), S
             }
         };
 
-        // Cancelled while listening: the audio is dropped and nothing is sent.
-        if cancelled(&state.assistant_cancel) {
-            return Ok(());
-        }
-
+        // A cancel that landed while the microphone was open closes the
+        // session here, as `Ok(false)` out of `run_turn` — the guard lives
+        // there rather than being repeated at this call site, for the same
+        // reason the empty-request guard does.
         match run_turn(&deps, &mut session, capture).await {
             // Nothing was said. The session closes — on the first turn because
             // the binding was pressed by accident, on a later one because the
@@ -409,11 +459,19 @@ async fn prepare(state: &Arc<AppState>, bindings: &BindingRepo) -> Result<Prepar
 /// lives here rather than at the call site because it is the spec's hardest
 /// requirement in this module — an empty request must never become a prompt —
 /// and a guard written at the call site is a guard the tests reach around.
+///
+/// The cancel check is here for the same reason, and *before* the speech check
+/// so that it holds whether or not the user got a word out: a session
+/// cancelled while it was listening must send nothing, and "nothing" includes
+/// the transcription of audio that was already captured.
 async fn run_turn(
     deps: &TurnDeps<'_>,
     session: &mut Session,
     capture: Capture,
 ) -> Result<bool, String> {
+    if cancelled(deps.cancel) {
+        return Ok(false);
+    }
     if !contains_speech(&capture.pcm) {
         return Ok(false);
     }
@@ -435,8 +493,35 @@ async fn capture_turn(
     audio: &mut dyn AudioIo,
     live: Option<LiveRecognizer<'_>>,
     cancel: &Arc<AtomicBool>,
+    submit: &Arc<AtomicBool>,
+    answer_store: &Arc<Mutex<Option<String>>>,
     surface: &Arc<dyn Surface>,
+    speaker: &dyn Speaker,
 ) -> Result<Capture, String> {
+    // Cleared on the way in, not on the way out, and for the same reason
+    // `assistant_cancel` is: the activation key pressed as one turn ends
+    // would otherwise end the follow-up before the user had said a word.
+    submit.store(false, Ordering::Relaxed);
+
+    // The previous answer stops being copyable at the same moment it stops
+    // being on screen — the surface clears it on seeing `Listening`. Leaving
+    // it would make the copy key put an answer to a question the user has
+    // already moved on from onto their clipboard, with nothing visible to say
+    // which answer they got.
+    *answer_store.lock().unwrap_or_else(|p| p.into_inner()) = None;
+
+    // The third of the stop paths on [`Speaker::stop`]: a turn that opens the
+    // microphone over the tail of the previous answer records the assistant's
+    // own voice and hands it to the recogniser as part of the follow-up. The
+    // ordering is the whole of it — stopping after `start_mic` would already
+    // have let that audio in.
+    //
+    // Usually there is nothing to stop, because [`present`] awaits playback.
+    // Usually is not always: playback runs on a blocking thread, and dropping
+    // the future that awaited it does not stop the thread — only this flag
+    // does.
+    speaker.stop();
+
     let mut frames = audio.start_mic().await.map_err(|e| e.to_string())?;
 
     // Opened after the device, so a recogniser that takes a moment to load its
@@ -486,6 +571,14 @@ async fn capture_turn(
         }
 
         if cancelled(cancel) {
+            break;
+        }
+        // The explicit end of a request. Checked before the pause detector and
+        // before the no-speech window, because those two are guesses about
+        // when the user finished and this is the user saying so: a submit that
+        // had to wait for `SPEECH_WAIT_SECS` to elapse would be a key press
+        // that appears to do nothing for four seconds.
+        if submit.load(Ordering::Relaxed) {
             break;
         }
         if rate == 0 {
@@ -571,7 +664,7 @@ async fn complete_turn(
     .map_err(|e| e.to_string())?;
 
     match plan(outcome, &deps.registry) {
-        RequestPlan::Answer { text } => present(deps, session, &utterance, text, None).await,
+        RequestPlan::Answer { text } => present(deps, session, &utterance, text, None, None).await,
 
         RequestPlan::Invoke { spec, args } => {
             // The last gate before anything happens outside this process. An
@@ -585,13 +678,28 @@ async fn complete_turn(
                 return Ok(());
             }
             let spoken = text.unwrap_or_else(|| format!("Done: {}.", spec.title));
-            present(deps, session, &utterance, spoken, disclosure).await
+            // The action travels with the answer from here on: this is the one
+            // branch where the user is being told that something *happened*
+            // rather than answered, and the routing spec asks for exactly that
+            // to be visible.
+            present(
+                deps,
+                session,
+                &utterance,
+                spoken,
+                disclosure,
+                Some(spec.title),
+            )
+            .await
         }
 
         // Both of these are words, not failures: the assistant understood
         // enough to ask, and the session stays open for the answer.
         RequestPlan::Clarify { question } => {
-            present(deps, session, &utterance, question, None).await
+            // No action: a question about which action was meant is not an
+            // invocation of one, and labelling it with a candidate would say
+            // the assistant had chosen when its whole point is that it has not.
+            present(deps, session, &utterance, question, None, None).await
         }
 
         RequestPlan::Fail { message } => Err(message),
@@ -772,40 +880,90 @@ async fn present(
     request: &str,
     answer: String,
     disclosure: Option<Disclosure>,
+    action: Option<&str>,
 ) -> Result<(), String> {
     deps.surface
-        .answer(request, &answer, disclosure.as_ref(), None);
+        .answer(request, &answer, action, disclosure.as_ref(), None);
+    // Stored beside the emit, never anywhere else, so the text the copy key
+    // yields cannot drift from the text on screen — which is the same reason
+    // the design forbids a spoken answer that differs from the shown one.
+    *deps.answer_store.lock().unwrap_or_else(|p| p.into_inner()) = Some(answer.clone());
 
-    let spoken = if deps.settings.speak_answers {
-        match deps.speaker.speak(&answer).await {
-            Ok(()) => true,
-            Err(error) => {
-                // Speech is attempted, never required. The answer stays on
-                // screen and the failure is re-emitted alongside it, rather
-                // than becoming a session failure that replaces the answer the
-                // user can still read.
-                tracing::warn!(%error, "assistant: the answer could not be spoken");
-                deps.surface
-                    .answer(request, &answer, disclosure.as_ref(), Some(&error));
-                false
-            }
-        }
-    } else {
-        false
-    };
-
+    // **`Presenting` is emitted before playback, not after it.**
+    //
+    // Playback is awaited, so emitting afterwards means the only state the
+    // surface ever sees is `speaking: false` — and the stop control, which
+    // exists precisely for the seconds an answer is in the air, would never
+    // appear in the running app. Reporting the *intent* to speak is what makes
+    // it appear for exactly as long as there is audio to stop; the second emit
+    // below takes it away again the moment there is not.
+    let will_speak = deps.settings.speak_answers;
     session.apply(SessionEvent::Answered {
-        text: answer,
-        spoken,
+        text: answer.clone(),
+        spoken: will_speak,
     });
-    // Playback above is awaited to completion, so by the time the state is
-    // emitted it is no longer speaking. Reported honestly rather than as
-    // `speaking: true`, which would leave a stop control on screen for audio
-    // that already finished.
+    deps.surface.state(session.state());
+
+    if will_speak {
+        deps.speaking.store(true, Ordering::Relaxed);
+        let result = speak_until_cancelled(deps, &answer).await;
+        // Lowered before anything else can await, so Escape stops meaning
+        // "silence this" the instant there is nothing left to silence.
+        deps.speaking.store(false, Ordering::Relaxed);
+        if let Err(error) = result {
+            // Speech is attempted, never required. The answer stays on screen
+            // and the failure is re-emitted alongside it, rather than becoming
+            // a session failure that replaces the answer the user can still
+            // read.
+            tracing::warn!(%error, "assistant: the answer could not be spoken");
+            deps.surface
+                .answer(request, &answer, action, disclosure.as_ref(), Some(&error));
+        }
+    }
+
     session.apply(SessionEvent::SpeechFinished);
     deps.surface.state(session.state());
     Ok(())
 }
+
+/// Speak `text`, and stop it if the session is cancelled while it plays.
+///
+/// The second of the stop paths on [`Speaker::stop`]. Speaking is awaited, so
+/// for the length of an answer this module is inside a single `.await` and
+/// nothing is watching the cancel flag — and "during the answer" is precisely
+/// when a cancel lands, because the answer is the part the user is sitting
+/// through. So the wait is interleaved with a poll of the flag.
+///
+/// A poll rather than a `watch` channel selected over: the flag is an
+/// `AtomicBool` shared with a synchronous playback thread and a capture loop
+/// (see `AppState::assistant_cancel`), and giving it a second, async spelling
+/// purely for this one waiter would mean two signals to set and one of them to
+/// forget. The cost is one timer per 50 ms of speech.
+async fn speak_until_cancelled(deps: &TurnDeps<'_>, text: &str) -> Result<(), String> {
+    let speaking = deps.speaker.speak(text);
+    tokio::pin!(speaking);
+    loop {
+        tokio::select! {
+            // Biased so a completed answer is never reported as a stop it
+            // raced: when both are ready, finishing wins.
+            biased;
+            result = &mut speaking => return result,
+            _ = tokio::time::sleep(SPEECH_CANCEL_POLL) => {
+                if cancelled(deps.cancel) {
+                    deps.speaker.stop();
+                }
+            }
+        }
+    }
+}
+
+/// How often a playing answer looks at the session's cancel flag.
+///
+/// The same 50 ms `play_pcm_cancellable` already wakes on, so a stop costs at
+/// most one extra tick beyond what playback itself would take to notice. A
+/// quarter of a second would be cheaper and would read as Escape having been
+/// ignored, which is the specific complaint cancellation exists to answer.
+const SPEECH_CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Whether the user has asked for this session to stop.
 fn cancelled(cancel: &Arc<AtomicBool>) -> bool {
@@ -845,16 +1003,38 @@ impl Surface for WindowSurface {
         &self,
         request: &str,
         text: &str,
+        action: Option<&str>,
         disclosure: Option<&Disclosure>,
         speech_error: Option<&str>,
     ) {
-        events::emit_assistant_answer(&self.app, request, text, disclosure, speech_error);
+        events::emit_assistant_answer(&self.app, request, text, action, disclosure, speech_error);
     }
 }
 
 /// Speaking through the user's bound TTS slot and the shared playback path.
 struct TtsSpeaker {
     state: Arc<AppState>,
+    /// Set while an answer should stop playing.
+    ///
+    /// Its own flag rather than a share of `assistant_cancel`, although the
+    /// session's cancel is one of the things that sets it (via
+    /// [`speak_until_cancelled`]): stopping an answer leaves the session open
+    /// with its answer on screen, and cancelling closes it. One flag for both
+    /// would make the microphone-opening stop in [`capture_turn`] cancel every
+    /// follow-up the instant it started.
+    ///
+    /// Taken from `AppState` rather than minted here, because the user's own
+    /// stop arrives as a hotkey press: a flag private to this struct could
+    /// only ever be set by this module, which is every caller except the one
+    /// the control exists for.
+    stop: Arc<AtomicBool>,
+}
+
+impl TtsSpeaker {
+    fn new(state: Arc<AppState>) -> Self {
+        let stop = state.assistant_speech_stop.clone();
+        Self { state, stop }
+    }
 }
 
 #[async_trait]
@@ -874,13 +1054,27 @@ impl Speaker for TtsSpeaker {
         )
         .await?;
 
-        let cancel = self.state.assistant_cancel.clone();
+        // Read and cleared in one step, on the way into playback rather than
+        // on the way out: a stop that arrived while the answer was still being
+        // synthesized has to silence *this* answer, and a flag cleared at the
+        // top of `speak` would have thrown that stop away and played it
+        // anyway. Cleared at all because the flag outlives one answer — the
+        // next turn's stop in `capture_turn` sets it before any of this runs.
+        if self.stop.swap(false, Ordering::Relaxed) || cancelled(&self.state.assistant_cancel) {
+            return Ok(());
+        }
+
+        let stop = self.stop.clone();
         tokio::task::spawn_blocking(move || {
-            kea_platform::audio::playback::play_pcm_cancellable(&pcm, &cancel)
+            kea_platform::audio::playback::play_pcm_cancellable(&pcm, &stop)
         })
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -899,12 +1093,16 @@ impl Drop for OverlayGuard {
     }
 }
 
-/// Releases the Escape binding when the session ends, however it ends.
+/// Releases the session's two bindings when it ends, however it ends.
 ///
 /// A guard rather than a call at each return: `run_session` has several early
 /// exits and more will be added, and the one that forgets is the one that
-/// leaves Escape captured from every other application on the Mac until KEA is
+/// leaves Escape — and `Cmd+Shift+C`, which other applications bind to real
+/// commands — captured from every other application on the Mac until KEA is
 /// restarted.
+///
+/// It also drops the answer, so the copy key cannot be handed a stale one by
+/// a session that starts before the user notices the last one ended.
 struct EscapeGuard {
     state: Arc<AppState>,
 }
@@ -912,6 +1110,22 @@ struct EscapeGuard {
 impl Drop for EscapeGuard {
     fn drop(&mut self) {
         crate::commands::set_assistant_cancellable(&self.state, false);
+        crate::commands::set_assistant_copyable(&self.state, false);
+        // Both cleared here rather than at the next session's start, because
+        // they are read by the hotkey thread: a `speaking` left set would give
+        // Escape the wrong meaning between sessions, when there is no voice to
+        // silence and a stale stop waiting to swallow the next answer.
+        self.state
+            .assistant_speaking
+            .store(false, Ordering::Relaxed);
+        self.state
+            .assistant_speech_stop
+            .store(false, Ordering::Relaxed);
+        *self
+            .state
+            .assistant_answer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
     }
 }
 
@@ -953,6 +1167,8 @@ mod tests {
         Partial(String),
         Answer {
             request: String,
+            /// The action's title, or `None` when the request was answered.
+            action: Option<String>,
             text: String,
             speech_error: Option<String>,
         },
@@ -1000,11 +1216,13 @@ mod tests {
             &self,
             request: &str,
             text: &str,
+            action: Option<&str>,
             _disclosure: Option<&Disclosure>,
             speech_error: Option<&str>,
         ) {
             self.shown.lock().unwrap().push(Shown::Answer {
                 request: request.to_string(),
+                action: action.map(str::to_string),
                 text: text.to_string(),
                 speech_error: speech_error.map(str::to_string),
             });
@@ -1110,10 +1328,43 @@ mod tests {
         }
     }
 
-    /// A speaker that records what it was asked to say, and can refuse.
+    /// How the fake speaker's playback behaves in time.
+    ///
+    /// A stop is only testable against a speaker that has something left to
+    /// stop, so the two non-instant shapes here are not embellishment: they
+    /// are the two ways the real speaker can still be playing when something
+    /// asks it to stop.
+    enum Playback {
+        /// Returns as soon as the text has been "spoken" — enough for every
+        /// test that is about what was said rather than when it ended.
+        Instant,
+        /// Does not return until [`Speaker::stop`] is called, the way
+        /// `play_pcm_cancellable` does not return until the sink drains or its
+        /// flag flips.
+        ///
+        /// It watches the stop and *nothing else* — in particular not the
+        /// session's cancel flag — because that is what the real speaker does:
+        /// playback polls the speaker's own flag, and a cancel reaches it only
+        /// by being turned into a stop. A fake that also watched the cancel
+        /// would end the answer by itself and leave the code that translates
+        /// one into the other untested.
+        UntilStopped,
+        /// Returns while the audio is still playing. Not a contrivance: real
+        /// playback is a blocking thread, and dropping the future that awaited
+        /// it leaves the thread running with only the stop flag to end it.
+        Detached,
+    }
+
+    /// A speaker that records what it was asked to say, can refuse, and can be
+    /// caught mid-answer.
     struct RecordingSpeaker {
         said: Mutex<Vec<String>>,
         fails_with: Option<String>,
+        playback: Playback,
+        /// True between the start of an answer and whatever ended it.
+        playing: Arc<AtomicBool>,
+        stopped: Arc<AtomicBool>,
+        timeline: Timeline,
     }
 
     impl RecordingSpeaker {
@@ -1121,16 +1372,46 @@ mod tests {
             Self {
                 said: Mutex::new(Vec::new()),
                 fails_with: None,
+                playback: Playback::Instant,
+                playing: Arc::new(AtomicBool::new(false)),
+                stopped: Arc::new(AtomicBool::new(false)),
+                timeline: Timeline::default(),
             }
         }
         fn broken(message: &str) -> Self {
             Self {
-                said: Mutex::new(Vec::new()),
                 fails_with: Some(message.to_string()),
+                ..Self::working()
             }
+        }
+        /// Plays until something stops it.
+        fn playing_until_stopped() -> Self {
+            Self {
+                playback: Playback::UntilStopped,
+                ..Self::working()
+            }
+        }
+        /// Hands back control while the answer is still audible.
+        fn leaving_playback_running() -> Self {
+            Self {
+                playback: Playback::Detached,
+                ..Self::working()
+            }
+        }
+        fn noting(mut self, timeline: Timeline) -> Self {
+            self.timeline = timeline;
+            self
         }
         fn said(&self) -> Vec<String> {
             self.said.lock().unwrap().clone()
+        }
+        fn is_playing(&self) -> bool {
+            self.playing.load(Ordering::SeqCst)
+        }
+        /// Whether the stop control was used, as opposed to the answer having
+        /// ended some other way.
+        fn was_stopped(&self) -> bool {
+            self.stopped.load(Ordering::SeqCst)
         }
     }
 
@@ -1138,10 +1419,48 @@ mod tests {
     impl Speaker for RecordingSpeaker {
         async fn speak(&self, text: &str) -> Result<(), String> {
             self.said.lock().unwrap().push(text.to_string());
+            self.timeline.note("answer started");
+            match &self.playback {
+                Playback::Instant => {}
+                Playback::Detached => self.playing.store(true, Ordering::SeqCst),
+                Playback::UntilStopped => {
+                    self.playing.store(true, Ordering::SeqCst);
+                    while !self.stopped.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                    self.playing.store(false, Ordering::SeqCst);
+                }
+            }
             match &self.fails_with {
                 Some(message) => Err(message.clone()),
                 None => Ok(()),
             }
+        }
+
+        fn stop(&self) {
+            self.stopped.store(true, Ordering::SeqCst);
+            if self.playing.swap(false, Ordering::SeqCst) {
+                self.timeline.note("answer stopped");
+            }
+        }
+    }
+
+    /// What happened across two fakes, in the order it happened.
+    ///
+    /// Shared by the speaker and the capture device because the follow-up stop
+    /// is entirely a claim about ordering: stopping playback *after* the
+    /// microphone opened would have recorded the tail of the last answer into
+    /// the next request, and a test that only checked "it was stopped" would
+    /// pass on exactly that bug.
+    #[derive(Clone, Default)]
+    struct Timeline(Arc<Mutex<Vec<&'static str>>>);
+
+    impl Timeline {
+        fn note(&self, what: &'static str) {
+            self.0.lock().unwrap().push(what);
+        }
+        fn events(&self) -> Vec<&'static str> {
+            self.0.lock().unwrap().clone()
         }
     }
 
@@ -1220,6 +1539,10 @@ mod tests {
         rate: u32,
         delivered: Arc<Mutex<Vec<f32>>>,
         state: DictationState,
+        timeline: Timeline,
+        /// Flags to raise just before a given frame is handed over, each one
+        /// standing in for a key press landing mid-question.
+        raise_at: Vec<(usize, Arc<AtomicBool>)>,
     }
 
     impl FramesAudio {
@@ -1229,7 +1552,38 @@ mod tests {
                 rate,
                 delivered: Arc::new(Mutex::new(Vec::new())),
                 state: DictationState::Idle,
+                timeline: Timeline::default(),
+                raise_at: Vec::new(),
             }
+        }
+
+        fn noting(mut self, timeline: Timeline) -> Self {
+            self.timeline = timeline;
+            self
+        }
+
+        /// Raise `cancel` just before the `nth` frame is handed over — the
+        /// user pressing Escape part-way through their own question.
+        ///
+        /// Tied to the frame count rather than to a sleep because this device
+        /// delivers as fast as the session reads: a wall-clock cancel would
+        /// land after the whole script had already been consumed, and the test
+        /// would be about running out of audio instead.
+        fn cancelling_at(mut self, nth: usize, cancel: Arc<AtomicBool>) -> Self {
+            self.raise_at.push((nth, cancel));
+            self
+        }
+
+        /// Raise `submit` just before the `nth` frame — the user pressing the
+        /// activation key again to say they have finished asking.
+        ///
+        /// Frame-counted for the same reason `cancelling_at` is: this device
+        /// delivers as fast as the session reads, so a wall-clock submit would
+        /// land after the script had run out and the test would be measuring
+        /// the end of the audio instead.
+        fn submitting_at(mut self, nth: usize, submit: Arc<AtomicBool>) -> Self {
+            self.raise_at.push((nth, submit));
+            self
         }
     }
 
@@ -1239,11 +1593,18 @@ mod tests {
             &mut self,
         ) -> Result<tokio::sync::mpsc::Receiver<PcmFrame>, AudioIoError> {
             self.state = DictationState::Listening;
+            self.timeline.note("microphone opened");
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let frames = self.frames.clone();
             let delivered = self.delivered.clone();
+            let raise_at = self.raise_at.clone();
             tokio::spawn(async move {
-                for frame in frames {
+                for (index, frame) in frames.into_iter().enumerate() {
+                    for (nth, flag) in &raise_at {
+                        if index == *nth {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                    }
                     delivered.lock().unwrap().extend_from_slice(&frame.samples);
                     if tx.send(frame).await.is_err() {
                         return;
@@ -1411,11 +1772,22 @@ mod tests {
         recording: Arc<RecordingSurface>,
         surface: Arc<dyn Surface>,
         cancel: Arc<AtomicBool>,
+        /// The explicit-submit flag, raised by a second press of the
+        /// activation key while the microphone is open.
+        submit: Arc<AtomicBool>,
+        /// Where `present` leaves the answer for the copy binding.
+        answer_store: Arc<Mutex<Option<String>>>,
+        /// Raised while an answer plays, which is what decides whether Escape
+        /// silences the voice or ends the session.
+        speaking: Arc<AtomicBool>,
         offline: CountingStt,
         offline_calls: Arc<AtomicUsizeCell>,
         llm: ScriptedLlm,
         prompts: Arc<Mutex<Vec<String>>>,
-        speaker: RecordingSpeaker,
+        /// Shared rather than owned: a stop arrives from outside the turn, so
+        /// a test has to hold the speaker while `run_turn` is still borrowing
+        /// it.
+        speaker: Arc<RecordingSpeaker>,
         dispatcher: Dispatcher,
         actions: ActionRepo,
         settings: AssistantSettings,
@@ -1436,11 +1808,14 @@ mod tests {
                 recording,
                 surface,
                 cancel: Arc::new(AtomicBool::new(false)),
+                submit: Arc::new(AtomicBool::new(false)),
+                answer_store: Arc::new(Mutex::new(None)),
+                speaking: Arc::new(AtomicBool::new(false)),
                 offline,
                 offline_calls,
                 llm,
                 prompts,
-                speaker: RecordingSpeaker::working(),
+                speaker: Arc::new(RecordingSpeaker::working()),
                 dispatcher: Dispatcher::new(),
                 actions: ledger().await,
                 settings: AssistantSettings::default(),
@@ -1453,7 +1828,7 @@ mod tests {
         }
 
         fn speaking_through(mut self, speaker: RecordingSpeaker) -> Self {
-            self.speaker = speaker;
+            self.speaker = Arc::new(speaker);
             self
         }
 
@@ -1473,8 +1848,10 @@ mod tests {
                 registry: ActionRegistry::default(),
                 dispatcher: &self.dispatcher,
                 actions: &self.actions,
-                speaker: &self.speaker,
+                speaker: &*self.speaker,
                 settings: self.settings.clone(),
+                answer_store: &self.answer_store,
+                speaking: &self.speaking,
             }
         }
 
@@ -1515,7 +1892,15 @@ mod tests {
         let h = Harness::new("what is the capital of france", answers_with("Paris.")).await;
         let mut audio = crate::commands::ReplayAudioIo::new(spoken_pcm(16_000, 2.0));
 
-        let capture = capture_turn(&mut audio, None, &h.cancel, &h.surface)
+        let capture = capture_turn(
+                &mut audio,
+                None,
+                &h.cancel,
+                &h.submit,
+                &h.answer_store,
+                &h.surface,
+                &*h.speaker,
+            )
             .await
             .expect("a replayed buffer captures");
 
@@ -1529,6 +1914,7 @@ mod tests {
             h.recording.answers(),
             vec![Shown::Answer {
                 request: "what is the capital of france".into(),
+                action: None,
                 text: "Paris.".into(),
                 speech_error: None,
             }]
@@ -1554,7 +1940,10 @@ mod tests {
                     opts: SttOpts::default(),
                 }),
                 &h.cancel,
+                &h.submit,
+                &h.answer_store,
                 &h.surface,
+                &*h.speaker,
             ),
         )
         .await
@@ -1586,7 +1975,15 @@ mod tests {
 
         let capture = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            capture_turn(&mut audio, None, &h.cancel, &h.surface),
+            capture_turn(
+                &mut audio,
+                None,
+                &h.cancel,
+                &h.submit,
+                &h.answer_store,
+                &h.surface,
+                &*h.speaker,
+            ),
         )
         .await
         .expect("the pause ends the capture rather than the script running out")
@@ -1600,6 +1997,93 @@ mod tests {
         assert!(
             secs > 1.0,
             "and it should not stop before the speech finished; got {secs}s"
+        );
+    }
+
+    /// Task 6.3's explicit-submit path: the user has finished asking and says
+    /// so, rather than waiting out a pause they did not intend.
+    ///
+    /// The script is unbroken speech with no qualifying pause in it, so the
+    /// pause detector cannot end this capture and `MAX_CAPTURE_SECS` is
+    /// twenty-five seconds away. Delete the submit check in `capture_turn` and
+    /// this test reads the whole twelve-second script instead of the first
+    /// second of it — it cannot pass by accident.
+    #[tokio::test]
+    async fn an_explicit_submit_ends_the_request_before_the_pause_would_have() {
+        let rate = 16_000;
+        let h = Harness::new("unused", answers_with("unused")).await;
+        let mut audio = FramesAudio::new(frames(rate, 12_000, 0), rate)
+            // 20ms frames, so this is the key pressed a second in.
+            .submitting_at(50, h.submit.clone());
+
+        let capture = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            capture_turn(
+                &mut audio,
+                None,
+                &h.cancel,
+                &h.submit,
+                &h.answer_store,
+                &h.surface,
+                &*h.speaker,
+            ),
+        )
+        .await
+        .expect("the submit ends the capture rather than the script running out")
+        .expect("capture succeeds");
+
+        let secs = capture.pcm.samples.len() as f32 / rate as f32;
+        assert!(
+            secs < 3.0,
+            "the request ended where the user said it did, not at the hard cap; got {secs}s"
+        );
+        assert!(
+            contains_speech(&capture.pcm),
+            "and what they had already said is what gets answered — a submit is \
+             not a cancel"
+        );
+    }
+
+    /// A submit is per-turn, not per-session. Left standing it would end the
+    /// follow-up the instant the microphone opened, before the user had said a
+    /// word — the same race the session's cancel flag is cleared on the way in
+    /// to avoid.
+    #[tokio::test]
+    async fn a_submit_does_not_survive_into_the_next_turn() {
+        let rate = 16_000;
+        let h = Harness::new("unused", answers_with("unused")).await;
+        h.submit.store(true, Ordering::Relaxed);
+        let mut script = frames(rate, 600, 2000);
+        script.extend(frames(rate, 600, 0));
+        let mut audio = FramesAudio::new(script, rate);
+
+        let capture = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            capture_turn(
+                &mut audio,
+                None,
+                &h.cancel,
+                &h.submit,
+                &h.answer_store,
+                &h.surface,
+                &*h.speaker,
+            ),
+        )
+        .await
+        .expect("capture ends")
+        .expect("capture succeeds");
+
+        // A stale submit would break out on the first frame, so this is the
+        // assertion that tells the two apart: 20ms of audio against the
+        // second and a bit that ends at the pause.
+        let secs = capture.pcm.samples.len() as f32 / rate as f32;
+        assert!(
+            secs > 1.0,
+            "the stale submit was cleared, so this turn ran to its own endpoint; got {secs}s"
+        );
+        assert!(
+            contains_speech(&capture.pcm),
+            "and the user's question is in the buffer to be answered"
         );
     }
 
@@ -1652,7 +2136,10 @@ mod tests {
                     opts: SttOpts::default(),
                 }),
                 &h.cancel,
+                &h.submit,
+                &h.answer_store,
                 &h.surface,
+                &*h.speaker,
             ),
         )
         .await
@@ -1678,6 +2165,7 @@ mod tests {
             h.recording.answers(),
             vec![Shown::Answer {
                 request: "what time is it".into(),
+                action: None,
                 text: "Ten past four.".into(),
                 speech_error: None,
             }]
@@ -1953,6 +2441,474 @@ mod tests {
             session.state(),
             &SessionState::Presenting { speaking: false },
             "and no stop-speaking control is offered for audio that never played"
+        );
+    }
+
+    /// Task 7.4's stop-speaking control, at the only point that can make it
+    /// appear.
+    ///
+    /// Playback is awaited, so a `Presenting` emitted *after* it would only
+    /// ever say `speaking: false` — and the control, which exists for exactly
+    /// the seconds an answer is in the air, would never reach the running app
+    /// while every component test of it went on passing against a payload no
+    /// backend sent. That is the shape this asserts against: a
+    /// `speaking: true` state reaching the surface, and a `speaking: false`
+    /// one after it.
+    #[tokio::test]
+    async fn the_surface_is_told_an_answer_is_playing_while_it_is_still_playing() {
+        let h = Harness::new("unused", answers_with("Paris.")).await;
+
+        h.turn(
+            &mut Session::new(),
+            capture_of(spoken_pcm(16_000, 2.0), Some("where is it")),
+        )
+        .await
+        .expect("the turn answers");
+
+        let states: Vec<SessionState> = h
+            .recording
+            .shown()
+            .into_iter()
+            .filter_map(|s| match s {
+                Shown::State(state) => Some(state),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            states.contains(&SessionState::Presenting { speaking: true }),
+            "the stop control has to be offered while there is audio to stop; got {states:?}"
+        );
+        assert_eq!(
+            states.last(),
+            Some(&SessionState::Presenting { speaking: false }),
+            "and taken away again the moment there is not"
+        );
+    }
+
+    /// The flag Escape reads to decide which of its two meanings applies. Left
+    /// raised it would make every press after an answer silence a voice that
+    /// has already stopped, and the session would become uncloseable.
+    #[tokio::test]
+    async fn the_playing_flag_is_lowered_once_the_answer_has_finished() {
+        let h = Harness::new("unused", answers_with("Paris.")).await;
+
+        h.turn(
+            &mut Session::new(),
+            capture_of(spoken_pcm(16_000, 2.0), Some("where is it")),
+        )
+        .await
+        .expect("the turn answers");
+
+        assert!(!h.speaking.load(Ordering::Relaxed));
+    }
+
+    /// With speaking switched off there is nothing to stop, so the flag is
+    /// never raised at all — Escape keeps its single meaning for a user who
+    /// turned the voice off.
+    #[tokio::test]
+    async fn a_silent_answer_never_claims_to_be_playing() {
+        let h = Harness::new("unused", answers_with("Paris."))
+            .await
+            .with_settings(AssistantSettings {
+                speak_answers: false,
+                show_answers: true,
+            });
+
+        h.turn(
+            &mut Session::new(),
+            capture_of(spoken_pcm(16_000, 2.0), Some("where is it")),
+        )
+        .await
+        .expect("the turn answers");
+
+        let states: Vec<SessionState> = h
+            .recording
+            .shown()
+            .into_iter()
+            .filter_map(|s| match s {
+                Shown::State(state) => Some(state),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !states.contains(&SessionState::Presenting { speaking: true }),
+            "no stop control for audio that never played; got {states:?}"
+        );
+        assert!(!h.speaking.load(Ordering::Relaxed));
+    }
+
+    // -- keeping the answer -----------------------------------------------
+
+    /// Task 7.4's copy control. The surface is a click-through, non-focusable
+    /// overlay, so the only control it can offer is a key — and the key is
+    /// handled on the hotkey thread, which reaches the answer through this
+    /// store and nothing else.
+    ///
+    /// The assertion is the *identity*, not merely that something was stored:
+    /// the design's rule that the spoken text is the displayed text is worth
+    /// nothing if the copied text is a third version.
+    #[tokio::test]
+    async fn the_answer_left_for_the_copy_key_is_exactly_the_answer_on_screen() {
+        let h = Harness::new("what is the capital of france", answers_with("Paris.")).await;
+
+        h.turn(
+            &mut Session::new(),
+            capture_of(spoken_pcm(16_000, 2.0), None),
+        )
+        .await
+        .expect("the turn answers");
+
+        assert_eq!(h.displayed(), vec!["Paris."]);
+        assert_eq!(
+            h.answer_store.lock().unwrap().as_deref(),
+            Some("Paris."),
+            "the copy key yields the text the user is looking at"
+        );
+    }
+
+    /// The answer stops being copyable at the moment it stops being on screen.
+    ///
+    /// The surface clears the answer when it sees `Listening`, so a store left
+    /// standing would put an answer to a question the user has already moved
+    /// on from onto their clipboard, with nothing visible to say which one
+    /// they got.
+    #[tokio::test]
+    async fn the_next_turn_takes_the_previous_answer_out_of_reach_of_the_copy_key() {
+        let rate = 16_000;
+        let h = Harness::new("unused", answers_with("Paris.")).await;
+        *h.answer_store.lock().unwrap() = Some("Paris.".into());
+        let mut audio = FramesAudio::new(frames(rate, 600, 2000), rate);
+
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            capture_turn(
+                &mut audio,
+                None,
+                &h.cancel,
+                &h.submit,
+                &h.answer_store,
+                &h.surface,
+                &*h.speaker,
+            ),
+        )
+        .await
+        .expect("capture ends on the pause")
+        .expect("capture succeeds");
+
+        assert_eq!(
+            h.answer_store.lock().unwrap().as_deref(),
+            None,
+            "nothing on screen, nothing to copy"
+        );
+    }
+
+    // -- cancellation -----------------------------------------------------
+
+    /// Task 6.6, cancelling while the assistant is listening. The audio was
+    /// really captured — the microphone was open and the user was talking —
+    /// and the claim is that none of it goes anywhere: not to the transcriber,
+    /// not to the router, not to the screen.
+    #[tokio::test]
+    async fn cancelling_while_listening_discards_the_captured_audio_and_sends_nothing() {
+        let h = Harness::new(
+            "should never be asked",
+            answers_with("should never be asked"),
+        )
+        .await;
+        // Escape a quarter of a second in, with the user still mid-question.
+        let mut audio =
+            FramesAudio::new(frames(16_000, 3000, 0), 16_000).cancelling_at(12, h.cancel.clone());
+
+        let capture = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            capture_turn(
+                &mut audio,
+                None,
+                &h.cancel,
+                &h.submit,
+                &h.answer_store,
+                &h.surface,
+                &*h.speaker,
+            ),
+        )
+        .await
+        .expect("the cancel ends the capture")
+        .expect("capture succeeds");
+
+        assert!(
+            contains_speech(&capture.pcm),
+            "the microphone did record the user speaking — the point is what happens to it next"
+        );
+
+        let asked = h
+            .turn(&mut Session::new(), capture)
+            .await
+            .expect("cancelling is the user's own choice, not a failure");
+
+        assert!(!asked, "the session closes");
+        assert!(h.prompts().is_empty(), "the request was never routed");
+        assert_eq!(
+            h.offline_calls.get(),
+            0,
+            "and the audio was never even transcribed"
+        );
+        assert!(h.displayed().is_empty());
+        assert!(
+            !h.recording
+                .shown()
+                .iter()
+                .any(|s| matches!(s, Shown::State(SessionState::Failed { .. }))),
+            "an error banner for the user's own Escape reads as a bug"
+        );
+    }
+
+    /// Task 6.6, cancelling while the request is being processed. The router
+    /// has already answered by the time the cancel lands, so the thing under
+    /// test is the gate in front of dispatch: an action that had not begun
+    /// must not begin now.
+    ///
+    /// Its opposite number is
+    /// `a_session_cancelled_mid_action_is_recorded_as_cancelled_not_failed`,
+    /// where the action *had* begun and is recorded as cancelled. Here there
+    /// is no row at all, because nothing ran.
+    #[tokio::test]
+    async fn cancelling_while_processing_runs_no_action_that_had_not_begun() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let escape = cancel.clone();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let h = Harness::new("unused", move |_utterance: &str| {
+            // Escape, arriving while the router was still thinking.
+            escape.store(true, Ordering::Relaxed);
+            r#"{"action": "read_focused"}"#.to_string()
+        })
+        .await
+        .handling(Arc::new(RecordingHandler {
+            id: READ_FOCUSED.id,
+            text: "a login form",
+            seen: seen.clone(),
+        }));
+        let h = Harness { cancel, ..h };
+
+        h.turn(
+            &mut Session::new(),
+            capture_of(spoken_pcm(16_000, 2.0), Some("read this")),
+        )
+        .await
+        .expect("cancelling is the user's own choice, not a failure");
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the action never ran, so nothing happened outside this process"
+        );
+        assert!(
+            h.actions.recent(10).await.unwrap().is_empty(),
+            "and nothing is recorded, because there is nothing that happened to record"
+        );
+        assert!(h.displayed().is_empty());
+        assert!(
+            !h.recording
+                .shown()
+                .iter()
+                .any(|s| matches!(s, Shown::State(SessionState::Failed { .. }))),
+            "an error banner for the user's own Escape reads as a bug"
+        );
+    }
+
+    // -- stopping an answer -----------------------------------------------
+
+    /// Task 6.9, the first of the three stop paths on [`Speaker::stop`]: the
+    /// user stops the answer themselves. Stopping the voice is not cancelling
+    /// the session — the text stays up and the session stays open — which is
+    /// the distinction the whole separate flag exists for.
+    #[tokio::test]
+    async fn stopping_a_playing_answer_ends_the_speech_and_leaves_the_answer_on_screen() {
+        let h = Harness::new("unused", answers_with("Paris, on the Seine."))
+            .await
+            .speaking_through(RecordingSpeaker::playing_until_stopped());
+        let mut session = Session::new();
+        let speaker = h.speaker.clone();
+
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                h.turn(
+                    &mut session,
+                    capture_of(spoken_pcm(16_000, 2.0), Some("where is it")),
+                ),
+            ),
+            async {
+                while !speaker.is_playing() {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+                speaker.stop();
+            }
+        );
+        result
+            .expect("the stop ends the answer, rather than leaving the turn waiting on it")
+            .expect("a stopped answer is not a failed request");
+
+        assert!(!h.speaker.is_playing(), "the voice stopped");
+        assert_eq!(
+            h.displayed(),
+            vec!["Paris, on the Seine."],
+            "and the answer is still there to read"
+        );
+        assert!(
+            !cancelled(&h.cancel),
+            "stopping the voice does not cancel the session"
+        );
+        assert_eq!(
+            session.state(),
+            &SessionState::Presenting { speaking: false },
+            "and no stop control is left on screen for audio that is no longer playing"
+        );
+    }
+
+    /// Task 6.9, the second stop path. Speaking is awaited, so nothing in this
+    /// module is watching the cancel flag while an answer plays — and that is
+    /// exactly when a cancel arrives. The fake speaker deliberately ignores
+    /// the session flag, so the only thing that can end this answer is
+    /// [`speak_until_cancelled`] turning the cancel into a stop: delete that
+    /// and this test hangs rather than passing quietly.
+    #[tokio::test]
+    async fn cancelling_the_session_while_an_answer_is_playing_stops_the_playback() {
+        let h = Harness::new("unused", answers_with("Paris."))
+            .await
+            .speaking_through(RecordingSpeaker::playing_until_stopped());
+        let mut session = Session::new();
+        let speaker = h.speaker.clone();
+        let cancel = h.cancel.clone();
+
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                h.turn(
+                    &mut session,
+                    capture_of(spoken_pcm(16_000, 2.0), Some("where is it")),
+                ),
+            ),
+            async {
+                while !speaker.is_playing() {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+                // Escape, as the hotkey dispatch sets it.
+                cancel.store(true, Ordering::Relaxed);
+            }
+        );
+        result
+            .expect("the cancel reaches the voice while it is still playing")
+            .expect("cancelling is the user's own choice, not a failure");
+
+        assert!(
+            h.speaker.was_stopped(),
+            "the session's cancel reached playback as a stop"
+        );
+        assert!(!h.speaker.is_playing());
+        assert_eq!(
+            h.displayed(),
+            vec!["Paris."],
+            "the answer was on screen before the voice started and the cancel did not take it down"
+        );
+    }
+
+    /// Task 6.9, the third stop path, and the one whose ordering is the whole
+    /// point: a follow-up that opens the microphone over the tail of the last
+    /// answer records the assistant's own voice and transcribes it as part of
+    /// the request.
+    ///
+    /// The speaker here hands control back while its audio is still playing,
+    /// which is not a contrivance — real playback is a blocking thread that
+    /// outlives the future which awaited it.
+    #[tokio::test]
+    async fn a_follow_up_turn_silences_the_previous_answer_before_opening_the_microphone() {
+        let timeline = Timeline::default();
+        let h = Harness::new("unused", answers_with("Paris."))
+            .await
+            .speaking_through(
+                RecordingSpeaker::leaving_playback_running().noting(timeline.clone()),
+            );
+        let mut session = Session::new();
+
+        h.turn(
+            &mut session,
+            capture_of(spoken_pcm(16_000, 2.0), Some("where is it")),
+        )
+        .await
+        .unwrap();
+        assert!(
+            h.speaker.is_playing(),
+            "the answer outlives the turn that spoke it"
+        );
+
+        session.apply(SessionEvent::FollowUpStarted);
+        let mut audio =
+            FramesAudio::new(frames(16_000, 600, 2000), 16_000).noting(timeline.clone());
+        let capture = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            capture_turn(
+                &mut audio,
+                None,
+                &h.cancel,
+                &h.submit,
+                &h.answer_store,
+                &h.surface,
+                &*h.speaker,
+            ),
+        )
+        .await
+        .expect("the follow-up captures")
+        .expect("capture succeeds");
+
+        assert_eq!(
+            timeline.events(),
+            vec!["answer started", "answer stopped", "microphone opened"],
+            "silencing the answer after the microphone opened would record it into the follow-up"
+        );
+        assert!(
+            contains_speech(&capture.pcm),
+            "and the follow-up itself is still captured"
+        );
+    }
+
+    // -- what the user is shown -------------------------------------------
+
+    /// Task 7.5, the routing spec's visibility requirement: a user watching the
+    /// surface can tell that something was *done* rather than answered, and
+    /// what. Named by the action's title, because `read_focused` is the
+    /// router's vocabulary and not a phrase anybody said.
+    ///
+    /// The other half — an answered request carrying no action at all — is
+    /// asserted by `a_canned_buffer_is_captured_and_answered_as_a_request`.
+    #[tokio::test]
+    async fn an_invoked_action_is_named_on_screen_in_the_users_own_words() {
+        let h = Harness::new("unused", routes_to_read_focused)
+            .await
+            .handling(Arc::new(RecordingHandler {
+                id: READ_FOCUSED.id,
+                text: "a login form",
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }));
+
+        h.turn(
+            &mut Session::new(),
+            capture_of(spoken_pcm(16_000, 2.0), Some("read this")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            h.recording.answers(),
+            vec![Shown::Answer {
+                request: "read this".into(),
+                action: Some(READ_FOCUSED.title.to_string()),
+                text: "a login form".into(),
+                speech_error: None,
+            }]
+        );
+        assert_ne!(
+            READ_FOCUSED.title, READ_FOCUSED.id,
+            "a title that were the id would make the assertion above vacuous"
         );
     }
 

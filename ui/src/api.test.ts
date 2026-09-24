@@ -6,12 +6,17 @@ import {
   getPermissionStatus,
   meetingMarkdown,
   onApiOpenPage,
+  onAssistantAnswer,
+  onAssistantPartial,
+  onAssistantState,
   onMeetingNotes,
   onMeetingNotesError,
   requestPermission,
   revealPath,
   setMeetingActionItemStatus,
   setMeetingTitle,
+  type AssistantAnswer,
+  type AssistantStatus,
   type MeetingNotes,
 } from "./api";
 import {
@@ -162,5 +167,178 @@ describe("meeting note events", () => {
     await onApiOpenPage(handler);
     emitTauriEvent("api:open-page", "meetings");
     expect(handler).toHaveBeenCalledWith("meetings");
+  });
+});
+
+/**
+ * The assistant listeners, tested at the only thing that can go wrong quietly:
+ * the event name.
+ *
+ * `assistant:state`, `assistant:answer` and `assistant:partial` are string
+ * literals repeated on both sides of the Tauri boundary — `emit_assistant_state`,
+ * `emit_assistant_answer` and `emit_assistant_partial` in
+ * `src-tauri/src/events.rs` spell them, and `listen` here spells them again.
+ * Nothing links the two, so a typo on either side is not a compile error and not
+ * a runtime error: the backend emits into the void, the surface never redraws,
+ * and the session looks like a shortcut that did nothing. These tests are the
+ * only place that comparison is made.
+ *
+ * Each test emits before asserting anything about unsubscription, so a listener
+ * that never subscribed fails here rather than passing an unlisten check that
+ * would be vacuously true.
+ */
+describe("assistant events", () => {
+  beforeEach(resetTauriMocks);
+
+  it("delivers a state change on the event name the backend emits", async () => {
+    const handler = vi.fn();
+    await onAssistantState(handler);
+    const status: AssistantStatus = { state: "listening" };
+    emitTauriEvent("assistant:state", status);
+    expect(handler).toHaveBeenCalledWith(status);
+  });
+
+  /**
+   * `message` and `speaking` are absent on the states they do not describe
+   * (`skip_serializing_if` on the Rust payload), so the surface distinguishes
+   * the states by the fields it receives. The listener must not normalise them
+   * into a fixed shape — a `speaking: false` invented for a failed state would
+   * read as "answering silently" instead of "it broke".
+   */
+  it("carries the per-state detail fields through untouched", async () => {
+    const handler = vi.fn();
+    await onAssistantState(handler);
+
+    emitTauriEvent("assistant:state", { state: "failed", message: "no microphone" });
+    expect(handler).toHaveBeenLastCalledWith({
+      state: "failed",
+      message: "no microphone",
+    });
+
+    emitTauriEvent("assistant:state", { state: "presenting", speaking: true });
+    expect(handler).toHaveBeenLastCalledWith({ state: "presenting", speaking: true });
+  });
+
+  it("stops delivering state changes once unsubscribed", async () => {
+    const handler = vi.fn();
+    const unlisten = await onAssistantState(handler);
+
+    emitTauriEvent("assistant:state", { state: "listening" });
+    expect(handler).toHaveBeenCalledTimes(1);
+
+    unlisten();
+    emitTauriEvent("assistant:state", { state: "processing" });
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("delivers an answer on the event name the backend emits", async () => {
+    const handler = vi.fn();
+    await onAssistantAnswer(handler);
+    const answer: AssistantAnswer = {
+      request: "what is on my calendar",
+      text: "Two meetings.",
+      read: "Weekly Sync, Budget review",
+      sent_externally: true,
+    };
+    emitTauriEvent("assistant:answer", answer);
+    expect(handler).toHaveBeenCalledWith(answer);
+  });
+
+  /**
+   * The listener forwards `event.payload` whole rather than rebuilding it key
+   * by key. `speech_error` is the case that proves it matters: Rust puts it on
+   * `AssistantAnswerPayload` and `AssistantAnswer` here does not declare it
+   * yet, and a listener that copied the declared fields across would drop it
+   * silently — the answer would appear with no sign that reading it aloud had
+   * failed, which is the one thing the disclosure is for.
+   */
+  it("forwards answer fields the TypeScript type does not yet declare", async () => {
+    const handler = vi.fn();
+    await onAssistantAnswer(handler);
+    const payload = {
+      request: "read me the notes",
+      text: "Here they are.",
+      speech_error: "no voice installed",
+    };
+    emitTauriEvent("assistant:answer", payload);
+    expect(handler).toHaveBeenCalledWith(payload);
+  });
+
+  it("stops delivering answers once unsubscribed", async () => {
+    const handler = vi.fn();
+    const unlisten = await onAssistantAnswer(handler);
+
+    emitTauriEvent("assistant:answer", { request: "first", text: "one" });
+    expect(handler).toHaveBeenCalledTimes(1);
+
+    unlisten();
+    emitTauriEvent("assistant:answer", { request: "second", text: "two" });
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("delivers a live hypothesis on the event name the backend emits", async () => {
+    const handler = vi.fn();
+    await onAssistantPartial(handler);
+
+    emitTauriEvent("assistant:partial", { text: "what time" });
+
+    expect(handler).toHaveBeenCalledWith({ text: "what time" });
+  });
+
+  /**
+   * Hypotheses replace one another rather than accumulating, and each one is
+   * the whole request so far. A listener that fired only on the first would
+   * leave the first word frozen on screen for the rest of the question, which
+   * looks exactly like recognition having died.
+   */
+  it("delivers every hypothesis, not just the first", async () => {
+    const handler = vi.fn();
+    await onAssistantPartial(handler);
+
+    emitTauriEvent("assistant:partial", { text: "what" });
+    emitTauriEvent("assistant:partial", { text: "what time" });
+    emitTauriEvent("assistant:partial", { text: "what time is it" });
+
+    expect(handler).toHaveBeenCalledTimes(3);
+    expect(handler).toHaveBeenLastCalledWith({ text: "what time is it" });
+  });
+
+  it("stops delivering hypotheses once unsubscribed", async () => {
+    const handler = vi.fn();
+    const unlisten = await onAssistantPartial(handler);
+
+    emitTauriEvent("assistant:partial", { text: "what" });
+    expect(handler).toHaveBeenCalledTimes(1);
+
+    unlisten();
+    emitTauriEvent("assistant:partial", { text: "what time" });
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * A copy-pasted listener that kept the name it was copied from would make
+   * both surfaces redraw on every event. The pass-through tests above would
+   * still catch a swap, but not a duplicate, because each of them only ever
+   * emits its own event.
+   */
+  it("keeps the three events apart", async () => {
+    const state = vi.fn();
+    const answer = vi.fn();
+    const partial = vi.fn();
+    await onAssistantState(state);
+    await onAssistantAnswer(answer);
+    await onAssistantPartial(partial);
+
+    emitTauriEvent("assistant:state", { state: "processing" });
+    expect(answer).not.toHaveBeenCalled();
+    expect(partial).not.toHaveBeenCalled();
+
+    emitTauriEvent("assistant:answer", { request: "q", text: "a" });
+    expect(state).toHaveBeenCalledTimes(1);
+    expect(partial).not.toHaveBeenCalled();
+
+    emitTauriEvent("assistant:partial", { text: "q" });
+    expect(state).toHaveBeenCalledTimes(1);
+    expect(answer).toHaveBeenCalledTimes(1);
   });
 });

@@ -668,6 +668,18 @@ export type AssistantStatus = {
 export type AssistantAnswer = {
   /** What the assistant heard, so a misheard question is visible. */
   request: string;
+  /**
+   * The **title** of the action the request was resolved to, when it was
+   * resolved to one — "Open an application", not `open_app`.
+   *
+   * Absent rather than null when the request was answered instead of actioned,
+   * which is the ordinary outcome: Rust omits the field entirely, so the
+   * surface tells the two apart by presence and never has to decide what a
+   * null means. Carrying the id instead was the alternative and would have
+   * made this file hold a second copy of the action catalog to turn it into
+   * something a user can read.
+   */
+  action?: string;
   text: string;
   /** What was read from another app, when anything was. */
   read?: string;
@@ -684,6 +696,30 @@ export const onAssistantAnswer = (
   handler: (answer: AssistantAnswer) => void,
 ): Promise<UnlistenFn> =>
   listen<AssistantAnswer>("assistant:answer", (event) => handler(event.payload));
+
+/**
+ * One live hypothesis for the request being spoken right now.
+ *
+ * Its own event rather than a field on the status, mirroring
+ * `onDictationPartial`: hypotheses arrive many times a second and a status
+ * change arrives four or five times a session, so folding them together would
+ * redraw the whole surface on every syllable.
+ *
+ * **Silence here is normal.** The streaming recogniser is not downloaded with
+ * the app and reports its own absence as the ordinary case, so a session that
+ * never delivers a partial is a session running without live recognition — not
+ * a stalled one. The surface says it is listening either way.
+ */
+export type AssistantPartial = {
+  text: string;
+};
+
+export const onAssistantPartial = (
+  handler: (partial: AssistantPartial) => void,
+): Promise<UnlistenFn> =>
+  listen<AssistantPartial>("assistant:partial", (event) =>
+    handler(event.payload),
+  );
 
 /**
  * The two output switches for an answer. Mirrors `AssistantSettings`.

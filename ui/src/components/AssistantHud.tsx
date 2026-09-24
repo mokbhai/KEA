@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   getAssistantSettings,
   onAssistantAnswer,
+  onAssistantPartial,
   onAssistantState,
   type AssistantAnswer,
   type AssistantSettings,
@@ -26,17 +27,38 @@ const CANCEL_HINT = "Esc to cancel";
 
 /**
  * The stop control for a spoken answer, which is the same key wearing a
- * different label.
+ * different label — and it is a different label because Escape genuinely does
+ * a different thing here.
+ *
+ * `assistant_escape` in `src-tauri/src/hotkeys.rs` resolves the press against
+ * whether an answer is playing: while one is, it silences the voice and leaves
+ * the answer on screen and the session open; with nothing playing, it cancels.
+ * So this line is not a euphemism for cancelling.
  *
  * A "Stop" button was the obvious alternative and is deliberately not here:
- * there is no stop-playback call at the Tauri boundary, so the only thing this
- * window can reach is the Escape binding the session holds while it is open.
- * A button wired to that would read as "stop the voice" and in fact end the
- * session, taking the answer off screen with it — a control that does more
- * than it says is worse than a line naming the key that already works. When a
- * stop-only command exists this becomes a button and this comment goes away.
+ * the overlay is `focusable(false)` and `set_ignore_cursor_events(true)`, so a
+ * button drawn in it would render and never be clickable. Every control this
+ * window can offer is a key, which is why all three of these are lines of text
+ * rather than affordances.
  */
 const STOP_SPEAKING_HINT = "Esc to stop speaking";
+
+/**
+ * The copy control, which is a key for the same reason the two above are.
+ *
+ * The overlay is `focusable(false)` and `set_ignore_cursor_events(true)` so
+ * that opening a session cannot take the caret out of the application the user
+ * is asking about — which means a button drawn here would render and never be
+ * clickable. `Cmd+Shift+C` is registered around a session and released when it
+ * ends (`set_assistant_copyable`), so this line is the only place it is
+ * advertised; a user who never sees it has no way to discover it exists.
+ *
+ * Shown only alongside an answer, because that is exactly when the binding has
+ * something to put on the clipboard — pressed at any other point in a session
+ * it deliberately does nothing rather than clearing what the user had copied
+ * for their own purposes.
+ */
+const COPY_HINT = "⌘⇧C to copy";
 
 /**
  * What the surface assumes about the two output switches until the real
@@ -66,6 +88,14 @@ export default function AssistantHud() {
     speaking?: boolean;
   } | null>(null);
   const [answer, setAnswer] = useState<AssistantAnswer | null>(null);
+  /**
+   * The live hypothesis for the request being spoken, or `null` when there is
+   * none — which is both the resting state and the whole of the
+   * no-streaming-model case. Never an empty string standing in for "none": the
+   * surface reserves no room for a line it is not showing, and `""` would
+   * reserve it.
+   */
+  const [partial, setPartial] = useState<string | null>(null);
   const [outputs, setOutputs] = useState<AssistantSettings>(BOTH_ON);
 
   useEffect(() => {
@@ -89,6 +119,12 @@ export default function AssistantHud() {
           // A new request clears the previous answer, so the panel never shows
           // an old answer beside a new question.
           setAnswer(null);
+          // And the previous hypothesis with it. Cleared on entering
+          // `listening` rather than on leaving it, so the recognised text stays
+          // up through `processing` — that is the window in which the user
+          // checks whether they were heard, and blanking it there would take
+          // the evidence away at the moment it is wanted.
+          setPartial(null);
           // The switches are edited in the settings window, which cannot reach
           // this one. Re-reading at the top of every turn is what stops a
           // change made a minute ago from taking effect a restart later.
@@ -96,6 +132,7 @@ export default function AssistantHud() {
         }
       }),
       onAssistantAnswer(setAnswer),
+      onAssistantPartial(({ text }) => setPartial(text)),
     ];
     return () => {
       live = false;
@@ -128,6 +165,23 @@ export default function AssistantHud() {
         {label && <span className="kea-hud__label">{label}</span>}
       </div>
 
+      {/* What the recogniser has made of the request so far, while the user
+          is still speaking it. Absent for the whole of a session running
+          without a streaming model, which is the ordinary case on a machine
+          that never downloaded one — the label above still says the assistant
+          is listening, which is what the spec asks for when live recognition
+          cannot produce text.
+
+          Dropped once the answer arrives rather than shown beside it: the
+          answer payload carries the request as the *offline* transcript heard
+          it, and two versions of the same question on screen at once invites
+          the user to wonder which one was answered. */}
+      {partial && !answer?.request && (
+        <div className="kea-hud__heard" title={partial}>
+          {partial}
+        </div>
+      )}
+
       {/* The request is shown before and alongside the answer: a misheard
           question is otherwise only inferable from a strange reply. It survives
           `show_answers` being off because it is not the answer — it is the
@@ -137,6 +191,22 @@ export default function AssistantHud() {
         <div className="kea-hud__request" title={answer.request}>
           “{answer.request}”
         </div>
+      )}
+
+      {/* What separates an answered request from an actioned one. Without it
+          the two are the same pill with different prose, and the user has no
+          way to tell that a question was quietly carried out rather than
+          replied to — the routing-visibility requirement asks for the selected
+          action, not just the text it produced.
+
+          It survives `show_answers` being off for the same reason the request
+          echo does: the switch is a preference about reading replies, not
+          consent to have things done unseen. Deliberately a small muted line
+          under the request rather than a heading: the answer is what the user
+          came for, and an action label loud enough to compete with it would
+          make every actioned turn look like an error. */}
+      {answer?.action && (
+        <div className="kea-hud__action">{answer.action}</div>
       )}
 
       {outputs.show_answers && answer?.text && (
@@ -154,13 +224,22 @@ export default function AssistantHud() {
         </div>
       )}
 
-      {/* One hint at a time, and stopping wins: while an answer is playing,
-          what the user most likely wants from Escape is silence. */}
-      {speaking ? (
-        <div className="kea-hud__hint">{STOP_SPEAKING_HINT}</div>
-      ) : (
-        working && <div className="kea-hud__hint">{CANCEL_HINT}</div>
-      )}
+      {/* One Escape hint at a time, and stopping wins: while an answer is
+          playing, what the user most likely wants from Escape is silence.
+
+          The copy hint sits beside it rather than competing for the slot,
+          because it names a different key and is true whenever an answer is on
+          screen — including while that answer is still being read aloud. */}
+      <div className="kea-hud__hints">
+        {speaking ? (
+          <span className="kea-hud__hint">{STOP_SPEAKING_HINT}</span>
+        ) : (
+          working && <span className="kea-hud__hint">{CANCEL_HINT}</span>
+        )}
+        {outputs.show_answers && answer?.text && (
+          <span className="kea-hud__hint">{COPY_HINT}</span>
+        )}
+      </div>
     </div>
   );
 }

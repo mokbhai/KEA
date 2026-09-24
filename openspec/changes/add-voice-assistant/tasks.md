@@ -40,22 +40,22 @@
 
 - [x] 6.1 Implement session state (`Listening`, `Processing`, `Presenting`, `Failed`) and its transitions as a pure state machine; verify unit tests for each transition including failure leaving the session open for retry
 - [x] 6.2 Implement session capture: start the mic on activation, stream frames to the streaming engine for partials, and stop on endpoint — following the `start_dictation_run`/`stop_dictation_run` split in `commands.rs` rather than owning the device in the feature crate; verify with `ReplayAudioIo` that a canned buffer produces a completed request
-- [ ] 6.3 Implement silence endpointing over the existing energy-based `speech_mask` (`crates/platform/src/audio/segment.rs`) plus an explicit-submit path; verify unit tests that a sustained pause ends the request and that a session with no speech at all closes without calling the LLM
+- [x] 6.3 Implement silence endpointing over the existing energy-based `speech_mask` (`crates/platform/src/audio/segment.rs`) plus an explicit-submit path; verify unit tests that a sustained pause ends the request and that a session with no speech at all closes without calling the LLM
 - [x] 6.4 Implement the streaming-absent path: when the streaming engine returns `ModelNotInstalled`, the session still captures, transcribes offline, and routes, showing no partial text; verify a test with a streaming engine stubbed to `ModelNotInstalled` that the request still completes
 - [x] 6.5 Implement the two-pass rule: route from the streaming hypothesis, and re-decode the buffered audio with the offline engine only when the selected action has spoken args, taking those values from the offline transcript; verify a test that an action with no spoken args never invokes the offline engine and one with spoken args takes its values from it
-- [ ] 6.6 Implement cancellation at each state, discarding captured audio and preventing any not-yet-started action from running; verify unit tests for cancel-while-listening and cancel-while-processing
+- [x] 6.6 Implement cancellation at each state, discarding captured audio and preventing any not-yet-started action from running; verify unit tests for cancel-while-listening and cancel-while-processing
 - [x] 6.7 Implement follow-up turns carrying prior turns as context, and discard all turns on close; verify tests that a follow-up sees earlier turns and that a fresh session sees none
 - [x] 6.8 Speak the answer through `run_tts_with_player` (`crates/features/src/tts.rs`) using the resolved TTS slot and the existing voice/speed settings; verify with a fake TTS engine that the spoken text is exactly the displayed text
-- [ ] 6.9 Implement stop-playback, and make session cancellation and the start of a follow-up both stop it; verify unit tests for each of the three stop paths
+- [x] 6.9 Implement stop-playback, and make session cancellation and the start of a follow-up both stop it; verify unit tests for each of the three stop paths
 - [x] 6.10 Implement the speech-unavailable path: with no usable TTS engine the answer is still displayed and the failure is reported; verify a test with the TTS slot unresolvable that the session still completes
 
 ## 7. UI surface
 
 - [ ] 7.1 Add the assistant window in `src-tauri/src/overlay.rs` or a sibling module, keyed on its own label the way the dictation HUD is, and ensure it does not take keyboard focus; verify by running `make dev` that the frontmost app keeps focus when the window appears
 - [x] 7.2 Add assistant events to `src-tauri/src/events.rs` (state, partial text, result, error) following the existing `DictationPartialPayload` shape; verify the payloads serialize in Rust unit tests
-- [ ] 7.3 Add the listeners to `ui/src/api.ts` alongside `onDictationState`/`onDictationLevel`; verify `ui/src/api.test.ts` covers each new listener
-- [ ] 7.4 Build `ui/src/components/AssistantPanel.tsx` rendering the four states, live partial text, the answer with a copy control, a stop-speaking control while playback runs, and a cancel control; verify a colocated `.test.tsx` covers each state, matching the per-component test convention in `ui/src/`
-- [ ] 7.5 Render the request text and the selected action before or alongside acting (the intent-routing visibility requirement); verify a component test asserts both are present when an action is invoked
+- [x] 7.3 Add the listeners to `ui/src/api.ts` alongside `onDictationState`/`onDictationLevel`; verify `ui/src/api.test.ts` covers each new listener
+- [x] 7.4 Build `ui/src/components/AssistantHud.tsx` (named for the `DictationHud.tsx` it sits beside in the overlay, not the `AssistantPanel.tsx` this task first said) rendering the four states, live partial text, the answer with a copy control, a stop-speaking control while playback runs, and a cancel control; verify a colocated `.test.tsx` covers each state, matching the per-component test convention in `ui/src/`
+- [x] 7.5 Render the request text and the selected action before or alongside acting (the intent-routing visibility requirement); verify a component test asserts both are present when an action is invoked
 - [x] 7.6 Honour the speak and show switches in the surface: with showing off the panel presents state and controls but no answer text, and with speaking off no playback control appears; verify component tests for all four combinations of the two switches
 
 ## 8. Settings

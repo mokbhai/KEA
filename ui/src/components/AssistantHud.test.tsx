@@ -42,15 +42,33 @@ async function setState(payload: {
 
 /** An answer arriving, then the state that says whether it is being spoken. */
 async function answerArrives(speaking: boolean) {
+  await answerPayloadArrives(ANSWER, speaking);
+}
+
+/** The same, for a turn whose payload is not the plain answered one. */
+async function answerPayloadArrives(
+  payload: Record<string, unknown>,
+  speaking: boolean,
+) {
   await act(async () => {
-    emitTauriEvent("assistant:answer", ANSWER);
+    emitTauriEvent("assistant:answer", payload);
   });
   await setState({ state: "presenting", speaking });
 }
 
 const answerText = () => document.querySelector(".kea-hud__answer")?.textContent ?? null;
 const stopControl = () => screen.queryByText("Esc to stop speaking");
+const copyControl = () => screen.queryByText("⌘⇧C to copy");
+const heard = () => document.querySelector(".kea-hud__heard")?.textContent ?? null;
+
+/** One live hypothesis arriving from the streaming recogniser. */
+async function partialArrives(text: string) {
+  await act(async () => {
+    emitTauriEvent("assistant:partial", { text });
+  });
+}
 const requestEcho = () => document.querySelector(".kea-hud__request")?.textContent ?? null;
+const actionLabel = () => document.querySelector(".kea-hud__action")?.textContent ?? null;
 
 describe("AssistantHud", () => {
   beforeEach(() => resetTauriMocks());
@@ -122,6 +140,60 @@ describe("AssistantHud", () => {
     expect(requestEcho()).toContain("what is the capital of France");
   });
 
+  // The routing-visibility requirement: the user must be able to see the
+  // request that was acted on *and* the action chosen for it. The two tests
+  // below are a pair — either one alone would pass against a surface that
+  // always showed the same thing.
+
+  it("names no action for a request that was answered rather than acted on", async () => {
+    await renderHud();
+
+    await answerArrives(false);
+
+    // The turn is on screen — so an absent label is a decision about this
+    // payload, not a HUD that failed to render.
+    expect(answerText()).toBe("Paris.");
+    expect(actionLabel()).toBeNull();
+  });
+
+  it("names the action that ran, so an actioned turn does not read as an answered one", async () => {
+    await renderHud();
+
+    await answerPayloadArrives(
+      {
+        request: "open safari",
+        action: "Open an application",
+        text: "Opened Safari.",
+      },
+      false,
+    );
+
+    // The title the backend sent, not an id and not a re-derived phrase: the
+    // frontend has no catalog to translate `open_app` with, which is why the
+    // event carries the words the user reads.
+    expect(actionLabel()).toBe("Open an application");
+    expect(requestEcho()).toContain("open safari");
+  });
+
+  it("keeps naming the action that ran when showing the answer is off", async () => {
+    // Hiding the reply is a preference about reading answers. Being told that
+    // something was *done* is the visibility requirement, which no output
+    // switch is allowed to turn off.
+    await renderHud({ show_answers: false });
+
+    await answerPayloadArrives(
+      {
+        request: "open safari",
+        action: "Open an application",
+        text: "Opened Safari.",
+      },
+      false,
+    );
+
+    expect(answerText()).toBeNull();
+    expect(actionLabel()).toBe("Open an application");
+  });
+
   it("keeps disclosing what was read and where it went when showing is off", async () => {
     // Being told that another app was read and that its text left the machine
     // is not something the display switch is allowed to buy silence on.
@@ -163,6 +235,130 @@ describe("AssistantHud", () => {
 
     expect(screen.getByText("Esc to cancel")).toBeTruthy();
     expect(stopControl()).toBeNull();
+  });
+
+  // Live recognition. The spec asks for the recognised text to appear *while*
+  // the user is still speaking, and for its absence to be an ordinary session
+  // rather than a stalled one — the streaming model is not shipped with the
+  // app, so most first sessions have no partials at all.
+
+  it("shows what it is hearing while the user is still speaking", async () => {
+    await renderHud();
+
+    await setState({ state: "listening" });
+    await partialArrives("what time");
+
+    expect(heard()).toBe("what time");
+  });
+
+  it("replaces each hypothesis with the next rather than accumulating them", async () => {
+    // Every partial is the whole request so far. Appending them would render
+    // "whatwhat timewhat time is it", which is the bug this asserts against.
+    await renderHud();
+
+    await setState({ state: "listening" });
+    await partialArrives("what");
+    await partialArrives("what time");
+    await partialArrives("what time is it");
+
+    expect(heard()).toBe("what time is it");
+  });
+
+  it("keeps the recognised text up while the request is being worked on", async () => {
+    // `processing` is the window in which the user checks whether they were
+    // heard correctly. Blanking the line on leaving `listening` would take the
+    // evidence away at exactly the moment it is wanted.
+    await renderHud();
+
+    await setState({ state: "listening" });
+    await partialArrives("what time is it");
+    await setState({ state: "processing" });
+
+    expect(heard()).toBe("what time is it");
+  });
+
+  it("says it is listening without a recognised line when live recognition is absent", async () => {
+    // The ordinary case on a machine that never downloaded the streaming
+    // model: the session still captures and still answers, and the surface
+    // must not read as a stall.
+    await renderHud();
+
+    await setState({ state: "listening" });
+
+    expect(heard()).toBeNull();
+    expect(screen.getByText("Listening…")).toBeTruthy();
+  });
+
+  it("drops the hypothesis when the answer arrives, so one question is on screen at a time", async () => {
+    // The answer carries the request as the offline transcript heard it. Two
+    // versions of the same question side by side invites the user to wonder
+    // which one was answered.
+    await renderHud();
+
+    await setState({ state: "listening" });
+    await partialArrives("what is the capital of frans");
+    await answerArrives(false);
+
+    expect(heard()).toBeNull();
+    expect(requestEcho()).toContain("what is the capital of France");
+  });
+
+  it("starts the next turn with no leftover hypothesis from the last one", async () => {
+    await renderHud();
+
+    await setState({ state: "listening" });
+    await partialArrives("what time is it");
+    await answerArrives(false);
+    await setState({ state: "listening" });
+
+    expect(heard()).toBeNull();
+  });
+
+  // The copy control. It is a key rather than a button because the overlay is
+  // click-through and non-focusable by construction, so this line is the only
+  // place the binding is discoverable — and the binding is registered around a
+  // session, so a user who never reads it never finds out it exists.
+
+  it("advertises the copy key while an answer is on screen", async () => {
+    await renderHud();
+
+    await answerArrives(false);
+
+    expect(copyControl()).toBeTruthy();
+  });
+
+  it("does not advertise copying before there is an answer to copy", async () => {
+    // The binding is held for the whole session, including the seconds before
+    // the first answer, where pressing it deliberately does nothing. A hint
+    // there would promise something the key does not do.
+    await renderHud();
+
+    await setState({ state: "listening" });
+
+    expect(copyControl()).toBeNull();
+  });
+
+  it("does not advertise copying an answer it was told not to show", async () => {
+    // With the display off there is nothing on screen to copy, and the user
+    // asked for the answer to stay out of sight — offering to put it on the
+    // clipboard would be the surface arguing with the setting.
+    await renderHud({ show_answers: false });
+
+    await answerArrives(true);
+
+    expect(answerText()).toBeNull();
+    expect(copyControl()).toBeNull();
+  });
+
+  it("offers copying and stopping together while an answer is still being read aloud", async () => {
+    // Two different keys, so they do not compete for one slot: one silences
+    // the voice, the other keeps the text.
+    await renderHud({ speak_answers: true, show_answers: true });
+
+    await answerArrives(true);
+
+    expect(stopControl()).toBeTruthy();
+    expect(copyControl()).toBeTruthy();
   });
 
   it("states why a request failed rather than leaving the pill blank", async () => {

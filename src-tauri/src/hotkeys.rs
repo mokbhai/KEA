@@ -29,8 +29,8 @@ use crate::commands::{
     record_hotkey_reg_status, register_hotkey, resolve_accelerator, run_dictation_action,
     run_selection_rewrite, start_meeting_inner, stop_meeting_inner, try_acquire_busy,
     undo_last_rewrite, BusyGuard, HotkeyAction, MeetingHotkeyAction, RewriteOverride,
-    ASSISTANT_ACTION_ID, ASSISTANT_CANCEL_ACTION_ID, DICTATION_ACTION_ID, HOTKEY_ACTIONS,
-    LOCK_CANCEL_ACTION_ID,
+    ASSISTANT_ACTION_ID, ASSISTANT_CANCEL_ACTION_ID, ASSISTANT_COPY_ACTION_ID,
+    DICTATION_ACTION_ID, HOTKEY_ACTIONS, LOCK_CANCEL_ACTION_ID,
     MEETINGS_ACTION_ID, OCR_ACTION_ID, PALETTE_ACTION_ID, REWRITE_ACTION_ID, TTS_ACTION_ID,
     UNDO_ACTION_ID,
 };
@@ -219,6 +219,66 @@ pub fn register_all(state: &Arc<AppState>, config_pool: &SqlitePool) -> mpsc::Re
     hk.on_action()
 }
 
+/// What Escape means in an open session.
+///
+/// **Two meanings for one key.** The session spec asks for both — stopping a
+/// spoken answer leaves the answer on screen and the session open, while
+/// cancelling closes it — and Escape is the only key the surface can offer,
+/// because the overlay is click-through and never takes focus. So the press
+/// resolves against what is happening: while an answer is in the air the thing
+/// the user almost certainly wants is silence, and a second press, with
+/// nothing playing, ends the session.
+///
+/// **Alternatives considered.** A second accelerator for stopping was the
+/// obvious one and was rejected: it would have to be held globally for the
+/// length of every session the way Escape is, and it would cost the user a key
+/// to learn for a thing they are already reaching for Escape to do. Making
+/// Escape always cancel — which is what shipped before this — reads as the
+/// same gesture, and takes the answer off screen the moment the user reaches
+/// to quiet it, which is precisely when they are still reading it.
+#[derive(Debug, PartialEq, Eq)]
+enum AssistantEscape {
+    /// Silence the answer; leave it on screen and the session open.
+    StopSpeaking,
+    /// Close the session.
+    CancelSession,
+}
+
+fn assistant_escape(answer_is_playing: bool) -> AssistantEscape {
+    if answer_is_playing {
+        AssistantEscape::StopSpeaking
+    } else {
+        AssistantEscape::CancelSession
+    }
+}
+
+/// What a press of the assistant's own activation key means right now.
+///
+/// Two meanings for one key, which the session spec asks for directly: a press
+/// while a session is open is *not* a second session, and is not to be dropped
+/// either — it is directed at the session already running, where the only
+/// thing it can sensibly mean is "I have finished asking".
+///
+/// A function rather than a condition inline in the dispatch loop because the
+/// rule is worth a test and the loop is not testable: reaching it needs an
+/// `AppHandle`, a registered global hotkey and a real press.
+#[derive(Debug, PartialEq, Eq)]
+enum AssistantPress {
+    /// Nothing is running: start a session.
+    OpenSession,
+    /// A session is listening: end its request now rather than waiting out a
+    /// pause the user did not intend.
+    SubmitRequest,
+}
+
+fn assistant_press(session_open: bool) -> AssistantPress {
+    if session_open {
+        AssistantPress::SubmitRequest
+    } else {
+        AssistantPress::OpenSession
+    }
+}
+
 /// Spawn the dispatch loop: one press in, one spawned handler out.
 ///
 /// The loop itself never awaits a handler — it stays free to read the next
@@ -239,8 +299,55 @@ pub fn spawn_dispatch_loop(state: Arc<AppState>, app: AppHandle, mut rx: mpsc::R
             // the table. No busy gate: cancelling is the one thing that must
             // work *while* the handler it cancels is still running.
             if action_id == ASSISTANT_CANCEL_ACTION_ID {
+                match assistant_escape(
+                    state
+                        .assistant_speaking
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ) {
+                    AssistantEscape::StopSpeaking => state
+                        .assistant_speech_stop
+                        .store(true, std::sync::atomic::Ordering::Relaxed),
+                    AssistantEscape::CancelSession => state
+                        .assistant_cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed),
+                }
+                continue;
+            }
+
+            // Copying the answer on screen. Registered around a session for
+            // the same reason Escape is, and matched here for the same reason:
+            // it has no [`HOTKEY_ACTIONS`] row. No busy gate either — the
+            // session it copies from is by definition still running, so the
+            // ordinary gate would drop every press.
+            if action_id == ASSISTANT_COPY_ACTION_ID {
+                // `Ok(false)` is the press that landed between turns, with
+                // nothing on screen yet. Doing nothing is the whole response:
+                // the alternative is clearing the user's clipboard for them.
+                if let Err(error) = crate::commands::copy_assistant_answer(
+                    &state.assistant_answer,
+                    &crate::commands::SystemClipboard,
+                ) {
+                    tracing::warn!(%error, "could not copy the assistant's answer");
+                }
+                continue;
+            }
+
+            // The activation key pressed while a session is already open.
+            //
+            // Decided before the gate for the same reason the palette's toggle
+            // is: the flag that would swallow this press is held for the whole
+            // of the run it belongs to, so nothing after the gate can ever see
+            // it. Setting a flag rather than spawning anything keeps this
+            // branch free of the second microphone claim it exists to prevent.
+            if action_id == ASSISTANT_ACTION_ID
+                && assistant_press(
+                    state
+                        .assistant_busy
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ) == AssistantPress::SubmitRequest
+            {
                 state
-                    .assistant_cancel
+                    .assistant_submit
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 continue;
             }
@@ -548,12 +655,17 @@ mod tests {
         assert_ne!(ASSISTANT_CANCEL_ACTION_ID, LOCK_CANCEL_ACTION_ID);
     }
 
+    /// Task 5.3. A press landing while a session runs must not start a second
+    /// one — two presses would claim the microphone twice, and the second
+    /// would fail inside the audio layer with a message about the device
+    /// rather than about the shortcut.
+    ///
+    /// It is not dropped either: see
+    /// `the_activation_key_ends_the_request_of_a_session_already_open`, which
+    /// is the other half of this rule and the reason the busy gate below is
+    /// never what the assistant's second press meets.
     #[test]
-    fn a_second_assistant_press_is_ignored_while_one_is_running() {
-        // The guard is held for the length of the session, so the second press
-        // finds the flag set and is dropped. Without this, two presses claim
-        // the microphone twice and the second fails inside the audio layer
-        // with a message about the device rather than about the shortcut.
+    fn a_second_assistant_press_does_not_start_a_second_session() {
         let flag = Arc::new(AtomicBool::new(false));
         let first = crate::commands::try_acquire_busy(&flag);
         assert!(first.is_some(), "the first press must run");
@@ -565,6 +677,50 @@ mod tests {
         assert!(
             crate::commands::try_acquire_busy(&flag).is_some(),
             "the flag must clear when the session ends"
+        );
+    }
+
+    /// Task 6.9's first stop path, at the point a press becomes one — and the
+    /// case that used to be wrong: the surface advertised "Esc to stop
+    /// speaking" while the backend cancelled the session, so the user who
+    /// reached to quiet a voice lost the answer they were reading.
+    ///
+    /// The pair is the test. Either case alone passes against a key with one
+    /// meaning, and one meaning is the bug in both directions: always
+    /// cancelling destroys the answer, always stopping leaves no way to end a
+    /// session at all.
+    #[test]
+    fn escape_silences_a_playing_answer_and_otherwise_ends_the_session() {
+        assert_eq!(assistant_escape(true), AssistantEscape::StopSpeaking);
+        assert_eq!(assistant_escape(false), AssistantEscape::CancelSession);
+    }
+
+    /// Task 6.3's explicit-submit path, at the point a press becomes one.
+    ///
+    /// The pair is the test: either case alone would pass against a key that
+    /// always meant the same thing, which is precisely the bug — a key that
+    /// always opens is a second microphone claim, and one that always submits
+    /// can never start a session at all.
+    #[test]
+    fn the_activation_key_ends_the_request_of_a_session_already_open() {
+        assert_eq!(assistant_press(false), AssistantPress::OpenSession);
+        assert_eq!(assistant_press(true), AssistantPress::SubmitRequest);
+    }
+
+    /// The copy key is registered around a session and released when it ends,
+    /// like Escape — and it matters more here, because unlike Escape this is a
+    /// combination other applications bind to commands of their own.
+    #[test]
+    fn the_assistant_copy_key_is_not_a_permanent_hotkey() {
+        assert!(
+            HOTKEY_ACTIONS
+                .iter()
+                .all(|a| a.action_id() != ASSISTANT_COPY_ACTION_ID),
+            "the copy key must not be a fixed hotkey row"
+        );
+        assert!(
+            handler_for(ASSISTANT_COPY_ACTION_ID).is_none(),
+            "it is matched in the dispatch loop, not through the table"
         );
     }
 

@@ -1115,6 +1115,19 @@ a:hover {
   white-space: nowrap;
 }
 
+/* The one mark that separates an actioned turn from an answered one, so it
+   has to be legible at a glance — but it sits above the answer, and anything
+   heavier than this would read as the headline instead of the reply. Muted
+   like the disclosure line, with the accent rule as the only thing that says
+   "something ran". */
+.kea-hud__action {
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--text-muted);
+  border-left: 2px solid var(--accent);
+  padding-left: 6px;
+}
+
 .kea-hud__answer {
   font-weight: 400;
   line-height: 1.45;
@@ -1122,10 +1135,36 @@ a:hover {
 }
 
 .kea-hud__disclosure,
+/* The live hypothesis, while the user is still speaking. Styled apart from
+   `.kea-hud__request` — upright rather than italic — because the two are
+   different claims: this is what the recogniser thinks it is hearing right
+   now, and the request echo is what was actually answered. Quoting it the way
+   the echo is quoted would suggest a finished sentence that is still moving. */
+.kea-hud__heard {
+  font-weight: 400;
+  color: var(--text);
+  /* One line, clipped at the start edge, so the newest words stay visible as
+     the sentence grows — the same choice the dictation HUD makes. */
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The hints sit on one row so a second one appearing cannot push the answer
+   up mid-read: the overlay is a fixed-height window, and vertical growth there
+   is the jump `overlay::HEIGHT` exists to avoid. */
+.kea-hud__hints {
+  display: flex;
+  gap: 10px;
+  flex-wrap: nowrap;
+}
+
 .kea-hud__hint {
   font-size: 0.75rem;
   font-weight: 400;
   color: var(--text-muted);
+  white-space: nowrap;
 }
 
 /* ── Live waveform ─────────────────────────────────────────────────── */
