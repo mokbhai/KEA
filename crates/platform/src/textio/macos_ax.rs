@@ -464,6 +464,137 @@ fn insert_via_accessibility_impl(text: &str) -> Result<(), String> {
 ///    is no longer there. Nothing else in the document changes.
 /// 4. Rewrite in Slack or a browser text box: the swap is likely refused by
 ///    the element; the message says so and nothing is overwritten.
+/// `AXValueType` for a boxed `CGPoint`.
+const K_AX_VALUE_CG_POINT: u32 = 1;
+/// `AXValueType` for a boxed `CGSize`.
+const K_AX_VALUE_CG_SIZE: u32 = 2;
+
+/// Where the focused window sits, in global screen points.
+///
+/// Top-left origin, which is both what AX reports and what `screencapture -R`
+/// expects — so no flip happens anywhere, and none should be added.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowBounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl WindowBounds {
+    /// Whether this rectangle could contain anything worth reading.
+    ///
+    /// A zero or negative extent comes back from minimised windows and from
+    /// elements that answer the attribute without meaning it. Capturing one
+    /// produces either an error or a blank image, and both waste a screen
+    /// recording on nothing.
+    pub fn is_capturable(&self) -> bool {
+        self.width >= 1.0 && self.height >= 1.0
+    }
+}
+
+/// The bounds of the frontmost application's focused window.
+///
+/// Deliberately the *focused window*, not the focused element: the element is
+/// often a text field occupying a fraction of what the user means by "this",
+/// and the whole point of reaching for a screenshot is that the element-level
+/// read already failed.
+///
+/// Uses `NSWorkspace` for the pid, as [`frontmost_pid`] does, so it tells the
+/// truth when Accessibility is the broken prerequisite rather than blaming the
+/// window.
+pub fn focused_window_bounds() -> Result<WindowBounds, String> {
+    if !is_ax_trusted() {
+        return Err("accessibility permission not granted".into());
+    }
+    let pid = frontmost_pid().ok_or("no frontmost application")?;
+
+    // SAFETY: `app_ax_element` hands back a +1 reference owned by an `AxRef`,
+    // and every `copy_attr` below does the same; each is released exactly once
+    // on drop. `AXValueGetValue` writes into a local of the matching type and
+    // reports whether the box actually held it.
+    unsafe {
+        let app = app_ax_element(pid).ok_or("AXUIElementCreateApplication failed")?;
+        set_ax_timeout(&app);
+
+        let window = app
+            .copy_attr("AXFocusedWindow")
+            .ok_or("the application reports no focused window")?;
+        set_ax_timeout(&window);
+
+        let position = window
+            .copy_attr("AXPosition")
+            .ok_or("the window reports no position")?;
+        let size = window
+            .copy_attr("AXSize")
+            .ok_or("the window reports no size")?;
+
+        let mut point = core_graphics::geometry::CGPoint { x: 0.0, y: 0.0 };
+        let mut extent = core_graphics::geometry::CGSize {
+            width: 0.0,
+            height: 0.0,
+        };
+
+        if !AXValueGetValue(
+            position.as_ptr(),
+            K_AX_VALUE_CG_POINT,
+            &mut point as *mut _ as *mut c_void,
+        ) {
+            return Err("the window position was not a point".into());
+        }
+        if !AXValueGetValue(
+            size.as_ptr(),
+            K_AX_VALUE_CG_SIZE,
+            &mut extent as *mut _ as *mut c_void,
+        ) {
+            return Err("the window size was not a size".into());
+        }
+
+        Ok(WindowBounds {
+            x: point.x,
+            y: point.y,
+            width: extent.width,
+            height: extent.height,
+        })
+    }
+}
+
+/// The entire text of the focused element, via `AXValue`.
+///
+/// The read half of what [`swap_in_focused_element`] does, and it exists for
+/// the assistant: "summarise this" has no selection to work from, so the
+/// question is what the user is *looking at* rather than what they highlighted.
+///
+/// The same elements that refuse an `AXValue` write refuse this read — web and
+/// Electron surfaces, and anything that is not a real text field — and that is
+/// an ordinary outcome, not a bug. The caller falls back rather than failing.
+///
+/// # Manual verification (macOS)
+/// 1. Put the caret in a TextEdit document with text but nothing selected:
+///    returns the document's text.
+/// 2. Focus a Finder window: refused, with a reason, and nothing else happens.
+pub fn focused_element_text() -> Result<String, String> {
+    if !is_ax_trusted() {
+        return Err("accessibility permission not granted".into());
+    }
+
+    // SAFETY: as in `swap_in_focused_element` — the system-wide element and the
+    // focused element are both +1 references from AX create/copy functions,
+    // released exactly once by `AxRef`.
+    unsafe {
+        let Some(system) = system_wide_element() else {
+            return Err("AXUIElementCreateSystemWide failed".into());
+        };
+        let Some(focused) = system.copy_attr("AXFocusedUIElement") else {
+            return Err("no focused UI element".into());
+        };
+        set_ax_timeout(&focused);
+        focused
+            .copy_string_attr("AXValue")
+            .ok_or_else(|| "the focused element has no readable text".to_string())
+    }
+}
+
 pub fn swap_in_focused_element(from: &str, to: &str) -> Result<(), String> {
     if !is_ax_trusted() {
         return Err("accessibility permission not granted".into());
@@ -504,6 +635,10 @@ extern "C" {
         attribute: core_foundation_sys::string::CFStringRef,
         value: core_foundation_sys::base::CFTypeRef,
     ) -> i32;
+    /// Unwraps an `AXValue` (a boxed `CGPoint`, `CGSize`, `CGRect`, ...) into
+    /// a plain struct. `the_type` is the `AXValueType` the box is expected to
+    /// hold; a mismatch returns false rather than writing garbage.
+    fn AXValueGetValue(value: *mut c_void, the_type: u32, value_ptr: *mut c_void) -> bool;
     fn AXIsProcessTrusted() -> bool;
     static kAXTrustedCheckOptionPrompt: core_foundation_sys::string::CFStringRef;
     fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;

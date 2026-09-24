@@ -11,6 +11,7 @@ import Onboarding from "./components/Onboarding";
 import Spinner from "./components/Spinner";
 import StatusPill from "./components/StatusPill";
 import AiProvidersPage from "./pages/AiProvidersPage";
+import AssistantPage from "./pages/AssistantPage";
 import DictationPage from "./pages/DictationPage";
 import GeneralPage from "./pages/GeneralPage";
 import HistoryPage from "./pages/HistoryPage";
@@ -268,6 +269,8 @@ function AppShell() {
 
   const renderPage = () => {
     switch (page) {
+      case "assistant":
+        return <AssistantPage onNavigate={navigate} />;
       case "rewrite":
         return <RewritePage onRunSetup={runSetup} onNavigate={navigate} />;
       case "dictation":
@@ -357,6 +360,7 @@ function AppShell() {
         >
           <nav className="kea-drawer__nav" aria-label="Main navigation">
             <div className="kea-drawer__group-label">Features</div>
+            {navItem("assistant", "Assistant", "💬")}
             {navItem("rewrite", "Rewrite", "✏️")}
             {navItem("dictation", "Dictation", "🎙")}
             {navItem("meetings", "Meetings", "👥")}

@@ -2,6 +2,7 @@
 //! permissions, screen capture/OCR, calendar).
 
 pub mod appnap;
+pub mod apps;
 pub mod audio;
 pub mod calendar;
 pub mod hotkeys;

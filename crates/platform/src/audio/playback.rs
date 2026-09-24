@@ -46,6 +46,62 @@ pub fn play_pcm_blocking(pcm: &PcmFrame) -> Result<(), AudioIoError> {
     Ok(())
 }
 
+/// Play `pcm`, stopping early if `cancel` is set.
+///
+/// A separate entry point rather than a flag on [`play_pcm_blocking`] because
+/// the two differ in what they own: the plain version hands the sink to
+/// `sleep_until_end` and never looks at it again, which is why nothing outside
+/// can stop it. This one keeps the sink and polls, so a spoken answer can be
+/// cut off the moment the user has heard enough — or has heard that their
+/// question was misunderstood, which is the more common reason.
+///
+/// Polls rather than blocking on a channel so the caller needs only an
+/// `AtomicBool`, which is what a hotkey handler in another task can set
+/// without plumbing a sender through the session.
+#[cfg(target_os = "macos")]
+pub fn play_pcm_cancellable(
+    pcm: &PcmFrame,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), AudioIoError> {
+    use rodio::{buffer::SamplesBuffer, OutputStream, Sink};
+    use std::sync::atomic::Ordering;
+
+    // Checked before any device is opened: a cancel that arrived while the
+    // answer was still being synthesized must not produce a burst of audio.
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
+    let samples = pcm_samples_for_playback(pcm)?;
+    let (_stream, stream_handle) = OutputStream::try_default()
+        .map_err(|e| AudioIoError::Other(format!("audio output unavailable: {e}")))?;
+    let sink = Sink::try_new(&stream_handle)
+        .map_err(|e| AudioIoError::Other(format!("audio sink unavailable: {e}")))?;
+    sink.append(SamplesBuffer::new(1, pcm.sample_rate_hz, samples));
+
+    // 50 ms is the same cadence the mic level poll runs at. Fast enough that a
+    // stop feels immediate, slow enough to cost nothing while an answer plays.
+    while !sink.empty() {
+        if cancel.load(Ordering::Relaxed) {
+            sink.stop();
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn play_pcm_cancellable(
+    pcm: &PcmFrame,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), AudioIoError> {
+    let _ = (pcm, cancel);
+    Err(AudioIoError::Other(
+        "playback not supported on this platform".into(),
+    ))
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn play_pcm_blocking(pcm: &PcmFrame) -> Result<(), AudioIoError> {
     let _ = pcm;

@@ -79,6 +79,23 @@ pub trait TextIo: Send + Sync {
             "putting text back is not available on this platform".into(),
         ))
     }
+
+    /// Everything in the focused element, selected or not.
+    ///
+    /// What the assistant needs and [`Self::capture_selection`] cannot give:
+    /// "what does this say" is asked about the window in front of the user,
+    /// who has selected nothing. Distinct from `capture_selection` rather than
+    /// folded into it because the two answer different questions and the
+    /// assistant tries them in order — a selection is a statement about what
+    /// the user means, and it wins when there is one.
+    ///
+    /// Defaults to refusing, which is the honest answer on a platform with no
+    /// way to read a focused element's text.
+    async fn capture_focused_text(&self) -> Result<String, TextIoError> {
+        Err(TextIoError::Other(
+            "reading the focused element is not available on this platform".into(),
+        ))
+    }
 }
 
 /// `haystack` with its one occurrence of `needle` replaced by `replacement`.

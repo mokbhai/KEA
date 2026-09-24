@@ -141,10 +141,19 @@ pub fn visible_for_state(state: DictationState) -> bool {
 
 /// Shows or hides the overlay for a dictation state. No-op when the overlay
 /// failed to build, so dictation still works without it.
+///
+/// Will not hide a window an assistant session is using. The two features
+/// cannot record at once — the assistant refuses to start while the microphone
+/// is held — but a dictation *attempt* during a session still emits `Idle` when
+/// it fails, and that emission must not pull the overlay out from under an
+/// answer the user is reading.
 pub fn sync_visibility(app: &AppHandle, state: DictationState) {
     let Some(window) = app.get_webview_window(LABEL) else {
         return;
     };
+    if !visible_for_state(state) && assistant_owns_overlay() {
+        return;
+    }
     if visible_for_state(state) {
         // Re-pin on every show: the user may have changed displays or
         // resolution since the window was built.
@@ -154,6 +163,36 @@ pub fn sync_visibility(app: &AppHandle, state: DictationState) {
         // `crate::nswindow::order_front_without_activating`. Called after
         // `show()` so it is ordering a window the system already considers
         // visible.
+        crate::nswindow::order_front_without_activating(&window);
+    } else {
+        let _ = window.hide();
+    }
+}
+
+/// Whether an assistant session currently has the overlay on screen.
+///
+/// A process-global rather than a field on the app state because the only
+/// reader is [`sync_visibility`], a free function the dictation path calls
+/// without a handle to anything else.
+static ASSISTANT_OVERLAY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn assistant_owns_overlay() -> bool {
+    ASSISTANT_OVERLAY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Show or hide the overlay for an assistant session.
+///
+/// Separate from [`sync_visibility`] because the two are driven by different
+/// state machines; the flag above is what stops them fighting over one window.
+pub fn sync_assistant_visibility(app: &AppHandle, visible: bool) {
+    ASSISTANT_OVERLAY.store(visible, std::sync::atomic::Ordering::Relaxed);
+    let Some(window) = app.get_webview_window(LABEL) else {
+        return;
+    };
+    if visible {
+        reposition(&window);
+        let _ = window.show();
         crate::nswindow::order_front_without_activating(&window);
     } else {
         let _ = window.hide();

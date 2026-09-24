@@ -650,6 +650,41 @@ export type DictationPartial = {
   is_final: boolean;
 };
 
+/** What the assistant surface is showing. Mirrors `AssistantStatePayload`. */
+export type AssistantState =
+  | "listening"
+  | "processing"
+  | "presenting"
+  | "failed";
+
+export type AssistantStatus = {
+  state: AssistantState;
+  /** Present only on `failed`. */
+  message?: string;
+  /** Present only on `presenting`. */
+  speaking?: boolean;
+};
+
+export type AssistantAnswer = {
+  /** What the assistant heard, so a misheard question is visible. */
+  request: string;
+  text: string;
+  /** What was read from another app, when anything was. */
+  read?: string;
+  /** Whether that content left the machine. */
+  sent_externally?: boolean;
+};
+
+export const onAssistantState = (
+  handler: (status: AssistantStatus) => void,
+): Promise<UnlistenFn> =>
+  listen<AssistantStatus>("assistant:state", (event) => handler(event.payload));
+
+export const onAssistantAnswer = (
+  handler: (answer: AssistantAnswer) => void,
+): Promise<UnlistenFn> =>
+  listen<AssistantAnswer>("assistant:answer", (event) => handler(event.payload));
+
 export const onDictationPartial = (
   handler: (partial: DictationPartial) => void,
 ): Promise<UnlistenFn> =>

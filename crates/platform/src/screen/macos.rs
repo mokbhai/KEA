@@ -66,7 +66,9 @@ use objc2::{class, msg_send};
 use objc2_foundation::{NSRect, NSString};
 
 use super::{
-    capture_parent_dir, classify_capture, png_dimensions, screencapture_args, CaptureOutcome,
+    capture_parent_dir, classify_capture, png_dimensions, screencapture_args,
+    observations_to_text, screencapture_rect_args, CaptureOutcome, CaptureRect, CapturedImage,
+    ScreenReader,
     CaptureSlot, CaptureVerdict, NormalizedRect, Observation, OcrOptions, ScreenCapture,
     ScreenError, TextRecognizer,
 };
@@ -114,6 +116,15 @@ impl ScreenCapture for MacScreenCapture {
         Ok(())
     }
 
+    async fn capture_rect(&self, rect: CaptureRect) -> Result<CapturedImage, ScreenError> {
+        self.availability()?;
+        let tool = self.tool.clone();
+        let staging = self.staging.clone();
+        tokio::task::spawn_blocking(move || capture_rect_blocking(&tool, &staging, rect))
+            .await
+            .map_err(|e| ScreenError::Capture(format!("capture task failed: {e}")))?
+    }
+
     async fn capture_region(&self) -> Result<CaptureOutcome, ScreenError> {
         // Checked before spawning so a missing tool is one clear error rather
         // than a confusing "no such file" from the process layer.
@@ -127,6 +138,31 @@ impl ScreenCapture for MacScreenCapture {
         tokio::task::spawn_blocking(move || capture_blocking(&tool, &staging))
             .await
             .map_err(|e| ScreenError::Capture(format!("capture task failed: {e}")))?
+    }
+}
+
+fn capture_rect_blocking(
+    tool: &Path,
+    staging: &Path,
+    rect: CaptureRect,
+) -> Result<CapturedImage, ScreenError> {
+    let slot = CaptureSlot::claim(staging, CAPTURE_FILE_NAME)?;
+
+    let output = std::process::Command::new(tool)
+        .args(screencapture_rect_args(rect, slot.path()))
+        .output()
+        .map_err(|e| ScreenError::Capture(format!("{} failed to run: {e}", tool.display())))?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match classify_capture(slot.written_bytes(), &stderr) {
+        CaptureVerdict::Captured => Ok(slot.finish()),
+        CaptureVerdict::Failed(message) => Err(ScreenError::Capture(message)),
+        // No crosshair, no human, nothing to cancel. Reaching this means the
+        // tool wrote nothing and said nothing, which is a failure wearing the
+        // wrong hat — reported rather than returned as a silent success.
+        CaptureVerdict::Cancelled => Err(ScreenError::Capture(
+            "the capture produced no image and gave no reason".into(),
+        )),
     }
 }
 
@@ -519,5 +555,60 @@ mod tests {
             let count: usize = msg_send![tags, count];
             assert_eq!(count, 2);
         });
+    }
+}
+
+/// Capture-and-OCR of the focused window.
+pub struct MacScreenReader {
+    capture: MacScreenCapture,
+    recognizer: MacTextRecognizer,
+}
+
+impl MacScreenReader {
+    pub fn new() -> Self {
+        Self {
+            capture: MacScreenCapture::new(),
+            recognizer: MacTextRecognizer::new(),
+        }
+    }
+}
+
+impl Default for MacScreenReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ScreenReader for MacScreenReader {
+    async fn read_focused_window(&self) -> Result<String, ScreenError> {
+        let bounds = crate::textio::macos_ax::focused_window_bounds()
+            .map_err(ScreenError::Unavailable)?;
+
+        if !bounds.is_capturable() {
+            return Err(ScreenError::Unavailable(
+                "the focused window has no visible area".into(),
+            ));
+        }
+
+        let image = self
+            .capture
+            .capture_rect(CaptureRect {
+                x: bounds.x,
+                y: bounds.y,
+                width: bounds.width,
+                height: bounds.height,
+            })
+            .await?;
+
+        // Spell correction off: this reads whatever is on screen, which is as
+        // likely to be an error message, a path or an identifier as prose, and
+        // Vision's correction pass mangles all three.
+        let opts = OcrOptions {
+            languages: Vec::new(),
+            language_correction: false,
+        };
+        let observations = self.recognizer.recognize(image.path(), &opts).await?;
+        Ok(observations_to_text(&observations))
     }
 }

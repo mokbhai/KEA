@@ -86,3 +86,15 @@ mod tests {
             .is_err());
     }
 }
+
+/// Always refuses: no non-interactive capture on this platform.
+pub struct StubScreenReader;
+
+#[async_trait::async_trait]
+impl super::ScreenReader for StubScreenReader {
+    async fn read_focused_window(&self) -> Result<String, super::ScreenError> {
+        Err(super::ScreenError::Unavailable(
+            "reading the focused window is not available on this platform".into(),
+        ))
+    }
+}

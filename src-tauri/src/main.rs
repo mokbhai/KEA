@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
+mod assistant;
 mod commands;
 mod events;
 mod hotkeys;
@@ -208,6 +209,26 @@ pub struct AppState {
     /// corrupted document, not a race that can be lost gracefully: the second
     /// one's ⌘C lands while the first one's ⌘V is still in flight.
     pub selection_busy: Arc<AtomicBool>,
+    /// Serialises assistant sessions.
+    ///
+    /// Its own flag rather than a share of `dictation_busy`, although both hold
+    /// the microphone. Sharing would make the assistant shortcut *silently
+    /// dropped* during a dictation, and the assistant's contract is that
+    /// activating while the microphone is in use says so — a press that
+    /// vanishes is indistinguishable from a broken shortcut. The device
+    /// conflict is reported by the handler; this flag only stops a second
+    /// session stacking on the first.
+    pub assistant_busy: Arc<AtomicBool>,
+    /// Set while the user wants the running assistant session to stop.
+    ///
+    /// A flag rather than a channel because the things that must observe it are
+    /// in different worlds: an async capture loop, a synchronous playback
+    /// thread, and the step between routing and dispatch. All three can read an
+    /// `AtomicBool`; none of them share a receiver.
+    ///
+    /// Cleared when a session starts, not when it ends, so a press that lands
+    /// microseconds after a session finishes cannot cancel the next one.
+    pub assistant_cancel: Arc<AtomicBool>,
 }
 
 fn on_tray_menu_event(app: &tauri::AppHandle, e: tauri::menu::MenuEvent) {
@@ -747,6 +768,8 @@ fn build_state(
         palette_counter: AtomicU64::new(0),
         last_rewrite: Mutex::new(None),
         selection_busy: Arc::new(AtomicBool::new(false)),
+        assistant_busy: Arc::new(AtomicBool::new(false)),
+        assistant_cancel: Arc::new(AtomicBool::new(false)),
         tts_busy: Arc::new(AtomicBool::new(false)),
         api_server: Mutex::new(None),
     })

@@ -189,6 +189,46 @@ pub enum CaptureVerdict {
 /// Note: `-o` is the shadow flag and `-r` the metadata flag — the plan
 /// attributed both behaviours to `-r`, which the tool's own usage text at HEAD
 /// contradicts.
+/// A rectangle to capture, in global screen points with a top-left origin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaptureRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Arguments for a capture of one rectangle, with no user interaction.
+///
+/// The same flags as [`screencapture_args`] minus `-i`, plus `-R`. The
+/// difference is the whole point: `-i` puts a crosshair on screen and waits for
+/// a human, which is right for "capture a region" and useless for an assistant
+/// answering a question about the window already in front of them.
+///
+/// `-R` takes `x,y,w,h` with a top-left origin, which is the coordinate space
+/// AX reports window positions in — so the bounds pass through unflipped, and
+/// nothing here should start flipping them.
+///
+/// Coordinates are rounded to whole points: `screencapture` parses integers,
+/// and a fractional value silently truncates rather than erroring.
+pub fn screencapture_rect_args(rect: CaptureRect, dest: &Path) -> Vec<String> {
+    vec![
+        "-R".into(),
+        format!(
+            "{},{},{},{}",
+            rect.x.round() as i64,
+            rect.y.round() as i64,
+            rect.width.round() as i64,
+            rect.height.round() as i64
+        ),
+        "-x".into(),
+        "-o".into(),
+        "-r".into(),
+        "-tpng".into(),
+        dest.to_string_lossy().into_owned(),
+    ]
+}
+
 pub fn screencapture_args(dest: &Path) -> Vec<String> {
     vec![
         "-i".into(),
@@ -241,6 +281,22 @@ pub trait ScreenCapture: Send + Sync {
     /// Let the user select a region. Blocks (asynchronously) for as long as
     /// they take.
     async fn capture_region(&self) -> Result<CaptureOutcome, ScreenError>;
+
+    /// Capture one rectangle without involving the user.
+    ///
+    /// No [`CaptureOutcome`] here because there is nothing to cancel: either an
+    /// image was produced or it was not. This needs Screen Recording, and
+    /// without it the tool writes nothing and complains, which surfaces as
+    /// [`ScreenError::Capture`].
+    ///
+    /// Defaults to refusing, which is the honest answer on a platform with no
+    /// non-interactive capture.
+    async fn capture_rect(&self, rect: CaptureRect) -> Result<CapturedImage, ScreenError> {
+        let _ = rect;
+        Err(ScreenError::Unavailable(
+            "capturing a region without the user is not available on this platform".into(),
+        ))
+    }
 }
 
 /// Construct the active platform [`ScreenCapture`] implementation for this OS.
@@ -603,6 +659,53 @@ pub fn png_dimensions(header: &[u8]) -> Option<(u32, u32)> {
         return None;
     }
     Some((width, height))
+}
+
+#[cfg(test)]
+mod rect_capture_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn args(rect: CaptureRect) -> Vec<String> {
+        screencapture_rect_args(rect, &PathBuf::from("/tmp/x.png"))
+    }
+
+    #[test]
+    fn a_rect_capture_never_asks_the_user() {
+        // `-i` is the crosshair. Its presence here would turn an assistant
+        // answering a question into a request to drag a box.
+        let a = args(CaptureRect { x: 0.0, y: 0.0, width: 100.0, height: 50.0 });
+        assert!(!a.contains(&"-i".to_string()), "got {a:?}");
+        assert!(a.contains(&"-R".to_string()));
+    }
+
+    #[test]
+    fn the_rect_is_passed_as_whole_points() {
+        // `screencapture` parses integers and truncates silently, so rounding
+        // here is what keeps a half-point window from shifting the capture.
+        let a = args(CaptureRect { x: 10.4, y: 20.6, width: 100.5, height: 50.4 });
+        let i = a.iter().position(|s| s == "-R").unwrap();
+        assert_eq!(a[i + 1], "10,21,101,50");
+    }
+
+    #[test]
+    fn the_output_format_is_forced_to_png() {
+        // The image size is read from the PNG header downstream, so a machine
+        // configured for JPEG would otherwise break OCR geometry.
+        let a = args(CaptureRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 });
+        assert!(a.contains(&"-tpng".to_string()));
+    }
+
+    #[test]
+    fn a_degenerate_window_is_not_capturable() {
+        use crate::textio::macos_ax::WindowBounds;
+        let zero = WindowBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        assert!(!zero.is_capturable());
+        let minimised = WindowBounds { x: 0.0, y: 0.0, width: 800.0, height: 0.0 };
+        assert!(!minimised.is_capturable());
+        let real = WindowBounds { x: 0.0, y: 0.0, width: 800.0, height: 600.0 };
+        assert!(real.is_capturable());
+    }
 }
 
 #[cfg(test)]
@@ -988,5 +1091,35 @@ mod tests {
         // on code turns it off.
         assert!(OcrOptions::default().language_correction);
         assert!(OcrOptions::default().languages.is_empty());
+    }
+}
+
+/// Reads the text of the window the user is looking at, by capturing it and
+/// running OCR.
+///
+/// **The last resort, and it has to exist.** Accessibility answers for real
+/// text fields and refuses for most web and Electron surfaces — browsers,
+/// Slack, editors — which is a large share of what someone is looking at when
+/// they ask what something means. Without this tier the assistant fails in
+/// exactly the places it is most useful.
+///
+/// It is also the most invasive thing KEA does: a screenshot of a window the
+/// user did not point at, taken without them initiating it. So it is the last
+/// tier rather than the first, it runs only when the cheaper reads have already
+/// come back empty, and the action that uses it discloses that it happened.
+#[async_trait]
+pub trait ScreenReader: Send + Sync {
+    async fn read_focused_window(&self) -> Result<String, ScreenError>;
+}
+
+/// Construct the active platform [`ScreenReader`] for this OS.
+pub fn new_screen_reader() -> Box<dyn ScreenReader> {
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(macos::MacScreenReader::new())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Box::new(stub::StubScreenReader)
     }
 }

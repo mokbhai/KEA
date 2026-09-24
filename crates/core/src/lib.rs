@@ -1,4 +1,5 @@
 pub mod app_context;
+pub mod assistant;
 pub mod dictation;
 pub mod error;
 pub mod log;

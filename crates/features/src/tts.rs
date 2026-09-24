@@ -89,6 +89,33 @@ pub async fn run_tts_synthesize(
     }
 }
 
+/// Synthesize text that did not come from the user's selection.
+///
+/// The assistant speaks its own answers, so the selection-reading entry points
+/// above cannot serve it: there is no selection, and the text to speak was
+/// produced a moment ago by a language model.
+///
+/// `feature_id` is whose `tts` slot to resolve. Passing it rather than
+/// hardcoding `"tts"` is what lets the assistant have its own voice binding —
+/// a user may well want a different, faster voice for spoken answers than for
+/// reading a document aloud.
+pub async fn speak_text_for(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    settings: &TtsSettings,
+    feature_id: &str,
+    text: &str,
+) -> Result<PcmFrame, String> {
+    if text.trim().is_empty() {
+        return Err("nothing to speak".into());
+    }
+    let binding = SlotResolver::new(engines, bindings)
+        .require_tts(feature_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    synthesize(engines, &binding, settings, text).await
+}
+
 async fn synthesize(
     engines: &EngineRegistry,
     binding: &Binding,

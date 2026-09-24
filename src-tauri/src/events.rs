@@ -858,3 +858,158 @@ pub fn emit_palette_open(app: &AppHandle, session_id: u64) {
 pub fn emit_palette_close(app: &AppHandle) {
     let _ = app.emit_to(crate::palette::LABEL, "palette:close", ());
 }
+
+/// What the assistant surface is showing.
+///
+/// The state is carried as a wire string with its detail alongside, rather than
+/// a tagged union, to match `dictation:state`: the frontend switches on a
+/// string and the extra fields are absent when they do not apply.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct AssistantStatePayload {
+    pub state: String,
+    /// Present only on `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Present only on `presenting`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaking: Option<bool>,
+}
+
+/// One answer, with what was asked and what was read to produce it.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct AssistantAnswerPayload {
+    /// What the assistant heard. Shown so a misheard question is visible
+    /// rather than inferred from a strange answer.
+    pub request: String,
+    pub text: String,
+    /// What was read from another application, when anything was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read: Option<String>,
+    /// Whether that content left the machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sent_externally: Option<bool>,
+}
+
+fn assistant_state_wire(state: &kea_core::assistant::SessionState) -> &'static str {
+    use kea_core::assistant::SessionState as S;
+    match state {
+        S::Listening => "listening",
+        S::Processing => "processing",
+        S::Presenting { .. } => "presenting",
+        S::Failed { .. } => "failed",
+    }
+}
+
+/// Whether an assistant state means the overlay should be on screen.
+///
+/// Every one of them does: a session that is open is a session the user should
+/// be able to see. `Failed` included — an error the user never sees is
+/// indistinguishable from a shortcut that did nothing, which is exactly the
+/// complaint this surface exists to answer.
+pub fn assistant_overlay_visible(state: &kea_core::assistant::SessionState) -> bool {
+    let _ = state;
+    true
+}
+
+pub fn emit_assistant_state(app: &AppHandle, state: &kea_core::assistant::SessionState) {
+    use kea_core::assistant::SessionState as S;
+    // Driven from the emit site, exactly as `emit_dictation_state` drives the
+    // dictation half, so the floating HUD tracks a session whether or not the
+    // settings window is open.
+    crate::overlay::sync_assistant_visibility(app, assistant_overlay_visible(state));
+    let _ = app.emit(
+        "assistant:state",
+        AssistantStatePayload {
+            state: assistant_state_wire(state).to_string(),
+            message: match state {
+                S::Failed { message } => Some(message.clone()),
+                _ => None,
+            },
+            speaking: match state {
+                S::Presenting { speaking } => Some(*speaking),
+                _ => None,
+            },
+        },
+    );
+}
+
+pub fn emit_assistant_answer(
+    app: &AppHandle,
+    request: &str,
+    text: &str,
+    disclosure: Option<&kea_core::assistant::dispatch::Disclosure>,
+) {
+    let _ = app.emit(
+        "assistant:answer",
+        AssistantAnswerPayload {
+            request: request.to_string(),
+            text: text.to_string(),
+            read: disclosure.map(|d| d.read.clone()),
+            sent_externally: disclosure.map(|d| d.sent_externally),
+        },
+    );
+}
+
+#[cfg(test)]
+mod assistant_event_tests {
+    use super::*;
+    use kea_core::assistant::SessionState;
+
+    #[test]
+    fn every_state_has_a_wire_spelling() {
+        assert_eq!(assistant_state_wire(&SessionState::Listening), "listening");
+        assert_eq!(
+            assistant_state_wire(&SessionState::Processing),
+            "processing"
+        );
+        assert_eq!(
+            assistant_state_wire(&SessionState::Presenting { speaking: true }),
+            "presenting"
+        );
+        assert_eq!(
+            assistant_state_wire(&SessionState::Failed {
+                message: "x".into()
+            }),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn detail_fields_are_absent_when_they_do_not_apply() {
+        // The frontend switches on `state`; a `speaking: null` on a listening
+        // payload would invite it to render a stop control.
+        let json = serde_json::to_string(&AssistantStatePayload {
+            state: "listening".into(),
+            message: None,
+            speaking: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"state":"listening"}"#);
+    }
+
+    #[test]
+    fn an_answer_with_no_disclosure_omits_both_disclosure_fields() {
+        let json = serde_json::to_string(&AssistantAnswerPayload {
+            request: "hi".into(),
+            text: "hello".into(),
+            read: None,
+            sent_externally: None,
+        })
+        .unwrap();
+        assert!(!json.contains("read"));
+        assert!(!json.contains("sent_externally"));
+    }
+
+    #[test]
+    fn an_answer_that_read_something_says_so_and_says_where_it_went() {
+        let json = serde_json::to_string(&AssistantAnswerPayload {
+            request: "what is this".into(),
+            text: "an error".into(),
+            read: Some("a screenshot of the window you're looking at".into()),
+            sent_externally: Some(true),
+        })
+        .unwrap();
+        assert!(json.contains("screenshot"));
+        assert!(json.contains(r#""sent_externally":true"#));
+    }
+}

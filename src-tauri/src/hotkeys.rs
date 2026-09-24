@@ -29,8 +29,10 @@ use crate::commands::{
     record_hotkey_reg_status, register_hotkey, resolve_accelerator, run_dictation_action,
     run_selection_rewrite, start_meeting_inner, stop_meeting_inner, try_acquire_busy,
     undo_last_rewrite, BusyGuard, HotkeyAction, MeetingHotkeyAction, RewriteOverride,
-    DICTATION_ACTION_ID, HOTKEY_ACTIONS, LOCK_CANCEL_ACTION_ID, MEETINGS_ACTION_ID, OCR_ACTION_ID,
-    PALETTE_ACTION_ID, REWRITE_ACTION_ID, TTS_ACTION_ID, UNDO_ACTION_ID,
+    ASSISTANT_ACTION_ID, ASSISTANT_CANCEL_ACTION_ID, DICTATION_ACTION_ID, HOTKEY_ACTIONS,
+    LOCK_CANCEL_ACTION_ID,
+    MEETINGS_ACTION_ID, OCR_ACTION_ID, PALETTE_ACTION_ID, REWRITE_ACTION_ID, TTS_ACTION_ID,
+    UNDO_ACTION_ID,
 };
 use crate::events::{
     emit_meeting_error, emit_rewrite_error, emit_rewrite_progress, emit_tts_error,
@@ -77,6 +79,7 @@ fn handler_for(action_id: &str) -> Option<Handler> {
         PALETTE_ACTION_ID => Some(handle_palette),
         OCR_ACTION_ID => Some(handle_ocr_capture),
         UNDO_ACTION_ID => Some(handle_undo_rewrite),
+        ASSISTANT_ACTION_ID => Some(handle_assistant),
         // The per-language translate shortcuts are one family rather than a
         // row each, so whether an id names one is asked of the hotkey table's
         // own lookup instead of pattern-matched on a prefix here — same
@@ -116,6 +119,12 @@ fn busy_flag(action_id: &str, state: &Arc<AppState>) -> Arc<AtomicBool> {
         // and a flag minted inside this table would be invisible to them —
         // two reads at once is two voices over each other.
         TTS_ACTION_ID => state.tts_busy.clone(),
+        // Its own flag, not a share of `dictation_busy`, although both hold the
+        // microphone. This one only stops a second session stacking on the
+        // first; the device conflict with dictation is reported by the handler,
+        // because a press swallowed by a shared flag is indistinguishable from
+        // a shortcut that has stopped working.
+        ASSISTANT_ACTION_ID => state.assistant_busy.clone(),
         // Fourth, and the reason the translate family shares one flag rather
         // than one per language: a translate shortcut is a selection rewrite
         // too, so two of them mashed together would fire two ⌘C/⌘V pairs at
@@ -224,6 +233,18 @@ pub fn spawn_dispatch_loop(state: Arc<AppState>, app: AppHandle, mut rx: mpsc::R
             // while a locked recording is running, and never user-rebindable —
             // but its press still arrives on this one accelerator stream, so
             // it is matched here rather than in the table.
+            // Escape while an assistant session is open. Like the lock-cancel
+            // case below it has no `HOTKEY_ACTIONS` row — it is registered only
+            // around a session — so its press is matched here rather than in
+            // the table. No busy gate: cancelling is the one thing that must
+            // work *while* the handler it cancels is still running.
+            if action_id == ASSISTANT_CANCEL_ACTION_ID {
+                state
+                    .assistant_cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+
             if action_id == LOCK_CANCEL_ACTION_ID {
                 // The same busy flag as every other dictation trigger: an
                 // Escape landing alongside the tap that stops the same lock
@@ -390,6 +411,25 @@ fn handle_tts<'a>(
     })
 }
 
+fn handle_assistant<'a>(
+    state: &'a Arc<AppState>,
+    app: &'a AppHandle,
+    _action: &'a HotkeyAction,
+    busy: BusyGuard,
+) -> HandlerFuture<'a> {
+    Box::pin(async move {
+        // Held for the whole session, which is what makes a second press a
+        // no-op rather than a second microphone claim.
+        let _busy = busy;
+        if let Err(error) = crate::assistant::run_session(state, app).await {
+            crate::events::emit_assistant_state(
+                app,
+                &kea_core::assistant::SessionState::Failed { message: error },
+            );
+        }
+    })
+}
+
 fn handle_meetings<'a>(
     state: &'a Arc<AppState>,
     app: &'a AppHandle,
@@ -483,6 +523,50 @@ fn handle_ocr_capture<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_is_not_a_permanent_hotkey() {
+        // Escape is registered around a running session and released when it
+        // ends. A row in the fixed table would hold it for the life of the
+        // process, taking it away from every other application on the Mac.
+        assert!(
+            HOTKEY_ACTIONS
+                .iter()
+                .all(|a| a.action_id() != ASSISTANT_CANCEL_ACTION_ID),
+            "the assistant's Escape must not be a fixed hotkey row"
+        );
+        assert!(
+            handler_for(ASSISTANT_CANCEL_ACTION_ID).is_none(),
+            "Escape is matched in the dispatch loop, not through the table"
+        );
+    }
+
+    #[test]
+    fn the_two_escape_bindings_are_distinct_actions() {
+        // Same key, two owners. They must stay distinguishable or cancelling a
+        // dictation lock would also cancel an assistant session.
+        assert_ne!(ASSISTANT_CANCEL_ACTION_ID, LOCK_CANCEL_ACTION_ID);
+    }
+
+    #[test]
+    fn a_second_assistant_press_is_ignored_while_one_is_running() {
+        // The guard is held for the length of the session, so the second press
+        // finds the flag set and is dropped. Without this, two presses claim
+        // the microphone twice and the second fails inside the audio layer
+        // with a message about the device rather than about the shortcut.
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = crate::commands::try_acquire_busy(&flag);
+        assert!(first.is_some(), "the first press must run");
+        assert!(
+            crate::commands::try_acquire_busy(&flag).is_none(),
+            "a second press while a session is open must be ignored"
+        );
+        drop(first);
+        assert!(
+            crate::commands::try_acquire_busy(&flag).is_some(),
+            "the flag must clear when the session ends"
+        );
+    }
 
     #[test]
     fn every_hotkey_action_has_a_handler() {

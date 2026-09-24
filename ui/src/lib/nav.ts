@@ -7,6 +7,7 @@
  * copy happened to mention it. Everything that navigates names this type.
  */
 export type Page =
+  | "assistant"
   | "rewrite"
   | "dictation"
   | "meetings"
@@ -28,6 +29,7 @@ export type Page =
  * other: the type annotation makes a missing entry a compile error.
  */
 export const PAGES: readonly Page[] = [
+  "assistant",
   "rewrite",
   "dictation",
   "meetings",

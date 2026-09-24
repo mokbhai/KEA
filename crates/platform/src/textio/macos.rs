@@ -431,6 +431,13 @@ impl TextIo for MacTextIo {
     /// over whatever is selected, and at undo time that is either nothing or
     /// something the user selected themselves. Refusing is the only honest
     /// answer when the element will not hand its text back.
+    async fn capture_focused_text(&self) -> Result<String, TextIoError> {
+        tokio::task::spawn_blocking(super::macos_ax::focused_element_text)
+            .await
+            .map_err(|e| TextIoError::Other(format!("focused-text read did not run: {e}")))?
+            .map_err(TextIoError::Other)
+    }
+
     async fn swap_in_focused(&self, from: &str, to: &str) -> Result<(), TextIoError> {
         let (from, to) = (from.to_string(), to.to_string());
         tokio::task::spawn_blocking(move || {

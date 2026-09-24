@@ -52,8 +52,9 @@ use kea_features::tts::run_tts_with_player;
 use kea_features::ProfileOverrides;
 use kea_features::{
     drain_and_stop_meeting, run_meeting_poll_segment, run_meeting_start, ActionGuard,
-    ActiveMeeting, CapKind, ContentStorageOpts, DictationFeature, FeatureRegistry, MeetingFeature,
-    MeetingRunContext, RewriteFeature, TranscribeFeature, TtsFeature,
+    ActiveMeeting, AssistantFeature, CapKind, ContentStorageOpts, DictationFeature,
+    FeatureRegistry, MeetingFeature, MeetingRunContext, RewriteFeature, TranscribeFeature,
+    TtsFeature, ASSISTANT_COMMAND_ID, ASSISTANT_FEATURE_ID,
 };
 use kea_infer::{
     temp_file_for, DownloadTransport, InferError, ModelDownloader, ModelKind, ModelRegistry,
@@ -93,6 +94,9 @@ pub const REWRITE_FEATURE_ID: &str = "rewrite";
 pub const REWRITE_COMMAND_ID: &str = "rewrite_selection";
 
 pub const DICTATION_ACTION_ID: &str = "dictation:push_to_talk";
+/// Action id of the assistant shortcut, derived from its `(feature, command)`
+/// pair like every other row of [`HOTKEY_ACTIONS`].
+pub const ASSISTANT_ACTION_ID: &str = "assistant:ask";
 pub const DICTATION_FEATURE_ID: &str = "dictation";
 pub const DICTATION_COMMAND_ID: &str = "push_to_talk";
 
@@ -163,7 +167,7 @@ impl HotkeyAction {
 /// `set_hotkey`, its rebind cleanup, collision detection and the
 /// effective-hotkey lookup — so adding a feature hotkey is a row here rather
 /// than another arm in five matches.
-pub const HOTKEY_ACTIONS: [HotkeyAction; 7] = [
+pub const HOTKEY_ACTIONS: [HotkeyAction; 8] = [
     HotkeyAction::fixed(REWRITE_FEATURE_ID, REWRITE_COMMAND_ID),
     HotkeyAction::fixed(DICTATION_FEATURE_ID, DICTATION_COMMAND_ID),
     HotkeyAction::fixed(TTS_FEATURE_ID, TTS_COMMAND_ID),
@@ -171,6 +175,7 @@ pub const HOTKEY_ACTIONS: [HotkeyAction; 7] = [
     HotkeyAction::fixed(REWRITE_FEATURE_ID, PALETTE_COMMAND),
     HotkeyAction::fixed(REWRITE_FEATURE_ID, OCR_COMMAND),
     HotkeyAction::fixed(REWRITE_FEATURE_ID, UNDO_COMMAND),
+    HotkeyAction::fixed(ASSISTANT_FEATURE_ID, ASSISTANT_COMMAND_ID),
 ];
 
 /// The command-id prefix of the per-language translate shortcuts.
@@ -199,6 +204,38 @@ pub const LOCK_CANCEL_ACTION_ID: &str = "dictation:cancel_lock";
 /// The accelerator behind [`LOCK_CANCEL_ACTION_ID`]. Not user-rebindable:
 /// "Escape cancels" is the platform convention, not a preference.
 const LOCK_CANCEL_ACCELERATOR: &str = "Escape";
+
+/// Escape, while — and only while — an assistant session is open.
+///
+/// The second instance of the rule [`LOCK_CANCEL_ACTION_ID`] established, and
+/// it is a rule rather than a coincidence: Escape is registered around the run
+/// that can be cancelled and released the moment it ends. Holding it for any
+/// longer takes Escape away from every other application on the Mac, where it
+/// dismisses dialogs, leaves full screen and backs out of half the software
+/// anyone uses.
+///
+/// This is also why an assistant session is a safe place to hold it and a
+/// meeting would not be: a session lasts seconds.
+pub const ASSISTANT_CANCEL_ACTION_ID: &str = "assistant:cancel";
+
+/// Register or release the assistant's Escape binding.
+///
+/// Failure is logged, not propagated: without it Escape does not cancel, and
+/// the session still ends on its own endpoint and its hard cap.
+pub fn set_assistant_cancellable(state: &Arc<AppState>, active: bool) {
+    let mut hotkeys = state.hotkeys.lock().unwrap_or_else(|p| p.into_inner());
+    let binding = HotkeyBinding {
+        accelerator: LOCK_CANCEL_ACCELERATOR.to_string(),
+    };
+    let result = if active {
+        hotkeys.register(binding, ASSISTANT_CANCEL_ACTION_ID.into())
+    } else {
+        hotkeys.unregister(&binding)
+    };
+    if let Err(error) = result {
+        tracing::warn!(%error, active, "could not update the assistant Escape binding");
+    }
+}
 
 /// The descriptor for a `(feature, command)` pair, or `None` when the pair is
 /// not a global hotkey — a binding persisted for some other command, say.
@@ -281,6 +318,7 @@ pub fn feature_registry() -> &'static FeatureRegistry {
         reg.register(Arc::new(MeetingFeature));
         reg.register(Arc::new(TtsFeature));
         reg.register(Arc::new(TranscribeFeature));
+        reg.register(Arc::new(AssistantFeature));
         reg
     })
 }
@@ -7596,6 +7634,19 @@ mod tests {
     }
 
     #[test]
+    fn the_assistant_is_registered_as_a_feature() {
+        // Registration is what makes its hotkey default readable and its
+        // engine slots configurable; an unregistered feature has a shortcut
+        // that resolves to nothing.
+        assert!(feature_registry()
+            .list_ids()
+            .contains(&ASSISTANT_FEATURE_ID.to_string()));
+        assert!(feature_registry()
+            .find_command(ASSISTANT_FEATURE_ID, ASSISTANT_COMMAND_ID)
+            .is_some());
+    }
+
+    #[test]
     fn hotkey_actions_cover_every_declaring_feature_exactly_once() {
         // The table and the features are the same four rows: each descriptor
         // names a command its feature actually declares, and no pair repeats.
@@ -7619,6 +7670,7 @@ mod tests {
                     PALETTE_ACTION_ID,
                     OCR_ACTION_ID,
                     UNDO_ACTION_ID,
+                    ASSISTANT_ACTION_ID,
                 ]
                 .contains(&action.action_id().as_str()),
                 "{} is not one of the declared action ids",
