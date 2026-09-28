@@ -16,6 +16,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Select Xcode 26
+        if: runner.os == 'macOS'
+        run: ./scripts/select_xcode.sh
       - name: Linux Tauri/webkit deps
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -36,6 +39,14 @@ jobs:
         run: cargo test --workspace
       - name: Build app crate
         run: cargo build -p kea-app
+      # The macOS release build enables features the default build leaves off,
+      # and those compile native Swift bridges of their own. Building them here
+      # is what keeps a release tag from being the first place they fail.
+      - name: Build app crate with macOS release features
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p kea-platform --features system-audio-sck
+          cargo build -p kea-app --features updater,whisper-metal,system-audio-sck
 
   smoke-launch:
     runs-on: macos-latest

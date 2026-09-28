@@ -95,6 +95,10 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
+      - name: Select Xcode 26
+        if: runner.os == 'macOS'
+        run: ./scripts/select_xcode.sh
+
       # libfuse2 is not a Tauri dependency but an appimagetool one: the bundler
       # downloads appimagetool and runs it, and on runner images without FUSE
       # that invocation fails with a bare "AppImages require FUSE to run".
