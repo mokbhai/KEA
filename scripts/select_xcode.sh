@@ -13,4 +13,4 @@ if [[ -z "$XCODE" ]]; then
     exit 1
 fi
 sudo xcode-select -s "$XCODE"
-xcodebuild -version
+echo "Selected $XCODE (SDK $(xcrun --show-sdk-version))"

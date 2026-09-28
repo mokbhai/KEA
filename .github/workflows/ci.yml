@@ -33,6 +33,13 @@ jobs:
       # cannot make CI green on a tree that the release build would reject.
       - name: Build UI
         run: cd ui && npm ci && npm run build
+      # The release job's Lint step, run here so a tag is not the first place
+      # it fails.
+      - name: Lint
+        if: runner.os == 'macOS'
+        run: |
+          npm --prefix ui run typecheck
+          ./scripts/check_kea_hygiene.sh
       - name: UI tests
         run: cd ui && npm test
       - name: Rust tests
