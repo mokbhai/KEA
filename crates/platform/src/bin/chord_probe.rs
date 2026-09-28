@@ -10,9 +10,20 @@
 //!
 //! Usage: cargo run -p kea-platform --bin chord-probe [hold_ms]
 
+// A Cargo `[[bin]]` builds on every target, and core-graphics is a macOS-only
+// dependency, so the probe compiles to a stub elsewhere.
+#[cfg(target_os = "macos")]
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType};
+#[cfg(target_os = "macos")]
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("chord-probe posts macOS CGEvents and does nothing on this platform");
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "macos")]
 fn post_flags(source: &CGEventSource, flags: CGEventFlags, label: &str) {
     match CGEvent::new(source.clone()) {
         Ok(event) => {
@@ -25,6 +36,7 @@ fn post_flags(source: &CGEventSource, flags: CGEventFlags, label: &str) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     let hold_ms: u64 = std::env::args()
         .nth(1)

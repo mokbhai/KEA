@@ -711,6 +711,7 @@ mod rect_capture_tests {
         assert!(a.contains(&"-tpng".to_string()));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_degenerate_window_is_not_capturable() {
         use crate::textio::macos_ax::WindowBounds;
