@@ -276,7 +276,12 @@ mod tests {
             },
             &reg(),
         );
-        assert_eq!(p, RequestPlan::Answer { text: "Paris.".into() });
+        assert_eq!(
+            p,
+            RequestPlan::Answer {
+                text: "Paris.".into()
+            }
+        );
         assert!(p.action().is_none());
     }
 
@@ -372,12 +377,7 @@ mod tests {
                 },
                 &reg(),
             ),
-            plan(
-                RoutingOutcome::Unparseable {
-                    reason: "x".into(),
-                },
-                &reg(),
-            ),
+            plan(RoutingOutcome::Unparseable { reason: "x".into() }, &reg()),
         ];
         for p in plans {
             assert!(p.action().is_none(), "{p:?} must not invoke");

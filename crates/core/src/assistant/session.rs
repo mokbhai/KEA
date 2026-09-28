@@ -263,7 +263,10 @@ mod tests {
         s.apply(answered("Paris.", true));
         assert_eq!(
             s.history(),
-            [("what is the capital of france".to_string(), "Paris.".to_string())]
+            [(
+                "what is the capital of france".to_string(),
+                "Paris.".to_string()
+            )]
         );
     }
 

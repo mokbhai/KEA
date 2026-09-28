@@ -674,7 +674,12 @@ mod rect_capture_tests {
     fn a_rect_capture_never_asks_the_user() {
         // `-i` is the crosshair. Its presence here would turn an assistant
         // answering a question into a request to drag a box.
-        let a = args(CaptureRect { x: 0.0, y: 0.0, width: 100.0, height: 50.0 });
+        let a = args(CaptureRect {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 50.0,
+        });
         assert!(!a.contains(&"-i".to_string()), "got {a:?}");
         assert!(a.contains(&"-R".to_string()));
     }
@@ -683,7 +688,12 @@ mod rect_capture_tests {
     fn the_rect_is_passed_as_whole_points() {
         // `screencapture` parses integers and truncates silently, so rounding
         // here is what keeps a half-point window from shifting the capture.
-        let a = args(CaptureRect { x: 10.4, y: 20.6, width: 100.5, height: 50.4 });
+        let a = args(CaptureRect {
+            x: 10.4,
+            y: 20.6,
+            width: 100.5,
+            height: 50.4,
+        });
         let i = a.iter().position(|s| s == "-R").unwrap();
         assert_eq!(a[i + 1], "10,21,101,50");
     }
@@ -692,18 +702,38 @@ mod rect_capture_tests {
     fn the_output_format_is_forced_to_png() {
         // The image size is read from the PNG header downstream, so a machine
         // configured for JPEG would otherwise break OCR geometry.
-        let a = args(CaptureRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 });
+        let a = args(CaptureRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        });
         assert!(a.contains(&"-tpng".to_string()));
     }
 
     #[test]
     fn a_degenerate_window_is_not_capturable() {
         use crate::textio::macos_ax::WindowBounds;
-        let zero = WindowBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        let zero = WindowBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        };
         assert!(!zero.is_capturable());
-        let minimised = WindowBounds { x: 0.0, y: 0.0, width: 800.0, height: 0.0 };
+        let minimised = WindowBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 0.0,
+        };
         assert!(!minimised.is_capturable());
-        let real = WindowBounds { x: 0.0, y: 0.0, width: 800.0, height: 600.0 };
+        let real = WindowBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+        };
         assert!(real.is_capturable());
     }
 }

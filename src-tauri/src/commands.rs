@@ -7440,8 +7440,8 @@ mod tests {
             "{copy:?} does not parse"
         );
         for action in HOTKEY_ACTIONS {
-            let accel = compiled_default_accelerator(action.feature, &action.command)
-                .unwrap_or_default();
+            let accel =
+                compiled_default_accelerator(action.feature, &action.command).unwrap_or_default();
             assert!(
                 !same_accelerator(&accel, &copy),
                 "{} shares the assistant's copy key",

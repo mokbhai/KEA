@@ -1893,16 +1893,16 @@ mod tests {
         let mut audio = crate::commands::ReplayAudioIo::new(spoken_pcm(16_000, 2.0));
 
         let capture = capture_turn(
-                &mut audio,
-                None,
-                &h.cancel,
-                &h.submit,
-                &h.answer_store,
-                &h.surface,
-                &*h.speaker,
-            )
-            .await
-            .expect("a replayed buffer captures");
+            &mut audio,
+            None,
+            &h.cancel,
+            &h.submit,
+            &h.answer_store,
+            &h.surface,
+            &*h.speaker,
+        )
+        .await
+        .expect("a replayed buffer captures");
 
         let asked = h
             .turn(&mut Session::new(), capture)

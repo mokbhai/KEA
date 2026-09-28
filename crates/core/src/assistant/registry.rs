@@ -144,7 +144,11 @@ mod tests {
         // The description is the only thing telling the model when to pick this
         // action over answering, so an empty one silently degrades routing.
         for spec in CATALOG {
-            assert!(!spec.description.is_empty(), "{} has no description", spec.id);
+            assert!(
+                !spec.description.is_empty(),
+                "{} has no description",
+                spec.id
+            );
             assert!(!spec.title.is_empty(), "{} has no title", spec.id);
         }
     }

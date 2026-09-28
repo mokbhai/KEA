@@ -174,8 +174,7 @@ pub fn sync_visibility(app: &AppHandle, state: DictationState) {
 /// A process-global rather than a field on the app state because the only
 /// reader is [`sync_visibility`], a free function the dictation path calls
 /// without a handle to anything else.
-static ASSISTANT_OVERLAY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static ASSISTANT_OVERLAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn assistant_owns_overlay() -> bool {
     ASSISTANT_OVERLAY.load(std::sync::atomic::Ordering::Relaxed)

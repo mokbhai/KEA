@@ -8,9 +8,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use kea_core::assistant::dispatch::{
-    ActionFailure, ActionHandler, ActionOutcome, Disclosure,
-};
+use kea_core::assistant::dispatch::{ActionFailure, ActionHandler, ActionOutcome, Disclosure};
 use kea_core::assistant::ResolvedArgs;
 use kea_platform::apps::{AppLaunchError, AppLauncher};
 use kea_platform::screen::ScreenReader;

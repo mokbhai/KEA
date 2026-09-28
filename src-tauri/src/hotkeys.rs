@@ -29,10 +29,9 @@ use crate::commands::{
     record_hotkey_reg_status, register_hotkey, resolve_accelerator, run_dictation_action,
     run_selection_rewrite, start_meeting_inner, stop_meeting_inner, try_acquire_busy,
     undo_last_rewrite, BusyGuard, HotkeyAction, MeetingHotkeyAction, RewriteOverride,
-    ASSISTANT_ACTION_ID, ASSISTANT_CANCEL_ACTION_ID, ASSISTANT_COPY_ACTION_ID,
-    DICTATION_ACTION_ID, HOTKEY_ACTIONS, LOCK_CANCEL_ACTION_ID,
-    MEETINGS_ACTION_ID, OCR_ACTION_ID, PALETTE_ACTION_ID, REWRITE_ACTION_ID, TTS_ACTION_ID,
-    UNDO_ACTION_ID,
+    ASSISTANT_ACTION_ID, ASSISTANT_CANCEL_ACTION_ID, ASSISTANT_COPY_ACTION_ID, DICTATION_ACTION_ID,
+    HOTKEY_ACTIONS, LOCK_CANCEL_ACTION_ID, MEETINGS_ACTION_ID, OCR_ACTION_ID, PALETTE_ACTION_ID,
+    REWRITE_ACTION_ID, TTS_ACTION_ID, UNDO_ACTION_ID,
 };
 use crate::events::{
     emit_meeting_error, emit_rewrite_error, emit_rewrite_progress, emit_tts_error,

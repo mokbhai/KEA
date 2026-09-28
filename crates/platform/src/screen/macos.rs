@@ -66,11 +66,10 @@ use objc2::{class, msg_send};
 use objc2_foundation::{NSRect, NSString};
 
 use super::{
-    capture_parent_dir, classify_capture, png_dimensions, screencapture_args,
-    observations_to_text, screencapture_rect_args, CaptureOutcome, CaptureRect, CapturedImage,
-    ScreenReader,
-    CaptureSlot, CaptureVerdict, NormalizedRect, Observation, OcrOptions, ScreenCapture,
-    ScreenError, TextRecognizer,
+    capture_parent_dir, classify_capture, observations_to_text, png_dimensions, screencapture_args,
+    screencapture_rect_args, CaptureOutcome, CaptureRect, CaptureSlot, CaptureVerdict,
+    CapturedImage, NormalizedRect, Observation, OcrOptions, ScreenCapture, ScreenError,
+    ScreenReader, TextRecognizer,
 };
 
 /// Always the absolute path: a capture must never resolve through `PATH`,
@@ -582,8 +581,8 @@ impl Default for MacScreenReader {
 #[async_trait]
 impl ScreenReader for MacScreenReader {
     async fn read_focused_window(&self) -> Result<String, ScreenError> {
-        let bounds = crate::textio::macos_ax::focused_window_bounds()
-            .map_err(ScreenError::Unavailable)?;
+        let bounds =
+            crate::textio::macos_ax::focused_window_bounds().map_err(ScreenError::Unavailable)?;
 
         if !bounds.is_capturable() {
             return Err(ScreenError::Unavailable(

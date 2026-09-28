@@ -117,7 +117,10 @@ pub fn build_routing_prompt(
         p.push_str("  (none — always answer)\n");
     }
     for spec in registry.list() {
-        p.push_str(&format!("- id: {}\n  when: {}\n", spec.id, spec.description));
+        p.push_str(&format!(
+            "- id: {}\n  when: {}\n",
+            spec.id, spec.description
+        ));
         if spec.args.is_empty() {
             p.push_str("  args: none\n");
         } else {
@@ -127,7 +130,11 @@ pub fn build_routing_prompt(
                     "    - {} ({}{})\n",
                     a.name,
                     a.ty.as_str(),
-                    if a.required { ", required" } else { ", optional" }
+                    if a.required {
+                        ", required"
+                    } else {
+                        ", optional"
+                    }
                 ));
             }
         }
@@ -156,10 +163,7 @@ fn unfence(s: &str) -> &str {
     };
     // Drop an optional language tag on the opening fence.
     let rest = rest.split_once('\n').map(|(_, r)| r).unwrap_or(rest);
-    rest.trim_end()
-        .strip_suffix("```")
-        .unwrap_or(rest)
-        .trim()
+    rest.trim_end().strip_suffix("```").unwrap_or(rest).trim()
 }
 
 /// Find the outermost JSON object in `s`.
@@ -384,7 +388,10 @@ mod tests {
         let out = route(&engine, &binding(), &reg(), "capital of france", &[])
             .await
             .unwrap();
-        assert!(out.is_success(), "answering must not be reported as failure");
+        assert!(
+            out.is_success(),
+            "answering must not be reported as failure"
+        );
         assert!(!out.invokes_action());
     }
 
@@ -397,7 +404,11 @@ mod tests {
         let p = build_routing_prompt(&reg(), "open mail", &[]);
         for spec in CATALOG {
             assert!(p.contains(spec.id), "{} missing from prompt", spec.id);
-            assert!(p.contains(spec.description), "{} description missing", spec.id);
+            assert!(
+                p.contains(spec.description),
+                "{} description missing",
+                spec.id
+            );
         }
         assert!(p.contains("app (text, required)"));
         assert!(p.contains("style (text, optional)"));
