@@ -518,24 +518,29 @@ mod tests {
 
     #[test]
     fn transcribe_paths_outside_the_home_are_refused() {
-        let home = Path::new("/Users/kea");
+        // `/Users/kea` has no drive letter, so it is not absolute on Windows
+        // and every path would be refused for the wrong reason.
+        let root = if cfg!(windows) { "C:\\" } else { "/" };
+        let abs = |p: &str| std::path::PathBuf::from(format!("{root}{p}"));
+        let home = abs("Users/kea");
+        let home = home.as_path();
         assert!(transcribe_path_allowed(
-            Path::new("/Users/kea/Recordings/a.m4a"),
+            &abs("Users/kea/Recordings/a.m4a"),
             home
         ));
-        assert!(!transcribe_path_allowed(Path::new("/etc/passwd"), home));
+        assert!(!transcribe_path_allowed(&abs("etc/passwd"), home));
         assert!(!transcribe_path_allowed(
             Path::new("Recordings/a.m4a"),
             home
         ));
         assert!(!transcribe_path_allowed(
-            Path::new("/Users/kea/../root/a.m4a"),
+            &abs("Users/kea/../root/a.m4a"),
             home
         ));
         // A sibling whose name merely starts with the home directory's is not
         // inside it; `starts_with` compares components, not bytes.
         assert!(!transcribe_path_allowed(
-            Path::new("/Users/kea-backup/a.m4a"),
+            &abs("Users/kea-backup/a.m4a"),
             home
         ));
     }
