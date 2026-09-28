@@ -28,6 +28,11 @@ tts-system = ["kea-engines/tts-system"]
 # builds everywhere so the workspace has one feature set.
 stt-apple = ["kea-engines/stt-apple"]
 sherpa = ["kea-infer/sherpa"]
+# ScreenCaptureKit system audio for meetings. macOS-only, so selected by host
+# in the Makefile and per-runner in release.yml like `whisper-metal`. Without
+# it a meeting records the mic alone, which only hears the other side when
+# it leaks out of the speakers — never through headphones.
+system-audio-sck = ["kea-platform/system-audio-sck"]
 
 # macOS only, and only for the dictation overlay: tao exposes
 # `visible_on_all_workspaces`, which sets NSWindowCollectionBehaviorCanJoinAllSpaces

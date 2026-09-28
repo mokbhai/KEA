@@ -153,7 +153,7 @@ jobs:
       # whisper.cpp's Metal backend is macOS-only, so it is selected per runner
       # rather than in the crate's default features, which Linux and Windows share.
       - name: Build and package release artifacts
-        run: ./scripts/package_release.sh --features "updater${{ runner.os == 'macOS' && ',whisper-metal' || '' }}"
+        run: ./scripts/package_release.sh --features "updater${{ runner.os == 'macOS' && ',whisper-metal,system-audio-sck' || '' }}"
 
       # Catches the case where the bundler silently produced no signature — an
       # unsigned release still yields installers, so without this check the job

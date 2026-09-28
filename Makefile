@@ -17,7 +17,7 @@ TAURI_BUILD_FLAGS ?=
 # release workflow makes the same choice per runner (.github/workflows/release.yml).
 # Override with `make build HOST_FEATURES=` to force a CPU build.
 ifeq ($(shell uname -s),Darwin)
-HOST_FEATURES ?= whisper-metal
+HOST_FEATURES ?= whisper-metal,system-audio-sck
 else
 HOST_FEATURES ?=
 endif
