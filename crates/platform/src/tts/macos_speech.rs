@@ -135,7 +135,11 @@ struct Rendered {
 
 fn find_voice(identifier: &str) -> Option<Retained<AVSpeechSynthesisVoice>> {
     let ns = NSString::from_str(identifier);
+    // Not always nil for an unknown identifier: on some macOS installs (the
+    // macos-15 CI image) it hands back a fallback voice, which would then be
+    // used silently in place of the one asked for.
     unsafe { AVSpeechSynthesisVoice::voiceWithIdentifier(&ns) }
+        .filter(|voice| unsafe { voice.identifier() }.to_string() == identifier)
 }
 
 /// Renders one utterance, blocking until the synthesizer signals the end of
