@@ -10,8 +10,8 @@
 
 ## 2. Chat core (pure)
 
-- [ ] 2.1 `kea_core::meetings::chat::build_chat_request` per design.md decision 4 (untrusted blocks, 20-message window, `allow_edits` wording, literal JSON example, `truncated`); verify tests that the transcript and notes are in tagged blocks, that edits are not invited when `allow_edits` is false, and that `truncated` is set past the cap
-- [ ] 2.2 `parse_chat_reply` with the prose fallback and identical-proposal drop; verify tests for valid JSON, fenced JSON, prose, a proposal equal to the current notes, and a proposal with missing sections (missing means unchanged)
+- [x] 2.1 `kea_core::meetings::chat::build_chat_request` per design.md decision 4 (untrusted blocks, 20-message window, `allow_edits` wording, literal JSON example, `truncated`); verify tests that the transcript and notes are in tagged blocks, that edits are not invited when `allow_edits` is false, and that `truncated` is set past the cap
+- [x] 2.2 `parse_chat_reply` with the prose fallback and identical-proposal drop; verify tests for valid JSON, fenced JSON, prose, a proposal equal to the current notes, and a proposal with missing sections (missing means unchanged)
 
 ## 3. Feature and commands
 
