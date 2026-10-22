@@ -13,8 +13,8 @@ use kea_core::resolve::SlotResolver;
 use kea_core::store::actions::{ActionRepo, ActionStatus, NewAction};
 use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_core::store::meetings::{
-    ActionItem, CaptureMode, Meeting, MeetingDetail, MeetingNotes, MeetingRepo, MeetingSpeaker,
-    MeetingStatus, NewActionItem, NewMeeting, NewSegment, TitleSource,
+    ActionItem, ActionItemStatus, CaptureMode, Meeting, MeetingDetail, MeetingNotes, MeetingRepo,
+    MeetingSpeaker, MeetingStatus, NewActionItem, NewMeeting, NewSegment, TitleSource,
 };
 use kea_core::store::usage::{NewUsageEvent, UsageRepo};
 use kea_core::store::vocabulary::VocabularyEntry;
@@ -305,6 +305,10 @@ fn unparsable_reply_text(error: &str) -> Option<&str> {
 /// Turn parsed notes into the row to store, and persist the action items as
 /// rows at the same time.
 ///
+/// `source_seq` is the last segment sequence the pass had read; it is stamped
+/// on any item the pass adds, and is what marks a row as the model's to
+/// reconcile on a later pass rather than the user's.
+///
 /// The rows are the source of truth and `meeting_notes.action_items` is a
 /// derived view of them, re-rendered on every write, so `MeetingDetail` and
 /// anything else reading the column keeps working and a meeting recorded
@@ -315,6 +319,7 @@ async fn persist_notes(
     parsed: &ParsedMeetingNotes,
     prompt_version: &str,
     binding: &Binding,
+    source_seq: i64,
 ) -> Result<MeetingNotes, String> {
     let incoming: Vec<NewActionItem> = parsed
         .action_item_rows()
@@ -328,7 +333,7 @@ async fn persist_notes(
         .collect();
 
     let rows = meetings
-        .merge_action_items(meeting_id, &incoming)
+        .reconcile_action_items(meeting_id, &incoming, source_seq)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -485,7 +490,20 @@ pub async fn run_interim_notes_pass(
             action_items: n.action_items.clone(),
             follow_ups: n.follow_ups.clone(),
             open_questions: n.open_questions.clone(),
-            action_item_rows: Vec::new(),
+            // The rows, not just the prose column rendered from them. Given
+            // only prose ("Send the deck — Priya (by Friday)") the model
+            // re-derives every item each pass, and each rewording used to
+            // land as another row.
+            action_item_rows: detail
+                .action_items
+                .iter()
+                .filter(|row| row.status == ActionItemStatus::Open)
+                .map(|row| kea_core::meetings::ParsedActionItem {
+                    text: row.text.clone(),
+                    owner: row.owner.clone(),
+                    due_hint: row.due_hint.clone(),
+                })
+                .collect(),
         })
         .unwrap_or_default();
 
@@ -512,6 +530,7 @@ pub async fn run_interim_notes_pass(
         &parsed,
         MEETING_INTERIM_PROMPT_VERSION,
         &binding,
+        (next_sequence - 1) as i64,
     )
     .await?;
 
@@ -1111,6 +1130,12 @@ async fn finalize_meeting(
         &parsed,
         MEETING_NOTES_PROMPT_VERSION,
         &binding,
+        partial
+            .segments
+            .iter()
+            .map(|s| s.sequence as i64)
+            .max()
+            .unwrap_or(0),
     )
     .await?;
 
@@ -2324,6 +2349,7 @@ mod item_16_17_tests {
             &parsed,
             MEETING_NOTES_PROMPT_VERSION,
             &binding,
+            0,
         )
         .await
         .unwrap();
@@ -2391,6 +2417,50 @@ mod item_16_17_tests {
         assert!(prompts[1].contains("closing remarks"));
         assert!(!prompts[1].contains("opening remarks"));
         assert!(prompts[1].contains("first half"));
+    }
+
+    /// The bug a user reported as "every item four times over": each pass
+    /// restated the same tasks in new words, and each wording became a row.
+    #[tokio::test]
+    async fn repeated_interim_passes_keep_one_row_per_task() {
+        let llm = RecordingLlm::new(&[
+            r#"{"summary":"s","decisions":"","action_items":"","follow_ups":"","open_questions":"","action_item_rows":[{"text":"Grant Confluence access","owner":"Onboarding lead","due_hint":"in progress now"}]}"#,
+            r#"{"summary":"s","decisions":"","action_items":"","follow_ups":"","open_questions":"","action_item_rows":[{"text":"Grant Confluence access; it will take a while to come through","owner":"Onboarding lead","due_hint":"in progress now"},{"text":"Schedule a meeting with Dan","owner":"Onboarding lead","due_hint":"for next Monday"}]}"#,
+        ]);
+        let (reg, bindings, _, meetings) = world(llm.clone()).await;
+        recording_meeting(&meetings, "m1", &["I'm granting Confluence now"]).await;
+
+        let first = run_interim_notes_pass(&reg, &bindings, &meetings, "m1", 0, None)
+            .await
+            .unwrap();
+        meetings
+            .append_segment(
+                "m1",
+                &NewSegment {
+                    sequence: 1,
+                    start_offset_ms: 30_000,
+                    end_offset_ms: 60_000,
+                    text: "it takes a while; I'll set you up with Dan on Monday".into(),
+                    speaker: Some(SpeakerChannel::Local),
+                },
+            )
+            .await
+            .unwrap();
+        run_interim_notes_pass(&reg, &bindings, &meetings, "m1", first.next_sequence, None)
+            .await
+            .unwrap();
+
+        let rows = meetings.action_items("m1").await.unwrap();
+        let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "Grant Confluence access; it will take a while to come through",
+                "Schedule a meeting with Dan",
+            ]
+        );
+        // The second pass was shown the list it had to carry forward.
+        assert!(llm.prompts()[1].contains(r#""text":"Grant Confluence access""#));
     }
 
     /// Nothing new means nothing to pay for.

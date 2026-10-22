@@ -289,8 +289,10 @@ pub struct ActionItem {
     pub owner: Option<String>,
     /// Verbatim from the transcript ("by Friday"), never resolved to a date.
     pub due_hint: Option<String>,
-    /// The `meeting_segments.sequence` the item was first seen in, so a later
-    /// pass can show where it came from. `None` for a hand-added item.
+    /// The last `meeting_segments.sequence` the pass that first wrote the item
+    /// had read, so a later pass can show roughly where it came from. `None`
+    /// for a hand-added item, which is also what keeps a later pass from
+    /// rewording or removing it.
     pub source_seq: Option<i64>,
     #[sqlx(try_from = "String")]
     pub status: ActionItemStatus,
@@ -353,6 +355,20 @@ pub fn normalize_action_key(text: &str) -> String {
         .join(" ")
         .trim_end_matches(['.', '!', ';', ':'])
         .to_string()
+}
+
+/// Whether two [`normalize_action_key`] keys name the same task.
+///
+/// Equal keys do, and so does a key that extends the other at a word
+/// boundary: a fold restating "grant confluence access" as "grant confluence
+/// access; it will take a while to come through" has added detail, not a task.
+pub fn same_action(a: &str, b: &str) -> bool {
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if short.is_empty() {
+        return false;
+    }
+    long.strip_prefix(short)
+        .is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_alphanumeric()))
 }
 
 pub struct MeetingRepo {
@@ -634,35 +650,103 @@ impl MeetingRepo {
         Ok(())
     }
 
-    /// Fold a synthesis pass's action items into the table, inserting only
-    /// what is not already there and returning the resulting rows.
+    /// Reconcile the table with a synthesis pass's action items and return the
+    /// resulting rows.
     ///
-    /// Insert-only, deliberately. Interim notes re-derive the whole list on
-    /// every pass, so a delete-and-rewrite would resurrect items the user had
-    /// already ticked off and would drop anything the fold compressed out of a
-    /// later pass. Matching is on [`normalize_action_key`], which is what
-    /// makes "Send the deck." and "send the deck" one item rather than two.
-    pub async fn merge_action_items(
+    /// Each pass re-derives the whole list, so the latest pass is the source
+    /// of truth for every row the model wrote and nobody has touched: such a
+    /// row is reworded in place when the pass restated it, and deleted when
+    /// the pass no longer lists it. Insert-only used to be the rule here, and
+    /// it kept every rewording of every task — "Grant Confluence access" and
+    /// "Grant Confluence access; it will take a while" became two rows, and a
+    /// long meeting ended with each item four times over.
+    ///
+    /// Two kinds of row are the user's and are never rewritten or removed: a
+    /// row that is no longer open (ticked off or dropped — deleting it would
+    /// resurrect it as a fresh open row on the next pass) and a hand-added
+    /// row, which is the one with no `source_seq`. An incoming item that
+    /// matches one of those is skipped rather than added a second time.
+    ///
+    /// Matching is [`same_action`], so "Send the deck." and "send the deck"
+    /// are one item, and so is a restatement that only adds detail.
+    pub async fn reconcile_action_items(
         &self,
         meeting_id: &str,
         incoming: &[NewActionItem],
+        source_seq: i64,
     ) -> Result<Vec<ActionItem>, KeaError> {
         let existing = self.action_items(meeting_id).await?;
-        let mut seen: Vec<String> = existing
+        let existing_keys: Vec<String> = existing
             .iter()
             .map(|row| normalize_action_key(&row.text))
             .collect();
+        let is_model_row =
+            |row: &ActionItem| row.status == ActionItemStatus::Open && row.source_seq.is_some();
+
+        let mut kept = vec![false; existing.len()];
+        let mut seen: Vec<String> = Vec::new();
+        let mut tx = self.pool.begin().await?;
 
         for item in incoming {
             let key = normalize_action_key(&item.text);
-            // An empty key is a blank line the model emitted, not an item.
-            if key.is_empty() || seen.contains(&key) {
+            // An empty key is a blank line the model emitted, not an item, and
+            // a key already handled this pass is the model repeating itself.
+            if key.is_empty() || seen.iter().any(|s| same_action(s, &key)) {
                 continue;
             }
-            self.add_action_item(meeting_id, item).await?;
-            seen.push(key);
+            seen.push(key.clone());
+
+            let matched = existing_keys
+                .iter()
+                .enumerate()
+                .find(|(i, k)| !kept[*i] && same_action(k, &key))
+                .map(|(i, _)| i);
+
+            match matched {
+                Some(i) => {
+                    kept[i] = true;
+                    let row = &existing[i];
+                    if is_model_row(row) {
+                        sqlx::query(
+                            "UPDATE meeting_action_items SET text = ?, owner = ?, due_hint = ?
+                             WHERE id = ?",
+                        )
+                        .bind(&item.text)
+                        .bind(&item.owner)
+                        .bind(&item.due_hint)
+                        .bind(row.id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+                None => {
+                    sqlx::query(
+                        "INSERT INTO meeting_action_items(
+                            meeting_id, text, owner, due_hint, source_seq, status
+                        ) VALUES (?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(meeting_id)
+                    .bind(&item.text)
+                    .bind(&item.owner)
+                    .bind(&item.due_hint)
+                    .bind(source_seq)
+                    .bind(ActionItemStatus::Open.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
         }
 
+        for (row, kept) in existing.iter().zip(&kept) {
+            if !kept && is_model_row(row) {
+                sqlx::query("DELETE FROM meeting_action_items WHERE id = ?")
+                    .bind(row.id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        tx.commit().await?;
         self.action_items(meeting_id).await
     }
 
@@ -1041,64 +1125,158 @@ mod tests {
         assert_eq!(normalize_action_key("   "), "");
     }
 
-    /// The whole reason `merge_action_items` is insert-only: a second pass
-    /// must not resurrect what the user has already ticked off.
+    #[test]
+    fn a_restatement_that_adds_detail_is_the_same_action() {
+        assert!(same_action(
+            "grant confluence access",
+            "grant confluence access"
+        ));
+        assert!(same_action(
+            "grant confluence access",
+            "grant confluence access; it will take a while to come through"
+        ));
+        assert!(same_action(
+            "bookmark sonar, confluence, bitbucket, and jenkins, including the links the lead sent",
+            "bookmark sonar, confluence, bitbucket, and jenkins"
+        ));
+        // A word boundary, not a character one.
+        assert!(!same_action("send the deck", "send the decks"));
+        assert!(!same_action("", "send the deck"));
+        assert!(!same_action("book the room", "send the deck"));
+    }
+
+    fn item(text: &str) -> NewActionItem {
+        NewActionItem {
+            text: text.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Every interim pass re-derives the whole list, rewording as it goes.
+    /// The table must end each pass holding that list once, not every
+    /// wording the meeting ever produced.
     #[tokio::test]
-    async fn a_second_pass_neither_duplicates_nor_resurrects_an_item() {
+    async fn a_later_pass_rewords_in_place_instead_of_adding_a_copy() {
         let (_pool, repo) = seeded("m12").await;
         let first = repo
-            .merge_action_items(
+            .reconcile_action_items(
                 "m12",
                 &[
                     NewActionItem {
-                        text: "Send the deck".into(),
-                        owner: Some("Priya".into()),
-                        due_hint: Some("by Friday".into()),
-                        source_seq: Some(3),
+                        text: "Grant Confluence access".into(),
+                        owner: Some("Onboarding lead".into()),
+                        due_hint: Some("in progress now".into()),
+                        source_seq: None,
                     },
-                    NewActionItem {
-                        text: "Book the room".into(),
-                        ..Default::default()
-                    },
+                    item("Sync with Dan on the DevOps project"),
                 ],
+                3,
             )
             .await
             .unwrap();
         assert_eq!(first.len(), 2);
-        assert_eq!(first[0].owner.as_deref(), Some("Priya"));
-        assert_eq!(first[0].due_hint.as_deref(), Some("by Friday"));
         assert_eq!(first[0].source_seq, Some(3));
 
-        repo.set_action_item_status(first[0].id, ActionItemStatus::Done)
-            .await
-            .unwrap();
-
         let second = repo
-            .merge_action_items(
+            .reconcile_action_items(
                 "m12",
                 &[
-                    // Re-worded by the fold, same task.
-                    NewActionItem {
-                        text: "- send the deck.".into(),
-                        ..Default::default()
-                    },
-                    NewActionItem {
-                        text: "Book the room".into(),
-                        ..Default::default()
-                    },
-                    NewActionItem {
-                        text: "Draft the summary".into(),
-                        ..Default::default()
-                    },
+                    item("Grant Confluence access; it will take a while to come through"),
+                    item("- sync with Dan on the DevOps project."),
+                    item("Send the onboarding documentation"),
+                    // The model repeating itself within one reply.
+                    item("Send the onboarding documentation"),
                     // A blank line is not an item.
                     NewActionItem::default(),
                 ],
+                7,
             )
             .await
             .unwrap();
         assert_eq!(second.len(), 3);
-        assert_eq!(second[0].status, ActionItemStatus::Done);
-        assert_eq!(second[2].text, "Draft the summary");
+        // Same row, newest wording, original position.
+        assert_eq!(second[0].id, first[0].id);
+        assert_eq!(
+            second[0].text,
+            "Grant Confluence access; it will take a while to come through"
+        );
+        assert_eq!(second[0].source_seq, Some(3));
+        assert_eq!(second[1].id, first[1].id);
+        assert_eq!(second[2].text, "Send the onboarding documentation");
+        assert_eq!(second[2].source_seq, Some(7));
+    }
+
+    /// A model row the latest pass no longer lists was folded into another
+    /// item or turned out not to be a task; keeping it is how duplicates pile
+    /// up.
+    #[tokio::test]
+    async fn a_model_row_the_latest_pass_drops_is_removed() {
+        let (_pool, repo) = seeded("m14").await;
+        repo.reconcile_action_items(
+            "m14",
+            &[
+                item("Put email address in the chat"),
+                item("Send email address in chat for system permissions"),
+            ],
+            1,
+        )
+        .await
+        .unwrap();
+        let rows = repo
+            .reconcile_action_items(
+                "m14",
+                &[item("Send email address in chat for system permissions")],
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].text,
+            "Send email address in chat for system permissions"
+        );
+    }
+
+    /// What the user has touched is theirs: a pass must neither resurrect a
+    /// ticked-off item, nor reword it, nor delete a hand-added one.
+    #[tokio::test]
+    async fn a_pass_leaves_ticked_and_hand_added_rows_alone() {
+        let (_pool, repo) = seeded("m15").await;
+        let first = repo
+            .reconcile_action_items("m15", &[item("Send the deck"), item("Book the room")], 1)
+            .await
+            .unwrap();
+        repo.set_action_item_status(first[0].id, ActionItemStatus::Done)
+            .await
+            .unwrap();
+        repo.set_action_item_status(first[1].id, ActionItemStatus::Dropped)
+            .await
+            .unwrap();
+        repo.add_action_item("m15", &item("Call the venue"))
+            .await
+            .unwrap();
+
+        let rows = repo
+            .reconcile_action_items(
+                "m15",
+                &[item("Send the deck by Friday"), item("Draft the summary")],
+                4,
+            )
+            .await
+            .unwrap();
+        let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "Send the deck",
+                "Book the room",
+                "Call the venue",
+                "Draft the summary"
+            ]
+        );
+        assert_eq!(rows[0].status, ActionItemStatus::Done);
+        assert_eq!(rows[1].status, ActionItemStatus::Dropped);
+        assert_eq!(rows[2].source_seq, None);
     }
 
     #[tokio::test]
