@@ -1,18 +1,24 @@
-//! The loopback HTTP server: one unix socket, six routes, one loop.
+//! The loopback HTTP server: one route table, two possible listeners.
 //!
 //! Modelled on [`crate::hotkeys`] — a table of routes and a dispatch loop —
 //! for the same reason that module exists: the per-route parts of a request
 //! belong next to the table that names them, and the composition root stays
 //! composition.
 //!
-//! The security argument for the whole feature lives in [`super::auth`]. The
-//! short version is that this listens on a **unix domain socket** at mode
-//! `0600` under the app data directory, never on a TCP port: a socket file
-//! gets filesystem access control for free and has no URL, so no web page can
-//! reach it and DNS rebinding has nothing to rebind. `curl --unix-socket`
-//! covers every scripting client that a port would have.
+//! The default listener is a **unix domain socket** at mode `0600` under the
+//! app data directory: a socket file gets filesystem access control for free
+//! and has no URL, so no web page can reach it. The second listener is an
+//! opt-in `127.0.0.1` TCP port for SDKs that can only be pointed at a URL. It
+//! runs the same service function as the socket, so routes, auth and limits are
+//! the same on both. [`LoopbackPort`] is what keeps it on loopback: it cannot
+//! be built from anything but a port number.
+//!
+//! The security argument for the whole feature, and what the port gives back,
+//! lives in [`super::auth`].
 
 use std::convert::Infallible;
+use std::future::Future;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -20,8 +26,10 @@ use std::time::Instant;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
+use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tauri::AppHandle;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
 use super::actions::{DictationVerb, KeaAction, RewriteRequest};
@@ -203,20 +211,204 @@ struct Runtime {
     limiter: Arc<Mutex<TokenBucket>>,
 }
 
+/// A loopback TCP port: the only kind of TCP address the API listens on.
+///
+/// A type rather than a `SocketAddr` parameter so the rule is enforced where
+/// the address is built. There is no constructor that takes a host, so a
+/// non-loopback bind cannot be written at a call site, only argued for in a
+/// change to this file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopbackPort(u16);
+
+impl LoopbackPort {
+    /// Port `0` asks the OS for a free one. Tests use it; the settings never
+    /// store it.
+    pub fn new(port: u16) -> Self {
+        Self(port)
+    }
+
+    pub fn port(self) -> u16 {
+        self.0
+    }
+
+    pub fn addr(self) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], self.0))
+    }
+}
+
+/// A running loopback TCP listener.
+pub struct TcpHandle {
+    shutdown: watch::Sender<bool>,
+    /// The address actually bound. It differs from the requested one only when
+    /// port `0` was asked for.
+    pub addr: SocketAddr,
+    task: tauri::async_runtime::JoinHandle<()>,
+}
+
+impl TcpHandle {
+    /// Stop accepting, and return once the listener has closed, so the port is
+    /// free for the next bind. Connections already accepted are not waited for
+    /// here: each finishes the request it is serving and then closes.
+    pub async fn stop(self) {
+        self.shutdown.send_replace(true);
+        let _ = self.task.await;
+    }
+}
+
 /// A running server. Dropping the handle does not stop it; [`Self::stop`]
 /// does, so turning the API off is an explicit act with a tidy-up.
 pub struct ServerHandle {
     shutdown: watch::Sender<bool>,
-    pub socket_path: PathBuf,
+    /// `None` only in the non-unix build, which runs the TCP port alone.
+    pub socket_path: Option<PathBuf>,
+    rt: Runtime,
+    /// Behind an async lock because the port is bound and released while the
+    /// settings page waits on it, and a std lock cannot be held across that.
+    tcp: tokio::sync::Mutex<Option<TcpHandle>>,
 }
 
 impl ServerHandle {
-    pub fn stop(&self) {
-        let _ = self.shutdown.send(true);
-        // Best effort: the accept loop unlinks too, but a listener that is
-        // already gone leaves the file behind and the next bind would have to
-        // clear it.
-        let _ = std::fs::remove_file(&self.socket_path);
+    /// Stop the socket and the TCP port.
+    ///
+    /// The socket file is removed as a best effort: the accept loop unlinks it
+    /// too, but a listener that is already gone leaves it behind and the next
+    /// bind would have to clear it.
+    pub async fn stop(&self) {
+        self.shutdown.send_replace(true);
+        if let Some(path) = &self.socket_path {
+            let _ = std::fs::remove_file(path);
+        }
+        let previous = self.tcp.lock().await.take();
+        if let Some(tcp) = previous {
+            tcp.stop().await;
+        }
+    }
+
+    /// The address the TCP port is listening on, or `None` if it is off.
+    pub async fn tcp_addr(&self) -> Option<SocketAddr> {
+        self.tcp.lock().await.as_ref().map(|tcp| tcp.addr)
+    }
+
+    /// Start, move or stop the TCP port on a running server. The socket is not
+    /// touched.
+    ///
+    /// The old listener closes before the new one binds, so binding the same
+    /// port again works. If the bind fails, the port is left off and the error
+    /// is returned; the socket keeps serving.
+    pub async fn set_tcp(&self, port: Option<LoopbackPort>) -> Result<Option<SocketAddr>, String> {
+        let mut slot = self.tcp.lock().await;
+        if let Some(previous) = slot.take() {
+            previous.stop().await;
+        }
+        let Some(port) = port else {
+            return Ok(None);
+        };
+        let listener = bind_tcp(port).await?;
+        let rt = self.rt.clone();
+        let tcp = spawn_tcp_loop(listener, move |req| handle(rt.clone(), req))?;
+        let addr = tcp.addr;
+        *slot = Some(tcp);
+        Ok(Some(addr))
+    }
+}
+
+/// Bind the loopback port.
+///
+/// A port already in use is the common failure, and the message names the
+/// address so the settings page can show it.
+async fn bind_tcp(port: LoopbackPort) -> Result<TcpListener, String> {
+    TcpListener::bind(port.addr())
+        .await
+        .map_err(|e| format!("could not listen on {}: {e}", port.addr()))
+}
+
+/// Start the accept loop for a bound listener.
+///
+/// Generic over the service so the loop and its stop can be tested over a real
+/// socket with a stand-in service. Production passes the same [`handle`] the
+/// unix socket serves, which is what keeps the two transports identical.
+fn spawn_tcp_loop<F, Fut>(listener: TcpListener, service: F) -> Result<TcpHandle, String>
+where
+    F: Fn(Request<Incoming>) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Response<Full<Bytes>>> + Send + 'static,
+{
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("could not read the listening address: {e}"))?;
+    let (shutdown, stop_rx) = watch::channel(false);
+    let task = tauri::async_runtime::spawn(accept_tcp(listener, stop_rx, service));
+    Ok(TcpHandle {
+        shutdown,
+        addr,
+        task,
+    })
+}
+
+async fn accept_tcp<F, Fut>(listener: TcpListener, mut stop: watch::Receiver<bool>, service: F)
+where
+    F: Fn(Request<Incoming>) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Response<Full<Bytes>>> + Send + 'static,
+{
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                // A dropped handle closes the channel, which is a stop too.
+                // Treating that as "no change yet" would spin the loop.
+                if changed.is_err() || *stop.borrow() {
+                    break;
+                }
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "local API: TCP accept failed");
+                        continue;
+                    }
+                };
+                tauri::async_runtime::spawn(serve_tcp_connection(
+                    TokioIo::new(stream),
+                    service.clone(),
+                    stop.clone(),
+                ));
+            }
+        }
+    }
+    // The listener drops with this function, which is what frees the port.
+    tracing::info!("local API TCP listener stopped");
+}
+
+/// Serve one TCP connection until the client closes it or the listener stops.
+///
+/// On stop, the request in flight is allowed to finish and the connection then
+/// closes. Without that, an idle keep-alive connection would hold the server
+/// open after the user has turned the port off.
+async fn serve_tcp_connection<F, Fut>(
+    io: TokioIo<TcpStream>,
+    service: F,
+    mut stop: watch::Receiver<bool>,
+) where
+    F: Fn(Request<Incoming>) -> Fut + Send + 'static,
+    Fut: Future<Output = Response<Full<Bytes>>> + Send + 'static,
+{
+    let svc = hyper::service::service_fn(move |req| {
+        let fut = service(req);
+        async move { Ok::<_, Infallible>(fut.await) }
+    });
+    let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, svc);
+    tokio::pin!(conn);
+    tokio::select! {
+        result = conn.as_mut() => {
+            if let Err(e) = result {
+                tracing::debug!(error = %e, "local API: connection ended");
+            }
+        }
+        _ = stop.changed() => {
+            conn.as_mut().graceful_shutdown();
+            if let Err(e) = conn.as_mut().await {
+                tracing::debug!(error = %e, "local API: connection ended");
+            }
+        }
     }
 }
 
@@ -354,19 +546,16 @@ async fn handle(rt: Runtime, req: Request<Incoming>) -> Response<Full<Bytes>> {
     }
 }
 
-/// Bind the socket and start accepting.
+/// Bind the unix socket and start its accept loop, returning its path.
 ///
-/// Returns once the socket is listening, so the settings page can report a
-/// bind failure rather than claiming the API is on.
+/// Its stop is the shared `shutdown` channel, so [`ServerHandle::stop`] stops
+/// it with the TCP port.
 #[cfg(unix)]
-pub async fn start(
-    state: Arc<AppState>,
-    app: AppHandle,
+fn start_socket(
+    rt: &Runtime,
+    shutdown: &watch::Sender<bool>,
     app_data_dir: &std::path::Path,
-    token: String,
-    rewrites_per_minute: u32,
-) -> Result<ServerHandle, String> {
-    use hyper_util::rt::TokioIo;
+) -> Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt;
     use tokio::net::UnixListener;
 
@@ -379,17 +568,8 @@ pub async fn start(
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("could not restrict {}: {e}", socket_path.display()))?;
 
-    let (shutdown, mut stop_rx) = watch::channel(false);
-    let rt = Runtime {
-        state,
-        app,
-        token: Arc::new(token),
-        limiter: Arc::new(Mutex::new(TokenBucket::per_minute(
-            rewrites_per_minute,
-            Instant::now(),
-        ))),
-    };
-
+    let mut stop_rx = shutdown.subscribe();
+    let rt = rt.clone();
     let listen_path = socket_path.clone();
     tauri::async_runtime::spawn(async move {
         tracing::info!(path = %listen_path.display(), "local API listening");
@@ -428,24 +608,64 @@ pub async fn start(
         tracing::info!(path = %listen_path.display(), "local API stopped");
     });
 
-    Ok(ServerHandle {
-        shutdown,
-        socket_path,
-    })
+    Ok(socket_path)
 }
 
-/// The API is a unix-socket feature, deliberately (see [`super::auth`]). On a
-/// platform without one there is nothing to fall back to that would still be
-/// worth shipping, so it stays off rather than quietly becoming a TCP port.
-#[cfg(not(unix))]
+/// Bind the transports the caller asks for and start accepting on them.
+///
+/// The unix socket is always bound where there is one. `tcp` adds the loopback
+/// port, and a bind failure there is returned to the caller. Nothing is left
+/// running when that happens, so a half-started API never reaches the settings
+/// page.
+///
+/// Returns once every requested listener is up, so the settings page can report
+/// a bind failure rather than claiming the API is on.
 pub async fn start(
-    _state: Arc<AppState>,
-    _app: AppHandle,
-    _app_data_dir: &std::path::Path,
-    _token: String,
-    _rewrites_per_minute: u32,
+    state: Arc<AppState>,
+    app: AppHandle,
+    app_data_dir: &std::path::Path,
+    token: String,
+    rewrites_per_minute: u32,
+    tcp: Option<LoopbackPort>,
 ) -> Result<ServerHandle, String> {
-    Err("the local API needs a unix domain socket, which this platform does not have".into())
+    let rt = Runtime {
+        state,
+        app,
+        token: Arc::new(token),
+        limiter: Arc::new(Mutex::new(TokenBucket::per_minute(
+            rewrites_per_minute,
+            Instant::now(),
+        ))),
+    };
+    let (shutdown, _) = watch::channel(false);
+
+    #[cfg(unix)]
+    let socket_path = Some(start_socket(&rt, &shutdown, app_data_dir)?);
+    // Without unix sockets the TCP port is the only transport, so a start
+    // with no port would be an API that cannot be reached.
+    #[cfg(not(unix))]
+    let socket_path = {
+        let _ = app_data_dir;
+        if tcp.is_none() {
+            return Err(
+                "the local API needs a unix domain socket on this platform; turn on the localhost port"
+                    .into(),
+            );
+        }
+        None
+    };
+
+    let handle = ServerHandle {
+        shutdown,
+        socket_path,
+        rt,
+        tcp: tokio::sync::Mutex::new(None),
+    };
+    if let Err(e) = handle.set_tcp(tcp).await {
+        handle.stop().await;
+        return Err(e);
+    }
+    Ok(handle)
 }
 
 #[cfg(test)]
@@ -563,6 +783,140 @@ mod tests {
         )
         .await;
         assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
+    }
+
+    /// The service the TCP tests serve. It runs the same [`plan_request`] the
+    /// socket test does, so auth and routing are the production code. A request
+    /// with `x-test-slow` is held for a while before it is answered, to test what
+    /// happens to one in flight at stop.
+    async fn tcp_test_service(req: Request<Incoming>) -> Response<Full<Bytes>> {
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+        let headers = req.headers().clone();
+        let body = Limited::new(req.into_body(), MAX_BODY)
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
+        if headers.contains_key("x-test-slow") {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        match plan_request(&method, &path, &headers, TEST_TOKEN.as_bytes(), &body) {
+            Ok(action) => json(
+                StatusCode::OK,
+                serde_json::json!({ "verb": action.label() }),
+            ),
+            Err(denied) => *denied,
+        }
+    }
+
+    /// One raw HTTP/1.1 exchange over TCP, read to the close.
+    async fn tcp_exchange(addr: SocketAddr, raw: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(raw.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[test]
+    fn the_port_can_only_be_loopback() {
+        for port in [0, 8765, 65535] {
+            assert!(LoopbackPort::new(port).addr().ip().is_loopback());
+        }
+        assert_eq!(
+            LoopbackPort::new(8765).addr(),
+            "127.0.0.1:8765".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tcp_port_accepts_a_bearer_token_and_refuses_a_rebound_host() {
+        let listener = bind_tcp(LoopbackPort::new(0)).await.unwrap();
+        let tcp = spawn_tcp_loop(listener, tcp_test_service).unwrap();
+        assert!(tcp.addr.ip().is_loopback());
+        let bearer = format!("Authorization: Bearer {TEST_TOKEN}");
+
+        let authorized = tcp_exchange(
+            tcp.addr,
+            &format!(
+                "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\n{bearer}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(authorized.starts_with("HTTP/1.1 200"), "{authorized}");
+        assert!(authorized.contains("\"verb\":\"status\""), "{authorized}");
+
+        let rebound = tcp_exchange(
+            tcp.addr,
+            &format!(
+                "GET /v1/status HTTP/1.1\r\nHost: attacker.example\r\n{bearer}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(rebound.starts_with("HTTP/1.1 401"), "{rebound}");
+
+        let anonymous = tcp_exchange(
+            tcp.addr,
+            "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(anonymous.starts_with("HTTP/1.1 401"), "{anonymous}");
+
+        tcp.stop().await;
+    }
+
+    #[tokio::test]
+    async fn stopping_the_tcp_port_refuses_new_connections() {
+        let listener = bind_tcp(LoopbackPort::new(0)).await.unwrap();
+        let tcp = spawn_tcp_loop(listener, tcp_test_service).unwrap();
+        let addr = tcp.addr;
+        assert!(
+            TcpStream::connect(addr).await.is_ok(),
+            "listening before stop"
+        );
+
+        tcp.stop().await;
+        assert!(
+            TcpStream::connect(addr).await.is_err(),
+            "still accepting after stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_in_flight_when_the_port_stops_still_gets_its_answer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = bind_tcp(LoopbackPort::new(0)).await.unwrap();
+        let tcp = spawn_tcp_loop(listener, tcp_test_service).unwrap();
+        let mut stream = TcpStream::connect(tcp.addr).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TEST_TOKEN}\r\nx-test-slow: 1\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        // Long enough for the connection to be accepted and the request begun.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        tcp.stop().await;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(text.contains("\"verb\":\"status\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_taken_port_is_reported_to_the_caller() {
+        let first = bind_tcp(LoopbackPort::new(0)).await.unwrap();
+        let taken = first.local_addr().unwrap().port();
+        let err = bind_tcp(LoopbackPort::new(taken)).await.unwrap_err();
+        assert!(err.contains(&taken.to_string()), "{err}");
+        drop(first);
     }
 
     #[test]

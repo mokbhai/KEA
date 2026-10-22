@@ -192,7 +192,7 @@ pub struct AppState {
     /// The handle is what stops it, so the toggle on the settings page has
     /// something to turn off; its presence is also the honest answer to "is
     /// the API running", which a settings row must not infer from the setting.
-    pub api_server: Mutex<Option<api::ServerHandle>>,
+    pub api_server: Mutex<Option<Arc<api::ServerHandle>>>,
     /// The last rewrite, while it can still be taken back, or `None`.
     ///
     /// One slot, not a stack: undo puts back the sentence the user just read
@@ -492,6 +492,8 @@ fn main() {
             api::settings::get_api_settings,
             api::settings::set_api_enabled,
             api::settings::set_api_rate_limit,
+            api::settings::set_api_tcp_enabled,
+            api::settings::set_api_tcp_port,
             api::settings::reveal_api_token,
             api::settings::regenerate_api_token,
             api::settings::install_cli_shim,

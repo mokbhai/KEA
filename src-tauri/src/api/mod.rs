@@ -9,7 +9,8 @@
 //! - [`auth`] — who may call, and the threat model, written down.
 //! - [`openai`] — the OpenAI wire shapes the model routes speak; pure.
 //! - [`ratelimit`] — a token bucket over the verbs that spend LLM credits.
-//! - [`server`] — the unix socket, the route table and the accept loop.
+//! - [`server`] — the unix socket, the opt-in loopback port, the route table
+//!   and the accept loops.
 //! - [`token`] — the bearer token, the socket path, the CLI shim's token file.
 //! - [`settings`] — the commands the General settings page drives this with.
 
@@ -40,6 +41,18 @@ pub const ENABLED_SETTING: &str = "api.enabled";
 
 /// The rate limit on the LLM-calling verbs, per minute.
 pub const RATE_LIMIT_SETTING: &str = "api.max_rewrites_per_minute";
+
+/// Whether the loopback TCP port is on. Absent reads as `false`, as for
+/// [`ENABLED_SETTING`]: the port is opt-in because it makes the API reachable
+/// from browser pages (see [`auth`]).
+pub const TCP_ENABLED_SETTING: &str = "api.tcp.enabled";
+
+/// The loopback TCP port. Absent reads as [`DEFAULT_TCP_PORT`].
+pub const TCP_PORT_SETTING: &str = "api.tcp.port";
+
+/// Where the TCP port listens when no port is set. Fixed rather than random so
+/// a script can be written against it once and keep working across restarts.
+pub const DEFAULT_TCP_PORT: u16 = 8765;
 
 /// The sender the `RunEvent::Opened` handler pushes URLs into.
 ///
