@@ -376,6 +376,26 @@ pub fn emit_meeting_notes_error(app: &AppHandle, message: &str) {
     );
 }
 
+/// Why voice separation is off for a meeting that asked for it.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct VoiceSeparationUnavailablePayload {
+    pub reason: String,
+}
+
+/// Raised once, when a meeting starts with voice separation on but cannot run.
+///
+/// A notice rather than `meeting:error`: the meeting still records with channel
+/// labels, so nothing is in trouble. The reason is what the user needs in order
+/// to fix it, which for a missing model is the download the Models page offers.
+pub fn emit_meeting_voice_separation_unavailable(app: &AppHandle, reason: &str) {
+    let _ = app.emit(
+        "meeting:voice_separation_unavailable",
+        VoiceSeparationUnavailablePayload {
+            reason: reason.to_string(),
+        },
+    );
+}
+
 /// Progress for one file-transcription job.
 ///
 /// Keyed by `job_id`, not by path — the same reason `model:download:*` keys
@@ -707,6 +727,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, r#"{"message":"provider refused"}"#);
+    }
+
+    /// The notice carries only the reason, so the UI can show it as text
+    /// without a second shape to parse.
+    #[test]
+    fn voice_separation_unavailable_payload_is_a_reason() {
+        let json = serde_json::to_string(&VoiceSeparationUnavailablePayload {
+            reason: "the speaker embedding model is not installed".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"reason":"the speaker embedding model is not installed"}"#
+        );
     }
 
     #[test]

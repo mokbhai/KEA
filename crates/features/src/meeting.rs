@@ -1,25 +1,31 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kea_core::dictation::{apply_vocabulary, hint_terms};
 use kea_core::meetings::{
     attribute_segment, build_interim_notes_request, build_meeting_notes_request,
-    build_meeting_title_request, build_notes_repair_request, format_transcript_for_synthesis,
-    parse_meeting_notes_json, render_action_items_prose, sanitize_meeting_title,
+    build_meeting_title_request, build_notes_repair_request, build_speaker_names_request,
+    embedding_windows, format_transcript_for_synthesis, parse_meeting_notes_json,
+    parse_speaker_names, person_display_name, render_action_items_prose, sanitize_meeting_title,
     should_run_interim, InterimCadence, MeetingSettings, ParsedMeetingNotes, SpeakerChannel,
-    MAX_CONSECUTIVE_INTERIM_FAILURES, MEETING_INTERIM_PROMPT_VERSION, MEETING_NOTES_PROMPT_VERSION,
+    SpeakerNameProposal, VoiceClusters, MAX_CONSECUTIVE_INTERIM_FAILURES,
+    MEETING_INTERIM_PROMPT_VERSION, MEETING_NOTES_PROMPT_VERSION, MIN_WINDOWS,
 };
 use kea_core::resolve::SlotResolver;
 use kea_core::store::actions::{ActionRepo, ActionStatus, NewAction};
 use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_core::store::meetings::{
     ActionItem, ActionItemStatus, CaptureMode, Meeting, MeetingDetail, MeetingNotes, MeetingRepo,
-    MeetingSpeaker, MeetingStatus, NewActionItem, NewMeeting, NewSegment, TitleSource,
+    MeetingSegment, MeetingSpeaker, MeetingStatus, NewActionItem, NewMeeting, NewSegment,
+    SegmentRelabel, SpeakerSource, TitleSource,
 };
 use kea_core::store::usage::{NewUsageEvent, UsageRepo};
 use kea_core::store::vocabulary::VocabularyEntry;
+use kea_core::transcript::speakers::speaker_key;
 use kea_engines::traits::{AudioPcm, LlmEngine, SttOpts, Transcript};
 use kea_engines::EngineRegistry;
+use kea_infer::{SpeakerEmbedder, SPEAKER_EMBEDDING_SAMPLE_RATE_HZ};
 use kea_platform::audio::util::resample_linear;
 use kea_platform::audio::SpeechSegment;
 use kea_platform::{AudioIo, PcmFrame, SystemAudioCapability};
@@ -28,6 +34,150 @@ use crate::feature::{CapKind, CapSlot, Command, Feature};
 
 const WHISPER_SAMPLE_RATE_HZ: u32 = 16_000;
 const MIN_SEGMENT_SECS: u32 = 1;
+
+/// Voice separation for one meeting: the online participant clusters, and the
+/// embedder that turns a segment's audio into the vectors they are built from.
+///
+/// Owned by the caller rather than by this crate, so its lifetime is the
+/// meeting's. The app holds it on the active session, and dropping the session
+/// drops every embedding with it; nothing here writes to disk.
+pub struct MeetingVoices {
+    clusters: VoiceClusters,
+    embedder: Arc<dyn SpeakerEmbedder>,
+    /// Participants whose row already exists. A row is written when a voice
+    /// first appears, not once per segment.
+    announced: BTreeSet<usize>,
+    /// Whether an embedder failure has been logged yet. A runtime that fails
+    /// once tends to fail on every window, so one warning per meeting says it.
+    warned: bool,
+}
+
+impl MeetingVoices {
+    pub fn new(embedder: Arc<dyn SpeakerEmbedder>) -> Self {
+        Self {
+            clusters: VoiceClusters::new(),
+            embedder,
+            announced: BTreeSet::new(),
+            warned: false,
+        }
+    }
+
+    /// Embeds a segment's audio and assigns it a participant. `None` means the
+    /// segment has too little speech to tell voices apart, and nothing is
+    /// recorded for it.
+    ///
+    /// Resampled here rather than by the caller: the embedder is pinned to one
+    /// rate, and the rate of the audio is a detail of the capture device.
+    async fn assign(&mut self, sequence: i32, audio: &PcmFrame) -> Result<Option<usize>, String> {
+        let resampled;
+        let samples: &[f32] = if audio.sample_rate_hz == SPEAKER_EMBEDDING_SAMPLE_RATE_HZ {
+            &audio.samples
+        } else {
+            resampled = resample_linear(audio, SPEAKER_EMBEDDING_SAMPLE_RATE_HZ);
+            &resampled.samples
+        };
+
+        // Checked before embedding: a segment that cannot reach the minimum
+        // would be embedded for nothing, and would spend the embedder's
+        // scripted or metered calls on audio that is then thrown away.
+        let ranges = embedding_windows(samples, SPEAKER_EMBEDDING_SAMPLE_RATE_HZ);
+        if ranges.len() < MIN_WINDOWS {
+            return Ok(None);
+        }
+        let windows: Vec<Vec<f32>> = ranges.into_iter().map(|r| samples[r].to_vec()).collect();
+        let embeddings = self
+            .embedder
+            .embed_batch(windows, SPEAKER_EMBEDDING_SAMPLE_RATE_HZ)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(self.clusters.assign(sequence, embeddings))
+    }
+
+    fn log_failure_once(&mut self, error: &str) {
+        if !self.warned {
+            self.warned = true;
+            tracing::warn!(
+                error,
+                "meeting: voice separation failed for a segment; keeping channel labels"
+            );
+        }
+    }
+}
+
+/// The audio whose voice labels a segment, or `None` when the segment keeps its
+/// channel label and is not embedded at all.
+///
+/// Two sources: only the remote half is embedded. The local half is the person
+/// sitting here, and embedding the mixed signal would let their voice and any
+/// echo into the remote clusters. One source (mic-only): the signal is all
+/// there is, so it is embedded whatever the channel decision says.
+fn voice_audio(segment: &SpeechSegment, channel: SpeakerChannel) -> Option<&PcmFrame> {
+    match (&segment.mic, &segment.system) {
+        (Some(_), Some(system)) => (channel == SpeakerChannel::Remote).then_some(system),
+        _ => Some(&segment.pcm),
+    }
+}
+
+/// The key a segment is stored under: the channel key, or a participant key
+/// when voice separation names the segment's voice.
+///
+/// Every failure returns the channel key. The voice is an improvement on the
+/// label, never a condition for the segment, so nothing here may fail the
+/// caller. An unassigned remote segment also brings the "Others" row into being
+/// here, since in a two-source meeting with voices the row is not seeded at
+/// start, and a segment labelled "Others" with no row would be a lie.
+async fn speaker_key_for_segment(
+    voices: Option<&mut MeetingVoices>,
+    meetings: &MeetingRepo,
+    meeting_id: &str,
+    segment: &SpeechSegment,
+    channel: SpeakerChannel,
+    sequence: i32,
+) -> String {
+    let channel_key = channel.as_str().to_string();
+    let Some(voices) = voices else {
+        return channel_key;
+    };
+    let Some(audio) = voice_audio(segment, channel) else {
+        return channel_key;
+    };
+
+    let assigned = match voices.assign(sequence, audio).await {
+        Ok(assigned) => assigned,
+        Err(e) => {
+            voices.log_failure_once(&e);
+            None
+        }
+    };
+    let Some(index) = assigned else {
+        if channel == SpeakerChannel::Remote {
+            if let Err(e) = meetings
+                .ensure_speaker(meeting_id, channel, channel.display_name())
+                .await
+            {
+                tracing::warn!(error = %e, meeting_id, "meeting: failed to seed the Others row");
+            }
+        }
+        return channel_key;
+    };
+
+    let index_u32 = index as u32;
+    if !voices.announced.contains(&index) {
+        if let Err(e) = meetings
+            .ensure_participant(
+                meeting_id,
+                &speaker_key(index_u32),
+                &person_display_name(index_u32),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, meeting_id, "meeting: failed to create a participant row");
+            return channel_key;
+        }
+        voices.announced.insert(index);
+    }
+    speaker_key(index_u32)
+}
 
 pub struct MeetingFeature;
 
@@ -130,12 +280,21 @@ fn segment_speaker(segment: &SpeechSegment) -> Option<SpeakerChannel> {
     }
 }
 
-/// The two sides a meeting can have, and what they are called before anyone
+/// The sides a meeting starts with, and what they are called before anyone
 /// renames them. A mic-only meeting has exactly one.
-fn default_speakers(mode: CaptureMode) -> &'static [SpeakerChannel] {
-    match mode {
-        CaptureMode::MicOnly => &[SpeakerChannel::Local],
-        CaptureMode::MicAndSystem => &[SpeakerChannel::Local, SpeakerChannel::Remote],
+///
+/// With voice separation the voices are the participants, so nothing is
+/// assumed about them up front. A mic-only meeting gets no "You": the person
+/// at the microphone is not the only voice in the room, and labelling any
+/// segment "You" by assumption is the error this feature exists to avoid. The
+/// "Others" row of a two-source meeting waits until a remote segment is left
+/// unassigned, for the same reason.
+fn default_speakers(mode: CaptureMode, voice_separation: bool) -> &'static [SpeakerChannel] {
+    match (mode, voice_separation) {
+        (CaptureMode::MicOnly, false) => &[SpeakerChannel::Local],
+        (CaptureMode::MicOnly, true) => &[],
+        (CaptureMode::MicAndSystem, false) => &[SpeakerChannel::Local, SpeakerChannel::Remote],
+        (CaptureMode::MicAndSystem, true) => &[SpeakerChannel::Local],
     }
 }
 
@@ -743,7 +902,7 @@ async fn append_transcribed_segment(
     meetings: &MeetingRepo,
     meeting_id: &str,
     pcm: PcmFrame,
-    speaker: Option<SpeakerChannel>,
+    speaker_key: Option<String>,
     sequence: i32,
     start_offset_ms: i64,
     vocabulary: &[VocabularyEntry],
@@ -765,7 +924,7 @@ async fn append_transcribed_segment(
                 start_offset_ms,
                 end_offset_ms,
                 text: text.clone(),
-                speaker_key: speaker.map(|c| c.as_str().to_string()),
+                speaker_key: speaker_key.clone(),
             },
         )
         .await
@@ -777,11 +936,17 @@ async fn append_transcribed_segment(
         text,
         start_offset_ms,
         end_offset_ms,
-        speaker_key: speaker.map(|c| c.as_str().to_string()),
+        speaker_key,
     })
 }
 
-pub async fn run_meeting_start(ctx: &mut MeetingRunContext<'_>) -> Result<ActiveMeeting, String> {
+/// Starts a meeting. `voice_separation` is whether voices will be separated for
+/// this meeting, decided by the caller: the setting alone is not enough, because
+/// the models may be missing or fail to load.
+pub async fn run_meeting_start(
+    ctx: &mut MeetingRunContext<'_>,
+    voice_separation: bool,
+) -> Result<ActiveMeeting, String> {
     let resolver = SlotResolver::new(ctx.engines, ctx.bindings);
     let stt_binding = resolver
         .require_stt("meetings")
@@ -826,7 +991,7 @@ pub async fn run_meeting_start(ctx: &mut MeetingRunContext<'_>) -> Result<Active
     // segment, so the detail view has names to show — and to rename — from the
     // moment recording starts. A failure here is logged, not fatal: a meeting
     // with unnamed sides is still a meeting.
-    for channel in default_speakers(capture_mode) {
+    for channel in default_speakers(capture_mode, voice_separation) {
         if let Err(e) = ctx
             .meetings
             .ensure_speaker(&meeting_id, *channel, channel.display_name())
@@ -877,11 +1042,17 @@ pub async fn run_meeting_start(ctx: &mut MeetingRunContext<'_>) -> Result<Active
     })
 }
 
+/// Cuts, attributes and transcribes one segment, if one is ready.
+///
+/// `voices` is `Some` when voice separation is active for this meeting. The
+/// embedder is consulted before transcription, because the key it decides is
+/// stored with the segment.
 pub async fn run_meeting_poll_segment(
     ctx: &mut MeetingRunContext<'_>,
     meeting_id: &str,
     sequence: &mut i32,
     elapsed_ms: &mut i64,
+    voices: Option<&mut MeetingVoices>,
 ) -> Result<Option<MeetingSegmentEvent>, String> {
     // Ends the segment at a pause in speech when there is one, and at the
     // user's configured length when the speaker never pauses — a boundary on
@@ -913,7 +1084,20 @@ pub async fn run_meeting_poll_segment(
     // They are dropped with the segment either way — there is no recording on
     // disk to go back to — so attribution has to happen while the audio is
     // still in hand.
-    let speaker = segment_speaker(&segment);
+    let speaker_key = match segment_speaker(&segment) {
+        Some(channel) => Some(
+            speaker_key_for_segment(
+                voices,
+                ctx.meetings,
+                meeting_id,
+                &segment,
+                channel,
+                *sequence,
+            )
+            .await,
+        ),
+        None => None,
+    };
 
     let event = append_transcribed_segment(
         ctx.engines,
@@ -921,7 +1105,7 @@ pub async fn run_meeting_poll_segment(
         ctx.meetings,
         meeting_id,
         segment.pcm,
-        speaker,
+        speaker_key,
         *sequence,
         *elapsed_ms,
         ctx.vocabulary,
@@ -1008,6 +1192,7 @@ pub async fn run_meeting_stop(
     session: &ActiveMeeting,
     drain_result: Result<SpeechSegment, String>,
     vocabulary: &[VocabularyEntry],
+    voices: Option<&mut MeetingVoices>,
 ) -> Result<MeetingDetail, String> {
     run_meeting_stop_with(
         engines,
@@ -1017,6 +1202,7 @@ pub async fn run_meeting_stop(
         session,
         drain_result,
         vocabulary,
+        voices,
         MeetingStopOptions::default(),
     )
     .await
@@ -1031,6 +1217,7 @@ pub async fn run_meeting_stop_with(
     session: &ActiveMeeting,
     drain_result: Result<SpeechSegment, String>,
     vocabulary: &[VocabularyEntry],
+    voices: Option<&mut MeetingVoices>,
     opts: MeetingStopOptions,
 ) -> Result<MeetingDetail, String> {
     let meeting_id = &session.meeting_id;
@@ -1051,6 +1238,7 @@ pub async fn run_meeting_stop_with(
         &existing,
         drain_result,
         vocabulary,
+        voices,
         &opts,
     )
     .await
@@ -1080,6 +1268,7 @@ async fn finalize_meeting(
     existing: &MeetingDetail,
     drain_result: Result<SpeechSegment, String>,
     vocabulary: &[VocabularyEntry],
+    mut voices: Option<&mut MeetingVoices>,
     opts: &MeetingStopOptions,
 ) -> Result<(), String> {
     let meeting_id = &session.meeting_id;
@@ -1096,19 +1285,57 @@ async fn finalize_meeting(
     if has_min_audio(&tail.pcm) {
         // The tail is attributed like every other segment: the last thing said
         // in a meeting is as worth labelling as the first.
-        let speaker = segment_speaker(&tail);
+        let speaker_key = match segment_speaker(&tail) {
+            Some(channel) => Some(
+                speaker_key_for_segment(
+                    voices.as_deref_mut(),
+                    meetings,
+                    meeting_id,
+                    &tail,
+                    channel,
+                    sequence,
+                )
+                .await,
+            ),
+            None => None,
+        };
         append_transcribed_segment(
-            engines, bindings, meetings, meeting_id, tail.pcm, speaker, sequence, elapsed_ms,
+            engines,
+            bindings,
+            meetings,
+            meeting_id,
+            tail.pcm,
+            speaker_key,
+            sequence,
+            elapsed_ms,
             vocabulary,
         )
         .await?;
     }
 
-    let partial = meetings
-        .get(meeting_id)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("meeting {meeting_id} not found"))?;
+    let mut partial = reload_meeting(meetings, meeting_id).await?;
+
+    // The stop-time pass runs before anything reads the labels: the names
+    // request and the notes both see the participants as they will stay.
+    if let Some(voices) = voices.as_deref() {
+        recluster_speakers(meetings, meeting_id, &partial.segments, voices).await;
+        partial = reload_meeting(meetings, meeting_id).await?;
+    }
+
+    // Names are inferred before the notes so the notes are written against
+    // them. Any failure inside is logged and skipped; the notes do not wait.
+    if infer_speaker_names(
+        engines,
+        bindings,
+        meetings,
+        meeting_id,
+        &partial,
+        opts.usage.as_ref(),
+    )
+    .await
+    {
+        partial = reload_meeting(meetings, meeting_id).await?;
+    }
 
     // The final pass reads the whole transcript rather than folding, even when
     // interim passes already wrote this row. The fold is an approximation, and
@@ -1164,6 +1391,145 @@ async fn finalize_meeting(
         .map_err(|e| e.to_string())
 }
 
+/// Reads the meeting back in full. The stop reads it after each write that
+/// changes what the next step must see, so the notes never work from labels
+/// that have since been rewritten.
+async fn reload_meeting(meetings: &MeetingRepo, meeting_id: &str) -> Result<MeetingDetail, String> {
+    meetings
+        .get(meeting_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("meeting {meeting_id} not found"))
+}
+
+/// The stop-time voice pass: every segment is relabelled from the whole
+/// meeting's voice evidence at once, and the new labels get their names.
+///
+/// A failure is logged and the live labels stand. The rewrite is a single
+/// transaction, so a failure leaves the rows exactly as they were.
+async fn recluster_speakers(
+    meetings: &MeetingRepo,
+    meeting_id: &str,
+    segments: &[MeetingSegment],
+    voices: &MeetingVoices,
+) {
+    let live: Vec<(i32, Option<String>)> = segments
+        .iter()
+        .map(|s| (s.sequence, s.speaker_key.clone()))
+        .collect();
+    let result = voices.clusters.recluster(&live);
+
+    // Only the segments whose key actually changes are written.
+    let current: BTreeMap<i32, Option<&str>> = segments
+        .iter()
+        .map(|s| (s.sequence, s.speaker_key.as_deref()))
+        .collect();
+    let relabels: Vec<SegmentRelabel> = result
+        .segments
+        .into_iter()
+        .filter(|(sequence, key)| current.get(sequence).copied().flatten() != Some(key.as_str()))
+        .map(|(sequence, speaker_key)| SegmentRelabel {
+            sequence,
+            speaker_key,
+        })
+        .collect();
+    if relabels.is_empty() {
+        return;
+    }
+
+    if let Err(e) = meetings
+        .remap_segment_speakers(meeting_id, &relabels, &result.fresh)
+        .await
+    {
+        tracing::warn!(
+            error = %e,
+            meeting_id,
+            "meeting: stop-time voice pass could not be applied; keeping live labels"
+        );
+    }
+}
+
+/// Asks the meeting's LLM who the "Person N" participants are, and applies the
+/// names the transcript backs.
+///
+/// Returns whether any name was written, so the caller knows to reload. A
+/// request that errors, a reply that will not parse, and every name that does
+/// not verify all leave the labels as they are. Nothing here can fail the stop.
+async fn infer_speaker_names(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    meetings: &MeetingRepo,
+    meeting_id: &str,
+    detail: &MeetingDetail,
+    usage: Option<&UsageRepo>,
+) -> bool {
+    // Only a row still on its default label is a candidate. A name the user
+    // typed, or one already inferred, is never asked about again.
+    let unnamed: Vec<&MeetingSpeaker> = detail
+        .speakers
+        .iter()
+        .filter(|s| s.source == SpeakerSource::Channel && s.display_name.starts_with("Person "))
+        .collect();
+    if unnamed.is_empty() {
+        return false;
+    }
+
+    let labels: Vec<&str> = unnamed.iter().map(|s| s.display_name.as_str()).collect();
+    let transcript = format_transcript_for_synthesis(&detail.segments, &detail.speakers);
+    let proposals =
+        match request_speaker_names(engines, bindings, &transcript, &labels, usage).await {
+            Ok(proposals) => proposals,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    meeting_id,
+                    "meeting: speaker name inference failed; keeping Person labels"
+                );
+                return false;
+            }
+        };
+
+    let mut applied = false;
+    for proposal in proposals {
+        let Some(row) = unnamed.iter().find(|s| s.display_name == proposal.speaker) else {
+            continue;
+        };
+        match meetings
+            .set_inferred_speaker_name(meeting_id, &row.speaker_key, &proposal.name)
+            .await
+        {
+            Ok(()) => applied = true,
+            Err(e) => tracing::warn!(
+                error = %e,
+                meeting_id,
+                "meeting: could not record an inferred speaker name"
+            ),
+        }
+    }
+    applied
+}
+
+/// The one names request, and the only place its usage is counted.
+///
+/// The verified proposals are returned, not the raw reply: validation against
+/// the transcript is part of the call's contract, not something each caller
+/// has to remember to do.
+async fn request_speaker_names(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    transcript: &str,
+    labels: &[&str],
+    usage: Option<&UsageRepo>,
+) -> Result<Vec<SpeakerNameProposal>, String> {
+    let (engine, binding) = meetings_llm(engines, bindings).await?;
+    let mut req = build_speaker_names_request(transcript, labels);
+    req.model = binding.model.clone();
+    req.provider_ref = binding.provider_ref.clone();
+    let resp = engine.complete(req).await.map_err(|e| e.to_string())?;
+    record_meeting_usage(usage, &binding, resp.usage).await;
+    Ok(parse_speaker_names(&resp.text, transcript, labels))
+}
+
 /// The title of the calendar event this recording happened during, if there is
 /// one worth using.
 ///
@@ -1216,6 +1582,7 @@ mod tests {
     use kea_engines::traits::{
         EngineCaps, EngineError, LlmEngine, LlmRequest, LlmResponse, SttEngine,
     };
+    use kea_infer::ScriptedEmbedder;
     use kea_platform::{AudioIoError, DictationState, MeetingState};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1654,19 +2021,21 @@ mod tests {
             vocabulary: &[],
         };
 
-        let session = run_meeting_start(&mut ctx).await.unwrap();
+        let session = run_meeting_start(&mut ctx, false).await.unwrap();
         let mut seq = 0;
         let mut elapsed = 0;
 
-        let ev1 = run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed)
-            .await
-            .unwrap();
+        let ev1 =
+            run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed, None)
+                .await
+                .unwrap();
         assert!(ev1.is_some());
         assert_eq!(ev1.unwrap().text, "hello");
 
-        let ev2 = run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed)
-            .await
-            .unwrap();
+        let ev2 =
+            run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed, None)
+                .await
+                .unwrap();
         assert!(ev2.is_some());
         assert_eq!(ev2.unwrap().text, "world");
 
@@ -1679,6 +2048,7 @@ mod tests {
             &session,
             drain_result,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -1763,14 +2133,15 @@ mod tests {
             vocabulary: &[],
         };
 
-        let session = run_meeting_start(&mut ctx).await.unwrap();
+        let session = run_meeting_start(&mut ctx, false).await.unwrap();
         let mut seq = 0;
         let mut elapsed = 0;
 
         // Poll only once — two frames remain undrained
-        let ev = run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed)
-            .await
-            .unwrap();
+        let ev =
+            run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed, None)
+                .await
+                .unwrap();
         assert!(ev.is_some());
         assert_eq!(ev.unwrap().text, "polled");
 
@@ -1784,6 +2155,7 @@ mod tests {
             &session,
             drain_result,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -1876,7 +2248,7 @@ mod tests {
             vocabulary: &[],
         };
 
-        let session = run_meeting_start(&mut ctx).await.unwrap();
+        let session = run_meeting_start(&mut ctx, false).await.unwrap();
         let drain_result = drain_and_stop_meeting(ctx.audio).await;
         let err = run_meeting_stop(
             ctx.engines,
@@ -1886,6 +2258,7 @@ mod tests {
             &session,
             drain_result,
             &[],
+            None,
         )
         .await
         .unwrap_err();
@@ -1962,16 +2335,21 @@ mod tests {
             vocabulary: &[],
         };
 
-        let session = run_meeting_start(&mut ctx).await.unwrap();
+        let session = run_meeting_start(&mut ctx, false).await.unwrap();
         let mut seq = 0;
         let mut elapsed = 0;
         let mut keys = Vec::new();
         for _ in 0..3 {
-            let ev =
-                run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed)
-                    .await
-                    .unwrap()
-                    .expect("a segment was queued");
+            let ev = run_meeting_poll_segment(
+                &mut ctx,
+                &session.meeting_id,
+                &mut seq,
+                &mut elapsed,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("a segment was queued");
             keys.push(ev.speaker_key);
         }
         assert_eq!(
@@ -2028,13 +2406,14 @@ mod tests {
             vocabulary: &[],
         };
 
-        let session = run_meeting_start(&mut ctx).await.unwrap();
+        let session = run_meeting_start(&mut ctx, false).await.unwrap();
         let mut seq = 0;
         let mut elapsed = 0;
-        let ev = run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed)
-            .await
-            .unwrap()
-            .unwrap();
+        let ev =
+            run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed, None)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(ev.speaker_key.as_deref(), Some("local"));
 
         let detail = meetings.get(&session.meeting_id).await.unwrap().unwrap();
@@ -2069,11 +2448,11 @@ mod tests {
             settings: &settings,
             vocabulary: &[],
         };
-        let session = run_meeting_start(&mut ctx).await.unwrap();
+        let session = run_meeting_start(&mut ctx, false).await.unwrap();
         let mut seq = 0;
         let mut elapsed = 0;
         for _ in 0..2 {
-            run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed)
+            run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed, None)
                 .await
                 .unwrap();
         }
@@ -2088,6 +2467,696 @@ mod tests {
         assert!(transcript.contains("You: mine"), "{transcript}");
         assert!(transcript.contains("Priya: theirs"), "{transcript}");
         assert!(!transcript.contains("Speaker:"), "{transcript}");
+    }
+
+    // --- voice separation (add-meeting-speaker-diarization) ---
+    //
+    // The embedder is scripted, so a test chooses each window's vector and
+    // therefore each voice. Two windows make a segment long enough to be
+    // labelled (`MIN_WINDOWS`), and 36 000 samples at 16 kHz is exactly two
+    // windows; 48 000 is three.
+
+    const TWO_WINDOWS: usize = 36_000;
+    const THREE_WINDOWS: usize = 48_000;
+
+    /// Three unit vectors that no two of which are close enough to join.
+    fn voice(index: usize) -> Vec<f32> {
+        let mut v = vec![0.0; 3];
+        v[index] = 1.0;
+        v
+    }
+
+    fn windows_of(voice: &[f32], count: usize) -> Vec<Result<Vec<f32>, String>> {
+        (0..count).map(|_| Ok(voice.to_vec())).collect()
+    }
+
+    fn tone(samples: usize, rate_hz: u32, amplitude: f32) -> PcmFrame {
+        PcmFrame {
+            samples: (0..samples)
+                .map(|i| {
+                    let t = i as f32 / rate_hz as f32;
+                    (std::f32::consts::TAU * 220.0 * t).sin() * amplitude
+                })
+                .collect(),
+            sample_rate_hz: rate_hz,
+        }
+    }
+
+    /// A two-source segment the attribution calls remote: the system half
+    /// carries the voice, the microphone half is quiet.
+    fn remote_segment(samples: usize, rate_hz: u32) -> SpeechSegment {
+        let mic = tone(samples, rate_hz, 0.01);
+        let system = tone(samples, rate_hz, 0.5);
+        SpeechSegment {
+            pcm: kea_platform::audio::mix_frames(&mic, &system),
+            has_speech: true,
+            mic: Some(mic),
+            system: Some(system),
+        }
+    }
+
+    /// A two-source segment the attribution calls local.
+    fn local_segment(samples: usize) -> SpeechSegment {
+        let mic = tone(samples, 16_000, 0.5);
+        let system = tone(samples, 16_000, 0.01);
+        SpeechSegment {
+            pcm: kea_platform::audio::mix_frames(&mic, &system),
+            has_speech: true,
+            mic: Some(mic),
+            system: Some(system),
+        }
+    }
+
+    fn mic_segment(samples: usize) -> SpeechSegment {
+        SpeechSegment {
+            pcm: tone(samples, 16_000, 0.5),
+            has_speech: true,
+            mic: None,
+            system: None,
+        }
+    }
+
+    /// The fake audio pops from the back, so segments are queued reversed to be
+    /// heard in the order given.
+    fn queued(segments: Vec<SpeechSegment>) -> Mutex<Vec<SpeechSegment>> {
+        Mutex::new(segments.into_iter().rev().collect())
+    }
+
+    fn empty_tail() -> Result<SpeechSegment, String> {
+        Ok(SpeechSegment {
+            pcm: PcmFrame {
+                samples: vec![],
+                sample_rate_hz: 16_000,
+            },
+            has_speech: false,
+            mic: None,
+            system: None,
+        })
+    }
+
+    /// Answers each meeting prompt by its kind, and keeps every prompt it was
+    /// asked, so a test can check what the model was shown.
+    struct KindLlm {
+        names_reply: String,
+        fail_names: bool,
+        prompts: Mutex<Vec<String>>,
+    }
+
+    const KIND_NOTES: &str = r#"{"summary":"kickoff summary","decisions":"","action_items":"","follow_ups":"","open_questions":""}"#;
+
+    impl KindLlm {
+        fn new(names_reply: &str, fail_names: bool) -> Arc<Self> {
+            Arc::new(Self {
+                names_reply: names_reply.to_string(),
+                fail_names,
+                prompts: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmEngine for KindLlm {
+        fn id(&self) -> &str {
+            "fake-llm"
+        }
+
+        fn capabilities(&self) -> EngineCaps {
+            EngineCaps { models: vec![] }
+        }
+
+        async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, EngineError> {
+            self.prompts.lock().unwrap().push(req.prompt.clone());
+            if req.prompt.contains("<participants>") {
+                if self.fail_names {
+                    return Err(EngineError::Other("names are down".into()));
+                }
+                return Ok(LlmResponse::untracked(self.names_reply.clone()));
+            }
+            if req.prompt.contains("<summary>") {
+                return Ok(LlmResponse::untracked("Sprint Planning"));
+            }
+            Ok(LlmResponse::untracked(KIND_NOTES))
+        }
+    }
+
+    /// Registries and repos for a voice test: the given transcript lines in
+    /// order, and the given LLM for both the names request and the notes.
+    async fn voice_world(
+        texts: &[&str],
+        llm: Arc<dyn LlmEngine>,
+    ) -> (EngineRegistry, BindingRepo, ActionRepo, MeetingRepo) {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(CountingFakeStt {
+            texts: texts.iter().map(|t| t.to_string()).collect(),
+            call: AtomicUsize::new(0),
+        }));
+        reg.register_llm(llm);
+
+        let (bindings, actions, meetings) = test_repos().await;
+        for slot in ["stt", "llm"] {
+            bindings
+                .set(
+                    "meetings",
+                    slot,
+                    Binding {
+                        engine_id: if slot == "stt" {
+                            "fake-stt"
+                        } else {
+                            "fake-llm"
+                        }
+                        .into(),
+                        model: None,
+                        provider_ref: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        (reg, bindings, actions, meetings)
+    }
+
+    fn two_source_audio(segments: Vec<SpeechSegment>) -> FakeMeetingAudioIo {
+        FakeMeetingAudioIo {
+            capability: SystemAudioCapability::ScreenCaptureKit,
+            pending_drains: queued(segments),
+            ..Default::default()
+        }
+    }
+
+    fn mic_only_audio(segments: Vec<SpeechSegment>) -> FakeMeetingAudioIo {
+        FakeMeetingAudioIo {
+            capability: SystemAudioCapability::MicOnly,
+            pending_drains: queued(segments),
+            ..Default::default()
+        }
+    }
+
+    fn voices_with(steps: Vec<Result<Vec<f32>, String>>) -> MeetingVoices {
+        MeetingVoices::new(Arc::new(ScriptedEmbedder::new(steps)))
+    }
+
+    fn settings(prefer_system_audio: bool) -> MeetingSettings {
+        MeetingSettings {
+            segment_duration_secs: 30,
+            prefer_system_audio,
+            ..MeetingSettings::default()
+        }
+    }
+
+    /// One poll that must produce a segment, with voices.
+    async fn poll_with(
+        ctx: &mut MeetingRunContext<'_>,
+        meeting_id: &str,
+        seq: &mut i32,
+        elapsed: &mut i64,
+        voices: &mut MeetingVoices,
+    ) -> MeetingSegmentEvent {
+        run_meeting_poll_segment(ctx, meeting_id, seq, elapsed, Some(voices))
+            .await
+            .unwrap()
+            .expect("a segment was queued")
+    }
+
+    fn speaker_map(detail: &MeetingDetail) -> BTreeMap<String, MeetingSpeaker> {
+        detail
+            .speakers
+            .iter()
+            .map(|s| (s.speaker_key.clone(), s.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn three_remote_voices_become_three_participants_and_local_stays_local() {
+        let (reg, bindings, actions, meetings) =
+            voice_world(&[], KindLlm::new("{\"names\":[]}", false)).await;
+        let mut audio = two_source_audio(vec![
+            remote_segment(THREE_WINDOWS, 16_000),
+            remote_segment(THREE_WINDOWS, 16_000),
+            remote_segment(THREE_WINDOWS, 16_000),
+            local_segment(THREE_WINDOWS),
+        ]);
+        let settings = settings(true);
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        // Nine windows for the three remote segments, in order. The local
+        // segment must embed nothing: any call past the script would fail.
+        let mut steps = Vec::new();
+        for index in 0..3 {
+            steps.extend(windows_of(&voice(index), 3));
+        }
+        let mut voices = voices_with(steps);
+
+        let session = run_meeting_start(&mut ctx, true).await.unwrap();
+        let (mut seq, mut elapsed) = (0, 0);
+        let mut keys = Vec::new();
+        for _ in 0..4 {
+            let ev = poll_with(
+                &mut ctx,
+                &session.meeting_id,
+                &mut seq,
+                &mut elapsed,
+                &mut voices,
+            )
+            .await;
+            keys.push(ev.speaker_key.unwrap());
+        }
+        assert_eq!(keys, vec!["spk0", "spk1", "spk2", "local"]);
+
+        let detail = meetings.get(&session.meeting_id).await.unwrap().unwrap();
+        let speakers = speaker_map(&detail);
+        assert_eq!(speakers["spk0"].display_name, "Person 1");
+        assert_eq!(speakers["spk1"].display_name, "Person 2");
+        assert_eq!(speakers["spk2"].display_name, "Person 3");
+        assert_eq!(speakers["local"].display_name, "You");
+    }
+
+    #[tokio::test]
+    async fn a_new_voice_gets_its_key_and_row_on_first_speech_and_a_return_reuses_it() {
+        let (reg, bindings, actions, meetings) =
+            voice_world(&[], KindLlm::new("{\"names\":[]}", false)).await;
+        let mut audio = two_source_audio(vec![
+            remote_segment(TWO_WINDOWS, 16_000),
+            remote_segment(TWO_WINDOWS, 16_000),
+            remote_segment(TWO_WINDOWS, 16_000),
+        ]);
+        let settings = settings(true);
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        let mut steps = windows_of(&voice(0), 2);
+        steps.extend(windows_of(&voice(1), 2));
+        steps.extend(windows_of(&voice(0), 2));
+        let mut voices = voices_with(steps);
+
+        let session = run_meeting_start(&mut ctx, true).await.unwrap();
+        let (mut seq, mut elapsed) = (0, 0);
+        let first = poll_with(
+            &mut ctx,
+            &session.meeting_id,
+            &mut seq,
+            &mut elapsed,
+            &mut voices,
+        )
+        .await;
+        assert_eq!(first.speaker_key.as_deref(), Some("spk0"));
+        let detail = meetings.get(&session.meeting_id).await.unwrap().unwrap();
+        assert!(
+            !speaker_map(&detail).contains_key("spk1"),
+            "no row before the voice speaks"
+        );
+
+        let second = poll_with(
+            &mut ctx,
+            &session.meeting_id,
+            &mut seq,
+            &mut elapsed,
+            &mut voices,
+        )
+        .await;
+        assert_eq!(second.speaker_key.as_deref(), Some("spk1"));
+        let detail = meetings.get(&session.meeting_id).await.unwrap().unwrap();
+        assert_eq!(speaker_map(&detail)["spk1"].display_name, "Person 2");
+
+        let third = poll_with(
+            &mut ctx,
+            &session.meeting_id,
+            &mut seq,
+            &mut elapsed,
+            &mut voices,
+        )
+        .await;
+        assert_eq!(
+            third.speaker_key.as_deref(),
+            Some("spk0"),
+            "same voice, same label"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mic_only_meeting_with_voices_never_labels_anyone_you() {
+        let (reg, bindings, actions, meetings) =
+            voice_world(&[], KindLlm::new("{\"names\":[]}", false)).await;
+        let mut audio = mic_only_audio(vec![mic_segment(TWO_WINDOWS), mic_segment(TWO_WINDOWS)]);
+        let settings = settings(false);
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        let mut steps = windows_of(&voice(0), 2);
+        steps.extend(windows_of(&voice(1), 2));
+        let mut voices = voices_with(steps);
+
+        let session = run_meeting_start(&mut ctx, true).await.unwrap();
+        let (mut seq, mut elapsed) = (0, 0);
+        let mut keys = Vec::new();
+        for _ in 0..2 {
+            let ev = poll_with(
+                &mut ctx,
+                &session.meeting_id,
+                &mut seq,
+                &mut elapsed,
+                &mut voices,
+            )
+            .await;
+            keys.push(ev.speaker_key.unwrap());
+        }
+        assert_eq!(keys, vec!["spk0", "spk1"]);
+
+        let detail = meetings.get(&session.meeting_id).await.unwrap().unwrap();
+        assert!(detail
+            .segments
+            .iter()
+            .all(|s| s.speaker_key.as_deref() != Some("local")));
+        assert!(
+            detail.speakers.iter().all(|s| s.display_name != "You"),
+            "no 'You' by assumption: {:?}",
+            detail.speakers
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_embedder_keeps_recording_and_labels_remote() {
+        let (reg, bindings, actions, meetings) =
+            voice_world(&[], KindLlm::new("{\"names\":[]}", false)).await;
+        let mut audio = two_source_audio(vec![
+            remote_segment(TWO_WINDOWS, 16_000),
+            remote_segment(TWO_WINDOWS, 16_000),
+        ]);
+        let settings = settings(true);
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        // The first call fails, and once the script is spent every call fails.
+        let mut voices = voices_with(vec![Err("embedding runtime broke".into())]);
+
+        let session = run_meeting_start(&mut ctx, true).await.unwrap();
+        let (mut seq, mut elapsed) = (0, 0);
+        for _ in 0..2 {
+            let ev = poll_with(
+                &mut ctx,
+                &session.meeting_id,
+                &mut seq,
+                &mut elapsed,
+                &mut voices,
+            )
+            .await;
+            assert_eq!(ev.speaker_key.as_deref(), Some("remote"));
+            assert!(!ev.text.is_empty());
+        }
+
+        let detail = meetings.get(&session.meeting_id).await.unwrap().unwrap();
+        assert_eq!(detail.segments.len(), 2, "recording went on");
+        assert!(detail
+            .segments
+            .iter()
+            .all(|s| s.speaker_key.as_deref() == Some("remote")));
+        // The unassigned remote side is still remote, so its row now exists.
+        assert_eq!(speaker_map(&detail)["remote"].display_name, "Others");
+    }
+
+    #[tokio::test]
+    async fn a_resampled_segment_is_embedded_at_the_model_rate() {
+        let (reg, bindings, actions, meetings) =
+            voice_world(&[], KindLlm::new("{\"names\":[]}", false)).await;
+        // 2.5 s at 48 kHz is 2.5 s at 16 kHz after resampling: two windows.
+        let mut audio = two_source_audio(vec![remote_segment(120_000, 48_000)]);
+        let settings = settings(true);
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        let mut voices = voices_with(windows_of(&voice(0), 2));
+
+        let session = run_meeting_start(&mut ctx, true).await.unwrap();
+        let (mut seq, mut elapsed) = (0, 0);
+        let ev = poll_with(
+            &mut ctx,
+            &session.meeting_id,
+            &mut seq,
+            &mut elapsed,
+            &mut voices,
+        )
+        .await;
+        assert_eq!(ev.speaker_key.as_deref(), Some("spk0"));
+    }
+
+    /// Two live voices, one of which the stop-time pass finds to be the other.
+    ///
+    /// Live, the second voice opens its own label, because its window is under
+    /// `JOIN_SIM` from the first centroid. Across the whole meeting the windows
+    /// of the two labels average above `MERGE_SIM`, so the stop merges them. The
+    /// vectors are chosen for exactly that: cos(a, b) = 0.5, cos(a, x) = 0.9,
+    /// cos(x, b) ≈ 0.83.
+    fn split_voice_vectors() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.5, 0.866_025_4, 0.0];
+        let x = vec![0.9, 0.435_889_9, 0.0];
+        (a, b, x)
+    }
+
+    #[tokio::test]
+    async fn a_voice_split_while_recording_is_one_participant_after_stop() {
+        let llm = KindLlm::new("{\"names\":[]}", false);
+        let (reg, bindings, actions, meetings) = voice_world(&[], llm.clone()).await;
+        let mut audio = two_source_audio(vec![
+            remote_segment(TWO_WINDOWS, 16_000),
+            remote_segment(TWO_WINDOWS, 16_000),
+            remote_segment(TWO_WINDOWS, 16_000),
+        ]);
+        let settings = settings(true);
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        let (a, b, x) = split_voice_vectors();
+        let mut steps = windows_of(&a, 2);
+        steps.extend(windows_of(&b, 2));
+        steps.extend(windows_of(&x, 2));
+        let mut voices = voices_with(steps);
+
+        let session = run_meeting_start(&mut ctx, true).await.unwrap();
+        let (mut seq, mut elapsed) = (0, 0);
+        let mut live = Vec::new();
+        for _ in 0..3 {
+            let ev = poll_with(
+                &mut ctx,
+                &session.meeting_id,
+                &mut seq,
+                &mut elapsed,
+                &mut voices,
+            )
+            .await;
+            live.push(ev.speaker_key.unwrap());
+        }
+        assert_eq!(live, vec!["spk0", "spk1", "spk0"], "the live split");
+
+        let detail = run_meeting_stop(
+            &reg,
+            &bindings,
+            &actions,
+            &meetings,
+            &session,
+            empty_tail(),
+            &[],
+            Some(&mut voices),
+        )
+        .await
+        .unwrap();
+
+        let remote: Vec<&str> = detail
+            .segments
+            .iter()
+            .filter_map(|s| s.speaker_key.as_deref())
+            .filter(|k| *k != "local")
+            .collect();
+        assert_eq!(remote, vec!["spk0", "spk0", "spk0"]);
+        let participants: Vec<&MeetingSpeaker> = detail
+            .speakers
+            .iter()
+            .filter(|s| s.speaker_key != "local")
+            .collect();
+        assert_eq!(participants.len(), 1, "{participants:?}");
+        assert_eq!(participants[0].display_name, "Person 1");
+
+        let prompts = llm.prompts();
+        assert!(
+            // "Person 2: " is how a transcript line is labelled. The bare name
+            // also appears in the prompts' own examples, which is not a line.
+            prompts.iter().all(|p| !p.contains("Person 2: ")),
+            "the notes prompt must show one label"
+        );
+        assert!(prompts
+            .iter()
+            .any(|p| p.contains("<transcript>") && p.contains("Person 1: ")));
+    }
+
+    /// Two remote voices with transcript lines, for the naming tests.
+    async fn two_named_candidates(llm: Arc<KindLlm>) -> (MeetingDetail, Arc<KindLlm>) {
+        let (reg, bindings, actions, meetings) = voice_world(
+            &["Okay, let's begin.", "Thanks Dan, that helps."],
+            llm.clone(),
+        )
+        .await;
+        let mut audio = two_source_audio(vec![
+            remote_segment(TWO_WINDOWS, 16_000),
+            remote_segment(TWO_WINDOWS, 16_000),
+        ]);
+        let settings = settings(true);
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        let mut steps = windows_of(&voice(0), 2);
+        steps.extend(windows_of(&voice(1), 2));
+        let mut voices = voices_with(steps);
+
+        let session = run_meeting_start(&mut ctx, true).await.unwrap();
+        let (mut seq, mut elapsed) = (0, 0);
+        for _ in 0..2 {
+            poll_with(
+                &mut ctx,
+                &session.meeting_id,
+                &mut seq,
+                &mut elapsed,
+                &mut voices,
+            )
+            .await;
+        }
+        let detail = run_meeting_stop(
+            &reg,
+            &bindings,
+            &actions,
+            &meetings,
+            &session,
+            empty_tail(),
+            &[],
+            Some(&mut voices),
+        )
+        .await
+        .unwrap();
+        (detail, llm)
+    }
+
+    #[tokio::test]
+    async fn an_inferred_name_reaches_the_notes_prompt() {
+        let reply = r#"{"names":[{"speaker":"Person 2","name":"Dan","evidence":"Thanks Dan, that helps."}]}"#;
+        let (detail, llm) = two_named_candidates(KindLlm::new(reply, false)).await;
+
+        let speakers = speaker_map(&detail);
+        assert_eq!(speakers["spk1"].display_name, "Dan");
+        assert_eq!(speakers["spk1"].source, SpeakerSource::Inferred);
+
+        let prompts = llm.prompts();
+        assert!(prompts.iter().any(|p| p.contains("<participants>")));
+        assert!(
+            prompts.iter().any(|p| p.contains("<transcript>")
+                && !p.contains("<participants>")
+                && p.contains("Dan: Thanks Dan, that helps.")),
+            "the notes prompt must carry the inferred name"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_that_does_not_verify_is_not_applied() {
+        let reply = r#"{"names":[{"speaker":"Person 2","name":"Priya","evidence":"Thanks Priya, that helps."}]}"#;
+        let (detail, _llm) = two_named_candidates(KindLlm::new(reply, false)).await;
+        assert_eq!(speaker_map(&detail)["spk1"].display_name, "Person 2");
+    }
+
+    #[tokio::test]
+    async fn a_failed_name_request_still_writes_the_notes() {
+        let (detail, _llm) = two_named_candidates(KindLlm::new("", true)).await;
+        assert_eq!(speaker_map(&detail)["spk1"].display_name, "Person 2");
+        let notes = detail.notes.expect("notes are written without names");
+        assert_eq!(notes.summary, "kickoff summary");
+        assert_eq!(detail.meeting.status, MeetingStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn no_name_request_when_nothing_is_left_to_name() {
+        let llm = KindLlm::new("{\"names\":[]}", false);
+        let (reg, bindings, actions, meetings) = voice_world(&[], llm.clone()).await;
+        let mut audio = two_source_audio(vec![
+            local_segment(TWO_WINDOWS),
+            remote_segment(TWO_WINDOWS, 16_000),
+        ]);
+        let settings = settings(true);
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        let session = run_meeting_start(&mut ctx, false).await.unwrap();
+        let (mut seq, mut elapsed) = (0, 0);
+        for _ in 0..2 {
+            run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed, None)
+                .await
+                .unwrap();
+        }
+        run_meeting_stop(
+            &reg,
+            &bindings,
+            &actions,
+            &meetings,
+            &session,
+            empty_tail(),
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            llm.prompts().iter().all(|p| !p.contains("<participants>")),
+            "no name request without a Person label"
+        );
     }
 }
 
@@ -2620,6 +3689,7 @@ mod item_16_17_tests {
             &session,
             drain,
             &[],
+            None,
             opts,
         )
         .await
