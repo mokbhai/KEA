@@ -840,8 +840,11 @@ export type MeetingSpeaker = {
   meeting_id: string;
   speaker_key: string;
   display_name: string;
-  /** "channel" is the default KEA assigned; "user" is a name someone typed. */
-  source: "channel" | "user";
+  /**
+   * "channel" is the default KEA assigned; "user" is a name someone typed;
+   * "inferred" is a name the LLM proposed from the transcript, pending confirm.
+   */
+  source: "channel" | "user" | "inferred";
 };
 
 export type MeetingSegmentEvent = {

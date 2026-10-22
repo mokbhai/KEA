@@ -765,7 +765,7 @@ async fn append_transcribed_segment(
                 start_offset_ms,
                 end_offset_ms,
                 text: text.clone(),
-                speaker,
+                speaker_key: speaker.map(|c| c.as_str().to_string()),
             },
         )
         .await
@@ -2237,7 +2237,7 @@ mod item_16_17_tests {
                         start_offset_ms: index as i64 * 30_000,
                         end_offset_ms: index as i64 * 30_000 + 30_000,
                         text: (*text).into(),
-                        speaker: Some(SpeakerChannel::Local),
+                        speaker_key: Some(SpeakerChannel::Local.as_str().into()),
                     },
                 )
                 .await
@@ -2394,7 +2394,7 @@ mod item_16_17_tests {
                     start_offset_ms: 30_000,
                     end_offset_ms: 60_000,
                     text: "closing remarks".into(),
-                    speaker: Some(SpeakerChannel::Local),
+                    speaker_key: Some(SpeakerChannel::Local.as_str().into()),
                 },
             )
             .await
@@ -2441,7 +2441,7 @@ mod item_16_17_tests {
                     start_offset_ms: 30_000,
                     end_offset_ms: 60_000,
                     text: "it takes a while; I'll set you up with Dan on Monday".into(),
-                    speaker: Some(SpeakerChannel::Local),
+                    speaker_key: Some(SpeakerChannel::Local.as_str().into()),
                 },
             )
             .await
