@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -116,6 +116,13 @@ const notionReady = {
   parent_page_error: null,
 };
 
+/// Settings live in the ⚙ slide-over, so a test that reaches a setting opens it
+/// first, the way a user does.
+async function openSettings() {
+  await userEvent.click(await screen.findByRole("button", { name: "Meeting settings" }));
+  return screen.findByRole("dialog", { name: "Meeting settings" });
+}
+
 describe("MeetingsPage", () => {
   beforeEach(() => resetTauriMocks());
 
@@ -200,6 +207,7 @@ describe("MeetingsPage", () => {
     mockWorld({ bindings: readyBindings });
     render(<MeetingsPage />);
 
+    await openSettings();
     const changeButtons = await screen.findAllByRole("button", { name: "Change…" });
     // [0] speech to text, [1] notes writing.
     await userEvent.click(changeButtons[1]);
@@ -221,6 +229,7 @@ describe("MeetingsPage", () => {
     });
     render(<MeetingsPage />);
 
+    await openSettings();
     await userEvent.click(
       await screen.findByRole("button", { name: "Use default again" }),
     );
@@ -265,6 +274,7 @@ describe("MeetingsPage", () => {
     });
     render(<MeetingsPage />);
 
+    await openSettings();
     const toggle = await screen.findByRole("switch", { name: "Record system audio too" });
     expect(toggle.getAttribute("aria-checked")).toBe("true");
 
@@ -432,6 +442,7 @@ describe("MeetingsPage", () => {
     mockWorld({ bindings: readyBindings });
     render(<MeetingsPage />);
 
+    await openSettings();
     const toggle = await screen.findByRole("switch", {
       name: "Notes while the meeting runs",
     });
@@ -454,6 +465,7 @@ describe("MeetingsPage", () => {
     mockWorld({ bindings: readyBindings });
     render(<MeetingsPage />);
 
+    await openSettings();
     const toggle = await screen.findByRole("switch", {
       name: "Separate speakers by voice",
     });
@@ -481,6 +493,7 @@ describe("MeetingsPage", () => {
     });
     render(<MeetingsPage />);
 
+    await openSettings();
     await userEvent.click(
       await screen.findByRole("switch", { name: "Separate speakers by voice" }),
     );
@@ -514,6 +527,7 @@ describe("MeetingsPage", () => {
     });
     render(<MeetingsPage />);
 
+    await openSettings();
     await userEvent.click(
       await screen.findByRole("switch", { name: "Separate speakers by voice" }),
     );
@@ -537,6 +551,7 @@ describe("MeetingsPage", () => {
     });
     render(<MeetingsPage />);
 
+    await openSettings();
     const toggle = await screen.findByRole("switch", {
       name: "Name meetings from your calendar",
     });
@@ -586,5 +601,95 @@ describe("MeetingsPage", () => {
 
     const line = (await screen.findByText("crosstalk")).closest("li");
     expect(line?.textContent).toBe("[00:00]crosstalk");
+  });
+
+  // --- settings slide-over ---
+
+  it("keeps the settings out of the page until ⚙ opens them", async () => {
+    mockWorld({ bindings: readyBindings });
+    render(<MeetingsPage />);
+
+    const gear = await screen.findByRole("button", { name: "Meeting settings" });
+    expect(gear.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    const dialog = await openSettings();
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(gear.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  // aria-modal says the page behind is inert; Tab must agree, or a keyboard
+  // user walks out of the dialog on the first Shift+Tab.
+  it("keeps Tab inside the open panel", async () => {
+    mockWorld({ bindings: readyBindings });
+    render(<MeetingsPage />);
+
+    const dialog = await openSettings();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Close" }));
+
+    await userEvent.tab({ shift: true });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    await userEvent.tab();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Close" }));
+  });
+
+  it("closes on Escape and returns focus to the ⚙ button", async () => {
+    mockWorld({ bindings: readyBindings });
+    render(<MeetingsPage />);
+
+    const gear = await screen.findByRole("button", { name: "Meeting settings" });
+    await userEvent.click(gear);
+    await screen.findByRole("dialog", { name: "Meeting settings" });
+    // Focus moves into the panel on open, so Escape is heard there.
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Close" }));
+
+    await userEvent.keyboard("{Escape}");
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(document.activeElement).toBe(gear);
+  });
+
+  it("closes from its Close button and from ⚙, returning focus each time", async () => {
+    mockWorld({ bindings: readyBindings });
+    render(<MeetingsPage />);
+
+    const gear = await screen.findByRole("button", { name: "Meeting settings" });
+    await userEvent.click(gear);
+    await userEvent.click(await screen.findByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(document.activeElement).toBe(gear);
+
+    // A second press of ⚙ is a toggle, not a reopen.
+    await userEvent.click(gear);
+    await screen.findByRole("dialog", { name: "Meeting settings" });
+    await userEvent.click(gear);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(document.activeElement).toBe(gear);
+  });
+
+  it("closes on an outside click and keeps a setting typed but not yet saved", async () => {
+    mockWorld({ bindings: readyBindings });
+    render(<MeetingsPage />);
+
+    await openSettings();
+    const seconds = screen.getByRole("spinbutton", {
+      name: "Seconds per transcript segment",
+    });
+    // A direct change rather than typing: userEvent cannot select the text of a
+    // number field, and typing onto the old value would clamp to 120.
+    fireEvent.change(seconds, { target: { value: "45" } });
+
+    await userEvent.click(screen.getByRole("heading", { level: 1, name: "Meetings" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    // Reopened, the value the user typed is still there: closing hid the panel
+    // and kept the page's state, rather than remounting it from the saved value.
+    await openSettings();
+    expect(
+      (screen.getByRole("spinbutton", { name: "Seconds per transcript segment" }) as HTMLInputElement)
+        .value,
+    ).toBe("45");
+    // Held locally, not written: this field only persists on blur.
+    expect(invokeCalls("set_meeting_settings")).toHaveLength(0);
   });
 });

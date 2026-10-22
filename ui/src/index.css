@@ -461,6 +461,57 @@ a:hover {
   }
 }
 
+/* ── Settings slide-over ───────────────────────────────────────────── */
+/* The scrim dims the page and takes the press that closes the panel. It sits
+   under the panel, and is hidden with the panel rather than unmounted. */
+.kea-slideover-scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 150;
+}
+
+.kea-slideover {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 160;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  width: min(440px, 100vw);
+  padding: 16px;
+  overflow-y: auto;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  box-shadow: -4px 0 16px rgba(0, 0, 0, 0.15);
+  animation: kea-slideover-in 0.2s ease;
+}
+
+/* The author's display rule above would otherwise override the hidden attribute. */
+.kea-slideover[hidden],
+.kea-slideover-scrim[hidden] {
+  display: none;
+}
+
+.kea-slideover__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+@keyframes kea-slideover-in {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
 /* ── Settings rows ─────────────────────────────────────────────────── */
 .kea-rows {
   background: var(--surface);

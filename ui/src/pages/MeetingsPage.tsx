@@ -38,15 +38,11 @@ import {
   type SystemAudioCapability,
 } from "../api";
 import Banner from "../components/Banner";
-import FeatureAiCard from "../components/FeatureAiCard";
 import FeatureBanner from "../components/FeatureBanner";
-import HotkeyRow from "../components/HotkeyRow";
 import LevelMeter from "../components/LevelMeter";
 import LoadingBlock from "../components/LoadingBlock";
 import MeetingDetailView from "../components/MeetingDetail";
-import NotionSettings from "../components/NotionSettings";
-import { Row, RowGroup } from "../components/SettingsRow";
-import Toggle from "../components/Toggle";
+import MeetingSettingsPanel from "../components/meetings/MeetingSettingsPanel";
 import TranscriptPanel, {
   speakerDisplayName,
   type TranscriptSegment,
@@ -57,9 +53,6 @@ import { useOptimisticSetting } from "../hooks/useOptimisticSetting";
 import type { SlotSpec } from "../lib/featureSlot";
 import { toMessage } from "../lib/format";
 import type { Navigate } from "../lib/nav";
-
-const MEETINGS_FEATURE = "meetings";
-const MEETINGS_COMMAND = "toggle_meeting";
 
 /**
  * The two speaker models voice separation needs, by their catalog ids. Both
@@ -80,44 +73,9 @@ const SLOTS: SlotSpec[] = [
   { feature: "meetings", slot: "llm", capability: "llm", label: "Notes writing" },
 ];
 
-const capabilityLabels: Record<SystemAudioCapability, string> = {
-  unavailable: "Mic only (system audio unavailable)",
-  mic_only: "Mic only",
-  loopback_device: "Mic + system (loopback device)",
-  screen_capture_kit: "Mic + system (ScreenCaptureKit)",
-};
-
 type Props = {
   onNavigate?: Navigate;
 };
-
-/**
- * The cost note that sits next to the interim-notes toggle.
- *
- * Spelled out rather than left as "uses AI": this spends the user's tokens on
- * a schedule they did not press a button for, and somebody who turns it on and
- * leaves a four-hour meeting running should not be surprised by the bill.
- */
-function interimHint(settings: MeetingSettings): string {
-  const everyMinutes = settings.interim_every_minutes;
-  const everySegments = settings.interim_every_segments;
-  return (
-    `Writes notes every ${everySegments} segments or ${everyMinutes} minutes, ` +
-    `whichever comes first — about ${Math.round(60 / Math.max(1, everyMinutes))} AI ` +
-    "calls an hour, billed to your notes provider. Off by default."
-  );
-}
-
-/**
- * The hint beside the voice-separation toggle.
- *
- * Says what the feature does with the audio, because turning it on means the
- * user's microphone and system audio are analysed for voices, and that is the
- * kind of thing somebody wants to read before they flip it.
- */
-const VOICE_HINT =
-  "Tells remote participants apart by voice, labelled Person 1, Person 2 and so on. " +
-  "Runs on this Mac and nothing about voices is saved. Needs two speaker models.";
 
 /**
  * What the page shows before the first `get_meeting_settings` resolves.
@@ -181,6 +139,18 @@ export default function MeetingsPage({ onNavigate }: Props) {
   // Set once the user edits a setting, so the mount fetch can't clobber input
   // typed before it resolves.
   const settingsTouchedRef = useRef(false);
+  const onSegmentDurationChange = (seconds: number) => {
+    settingsTouchedRef.current = true;
+    setSettings({ ...settings, segment_duration_secs: seconds });
+  };
+  // The panel's state lives here, so closing it only hides it. Focus goes back
+  // to the ⚙ that opened it, whichever way it was closed.
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsButtonRef = useRef<HTMLButtonElement>(null);
+  const closeSettings = useCallback(() => {
+    setSettingsOpen(false);
+    settingsButtonRef.current?.focus();
+  }, []);
 
   const recording = state === "recording";
   const processing = state === "processing";
@@ -617,13 +587,49 @@ export default function MeetingsPage({ onNavigate }: Props) {
 
   return (
     <div>
-      <header>
-        <h1 style={{ marginTop: 0 }}>Meetings</h1>
-        <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
-          Record a meeting, watch the transcript appear live, and get notes when you
-          stop.
-        </p>
+      <header style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <h1 style={{ marginTop: 0 }}>Meetings</h1>
+          <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
+            Record a meeting, watch the transcript appear live, and get notes when you
+            stop.
+          </p>
+        </div>
+        <button
+          ref={settingsButtonRef}
+          type="button"
+          className="kea-btn"
+          aria-label="Meeting settings"
+          title="Meeting settings"
+          aria-haspopup="dialog"
+          aria-expanded={settingsOpen}
+          onClick={() => (settingsOpen ? closeSettings() : setSettingsOpen(true))}
+        >
+          ⚙
+        </button>
       </header>
+
+      <MeetingSettingsPanel
+        open={settingsOpen}
+        onClose={closeSettings}
+        anchorRef={settingsButtonRef}
+        settings={settings}
+        meetingSettings={meetingSettings}
+        saveSettings={saveSettings}
+        onSegmentDurationChange={onSegmentDurationChange}
+        capability={capability}
+        calendarPerm={calendarPerm}
+        requestCalendar={requestCalendar}
+        actionBusy={actionBusy}
+        voiceEnablePending={voiceEnablePending}
+        voiceModelsReady={voiceModelsReady}
+        voiceDownloading={voiceDownloading}
+        voiceStatus={voiceStatus}
+        toggleVoiceSeparation={toggleVoiceSeparation}
+        downloadVoiceModels={downloadVoiceModels}
+        ai={ai}
+        onNotionStatusChange={setNotionStatus}
+      />
 
       <FeatureBanner ai={ai} onNavigate={onNavigate} />
 
@@ -645,154 +651,6 @@ export default function MeetingsPage({ onNavigate }: Props) {
           permission.
         </Banner>
       )}
-
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Behavior</h2>
-        <RowGroup aria-label="Meeting behavior">
-          <HotkeyRow
-            feature={MEETINGS_FEATURE}
-            command={MEETINGS_COMMAND}
-            label="Shortcut"
-            hint="Starts or stops meeting notes."
-            checkRegistration
-          />
-          <Row
-            label="Record system audio too"
-            hint={`Right now: ${capabilityLabels[capability]}.`}
-          >
-            {meetingSettings.savedKey === "prefer_system_audio" && (
-              <span className="kea-saved">Saved ✓</span>
-            )}
-            <Toggle
-              label="Record system audio too"
-              checked={settings.prefer_system_audio}
-              disabled={meetingSettings.busy}
-              onChange={(next) =>
-                void saveSettings({ prefer_system_audio: next }, "prefer_system_audio")
-              }
-            />
-          </Row>
-          <Row
-            label="Notes while the meeting runs"
-            hint={interimHint(settings)}
-          >
-            {meetingSettings.savedKey === "interim_notes" && (
-              <span className="kea-saved">Saved ✓</span>
-            )}
-            <Toggle
-              label="Notes while the meeting runs"
-              checked={settings.interim_notes ?? false}
-              disabled={meetingSettings.busy}
-              onChange={(next) => void saveSettings({ interim_notes: next }, "interim_notes")}
-            />
-          </Row>
-          <Row
-            label="Name meetings from your calendar"
-            hint="Uses the title of the calendar event you were in. Your calendar is read on this Mac and never sent to an AI provider."
-          >
-            {meetingSettings.savedKey === "calendar_titles" && (
-              <span className="kea-saved">Saved ✓</span>
-            )}
-            {settings.calendar_titles && calendarPerm !== "Granted" && (
-              <button
-                type="button"
-                className="kea-btn"
-                onClick={() => void requestCalendar()}
-                disabled={actionBusy}
-              >
-                Grant access
-              </button>
-            )}
-            <Toggle
-              label="Name meetings from your calendar"
-              checked={settings.calendar_titles ?? false}
-              disabled={meetingSettings.busy}
-              onChange={(next) => {
-                void saveSettings({ calendar_titles: next }, "calendar_titles");
-                // Asking on the toggle rather than on the first recording: the
-                // prompt is the point at which the user has said yes to this,
-                // and interrupting a meeting to ask would be the opposite.
-                if (next && calendarPerm !== "Granted") void requestCalendar();
-              }}
-            />
-          </Row>
-          <Row label="Separate speakers by voice" hint={VOICE_HINT}>
-            {meetingSettings.savedKey === "voice_separation" && (
-              <span className="kea-saved">Saved ✓</span>
-            )}
-            {voiceEnablePending && !voiceModelsReady && (
-              <button
-                type="button"
-                className="kea-btn"
-                onClick={() => void downloadVoiceModels()}
-                disabled={voiceDownloading || meetingSettings.busy}
-              >
-                {voiceDownloading ? "Downloading…" : "Download speaker models"}
-              </button>
-            )}
-            <Toggle
-              label="Separate speakers by voice"
-              checked={settings.voice_separation ?? false}
-              disabled={meetingSettings.busy}
-              onChange={(next) => void toggleVoiceSeparation(next)}
-            />
-          </Row>
-          {voiceEnablePending && !voiceModelsReady && (
-            <p className="kea-muted" role="status" style={{ margin: "0 0 12px", fontSize: "0.8125rem" }}>
-              Turning this on needs two speaker models, which are not installed yet.
-              {" "}Download them and voice separation turns on when they are ready.
-            </p>
-          )}
-          {voiceStatus && (
-            <p className="kea-muted" role="alert" style={{ margin: "0 0 12px", fontSize: "0.8125rem" }}>
-              {voiceStatus}
-            </p>
-          )}
-          <Row
-            label="Transcribe every"
-            hint="How often live transcript segments appear. Applies from the next meeting."
-          >
-            {meetingSettings.savedKey === "segment_duration_secs" && (
-              <span className="kea-saved">Saved ✓</span>
-            )}
-            <input
-              className="kea-input"
-              type="number"
-              aria-label="Seconds per transcript segment"
-              min={5}
-              max={120}
-              step={5}
-              value={settings.segment_duration_secs}
-              disabled={meetingSettings.busy}
-              onChange={(e) => {
-                settingsTouchedRef.current = true;
-                const v = parseInt(e.target.value, 10);
-                if (!isNaN(v)) setSettings({ ...settings, segment_duration_secs: v });
-              }}
-              onBlur={(e) => {
-                const v = parseInt(e.target.value, 10);
-                if (isNaN(v)) return;
-                // Clamp on persist: the backend takes any u32, so keep the
-                // value inside the advisory 5-120s range (negatives would
-                // fail u32 deserialization outright).
-                const clamped = Math.min(120, Math.max(5, v));
-                void saveSettings({ segment_duration_secs: clamped }, "segment_duration_secs");
-              }}
-              style={{ width: 88 }}
-            />
-            <span className="kea-muted">seconds</span>
-          </Row>
-        </RowGroup>
-        {meetingSettings.error && (
-          <p style={{ marginTop: 8, fontSize: "0.8125rem", color: "var(--danger)" }}>
-            {meetingSettings.error}
-          </p>
-        )}
-      </section>
-
-      <FeatureAiCard ai={ai} featureLabel="Meetings" />
-
-      <NotionSettings onStatusChange={setNotionStatus} />
 
       <section style={{ marginBottom: 24 }}>
         <h2 style={{ margin: "0 0 12px" }}>Try it</h2>

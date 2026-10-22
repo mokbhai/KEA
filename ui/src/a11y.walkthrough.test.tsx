@@ -145,10 +145,13 @@ const CONTROL_SELECTOR = "button, a[href], input, select, textarea";
  * the ways a control gets hidden from the keyboard, so excluding them here
  * would let a regression delete itself from the expectation instead of failing
  * the test. They are asserted against separately below.
+ *
+ * A control inside a `hidden` subtree is not on screen, so a mouse cannot
+ * reach it either: a closed slide-over is not part of the page's controls.
  */
 function operableControls(): HTMLElement[] {
   return Array.from(document.body.querySelectorAll<HTMLElement>(CONTROL_SELECTOR)).filter(
-    (el) => !el.hasAttribute("disabled"),
+    (el) => !el.hasAttribute("disabled") && el.closest("[hidden]") === null,
   );
 }
 
