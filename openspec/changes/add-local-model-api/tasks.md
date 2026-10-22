@@ -24,7 +24,7 @@
 
 - [x] 4.1 Add the four routes to the route table, with a per-route body limit (25 MB for transcriptions, 1 MB otherwise) returning `413`; verify the route-table test and a socket test that an oversized body gets `413`
 - [x] 4.2 Accept `Authorization: Bearer` alongside `x-kea-token` in `auth.rs` with the same constant-time compare, and rewrite the module doc's transport section for the opt-in port; verify auth unit tests for both headers, a wrong bearer, and `Origin` still refused
-- [ ] 4.3 TCP listener: optional `127.0.0.1:<port>` accept loop over the same service, a `watch`-based stop that lets in-flight requests finish, bind errors returned to the caller, and TCP-only operation on non-Unix; verify tests that bind an ephemeral port, authenticate via bearer, refuse `Host: attacker.example`, and stop accepting after disable
+- [x] 4.3 TCP listener: optional `127.0.0.1:<port>` accept loop over the same service, a `watch`-based stop that lets in-flight requests finish, bind errors returned to the caller, and TCP-only operation on non-Unix; verify tests that bind an ephemeral port, authenticate via bearer, refuse `Host: attacker.example`, and stop accepting after disable
 - [ ] 4.4 Settings `api.tcp.enabled` (default off) and `api.tcp.port` (default 8765) in `api/settings.rs`, applied live; verify a settings test that the defaults read as off/8765 and a port conflict is reported without stopping the socket
 
 ## 5. CLI

@@ -91,7 +91,7 @@ die() {
 # The trailing X keeps a final newline in the argument from being dropped by
 # the command substitution; it is stripped again before returning.
 json_escape() {
-  escaped=$(printf '%sX' "$1" | awk "$(awk_json_escape)")
+  escaped=$(printf '%sX' "$1" | LC_ALL=C awk "$(awk_json_escape)")
   printf '%s' "${escaped%X}"
 }
 
@@ -99,6 +99,12 @@ json_string() {
   printf '"%s"' "$(json_escape "$1")"
 }
 
+# Every awk program here runs under LC_ALL=C, so it works on bytes. The
+# decoder builds UTF-8 itself, one `%c` per byte; in a UTF-8 locale GNU awk
+# (Ubuntu's) prints `%c 240` as the character U+00F0 rather than the byte
+# 0xF0, and every non-ASCII reply came out double-encoded. BSD awk on macOS
+# prints the byte either way, which is why only Linux CI saw it.
+#
 # Only the awk programs below read JSON. The API's responses are compact
 # JSON, and jq is not a dependency of KEA, so these walk the text by hand.
 
@@ -394,7 +400,7 @@ api() {
         rm -f "$body_file"
         exit 22
       fi
-      message=$(awk "$(awk_json_lib)
+      message=$(LC_ALL=C awk "$(awk_json_lib)
 $(awk_error_message)" < "$body_file" || true)
       rm -f "$body_file"
       echo "kea: ${message:-HTTP $http_status}" >&2
@@ -546,13 +552,13 @@ case "$command" in
         if [ "$speakers" -eq 0 ]; then
           printf '%s\n' "$transcript"
         elif [ "$format" = text ]; then
-          printf '%s\n' "$transcript" | awk "$(awk_json_lib)
+          printf '%s\n' "$transcript" | LC_ALL=C awk "$(awk_json_lib)
 $(awk_speaker_text)"
         elif [ "$format" = srt ]; then
-          printf '%s\n' "$transcript" | awk "$(awk_json_lib)
+          printf '%s\n' "$transcript" | LC_ALL=C awk "$(awk_json_lib)
 $(awk_srt)"
         else
-          printf '%s\n' "$transcript" | awk "$(awk_json_lib)
+          printf '%s\n' "$transcript" | LC_ALL=C awk "$(awk_json_lib)
 $(awk_vtt)"
         fi
         ;;
@@ -638,7 +644,7 @@ ${piped}"
     body="${body}}"
 
     reply=$(api_json POST /v1/chat/completions "$body") || exit $?
-    printf '%s\n' "$reply" | awk "$(awk_json_lib)
+    printf '%s\n' "$reply" | LC_ALL=C awk "$(awk_json_lib)
 $(awk_chat_content)"
     ;;
   models)
@@ -654,7 +660,7 @@ $(awk_chat_content)"
     if [ "$as_json" -eq 1 ]; then
       printf '%s\n' "$listing"
     else
-      printf '%s\n' "$listing" | awk "$(awk_json_lib)
+      printf '%s\n' "$listing" | LC_ALL=C awk "$(awk_json_lib)
 $(awk_models)"
     fi
     ;;
