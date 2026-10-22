@@ -260,22 +260,25 @@ export default function AskAiTab({
     if (currentMeeting.current === id) setMessages(list);
   };
 
-  const send = async (text: string, fromDraft: boolean) => {
+  /** Sends one message; true when the reply came back. */
+  const send = async (text: string, fromDraft: boolean): Promise<boolean> => {
     const trimmed = text.trim();
-    if (!trimmed || turnInFlight.current || aiReady !== true) return;
+    if (!trimmed || turnInFlight.current || aiReady !== true) return false;
     const id = meetingId;
     turnInFlight.current = true;
     setPendingText(trimmed);
     setSendError(null);
     try {
       const result = await sendMeetingChat(id, trimmed);
-      if (currentMeeting.current !== id) return;
+      if (currentMeeting.current !== id) return false;
       setTruncated(result.truncated);
       if (fromDraft) setDraft("");
       await reloadChat(id);
+      return true;
     } catch (e) {
       // The typed text stays in the box, so a retry does not start from scratch.
       if (currentMeeting.current === id) setSendError(toMessage(e));
+      return false;
     } finally {
       turnInFlight.current = false;
       if (currentMeeting.current === id) setPendingText(null);
@@ -290,12 +293,15 @@ export default function AskAiTab({
     }
   };
 
-  const sendTranslate = () => {
+  // The language is kept until the reply lands, like the draft, so a failed
+  // send can be retried without typing it again.
+  const sendTranslate = async () => {
     const lang = language.trim();
     if (!lang) return;
-    setLanguage("");
-    setTranslating(false);
-    void send(`Translate the notes into ${lang}.`, false);
+    if (await send(`Translate the notes into ${lang}.`, false)) {
+      setLanguage("");
+      setTranslating(false);
+    }
   };
 
   const applyProposal = async (message: MeetingChatMessage) => {
@@ -497,11 +503,11 @@ export default function AskAiTab({
                 disabled={busy}
                 onChange={(e) => setLanguage(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter") sendTranslate();
+                  if (e.key === "Enter") void sendTranslate();
                 }}
                 style={{ flex: 1, minWidth: 0 }}
               />
-              <button type="button" className="kea-btn" onClick={sendTranslate} disabled={busy || !language.trim()}>
+              <button type="button" className="kea-btn" onClick={() => void sendTranslate()} disabled={busy || !language.trim()}>
                 Send translation
               </button>
             </div>

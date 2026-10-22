@@ -482,7 +482,10 @@ export default function SummaryTab({
   const { meeting, notes, speakers, action_items: actionItems } = detail;
   const canExport = Boolean(onCopyMarkdown || onSaveMarkdown || onExportNotion);
   const hasNotes = Boolean(notes) || actionItems.length > 0;
-  const canEdit = Boolean(onNotesChanged) && Boolean(notes);
+  // Not while the final notes are still being written: that pass rewrites the
+  // notes, the backend refuses changes until it finishes, and an Edit button
+  // that can only fail is worse than none.
+  const canEdit = Boolean(onNotesChanged) && Boolean(notes) && !generating;
   const editBusyNow = busy || editBusy;
 
   const startEdit = (section: NotesSectionKey) => {
@@ -537,7 +540,9 @@ export default function SummaryTab({
           section,
           editing: editing === section,
           draft,
-          busy: editBusyNow,
+          // One section edits at a time: opening another would throw away the
+          // unsaved text in the open one.
+          busy: editBusyNow || (editing !== null && editing !== section),
           onStart: startEdit,
           onDraftChange: setDraft,
           onSave: () => void saveEdit(),

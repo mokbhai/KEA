@@ -232,6 +232,24 @@ describe("AskAiTab quick prompts", () => {
   });
 });
 
+describe("AskAiTab translate errors", () => {
+  it("keeps the language when the translation fails to send", async () => {
+    onInvoke({
+      get_meeting_chat: () => [],
+      send_meeting_chat: () => {
+        throw new Error("the provider is unreachable");
+      },
+    });
+    renderAsk();
+    await userEvent.click(await screen.findByRole("button", { name: "Translate" }));
+    await userEvent.type(screen.getByLabelText("Translate into which language"), "Spanish");
+    await userEvent.click(screen.getByRole("button", { name: "Send translation" }));
+
+    expect(await screen.findByText(/the provider is unreachable/)).toBeTruthy();
+    expect((screen.getByLabelText("Translate into which language") as HTMLInputElement).value).toBe("Spanish");
+  });
+});
+
 describe("AskAiTab citations", () => {
   it("makes an in-range time a button that jumps, and leaves a later one as text", async () => {
     const onJumpTo = vi.fn();

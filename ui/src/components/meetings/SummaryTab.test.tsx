@@ -413,4 +413,22 @@ describe("SummaryTab", () => {
     expect(screen.queryByRole("button", { name: /^Edit / })).toBeNull();
     expect(screen.getByText("Editing is available when the meeting ends.")).toBeTruthy();
   });
+
+  // Found in review: between stop and the final notes the backend still
+  // refuses changes, so no Edit may be offered in that window either.
+  it("offers no Edit while the final notes are being written", () => {
+    renderSummary({
+      detail: meetingDetail({ notes: meetingNotes }),
+      generating: true,
+      onNotesChanged: vi.fn(),
+    });
+    expect(screen.queryByRole("button", { name: /^Edit / })).toBeNull();
+  });
+
+  it("keeps one section open at a time so unsaved text is not thrown away", async () => {
+    renderSummary({ detail: meetingDetail({ notes: meetingNotes }), onNotesChanged: vi.fn() });
+    await userEvent.click(screen.getByRole("button", { name: "Edit summary" }));
+    await userEvent.type(screen.getByLabelText("Summary text"), " more");
+    expect((screen.getByRole("button", { name: "Edit decisions" }) as HTMLButtonElement).disabled).toBe(true);
+  });
 });

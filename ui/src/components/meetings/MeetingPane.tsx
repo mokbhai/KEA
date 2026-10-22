@@ -313,7 +313,7 @@ const MeetingPane = forwardRef<MeetingPaneHandle, MeetingPaneProps>(function Mee
     <div hidden={tab !== "ask"}>
       <AskAiTab
         meetingId={meeting.id}
-        recording={live}
+        recording={live || generating}
         durationMs={meetingDurationMs(meeting, transcriptSegments)}
         notes={current?.notes ?? null}
         onJumpTo={jumpTo}

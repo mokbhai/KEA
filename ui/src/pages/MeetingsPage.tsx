@@ -350,6 +350,8 @@ export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMe
     if (next.meeting.id !== selectedIdRef.current) return;
     detailRequest.current++;
     setDetail(next);
+    // The read this supersedes can no longer clear its own loading flag.
+    setDetailLoading(false);
   }, []);
 
   useEffect(() => {
