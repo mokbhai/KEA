@@ -23,7 +23,7 @@ use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
@@ -72,13 +72,10 @@ pub fn decode_file(path: &Path) -> Result<PcmFrame, DecodeError> {
 /// [`decode_file`] at an explicit rate, so a test can assert the resample.
 pub fn decode_file_at(path: &Path, target_rate_hz: u32) -> Result<PcmFrame, DecodeError> {
     let name = path.display().to_string();
-    let open = |message: String| DecodeError::Open {
+    let file = std::fs::File::open(path).map_err(|e| DecodeError::Open {
         path: name.clone(),
-        message,
-    };
-
-    let file = std::fs::File::open(path).map_err(|e| open(e.to_string()))?;
-    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+        message: e.to_string(),
+    })?;
 
     // The extension is a *hint*, never the decision: symphonia probes the
     // bytes. A `.m4a` that is really an MP3 still decodes, and a file with no
@@ -88,9 +85,53 @@ pub fn decode_file_at(path: &Path, target_rate_hz: u32) -> Result<PcmFrame, Deco
         hint.with_extension(ext);
     }
 
+    decode_source(Box::new(file), &hint, &name, target_rate_hz)
+}
+
+/// Decodes an in-memory encoded file (the body of an API upload) to the same
+/// mono PCM [`decode_file`] produces, so a request never touches disk.
+///
+/// The bytes are copied once into the `Cursor` because symphonia's
+/// `MediaSource` must own its data (`Box<dyn MediaSource>` is `'static`). A
+/// 25 MB upload makes that copy cheap next to the decode itself. With no path,
+/// there is no extension to hint from, so the probe works from the bytes alone,
+/// which is the same position a mislabelled file on disk is in.
+pub fn decode_bytes(bytes: &[u8], target_rate_hz: u32) -> Result<PcmFrame, DecodeError> {
+    decode_source(
+        Box::new(std::io::Cursor::new(bytes.to_vec())),
+        &Hint::new(),
+        IN_MEMORY_NAME,
+        target_rate_hz,
+    )
+}
+
+/// The name errors carry when there is no path to report. It is what the
+/// caller sees in a `400` body, so it says what the input was.
+const IN_MEMORY_NAME: &str = "uploaded audio";
+
+/// The shared decoding core behind [`decode_file_at`] and [`decode_bytes`].
+///
+/// Everything after the container is opened is identical for both sources, so
+/// the two entry points differ only in where the bytes come from. That is what
+/// lets a test assert that the byte path and the path path agree sample for
+/// sample: there is one decoder, not two that could drift apart.
+fn decode_source(
+    source: Box<dyn MediaSource>,
+    hint: &Hint,
+    name: &str,
+    target_rate_hz: u32,
+) -> Result<PcmFrame, DecodeError> {
+    let name = name.to_string();
+    let open = |message: String| DecodeError::Open {
+        path: name.clone(),
+        message,
+    };
+
+    let stream = MediaSourceStream::new(source, Default::default());
+
     let probed = symphonia::default::get_probe()
         .format(
-            &hint,
+            hint,
             stream,
             &FormatOptions {
                 enable_gapless: true,
@@ -262,9 +303,9 @@ pub fn is_probably_decodable(path: &Path) -> bool {
 mod tests {
     use super::*;
 
-    /// A 16-bit PCM WAV of `secs` seconds of a sine at `freq_hz`, written
-    /// byte by byte so the test needs no encoder and no committed binary.
-    fn sine_wav(path: &Path, rate: u32, channels: u16, secs: f32, freq_hz: f32) {
+    /// A 16-bit PCM WAV of `secs` seconds of a sine at `freq_hz`, built byte by
+    /// byte so the test needs no encoder and no committed binary.
+    fn sine_wav_bytes(rate: u32, channels: u16, secs: f32, freq_hz: f32) -> Vec<u8> {
         let frames = (rate as f32 * secs) as u32;
         let data_len = frames * channels as u32 * 2;
         let mut out: Vec<u8> = Vec::with_capacity(44 + data_len as usize);
@@ -288,7 +329,48 @@ mod tests {
                 out.extend_from_slice(&sample.to_le_bytes());
             }
         }
-        std::fs::write(path, out).unwrap();
+        out
+    }
+
+    fn sine_wav(path: &Path, rate: u32, channels: u16, secs: f32, freq_hz: f32) {
+        std::fs::write(path, sine_wav_bytes(rate, channels, secs, freq_hz)).unwrap();
+    }
+
+    /// The bytes path must agree with the path path sample for sample: both
+    /// run the same `decode_source`, so any difference is a regression in the
+    /// shared core, not a rounding question.
+    #[test]
+    fn decode_bytes_matches_decode_file_on_the_same_wav() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tone.wav");
+        let bytes = sine_wav_bytes(44_100, 2, 0.5, 440.0);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let from_path = decode_file(&path).unwrap();
+        let from_bytes = decode_bytes(&bytes, DECODE_SAMPLE_RATE_HZ).unwrap();
+        assert_eq!(from_bytes.sample_rate_hz, from_path.sample_rate_hz);
+        assert_eq!(from_bytes.samples, from_path.samples);
+        assert!(super::super::util::rms_level(&from_bytes.samples) > 0.1);
+    }
+
+    /// Garbage bytes have no container to read, so they must come back as an
+    /// error that names the in-memory input, not a panic and not silence.
+    #[test]
+    fn garbage_bytes_are_refused_with_a_decode_error() {
+        let err = decode_bytes(b"this is not audio, it is prose", 16_000).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DecodeError::Unsupported { .. } | DecodeError::Open { .. }
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains(IN_MEMORY_NAME), "{err}");
+    }
+
+    #[test]
+    fn empty_bytes_are_refused_with_a_decode_error() {
+        assert!(decode_bytes(&[], 16_000).is_err());
     }
 
     #[test]

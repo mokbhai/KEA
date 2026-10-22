@@ -187,12 +187,19 @@ pub struct AppState {
     /// that starts a read, and two reads at once is two voices over each
     /// other. See `hotkeys::busy_flag`.
     pub tts_busy: Arc<AtomicBool>,
+    /// True while an API transcription is running. Its own flag, not
+    /// `file_transcribe_busy`: a script's upload must not make the Transcribe
+    /// page report busy, and a running file job must not refuse an upload.
+    pub api_stt_busy: Arc<AtomicBool>,
+    /// True while an API speech synthesis is running. Synthesis only: an API
+    /// request never plays audio, so it does not claim `tts_busy`.
+    pub api_tts_busy: Arc<AtomicBool>,
     /// The local API server while it is listening, or `None`.
     ///
     /// The handle is what stops it, so the toggle on the settings page has
     /// something to turn off; its presence is also the honest answer to "is
     /// the API running", which a settings row must not infer from the setting.
-    pub api_server: Mutex<Option<api::ServerHandle>>,
+    pub api_server: Mutex<Option<Arc<api::ServerHandle>>>,
     /// The last rewrite, while it can still be taken back, or `None`.
     ///
     /// One slot, not a stack: undo puts back the sentence the user just read
@@ -492,6 +499,8 @@ fn main() {
             api::settings::get_api_settings,
             api::settings::set_api_enabled,
             api::settings::set_api_rate_limit,
+            api::settings::set_api_tcp_enabled,
+            api::settings::set_api_tcp_port,
             api::settings::reveal_api_token,
             api::settings::regenerate_api_token,
             api::settings::install_cli_shim,
@@ -824,6 +833,8 @@ fn build_state(
         assistant_speaking: Arc::new(AtomicBool::new(false)),
         assistant_speech_stop: Arc::new(AtomicBool::new(false)),
         tts_busy: Arc::new(AtomicBool::new(false)),
+        api_stt_busy: Arc::new(AtomicBool::new(false)),
+        api_tts_busy: Arc::new(AtomicBool::new(false)),
         api_server: Mutex::new(None),
     })
 }

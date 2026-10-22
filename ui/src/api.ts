@@ -1334,9 +1334,31 @@ export type ApiSettings = {
   max_rewrites_per_minute: number;
   /** False where there are no unix sockets, and so no API to enable. */
   supported: boolean;
+  /** False on Windows, where the localhost port is the only way in. */
+  unix_socket_supported: boolean;
+  /** Whether the opt-in localhost port is switched on. Off by default. */
+  tcp_enabled: boolean;
+  /** Whether the port is listening right now. */
+  tcp_running: boolean;
+  /** Why the port is on but not listening, typically another process on it. */
+  tcp_error: string | null;
+  /** The port the listener uses, or would use the next time it starts. */
+  tcp_port: number;
 };
 
 export const getApiSettings = () => invoke<ApiSettings>("get_api_settings");
+
+/**
+ * Switches the loopback port on or off, live. Resolves with the settings as
+ * the backend now reports them; rejects, and leaves the setting off, when the
+ * port cannot be bound.
+ */
+export const setApiTcpEnabled = (enabled: boolean) =>
+  invoke<ApiSettings>("set_api_tcp_enabled", { enabled });
+
+/** Moves the loopback port. Rejects when the new port cannot be bound. */
+export const setApiTcpPort = (port: number) =>
+  invoke<ApiSettings>("set_api_tcp_port", { port });
 
 /** Binds or unbinds the socket, then records the setting. */
 export const setApiEnabled = (enabled: boolean) =>

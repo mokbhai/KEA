@@ -10,22 +10,46 @@ use std::sync::Arc;
 
 use kea_core::store::settings::SettingsRepo;
 use serde::Serialize;
+use sqlx::SqlitePool;
 use tauri::{AppHandle, Manager, State};
 
-use super::{ratelimit, server, token, ENABLED_SETTING, RATE_LIMIT_SETTING};
+use super::server::LoopbackPort;
+use super::{
+    ratelimit, server, token, DEFAULT_TCP_PORT, ENABLED_SETTING, RATE_LIMIT_SETTING,
+    TCP_ENABLED_SETTING, TCP_PORT_SETTING,
+};
+use crate::commands::read_bool_setting;
 use crate::AppState;
 
-/// What the settings page shows. `running` is asked of the handle rather than
-/// inferred from `enabled`: a bind that failed must not read as on.
+/// What the settings page shows. `running` and `tcp_running` are asked of the
+/// handles rather than inferred from the settings: a bind that failed must not
+/// read as on.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiSettings {
     pub enabled: bool,
     pub running: bool,
-    /// Empty on a platform with no unix sockets, where `supported` is false.
+    /// Empty where there is no unix socket.
     pub socket_path: String,
     pub token_file: String,
     pub max_rewrites_per_minute: u32,
+    /// Whether the API can run on this platform at all. True everywhere now
+    /// that the loopback port exists; on a platform without unix sockets the
+    /// port is the only transport. Use `unix_socket_supported` to decide what
+    /// to show.
     pub supported: bool,
+    /// Whether this OS has unix sockets, the default transport. False on
+    /// Windows, where the port is the only way in.
+    pub unix_socket_supported: bool,
+    /// Whether the loopback port is switched on. Off by default on every OS;
+    /// on one without unix sockets the API cannot start until it is on.
+    pub tcp_enabled: bool,
+    /// Whether the port is listening right now.
+    pub tcp_running: bool,
+    /// Why the port is switched on but not listening — typically another
+    /// process holding it. `None` when it is listening or switched off.
+    pub tcp_error: Option<String>,
+    /// The port the listener uses, or would use the next time it starts.
+    pub tcp_port: u16,
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -48,12 +72,34 @@ async fn rate_limit(state: &Arc<AppState>) -> u32 {
         .unwrap_or(ratelimit::DEFAULT_REWRITES_PER_MINUTE)
 }
 
+/// The running server, if there is one. Cloned out of the slot so the caller
+/// can await on it without holding the std lock.
+fn running_server(state: &Arc<AppState>) -> Option<Arc<server::ServerHandle>> {
+    match state.api_server.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
 fn is_running(state: &Arc<AppState>) -> bool {
-    state
-        .api_server
-        .lock()
-        .map(|guard| guard.is_some())
-        .unwrap_or(false)
+    running_server(state).is_some()
+}
+
+/// The loopback port, read through the same tolerant path as the rate limit.
+/// Zero is refused at the setter, so a `0` here can only be a hand-edited row,
+/// and it falls back rather than binding a random port the page cannot show.
+async fn tcp_port(pool: &SqlitePool) -> u16 {
+    SettingsRepo::new(pool.clone())
+        .get_optional::<u16>(TCP_PORT_SETTING)
+        .await
+        .ok()
+        .flatten()
+        .filter(|port| *port != 0)
+        .unwrap_or(DEFAULT_TCP_PORT)
+}
+
+async fn tcp_enabled(pool: &SqlitePool) -> bool {
+    read_bool_setting(pool, TCP_ENABLED_SETTING, false).await
 }
 
 /// Bind the socket, mint the token if there is none, and write the token file.
@@ -66,35 +112,44 @@ pub async fn start_server(state: &Arc<AppState>, app: &AppHandle) -> Result<(), 
     }
     let dir = app_data_dir(app)?;
     let secret = token::load_or_mint(state.credentials.as_ref()).await?;
+    // The port is opt-in everywhere, Windows included: a browser-reachable
+    // listener must never start because of the platform. Where it is the only
+    // transport, `server::start` refuses to start without it and says so.
+    let tcp_on = tcp_enabled(&state.config_pool).await;
+    let tcp = tcp_on.then_some(LoopbackPort::new(tcp_port(&state.config_pool).await));
     let handle = server::start(
         state.clone(),
         app.clone(),
         &dir,
         secret.clone(),
         rate_limit(state).await,
+        tcp,
     )
     .await?;
-    // Only after the socket is up: a token file for an API that is not
+    // Only after the transports are up: a token file for an API that is not
     // listening is a secret on disk buying nothing.
-    token::write_token_file(&dir, &secret)?;
+    if let Err(e) = token::write_token_file(&dir, &secret) {
+        handle.stop().await;
+        return Err(e);
+    }
     match state.api_server.lock() {
-        Ok(mut slot) => *slot = Some(handle),
-        Err(poisoned) => *poisoned.into_inner() = Some(handle),
+        Ok(mut slot) => *slot = Some(Arc::new(handle)),
+        Err(poisoned) => *poisoned.into_inner() = Some(Arc::new(handle)),
     }
     Ok(())
 }
 
-/// Stop the socket and delete the token file.
+/// Stop the socket and the port, and delete the token file.
 ///
 /// The file goes with the server, always: a `0600` token left behind for a
 /// disabled API is the one piece of this design with no upside.
-pub fn stop_server(state: &Arc<AppState>, app: &AppHandle) {
+pub async fn stop_server(state: &Arc<AppState>, app: &AppHandle) {
     let handle = match state.api_server.lock() {
         Ok(mut slot) => slot.take(),
         Err(poisoned) => poisoned.into_inner().take(),
     };
     if let Some(handle) = handle {
-        handle.stop();
+        handle.stop().await;
     }
     if let Ok(dir) = app_data_dir(app) {
         token::remove_token_file(&dir);
@@ -108,14 +163,28 @@ pub async fn get_api_settings(
 ) -> Result<ApiSettings, String> {
     let state = state.inner().clone();
     let dir = app_data_dir(&app)?;
+    let server = running_server(&state);
+    let (tcp_running, tcp_error) = match &server {
+        Some(server) => (server.tcp_addr().await.is_some(), server.tcp_error()),
+        None => (false, None),
+    };
     Ok(ApiSettings {
         enabled: crate::commands::read_bool_setting(&state.config_pool, ENABLED_SETTING, false)
             .await,
-        running: is_running(&state),
-        socket_path: token::socket_path(&dir).to_string_lossy().into_owned(),
+        running: server.is_some(),
+        socket_path: if cfg!(unix) {
+            token::socket_path(&dir).to_string_lossy().into_owned()
+        } else {
+            String::new()
+        },
         token_file: token::token_file_path(&dir).to_string_lossy().into_owned(),
         max_rewrites_per_minute: rate_limit(&state).await,
-        supported: cfg!(unix),
+        supported: true,
+        unix_socket_supported: cfg!(unix),
+        tcp_enabled: tcp_enabled(&state.config_pool).await,
+        tcp_running,
+        tcp_error,
+        tcp_port: tcp_port(&state.config_pool).await,
     })
 }
 
@@ -133,7 +202,7 @@ pub async fn set_api_enabled(
     if enabled {
         start_server(&owned, &app).await?;
     } else {
-        stop_server(&owned, &app);
+        stop_server(&owned, &app).await;
     }
     SettingsRepo::new(owned.config_pool.clone())
         .set(ENABLED_SETTING, &enabled)
@@ -160,6 +229,79 @@ pub async fn set_api_rate_limit(state: State<'_, Arc<AppState>>, limit: u32) -> 
     Ok(())
 }
 
+/// Switch the loopback port on or off, live.
+///
+/// While the API runs, this starts or stops only the port; the socket keeps
+/// serving. The setting is written only once the port is in the state it
+/// names, so a failed bind leaves the toggle off rather than claiming a port
+/// that is not open. Off while the API is stopped just records the choice for
+/// the next start.
+#[tauri::command]
+pub async fn set_api_tcp_enabled(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+    enabled: bool,
+) -> Result<ApiSettings, String> {
+    let owned = state.inner().clone();
+    if cfg!(not(unix)) && !enabled {
+        return Err(
+            "this platform has no unix socket, so the localhost port cannot be turned off while the API runs; turn the API off instead"
+                .into(),
+        );
+    }
+    if let Some(server) = running_server(&owned) {
+        let port = if enabled {
+            Some(LoopbackPort::new(tcp_port(&owned.config_pool).await))
+        } else {
+            None
+        };
+        server.set_tcp(port).await?;
+    }
+    SettingsRepo::new(owned.config_pool.clone())
+        .set(TCP_ENABLED_SETTING, &enabled)
+        .await
+        .map_err(|e| e.to_string())?;
+    get_api_settings(state, app).await
+}
+
+/// Change the loopback port. If the port is listening, it moves now.
+///
+/// A port that cannot be bound is an error, and the socket keeps serving. The
+/// port is then not listening, so the enabled setting is cleared to match:
+/// the toggle must not claim a port that is not open. The new number is stored
+/// only once it has bound.
+#[tauri::command]
+pub async fn set_api_tcp_port(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+    port: u16,
+) -> Result<ApiSettings, String> {
+    let owned = state.inner().clone();
+    if port == 0 {
+        return Err("the port must be between 1 and 65535".into());
+    }
+    if let Some(server) = running_server(&owned) {
+        if tcp_enabled(&owned.config_pool).await {
+            if let Err(bind_error) = server.set_tcp(Some(LoopbackPort::new(port))).await {
+                // Not on Windows: there the port is the only transport, and
+                // clearing the setting would only hide that it is down.
+                if cfg!(unix) {
+                    SettingsRepo::new(owned.config_pool.clone())
+                        .set(TCP_ENABLED_SETTING, &false)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                return Err(bind_error);
+            }
+        }
+    }
+    SettingsRepo::new(owned.config_pool.clone())
+        .set(TCP_PORT_SETTING, &port)
+        .await
+        .map_err(|e| e.to_string())?;
+    get_api_settings(state, app).await
+}
+
 /// The token, for the reveal-and-copy row.
 #[tauri::command]
 pub async fn reveal_api_token(state: State<'_, Arc<AppState>>) -> Result<String, String> {
@@ -180,7 +322,7 @@ pub async fn regenerate_api_token(
     // rewrites the shim's token file, so the file and the keychain cannot be
     // left disagreeing.
     if is_running(&state) {
-        stop_server(&state, &app);
+        stop_server(&state, &app).await;
         start_server(&state, &app).await?;
     }
     Ok(secret)
@@ -268,6 +410,31 @@ fn manual_instructions(source: &std::path::Path, target: &std::path::Path, why: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Until someone writes them, the port is off and listens on 8765, and a
+    /// stored `0` (which the setter refuses) falls back rather than binding a
+    /// random port the page could not show.
+    #[tokio::test]
+    async fn the_tcp_port_is_off_on_8765_until_someone_sets_it() {
+        use kea_core::store::db::{open_pool, run_config_migrations};
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+
+        assert!(!tcp_enabled(&pool).await);
+        assert_eq!(tcp_port(&pool).await, 8765);
+
+        SettingsRepo::new(pool.clone())
+            .set(TCP_PORT_SETTING, &0u16)
+            .await
+            .unwrap();
+        assert_eq!(tcp_port(&pool).await, DEFAULT_TCP_PORT);
+
+        SettingsRepo::new(pool.clone())
+            .set(TCP_PORT_SETTING, &9000u16)
+            .await
+            .unwrap();
+        assert_eq!(tcp_port(&pool).await, 9000);
+    }
 
     #[cfg(unix)]
     #[test]

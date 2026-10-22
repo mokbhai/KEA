@@ -11,6 +11,11 @@
 # handler app, and every selection verb depends on the user's app being
 # frontmost. `-g` leaves KEA in the background so the selection survives.
 #
+# The request/response half also has a TCP form, for scripts and SDKs that
+# cannot reach a Unix socket. `--api-url` (or `KEA_API_URL`) points the same
+# requests at the TCP port. Auth is the same on both: the token goes in an
+# `Authorization: Bearer` header.
+#
 # Installed by KEA's "Install command-line tool" button, which symlinks this
 # file out of the app bundle into /usr/local/bin/kea. It lives inside the
 # bundle so it is covered by the same (ad-hoc, under `make install`) code
@@ -23,10 +28,11 @@ set -eu
 APP_SUPPORT="${HOME}/Library/Application Support/ai.kea.desktop"
 SOCKET="${KEA_API_SOCKET:-${APP_SUPPORT}/kea-api.sock}"
 TOKEN_FILE="${KEA_API_TOKEN_FILE:-${APP_SUPPORT}/api-token}"
+API_URL="${KEA_API_URL:-}"
 
 usage() {
   cat >&2 <<'USAGE'
-usage: kea <command> [options]
+usage: kea [--api-url URL] <command> [options]
 
 Fire-and-forget (no local API needed):
   kea rewrite [--mode MODE] [--preset ID] [--instruction TEXT]
@@ -41,14 +47,372 @@ Request/response (needs the local API, enabled on KEA's General page):
   kea transcribe PATH                       transcribes an audio/video file
   kea status                                prints version and lifecycle state
 
+Models (the local API's OpenAI-compatible routes):
+  kea stt FILE|- [--format text|json|srt|vtt|verbose_json]
+                 [--language CODE] [--model ID] [--speakers]
+                                            prints the transcript
+  kea tts TEXT|- [--voice ID] [--speed N] [--model ID] [--out FILE]
+                                            writes WAV to FILE, or to stdout
+                                            when piped
+  kea llm PROMPT|- [--system TEXT] [--model ID]
+                                            prints the reply; piped stdin is
+                                            appended to PROMPT
+  kea models [--json]                       lists the models the API accepts
+
 MODE is one of: improve, fix_grammar, professional, concise, friendly,
 audio_refinement, ask_kea, translate.
+
+--speakers labels each segment "Person 1", "Person 2", … (needs the speaker
+models). --speed is 0.25 to 4.0.
+
+Options:
+  --api-url URL        use the TCP port instead of the Unix socket
+                       (e.g. http://127.0.0.1:8765)
 
 Environment:
   KEA_API_SOCKET       override the socket path
   KEA_API_TOKEN_FILE   override the token file path
+  KEA_API_URL          same as --api-url
 USAGE
   exit 64
+}
+
+die() {
+  echo "kea: $*" >&2
+  exit 64
+}
+
+# JSON string escaping for request bodies. Every character that is illegal
+# unescaped inside a JSON string is rewritten: quote, backslash, the named
+# control characters, and the rest of 0x01–0x1f as \u00XX. Newlines are
+# rejoined as \n. The awk program does the per-character work, because sed
+# cannot match control characters portably and a prompt may hold any of them.
+#
+# The trailing X keeps a final newline in the argument from being dropped by
+# the command substitution; it is stripped again before returning.
+json_escape() {
+  escaped=$(printf '%sX' "$1" | LC_ALL=C awk "$(awk_json_escape)")
+  printf '%s' "${escaped%X}"
+}
+
+json_string() {
+  printf '"%s"' "$(json_escape "$1")"
+}
+
+# Every awk program here runs under LC_ALL=C, so it works on bytes. The
+# decoder builds UTF-8 itself, one `%c` per byte; in a UTF-8 locale GNU awk
+# (Ubuntu's) prints `%c 240` as the character U+00F0 rather than the byte
+# 0xF0, and every non-ASCII reply came out double-encoded. BSD awk on macOS
+# prints the byte either way, which is why only Linux CI saw it.
+#
+# Only the awk programs below read JSON. The API's responses are compact
+# JSON, and jq is not a dependency of KEA, so these walk the text by hand.
+
+awk_json_escape() {
+  cat <<'AWK'
+BEGIN {
+  for (i = 1; i < 32; i++) esc[sprintf("%c", i)] = sprintf("\\u%04x", i)
+  esc["\""] = "\\\""
+  esc["\\"] = "\\\\"
+  esc["\b"] = "\\b"
+  esc["\f"] = "\\f"
+  esc["\t"] = "\\t"
+  esc["\r"] = "\\r"
+}
+{
+  out = ""
+  n = length($0)
+  for (i = 1; i <= n; i++) {
+    c = substr($0, i, 1)
+    out = out ((c in esc) ? esc[c] : c)
+  }
+  printf "%s%s", (NR > 1 ? "\\n" : ""), out
+}
+AWK
+}
+
+# Shared functions for the response readers. Each reader program reads the
+# whole body into `buf` first.
+awk_json_lib() {
+  cat <<'AWK'
+function hex4(h,    k, v, c) {
+  v = 0
+  for (k = 1; k <= 4; k++) {
+    c = index("0123456789abcdef", tolower(substr(h, k, 1))) - 1
+    if (c < 0) c = 0
+    v = v * 16 + c
+  }
+  return v
+}
+
+function utf8(cp) {
+  if (cp < 128) return sprintf("%c", cp)
+  if (cp < 2048) return sprintf("%c%c", 192 + int(cp / 64), 128 + cp % 64)
+  if (cp < 65536) return sprintf("%c%c%c", 224 + int(cp / 4096), 128 + int(cp / 64) % 64, 128 + cp % 64)
+  return sprintf("%c%c%c%c", 240 + int(cp / 262144), 128 + int(cp / 4096) % 64, 128 + int(cp / 64) % 64, 128 + cp % 64)
+}
+
+# Decodes the JSON string that starts at v (v begins with the opening quote).
+function json_string(v,    out, i, n, c, d, cp, lo) {
+  out = ""
+  n = length(v)
+  i = 2
+  while (i <= n) {
+    c = substr(v, i, 1)
+    if (c == "\"") break
+    if (c != "\\") { out = out c; i++; continue }
+    d = substr(v, i + 1, 1)
+    i += 2
+    if (d == "n") out = out "\n"
+    else if (d == "t") out = out "\t"
+    else if (d == "r") out = out "\r"
+    else if (d == "b") out = out "\b"
+    else if (d == "f") out = out "\f"
+    else if (d == "u") {
+      cp = hex4(substr(v, i, 4))
+      i += 4
+      # A character outside the BMP arrives as a surrogate pair.
+      if (cp >= 55296 && cp <= 56319 && substr(v, i, 2) == "\\u") {
+        lo = hex4(substr(v, i + 2, 4))
+        if (lo >= 56320 && lo <= 57343) {
+          cp = 65536 + (cp - 55296) * 1024 + (lo - 56320)
+          i += 6
+        }
+      }
+      out = out utf8(cp)
+    }
+    else out = out d
+  }
+  return out
+}
+
+# The value of the first "key": in s, decoded if it is a string, raw if it is
+# a number or a literal, empty if the key is absent.
+function json_value(s, key,    pat, i, j, p, rest, v) {
+  pat = "\"" key "\""
+  i = 1
+  while ((j = index(substr(s, i), pat)) > 0) {
+    p = i + j - 1 + length(pat)
+    rest = substr(s, p)
+    if (match(rest, /^[ \t\r\n]*:[ \t\r\n]*/)) {
+      v = substr(rest, RLENGTH + 1)
+      if (substr(v, 1, 1) == "\"") return json_string(v)
+      if (match(v, /^[^,} \t\r\n]+/)) return substr(v, 1, RLENGTH)
+      return ""
+    }
+    i = p
+  }
+  return ""
+}
+
+# Splits the objects that sit one level inside the top-level object (the
+# elements of `data` or `segments`) into items[1..n]. Braces inside strings
+# are skipped, so a transcript that contains "{" does not break the split.
+function json_items(s, items,    i, n, c, depth, instr, esc, start, k) {
+  n = length(s)
+  depth = 0
+  instr = 0
+  esc = 0
+  k = 0
+  for (i = 1; i <= n; i++) {
+    c = substr(s, i, 1)
+    if (instr) {
+      if (esc) esc = 0
+      else if (c == "\\") esc = 1
+      else if (c == "\"") instr = 0
+    } else if (c == "\"") instr = 1
+    else if (c == "{") {
+      depth++
+      if (depth == 2) start = i
+    } else if (c == "}") {
+      if (depth == 2) items[++k] = substr(s, start, i - start + 1)
+      depth--
+    }
+  }
+  return k
+}
+
+# Seconds as an SRT (",") or VTT (".") timestamp.
+function stamp(sec, sep,    ms) {
+  ms = int(sec * 1000 + 0.5)
+  return sprintf("%02d:%02d:%02d%s%03d", int(ms / 3600000), int(ms / 60000) % 60, int(ms / 1000) % 60, sep, ms % 1000)
+}
+
+function cue_text(item,    t, sp) {
+  t = json_value(item, "text")
+  sp = json_value(item, "speaker")
+  return (sp == "") ? t : (sp ": " t)
+}
+AWK
+}
+
+awk_error_message() {
+  cat <<'AWK'
+{ buf = buf $0 "\n" }
+END { printf "%s", json_value(buf, "message") }
+AWK
+}
+
+awk_chat_content() {
+  cat <<'AWK'
+{ buf = buf $0 "\n" }
+END { printf "%s\n", json_value(buf, "content") }
+AWK
+}
+
+awk_models() {
+  cat <<'AWK'
+{ buf = buf $0 "\n" }
+END {
+  n = json_items(buf, items)
+  for (k = 1; k <= n; k++) {
+    id = json_value(items[k], "id")
+    if (id == "") continue
+    line = id "  " json_value(items[k], "kea_capability")
+    if (json_value(items[k], "kea_default") == "true") line = line "  [default]"
+    print line
+  }
+}
+AWK
+}
+
+awk_srt() {
+  cat <<'AWK'
+{ buf = buf $0 "\n" }
+END {
+  n = json_items(buf, items)
+  for (k = 1; k <= n; k++) {
+    printf "%d\n%s --> %s\n%s\n\n", k,
+      stamp(json_value(items[k], "start") + 0, ","),
+      stamp(json_value(items[k], "end") + 0, ","),
+      cue_text(items[k])
+  }
+}
+AWK
+}
+
+awk_vtt() {
+  cat <<'AWK'
+{ buf = buf $0 "\n" }
+END {
+  printf "WEBVTT\n\n"
+  n = json_items(buf, items)
+  for (k = 1; k <= n; k++) {
+    printf "%s --> %s\n%s\n\n",
+      stamp(json_value(items[k], "start") + 0, "."),
+      stamp(json_value(items[k], "end") + 0, "."),
+      cue_text(items[k])
+  }
+}
+AWK
+}
+
+awk_speaker_text() {
+  cat <<'AWK'
+{ buf = buf $0 "\n" }
+END {
+  n = json_items(buf, items)
+  for (k = 1; k <= n; k++) print cue_text(items[k])
+}
+AWK
+}
+
+# Refuses a transport that cannot work before any request is made.
+#   * the Unix socket must exist, unless --api-url or KEA_API_URL is set;
+#   * the token must be readable on either transport.
+# Exit 69 means the API is off; 77 means the token is missing.
+check_transport() {
+  if [ -z "$API_URL" ] && [ ! -S "$SOCKET" ]; then
+    echo "kea: the local API is not running. Turn it on in KEA > General." >&2
+    exit 69
+  fi
+  if [ ! -r "$TOKEN_FILE" ]; then
+    echo "kea: cannot read $TOKEN_FILE. Turn the local API off and on again in KEA > General." >&2
+    exit 77
+  fi
+}
+
+# Sends one request and writes the response body to standard output. The
+# body is passed through untouched, so WAV audio survives. An error response
+# prints the API's error.message to standard error and exits 1.
+#
+# --fail-with-body is not used: curl would then print the error body on
+# stdout too, and the caller would have to tell it apart from a success body.
+# The body goes to a temp file, and the status comes back on stdout.
+#
+# Callers capture this with $(...) for JSON replies. A failure then exits only
+# the subshell, so those callers must propagate the status with `|| exit $?`.
+api() {
+  method="$1"; path="$2"; shift 2
+  check_transport
+  token=$(cat "$TOKEN_FILE")
+  body_file=$(mktemp)
+
+  rc=0
+  if [ -n "$API_URL" ]; then
+    http_status=$(curl --silent --output "$body_file" --write-out '%{http_code}' \
+      -X "$method" \
+      -H "authorization: Bearer ${token}" \
+      "$@" \
+      "${API_URL%/}${path}") || rc=$?
+  else
+    http_status=$(curl --silent --output "$body_file" --write-out '%{http_code}' \
+      --unix-socket "$SOCKET" \
+      -X "$method" \
+      -H "authorization: Bearer ${token}" \
+      "$@" \
+      "http://localhost${path}") || rc=$?
+  fi
+
+  if [ "$rc" -eq 7 ]; then
+    # Connection refused: nothing is listening on the socket or the port.
+    rm -f "$body_file"
+    if [ -n "$API_URL" ]; then
+      echo "kea: nothing is listening at $API_URL. Turn on the local API and its TCP port in KEA > General." >&2
+    else
+      echo "kea: the local API is not running. Turn it on in KEA > General." >&2
+    fi
+    exit 69
+  elif [ "$rc" -eq 26 ]; then
+    # curl could not read what it was asked to upload. The API is fine; the
+    # input is not, and saying "not running" would send the user to the wrong
+    # place.
+    rm -f "$body_file"
+    echo "kea: could not read the input to upload." >&2
+    exit 66
+  elif [ "$rc" -ne 0 ]; then
+    rm -f "$body_file"
+    echo "kea: the request to the local API failed (curl exit $rc)." >&2
+    exit 1
+  fi
+
+  case "$http_status" in
+    2??)
+      cat "$body_file"
+      rm -f "$body_file"
+      ;;
+    *)
+      if [ "$LEGACY_ERRORS" -eq 1 ]; then
+        # The verbs that predate the model commands printed KEA's error body
+        # on stdout and exited 22, as `curl --fail-with-body` does. Scripts
+        # written against them keep that contract.
+        cat "$body_file"
+        rm -f "$body_file"
+        exit 22
+      fi
+      message=$(LC_ALL=C awk "$(awk_json_lib)
+$(awk_error_message)" < "$body_file" || true)
+      rm -f "$body_file"
+      echo "kea: ${message:-HTTP $http_status}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# A JSON request: the body is a string the caller has already built.
+api_json() {
+  method="$1"; path="$2"; body="$3"
+  api "$method" "$path" -H "content-type: application/json" --data "$body"
 }
 
 # URL-encode one argument. `od` rather than a shell loop over characters: this
@@ -63,38 +427,20 @@ open_url() {
   open -g "$1"
 }
 
-api() {
-  method="$1"; path="$2"; shift 2
-  if [ ! -S "$SOCKET" ]; then
-    echo "kea: the local API is not running. Turn it on in KEA > General." >&2
-    exit 69
-  fi
-  if [ ! -r "$TOKEN_FILE" ]; then
-    echo "kea: cannot read $TOKEN_FILE. Turn the local API off and on again in KEA > General." >&2
-    exit 77
-  fi
-  token=$(cat "$TOKEN_FILE")
-  # --fail-with-body so a 409 or 429 still prints KEA's explanation, and the
-  # exit status still says it failed.
-  curl --silent --show-error --fail-with-body \
-    --unix-socket "$SOCKET" \
-    -X "$method" \
-    -H "x-kea-token: ${token}" \
-    -H "content-type: application/json" \
-    "$@" \
-    "http://localhost${path}"
-}
-
-json_string() {
-  # Quote a value for a JSON body. Only the two characters that can break out
-  # of a JSON string need escaping here; control characters in a shell
-  # argument are already vanishingly unlikely and would be rejected by the
-  # server's parser rather than misread.
-  printf '"%s"' "$(printf %s "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
-}
+# --api-url may come before the command as well as after it.
+while [ $# -ge 2 ] && [ "$1" = "--api-url" ]; do
+  API_URL="$2"
+  shift 2
+done
 
 [ $# -ge 1 ] || usage
 command="$1"; shift
+
+# See `api`: only the model commands use the newer error contract.
+case "$command" in
+  stt|tts|llm|models) LEGACY_ERRORS=0 ;;
+  *) LEGACY_ERRORS=1 ;;
+esac
 
 case "$command" in
   rewrite)
@@ -117,7 +463,7 @@ case "$command" in
       [ -n "$preset" ] && body="${body}\"preset_id\":$(json_string "$preset"),"
       [ -n "$instruction" ] && body="${body}\"instruction\":$(json_string "$instruction"),"
       body="${body}\"insert\":$( [ "$insert" -eq 1 ] && echo true || echo false )}"
-      api POST /v1/rewrite --data "$body"
+      api_json POST /v1/rewrite "$body"
       echo
     else
       url="kea://rewrite"; sep="?"
@@ -132,7 +478,7 @@ case "$command" in
     open_url "kea://dictation/$1"
     ;;
   dictate-stop)
-    api POST /v1/dictation/stop --data '{}'
+    api_json POST /v1/dictation/stop '{}'
     echo
     ;;
   read-aloud)
@@ -140,7 +486,7 @@ case "$command" in
     ;;
   transcribe)
     [ $# -eq 1 ] || usage
-    api POST /v1/transcribe --data "{\"path\":$(json_string "$1")}"
+    api_json POST /v1/transcribe "{\"path\":$(json_string "$1")}"
     echo
     ;;
   open)
@@ -151,6 +497,172 @@ case "$command" in
   status)
     api GET /v1/status
     echo
+    ;;
+  stt)
+    file=""; format="text"; language=""; model=""; speakers=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --format) format="$2"; shift 2 ;;
+        --language) language="$2"; shift 2 ;;
+        --model) model="$2"; shift 2 ;;
+        --speakers) speakers=1; shift ;;
+        --api-url) API_URL="$2"; shift 2 ;;
+        -) [ -z "$file" ] || usage; file="-"; shift ;;
+        -*) usage ;;
+        *) [ -z "$file" ] || usage; file="$1"; shift ;;
+      esac
+    done
+    [ -n "$file" ] || usage
+    case "$format" in
+      text|json|srt|vtt|verbose_json) ;;
+      *) die "--format must be text, json, srt, vtt or verbose_json" ;;
+    esac
+
+    # Speaker labels exist only on verbose_json segments, so --speakers asks
+    # for that and the text, SRT and VTT forms are built here from the
+    # segments. Without --speakers the server's own format is passed through.
+    if [ "$speakers" -eq 1 ]; then
+      api_format="verbose_json"
+    else
+      api_format="$format"
+    fi
+    if [ "$file" != "-" ] && [ ! -r "$file" ]; then
+      echo "kea: cannot read $file" >&2
+      exit 66
+    fi
+    # Quoted inside the form spec: unquoted, curl reads `;` and `,` in a path
+    # as the start of a field option and cuts the name there.
+    quoted_file=$(printf %s "$file" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    if [ "$file" = "-" ]; then
+      set -- -F "file=@-;filename=stdin"
+    else
+      set -- -F "file=@\"${quoted_file}\""
+    fi
+    set -- "$@" --form-string "response_format=${api_format}"
+    [ -z "$language" ] || set -- "$@" --form-string "language=${language}"
+    [ -z "$model" ] || set -- "$@" --form-string "model=${model}"
+    [ "$speakers" -eq 0 ] || set -- "$@" --form-string "speakers=true"
+
+    transcript=$(api POST /v1/audio/transcriptions "$@") || exit $?
+    case "$format" in
+      json|verbose_json)
+        printf '%s\n' "$transcript"
+        ;;
+      *)
+        if [ "$speakers" -eq 0 ]; then
+          printf '%s\n' "$transcript"
+        elif [ "$format" = text ]; then
+          printf '%s\n' "$transcript" | LC_ALL=C awk "$(awk_json_lib)
+$(awk_speaker_text)"
+        elif [ "$format" = srt ]; then
+          printf '%s\n' "$transcript" | LC_ALL=C awk "$(awk_json_lib)
+$(awk_srt)"
+        else
+          printf '%s\n' "$transcript" | LC_ALL=C awk "$(awk_json_lib)
+$(awk_vtt)"
+        fi
+        ;;
+    esac
+    ;;
+  tts)
+    text=""; voice=""; speed=""; model=""; out=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --voice) voice="$2"; shift 2 ;;
+        --speed) speed="$2"; shift 2 ;;
+        --model) model="$2"; shift 2 ;;
+        --out) out="$2"; shift 2 ;;
+        --api-url) API_URL="$2"; shift 2 ;;
+        -) [ -z "$text" ] || usage; text="-"; shift ;;
+        -*) usage ;;
+        *) [ -z "$text" ] || usage; text="$1"; shift ;;
+      esac
+    done
+    [ -n "$text" ] || usage
+    # Audio is binary. Without --out and with a terminal on stdout it would
+    # print garbage, so refuse before any request is made.
+    if [ -z "$out" ] && [ -t 1 ]; then
+      echo "kea: the audio is binary and would garble the terminal. Pass --out FILE, or pipe it (kea tts … | afplay -)." >&2
+      exit 64
+    fi
+    if [ "$text" = "-" ]; then
+      text=$(cat)
+    fi
+    case "$speed" in
+      "") ;;
+      *[!0-9.]*|*.*.*|.) die "--speed must be a number between 0.25 and 4.0" ;;
+    esac
+
+    body="{\"input\":$(json_string "$text"),\"response_format\":\"wav\""
+    [ -z "$voice" ] || body="${body},\"voice\":$(json_string "$voice")"
+    [ -z "$speed" ] || body="${body},\"speed\":${speed}"
+    [ -z "$model" ] || body="${body},\"model\":$(json_string "$model")"
+    body="${body}}"
+
+    if [ -n "$out" ]; then
+      # Written from a temp file so a failed request leaves no empty file
+      # behind, and so the output keeps the umask rather than mktemp's 0600.
+      tmp=$(mktemp)
+      trap 'rm -f "$tmp"' EXIT
+      api_json POST /v1/audio/speech "$body" > "$tmp"
+      cat "$tmp" > "$out"
+    else
+      api_json POST /v1/audio/speech "$body"
+    fi
+    ;;
+  llm)
+    prompt=""; system=""; model=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --system) system="$2"; shift 2 ;;
+        --model) model="$2"; shift 2 ;;
+        --api-url) API_URL="$2"; shift 2 ;;
+        -) [ -z "$prompt" ] || usage; prompt="-"; shift ;;
+        -*) usage ;;
+        *) [ -z "$prompt" ] || usage; prompt="$1"; shift ;;
+      esac
+    done
+    [ -n "$prompt" ] || usage
+    if [ "$prompt" = "-" ]; then
+      prompt=$(cat)
+    elif [ ! -t 0 ]; then
+      # `git diff | kea llm "Summarise"`: the piped text follows the
+      # instruction after a blank line.
+      piped=$(cat)
+      if [ -n "$piped" ]; then
+        prompt="${prompt}
+
+${piped}"
+      fi
+    fi
+
+    messages="["
+    [ -z "$system" ] || messages="${messages}{\"role\":\"system\",\"content\":$(json_string "$system")},"
+    messages="${messages}{\"role\":\"user\",\"content\":$(json_string "$prompt")}]"
+    body="{\"messages\":${messages}"
+    [ -z "$model" ] || body="${body},\"model\":$(json_string "$model")"
+    body="${body}}"
+
+    reply=$(api_json POST /v1/chat/completions "$body") || exit $?
+    printf '%s\n' "$reply" | LC_ALL=C awk "$(awk_json_lib)
+$(awk_chat_content)"
+    ;;
+  models)
+    as_json=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --json) as_json=1; shift ;;
+        --api-url) API_URL="$2"; shift 2 ;;
+        *) usage ;;
+      esac
+    done
+    listing=$(api GET /v1/models) || exit $?
+    if [ "$as_json" -eq 1 ]; then
+      printf '%s\n' "$listing"
+    else
+      printf '%s\n' "$listing" | LC_ALL=C awk "$(awk_json_lib)
+$(awk_models)"
+    fi
     ;;
   -h|--help|help)
     usage

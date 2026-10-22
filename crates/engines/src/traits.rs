@@ -292,6 +292,19 @@ pub trait TtsEngine: Send + Sync {
     fn id(&self) -> &str;
     fn capabilities(&self) -> EngineCaps;
     async fn synthesize(&self, text: &str, opts: TtsOpts) -> Result<AudioPcm, EngineError>;
+
+    /// The voice names this engine can speak with for `model`, when it can
+    /// list them.
+    ///
+    /// `None` means the engine does not enumerate voices: a hosted provider
+    /// takes its own names and refuses the ones it does not know, so the
+    /// caller passes a name through. `Some` is the complete list, and the
+    /// caller refuses a name outside it. That matters because the local
+    /// engines fall back to a default voice on an unknown name, which is the
+    /// substitution the API must not make silently.
+    fn voice_names(&self, _model: Option<&str>) -> Option<Vec<String>> {
+        None
+    }
 }
 
 #[cfg(test)]

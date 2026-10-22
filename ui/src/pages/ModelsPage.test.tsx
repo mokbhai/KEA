@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { emitTauriEvent, invokeCalls, onInvoke, resetTauriMocks } from "../test-utils/tauri";
@@ -242,5 +242,42 @@ describe("ModelsPage", () => {
       kind: "whisper",
       modelId: "whisper-base",
     });
+  });
+
+  /**
+   * The API feature has its own slots, so an unbound API row must read as
+   * inheriting the shared default rather than as a choice of its own.
+   */
+  it("lists speech, voice and language-model rows for the API, using the defaults", async () => {
+    onInvoke({
+      list_whisper_models: () => WHISPER_CATALOG,
+      list_installed_whisper_models: () => ["whisper-base"],
+      list_onnx_models: () => [],
+      list_installed_onnx_models: () => [],
+      list_providers: () => [{ provider_ref: "openai", name: "OpenAI", built_in: true }],
+      has_credential: () => true,
+      get_dictation_settings: () => ({ active_model: "whisper-base" }),
+      get_tts_settings: () => ({ active_model: null }),
+      get_binding: (args) => {
+        if (args?.feature === "api") return null;
+        if (args?.feature !== "default") return null;
+        return args?.slot === "stt"
+          ? { engine_id: "whisper", model: "whisper-base", provider_ref: null }
+          : args?.slot === "llm"
+            ? { engine_id: "openai", model: "gpt-4o-mini", provider_ref: "openai" }
+            : null;
+      },
+    });
+    render(<ModelsPage />);
+
+    expect(await screen.findByRole("heading", { level: 2, name: "API" })).toBeTruthy();
+    const group = screen.getByRole("group", { name: "API AI" });
+    expect(within(group).getByText("Speech to text")).toBeTruthy();
+    expect(within(group).getByText("Text to speech")).toBeTruthy();
+    expect(within(group).getByText("Language model")).toBeTruthy();
+    await waitFor(() =>
+      expect(within(group).getAllByText(/^Using default/)).toHaveLength(2),
+    );
+    expect(within(group).getByText(/^Using default — .*gpt-4o-mini/)).toBeTruthy();
   });
 });

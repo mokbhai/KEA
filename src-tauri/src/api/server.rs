@@ -1,18 +1,24 @@
-//! The loopback HTTP server: one unix socket, six routes, one loop.
+//! The loopback HTTP server: one route table, two possible listeners.
 //!
 //! Modelled on [`crate::hotkeys`] — a table of routes and a dispatch loop —
 //! for the same reason that module exists: the per-route parts of a request
 //! belong next to the table that names them, and the composition root stays
 //! composition.
 //!
-//! The security argument for the whole feature lives in [`super::auth`]. The
-//! short version is that this listens on a **unix domain socket** at mode
-//! `0600` under the app data directory, never on a TCP port: a socket file
-//! gets filesystem access control for free and has no URL, so no web page can
-//! reach it and DNS rebinding has nothing to rebind. `curl --unix-socket`
-//! covers every scripting client that a port would have.
+//! The default listener is a **unix domain socket** at mode `0600` under the
+//! app data directory: a socket file gets filesystem access control for free
+//! and has no URL, so no web page can reach it. The second listener is an
+//! opt-in `127.0.0.1` TCP port for SDKs that can only be pointed at a URL. It
+//! runs the same service function as the socket, so routes, auth and limits are
+//! the same on both. [`LoopbackPort`] is what keeps it on loopback: it cannot
+//! be built from anything but a port number.
+//!
+//! The security argument for the whole feature, and what the port gives back,
+//! lives in [`super::auth`].
 
 use std::convert::Infallible;
+use std::future::Future;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -20,13 +26,20 @@ use std::time::Instant;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
+use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tauri::AppHandle;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
+
+use kea_core::store::bindings::BindingRepo;
+use kea_core::store::usage::UsageRepo;
 
 use super::actions::{DictationVerb, KeaAction, RewriteRequest};
 use super::auth::{authorize, Denied};
 use super::exec::{execute, spends_llm_credits, ActionError, ActionOutcome};
+use super::models::{self, Deps, Reply};
+use super::openai::ApiError;
 use super::ratelimit::TokenBucket;
 use super::token;
 use crate::AppState;
@@ -35,6 +48,12 @@ use crate::AppState;
 /// hundred kilobytes; a megabyte is generous and stops a local process from
 /// making KEA buffer its way out of memory.
 const MAX_BODY: usize = 1024 * 1024;
+
+/// Biggest transcription upload. OpenAI's own limit for the same route, so a
+/// client that checks its file size before sending hits the same wall here.
+/// About an hour of compressed audio; the decoded PCM is the same footprint
+/// file transcription already accepts.
+const MAX_UPLOAD_BODY: usize = 25 * 1024 * 1024;
 
 /// One route: the method and path that name it, and the verb it produces.
 ///
@@ -54,6 +73,36 @@ enum RouteKind {
     Speak,
     Transcribe,
     Status,
+    // The OpenAI-compatible model routes. They do not produce a `KeaAction`:
+    // they are answered by `models`, with their own bodies and errors.
+    ModelTranscriptions,
+    ModelSpeech,
+    ModelChat,
+    ModelList,
+}
+
+impl RouteKind {
+    /// Whether this route is one of the OpenAI-compatible ones. Those answer
+    /// with OpenAI's error shape and a route-sized body limit; every other
+    /// route keeps its existing responses.
+    fn is_model_route(self) -> bool {
+        matches!(
+            self,
+            RouteKind::ModelTranscriptions
+                | RouteKind::ModelSpeech
+                | RouteKind::ModelChat
+                | RouteKind::ModelList
+        )
+    }
+
+    /// The most body this route will read. Only the upload route is larger
+    /// than the general limit.
+    fn body_limit(self) -> usize {
+        match self {
+            RouteKind::ModelTranscriptions => MAX_UPLOAD_BODY,
+            _ => MAX_BODY,
+        }
+    }
 }
 
 fn routes() -> Vec<Route> {
@@ -90,6 +139,26 @@ fn routes() -> Vec<Route> {
             method: Method::GET,
             path: "/v1/status",
             kind: RouteKind::Status,
+        },
+        Route {
+            method: Method::POST,
+            path: "/v1/audio/transcriptions",
+            kind: RouteKind::ModelTranscriptions,
+        },
+        Route {
+            method: Method::POST,
+            path: "/v1/audio/speech",
+            kind: RouteKind::ModelSpeech,
+        },
+        Route {
+            method: Method::POST,
+            path: "/v1/chat/completions",
+            kind: RouteKind::ModelChat,
+        },
+        Route {
+            method: Method::GET,
+            path: "/v1/models",
+            kind: RouteKind::ModelList,
         },
     ]
 }
@@ -190,6 +259,14 @@ fn action_for(kind: RouteKind, body: &[u8]) -> Result<KeaAction, ActionError> {
             })
         }
         RouteKind::Status => Ok(KeaAction::Status),
+        // Answered by `models`, never planned as an action. Reaching this
+        // arm would be a routing bug, so it is refused rather than guessed at.
+        RouteKind::ModelTranscriptions
+        | RouteKind::ModelSpeech
+        | RouteKind::ModelChat
+        | RouteKind::ModelList => Err(ActionError::Failed(
+            "a model route is not a KEA action".into(),
+        )),
     }
 }
 
@@ -203,20 +280,236 @@ struct Runtime {
     limiter: Arc<Mutex<TokenBucket>>,
 }
 
+/// A loopback TCP port: the only kind of TCP address the API listens on.
+///
+/// A type rather than a `SocketAddr` parameter so the rule is enforced where
+/// the address is built. There is no constructor that takes a host, so a
+/// non-loopback bind cannot be written at a call site, only argued for in a
+/// change to this file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopbackPort(u16);
+
+impl LoopbackPort {
+    /// Port `0` asks the OS for a free one. Tests use it; the settings never
+    /// store it.
+    pub fn new(port: u16) -> Self {
+        Self(port)
+    }
+
+    pub fn port(self) -> u16 {
+        self.0
+    }
+
+    pub fn addr(self) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], self.0))
+    }
+}
+
+/// A running loopback TCP listener.
+pub struct TcpHandle {
+    shutdown: watch::Sender<bool>,
+    /// The address actually bound. It differs from the requested one only when
+    /// port `0` was asked for.
+    pub addr: SocketAddr,
+    task: tauri::async_runtime::JoinHandle<()>,
+}
+
+impl TcpHandle {
+    /// Stop accepting, and return once the listener has closed, so the port is
+    /// free for the next bind. Connections already accepted are not waited for
+    /// here: each finishes the request it is serving and then closes.
+    pub async fn stop(self) {
+        self.shutdown.send_replace(true);
+        let _ = self.task.await;
+    }
+}
+
 /// A running server. Dropping the handle does not stop it; [`Self::stop`]
 /// does, so turning the API off is an explicit act with a tidy-up.
 pub struct ServerHandle {
     shutdown: watch::Sender<bool>,
-    pub socket_path: PathBuf,
+    /// `None` only in the non-unix build, which runs the TCP port alone.
+    pub socket_path: Option<PathBuf>,
+    rt: Runtime,
+    /// Behind an async lock because the port is bound and released while the
+    /// settings page waits on it, and a std lock cannot be held across that.
+    tcp: tokio::sync::Mutex<Option<TcpHandle>>,
+    /// Why the port asked for is not open, for the settings page. Kept on the
+    /// handle rather than returned once, because the API can come up at launch
+    /// with nobody waiting on the result.
+    tcp_error: std::sync::Mutex<Option<String>>,
 }
 
 impl ServerHandle {
-    pub fn stop(&self) {
-        let _ = self.shutdown.send(true);
-        // Best effort: the accept loop unlinks too, but a listener that is
-        // already gone leaves the file behind and the next bind would have to
-        // clear it.
-        let _ = std::fs::remove_file(&self.socket_path);
+    /// Stop the socket and the TCP port.
+    ///
+    /// The socket file is removed as a best effort: the accept loop unlinks it
+    /// too, but a listener that is already gone leaves it behind and the next
+    /// bind would have to clear it.
+    pub async fn stop(&self) {
+        self.shutdown.send_replace(true);
+        if let Some(path) = &self.socket_path {
+            let _ = std::fs::remove_file(path);
+        }
+        let previous = self.tcp.lock().await.take();
+        if let Some(tcp) = previous {
+            tcp.stop().await;
+        }
+    }
+
+    /// Why the requested port is not open, if it is not.
+    pub fn tcp_error(&self) -> Option<String> {
+        match self.tcp_error.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn set_tcp_error(&self, error: Option<String>) {
+        match self.tcp_error.lock() {
+            Ok(mut slot) => *slot = error,
+            Err(poisoned) => *poisoned.into_inner() = error,
+        }
+    }
+
+    /// The address the TCP port is listening on, or `None` if it is off.
+    pub async fn tcp_addr(&self) -> Option<SocketAddr> {
+        self.tcp.lock().await.as_ref().map(|tcp| tcp.addr)
+    }
+
+    /// Start, move or stop the TCP port on a running server. The socket is not
+    /// touched.
+    ///
+    /// The old listener closes before the new one binds, so binding the same
+    /// port again works. If the bind fails, the port is left off and the error
+    /// is returned; the socket keeps serving.
+    pub async fn set_tcp(&self, port: Option<LoopbackPort>) -> Result<Option<SocketAddr>, String> {
+        let mut slot = self.tcp.lock().await;
+        if let Some(previous) = slot.take() {
+            previous.stop().await;
+        }
+        self.set_tcp_error(None);
+        let Some(port) = port else {
+            return Ok(None);
+        };
+        // Checked under the lock `stop` also takes: a stop that lands first is
+        // seen here, and one that lands after waits and then closes what this
+        // bound. Either way no port outlives a stopped API.
+        if *self.shutdown.borrow() {
+            return Err("the local API is stopped".into());
+        }
+        let listener = match bind_tcp(port).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                self.set_tcp_error(Some(e.clone()));
+                return Err(e);
+            }
+        };
+        let rt = self.rt.clone();
+        let tcp = spawn_tcp_loop(listener, move |req| handle(rt.clone(), req))?;
+        let addr = tcp.addr;
+        *slot = Some(tcp);
+        Ok(Some(addr))
+    }
+}
+
+/// Bind the loopback port.
+///
+/// A port already in use is the common failure, and the message names the
+/// address so the settings page can show it.
+async fn bind_tcp(port: LoopbackPort) -> Result<TcpListener, String> {
+    TcpListener::bind(port.addr())
+        .await
+        .map_err(|e| format!("could not listen on {}: {e}", port.addr()))
+}
+
+/// Start the accept loop for a bound listener.
+///
+/// Generic over the service so the loop and its stop can be tested over a real
+/// socket with a stand-in service. Production passes the same [`handle`] the
+/// unix socket serves, which is what keeps the two transports identical.
+fn spawn_tcp_loop<F, Fut>(listener: TcpListener, service: F) -> Result<TcpHandle, String>
+where
+    F: Fn(Request<Incoming>) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Response<Full<Bytes>>> + Send + 'static,
+{
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("could not read the listening address: {e}"))?;
+    let (shutdown, stop_rx) = watch::channel(false);
+    let task = tauri::async_runtime::spawn(accept_tcp(listener, stop_rx, service));
+    Ok(TcpHandle {
+        shutdown,
+        addr,
+        task,
+    })
+}
+
+async fn accept_tcp<F, Fut>(listener: TcpListener, mut stop: watch::Receiver<bool>, service: F)
+where
+    F: Fn(Request<Incoming>) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Response<Full<Bytes>>> + Send + 'static,
+{
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                // A dropped handle closes the channel, which is a stop too.
+                // Treating that as "no change yet" would spin the loop.
+                if changed.is_err() || *stop.borrow() {
+                    break;
+                }
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "local API: TCP accept failed");
+                        continue;
+                    }
+                };
+                tauri::async_runtime::spawn(serve_tcp_connection(
+                    TokioIo::new(stream),
+                    service.clone(),
+                    stop.clone(),
+                ));
+            }
+        }
+    }
+    // The listener drops with this function, which is what frees the port.
+    tracing::info!("local API TCP listener stopped");
+}
+
+/// Serve one TCP connection until the client closes it or the listener stops.
+///
+/// On stop, the request in flight is allowed to finish and the connection then
+/// closes. Without that, an idle keep-alive connection would hold the server
+/// open after the user has turned the port off.
+async fn serve_tcp_connection<F, Fut>(
+    io: TokioIo<TcpStream>,
+    service: F,
+    mut stop: watch::Receiver<bool>,
+) where
+    F: Fn(Request<Incoming>) -> Fut + Send + 'static,
+    Fut: Future<Output = Response<Full<Bytes>>> + Send + 'static,
+{
+    let svc = hyper::service::service_fn(move |req| {
+        let fut = service(req);
+        async move { Ok::<_, Infallible>(fut.await) }
+    });
+    let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, svc);
+    tokio::pin!(conn);
+    tokio::select! {
+        result = conn.as_mut() => {
+            if let Err(e) = result {
+                tracing::debug!(error = %e, "local API: connection ended");
+            }
+        }
+        _ = stop.changed() => {
+            conn.as_mut().graceful_shutdown();
+            if let Err(e) = conn.as_mut().await {
+                tracing::debug!(error = %e, "local API: connection ended");
+            }
+        }
     }
 }
 
@@ -293,16 +586,42 @@ async fn handle(rt: Runtime, req: Request<Incoming>) -> Response<Full<Bytes>> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let headers = req.headers().clone();
+    let kind = match_route(&method, &path);
+    // The model routes answer in OpenAI's shape, refusals included, so the
+    // shape is decided from the route before anything else is checked.
+    let openai = kind.is_some_and(RouteKind::is_model_route);
 
-    let body = match Limited::new(req.into_body(), MAX_BODY).collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => {
+    // Authorization comes before the body is read: a 25 MB upload from a
+    // process without the token should cost KEA nothing. `plan_request`
+    // repeats the check for the routes that take the action path, which is
+    // harmless: it can only refuse what this has already let through.
+    if let Err(denied) = authorize(&headers, rt.token.as_bytes()) {
+        tracing::warn!(%method, %path, reason = denied.reason(), "local API: request denied");
+        return if openai {
+            openai_error(ApiError::auth("invalid or missing API token"))
+        } else {
+            error_response(status_code(Denied::status(denied)), "unauthorized")
+        };
+    }
+    let Some(kind) = kind else {
+        return error_response(StatusCode::NOT_FOUND, "no such endpoint");
+    };
+
+    let limit = kind.body_limit();
+    let body = match collect_body(req.into_body(), limit).await {
+        Ok(bytes) => bytes,
+        Err(()) if openai => return openai_error(ApiError::too_large(limit)),
+        Err(()) => {
             return error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request body is too large or could not be read",
             )
         }
     };
+
+    if kind.is_model_route() {
+        return serve_model_route(&rt, &method, &path, kind, &headers, body).await;
+    }
 
     let action = match plan_request(&method, &path, &headers, rt.token.as_bytes(), &body) {
         Ok(action) => action,
@@ -354,19 +673,130 @@ async fn handle(rt: Runtime, req: Request<Incoming>) -> Response<Full<Bytes>> {
     }
 }
 
-/// Bind the socket and start accepting.
+/// Reads a body up to `limit` bytes. Over the limit, or unreadable, is `Err`:
+/// the caller decides the response, because its shape depends on the route.
+async fn collect_body(body: Incoming, limit: usize) -> Result<Bytes, ()> {
+    Limited::new(body, limit)
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes())
+        .map_err(|_| ())
+}
+
+/// The installed models of every download-based local engine, read from disk
+/// per request: a download that finishes while the API runs is callable on
+/// the next request, with no cache to invalidate.
+fn installed_models(state: &AppState) -> models::InstalledModels {
+    use crate::commands::{installed_onnx_model_ids, onnx_catalog_for_kind};
+    use kea_infer::ModelKind;
+
+    let onnx = |storage: &kea_infer::ModelStorage, kind: ModelKind| {
+        onnx_catalog_for_kind(kind)
+            .map(|catalog| installed_onnx_model_ids(storage, &catalog))
+            .unwrap_or_default()
+    };
+    models::InstalledModels::default()
+        .with("whisper", state.model_storage.installed_models())
+        .with(
+            "parakeet",
+            onnx(&state.parakeet_storage, ModelKind::Parakeet),
+        )
+        .with("sherpa-tts", onnx(&state.tts_storage, ModelKind::Tts))
+}
+
+/// Carries out one of the OpenAI-compatible routes.
 ///
-/// Returns once the socket is listening, so the settings page can report a
-/// bind failure rather than claiming the API is on.
+/// The dependencies are borrowed from the app for this request only. The
+/// repositories are cheap handles over the pools, so building them per
+/// request is what the action path does too.
+async fn serve_model_route(
+    rt: &Runtime,
+    method: &Method,
+    path: &str,
+    kind: RouteKind,
+    headers: &http::HeaderMap,
+    body: Bytes,
+) -> Response<Full<Bytes>> {
+    let bindings = BindingRepo::new(rt.state.config_pool.clone());
+    let usage = UsageRepo::new(rt.state.data_pool.clone());
+    let diarizer = models::production_diarizer();
+    let installed = installed_models(&rt.state);
+    let deps = Deps {
+        engines: &rt.state.engines,
+        bindings: &bindings,
+        usage: &usage,
+        credentials: rt.state.credentials.as_ref(),
+        diarization: &rt.state.diarization_storage,
+        diarizer: diarizer.as_deref(),
+        stt_busy: &rt.state.api_stt_busy,
+        tts_busy: &rt.state.api_tts_busy,
+        limiter: &rt.limiter,
+        installed: &installed,
+    };
+
+    let result = match kind {
+        RouteKind::ModelTranscriptions => {
+            let content_type = headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok());
+            models::transcriptions(&deps, content_type, body).await
+        }
+        RouteKind::ModelSpeech => models::speech(&deps, &body).await,
+        RouteKind::ModelChat => models::chat(&deps, &body).await,
+        _ => models::list(&deps).await,
+    };
+    match result {
+        Ok(reply) => {
+            tracing::info!(%method, %path, outcome = "ok", "local API");
+            model_reply(reply)
+        }
+        Err(error) => {
+            tracing::warn!(%method, %path, status = error.status, outcome = "error", "local API");
+            openai_error(error)
+        }
+    }
+}
+
+/// An [`ApiError`] in OpenAI's error shape, with `Retry-After` where the
+/// caller is expected to come back.
+fn openai_error(error: ApiError) -> Response<Full<Bytes>> {
+    let mut response = json(status_code(error.status), error.body());
+    if let Some(seconds) = error.retry_after {
+        if let Ok(value) = http::HeaderValue::from_str(&seconds.max(1).to_string()) {
+            response
+                .headers_mut()
+                .insert(http::header::RETRY_AFTER, value);
+        }
+    }
+    response
+}
+
+/// A model route's success, with its content type and any extra headers.
+fn model_reply(reply: Reply) -> Response<Full<Bytes>> {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, reply.content_type)
+        .header("x-content-type-options", "nosniff");
+    for (name, value) in reply.headers {
+        if let Ok(value) = http::HeaderValue::from_str(&value) {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+        .body(Full::new(Bytes::from(reply.body)))
+        .unwrap_or_else(|_| openai_error(ApiError::internal("could not build the response")))
+}
+
+/// Bind the unix socket and start its accept loop, returning its path.
+///
+/// Its stop is the shared `shutdown` channel, so [`ServerHandle::stop`] stops
+/// it with the TCP port.
 #[cfg(unix)]
-pub async fn start(
-    state: Arc<AppState>,
-    app: AppHandle,
+fn start_socket(
+    rt: &Runtime,
+    shutdown: &watch::Sender<bool>,
     app_data_dir: &std::path::Path,
-    token: String,
-    rewrites_per_minute: u32,
-) -> Result<ServerHandle, String> {
-    use hyper_util::rt::TokioIo;
+) -> Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt;
     use tokio::net::UnixListener;
 
@@ -379,17 +809,8 @@ pub async fn start(
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("could not restrict {}: {e}", socket_path.display()))?;
 
-    let (shutdown, mut stop_rx) = watch::channel(false);
-    let rt = Runtime {
-        state,
-        app,
-        token: Arc::new(token),
-        limiter: Arc::new(Mutex::new(TokenBucket::per_minute(
-            rewrites_per_minute,
-            Instant::now(),
-        ))),
-    };
-
+    let mut stop_rx = shutdown.subscribe();
+    let rt = rt.clone();
     let listen_path = socket_path.clone();
     tauri::async_runtime::spawn(async move {
         tracing::info!(path = %listen_path.display(), "local API listening");
@@ -428,24 +849,69 @@ pub async fn start(
         tracing::info!(path = %listen_path.display(), "local API stopped");
     });
 
-    Ok(ServerHandle {
-        shutdown,
-        socket_path,
-    })
+    Ok(socket_path)
 }
 
-/// The API is a unix-socket feature, deliberately (see [`super::auth`]). On a
-/// platform without one there is nothing to fall back to that would still be
-/// worth shipping, so it stays off rather than quietly becoming a TCP port.
-#[cfg(not(unix))]
+/// Bind the transports the caller asks for and start accepting on them.
+///
+/// The unix socket is always bound where there is one. `tcp` adds the loopback
+/// port. A bind failure there does not take the socket down with it — a busy
+/// port at launch must not cost the user the API they already had — so the
+/// handle comes back with the reason in [`ServerHandle::tcp_error`]. Without a
+/// unix socket the port is the only transport, and its failure is the start's.
+///
+/// Returns once every requested listener is up, so the settings page can report
+/// a bind failure rather than claiming the API is on.
 pub async fn start(
-    _state: Arc<AppState>,
-    _app: AppHandle,
-    _app_data_dir: &std::path::Path,
-    _token: String,
-    _rewrites_per_minute: u32,
+    state: Arc<AppState>,
+    app: AppHandle,
+    app_data_dir: &std::path::Path,
+    token: String,
+    rewrites_per_minute: u32,
+    tcp: Option<LoopbackPort>,
 ) -> Result<ServerHandle, String> {
-    Err("the local API needs a unix domain socket, which this platform does not have".into())
+    let rt = Runtime {
+        state,
+        app,
+        token: Arc::new(token),
+        limiter: Arc::new(Mutex::new(TokenBucket::per_minute(
+            rewrites_per_minute,
+            Instant::now(),
+        ))),
+    };
+    let (shutdown, _) = watch::channel(false);
+
+    #[cfg(unix)]
+    let socket_path = Some(start_socket(&rt, &shutdown, app_data_dir)?);
+    // Without unix sockets the TCP port is the only transport, so a start
+    // with no port would be an API that cannot be reached.
+    #[cfg(not(unix))]
+    let socket_path = {
+        let _ = app_data_dir;
+        if tcp.is_none() {
+            return Err(
+                "the local API needs a unix domain socket on this platform; turn on the localhost port"
+                    .into(),
+            );
+        }
+        None
+    };
+
+    let handle = ServerHandle {
+        shutdown,
+        socket_path,
+        rt,
+        tcp: tokio::sync::Mutex::new(None),
+        tcp_error: std::sync::Mutex::new(None),
+    };
+    if let Err(e) = handle.set_tcp(tcp).await {
+        if handle.socket_path.is_none() {
+            handle.stop().await;
+            return Err(e);
+        }
+        tracing::warn!(error = %e, "local API: the localhost port did not open; the socket is serving");
+    }
+    Ok(handle)
 }
 
 #[cfg(test)]
@@ -565,6 +1031,140 @@ mod tests {
         assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
     }
 
+    /// The service the TCP tests serve. It runs the same [`plan_request`] the
+    /// socket test does, so auth and routing are the production code. A request
+    /// with `x-test-slow` is held for a while before it is answered, to test what
+    /// happens to one in flight at stop.
+    async fn tcp_test_service(req: Request<Incoming>) -> Response<Full<Bytes>> {
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+        let headers = req.headers().clone();
+        let body = Limited::new(req.into_body(), MAX_BODY)
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
+        if headers.contains_key("x-test-slow") {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        match plan_request(&method, &path, &headers, TEST_TOKEN.as_bytes(), &body) {
+            Ok(action) => json(
+                StatusCode::OK,
+                serde_json::json!({ "verb": action.label() }),
+            ),
+            Err(denied) => *denied,
+        }
+    }
+
+    /// One raw HTTP/1.1 exchange over TCP, read to the close.
+    async fn tcp_exchange(addr: SocketAddr, raw: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(raw.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[test]
+    fn the_port_can_only_be_loopback() {
+        for port in [0, 8765, 65535] {
+            assert!(LoopbackPort::new(port).addr().ip().is_loopback());
+        }
+        assert_eq!(
+            LoopbackPort::new(8765).addr(),
+            "127.0.0.1:8765".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tcp_port_accepts_a_bearer_token_and_refuses_a_rebound_host() {
+        let listener = bind_tcp(LoopbackPort::new(0)).await.unwrap();
+        let tcp = spawn_tcp_loop(listener, tcp_test_service).unwrap();
+        assert!(tcp.addr.ip().is_loopback());
+        let bearer = format!("Authorization: Bearer {TEST_TOKEN}");
+
+        let authorized = tcp_exchange(
+            tcp.addr,
+            &format!(
+                "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\n{bearer}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(authorized.starts_with("HTTP/1.1 200"), "{authorized}");
+        assert!(authorized.contains("\"verb\":\"status\""), "{authorized}");
+
+        let rebound = tcp_exchange(
+            tcp.addr,
+            &format!(
+                "GET /v1/status HTTP/1.1\r\nHost: attacker.example\r\n{bearer}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(rebound.starts_with("HTTP/1.1 401"), "{rebound}");
+
+        let anonymous = tcp_exchange(
+            tcp.addr,
+            "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(anonymous.starts_with("HTTP/1.1 401"), "{anonymous}");
+
+        tcp.stop().await;
+    }
+
+    #[tokio::test]
+    async fn stopping_the_tcp_port_refuses_new_connections() {
+        let listener = bind_tcp(LoopbackPort::new(0)).await.unwrap();
+        let tcp = spawn_tcp_loop(listener, tcp_test_service).unwrap();
+        let addr = tcp.addr;
+        assert!(
+            TcpStream::connect(addr).await.is_ok(),
+            "listening before stop"
+        );
+
+        tcp.stop().await;
+        assert!(
+            TcpStream::connect(addr).await.is_err(),
+            "still accepting after stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_in_flight_when_the_port_stops_still_gets_its_answer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = bind_tcp(LoopbackPort::new(0)).await.unwrap();
+        let tcp = spawn_tcp_loop(listener, tcp_test_service).unwrap();
+        let mut stream = TcpStream::connect(tcp.addr).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TEST_TOKEN}\r\nx-test-slow: 1\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        // Long enough for the connection to be accepted and the request begun.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        tcp.stop().await;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(text.contains("\"verb\":\"status\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_taken_port_is_reported_to_the_caller() {
+        let first = bind_tcp(LoopbackPort::new(0)).await.unwrap();
+        let taken = first.local_addr().unwrap().port();
+        let err = bind_tcp(LoopbackPort::new(taken)).await.unwrap_err();
+        assert!(err.contains(&taken.to_string()), "{err}");
+        drop(first);
+    }
+
     #[test]
     fn every_documented_route_matches_and_nothing_else_does() {
         for route in routes() {
@@ -580,6 +1180,177 @@ mod tests {
         assert_eq!(match_route(&Method::POST, "/v1/status"), None);
         assert_eq!(match_route(&Method::POST, "/rewrite"), None);
         assert_eq!(match_route(&Method::GET, "/"), None);
+    }
+
+    #[test]
+    fn the_model_routes_are_in_the_table_with_their_own_limits() {
+        assert_eq!(
+            match_route(&Method::POST, "/v1/audio/transcriptions"),
+            Some(RouteKind::ModelTranscriptions)
+        );
+        assert_eq!(
+            match_route(&Method::POST, "/v1/audio/speech"),
+            Some(RouteKind::ModelSpeech)
+        );
+        assert_eq!(
+            match_route(&Method::POST, "/v1/chat/completions"),
+            Some(RouteKind::ModelChat)
+        );
+        assert_eq!(
+            match_route(&Method::GET, "/v1/models"),
+            Some(RouteKind::ModelList)
+        );
+        // Method and path are both part of the match.
+        assert_eq!(match_route(&Method::GET, "/v1/audio/speech"), None);
+        assert_eq!(match_route(&Method::POST, "/v1/models"), None);
+
+        assert_eq!(
+            RouteKind::ModelTranscriptions.body_limit(),
+            25 * 1024 * 1024
+        );
+        assert_eq!(RouteKind::ModelChat.body_limit(), MAX_BODY);
+        assert_eq!(RouteKind::Rewrite.body_limit(), MAX_BODY);
+        assert!(RouteKind::ModelSpeech.is_model_route());
+        assert!(!RouteKind::Speak.is_model_route());
+        // A model route never becomes a KEA action, so the action path
+        // cannot be reached with one by mistake.
+        assert!(action_for(RouteKind::ModelChat, b"{}").is_err());
+    }
+
+    /// The stand-in service the body-limit socket test serves. It runs the
+    /// same authorization, routing and body collection that `handle` runs,
+    /// and answers with the same error shapes, so the limits are exercised
+    /// over a real socket without an `AppState` to carry the engines.
+    #[cfg(unix)]
+    async fn body_limit_service(req: Request<Incoming>) -> Response<Full<Bytes>> {
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+        let headers = req.headers().clone();
+        let kind = match_route(&method, &path);
+        let openai = kind.is_some_and(RouteKind::is_model_route);
+        if authorize(&headers, TEST_TOKEN.as_bytes()).is_err() {
+            return if openai {
+                openai_error(ApiError::auth("invalid or missing API token"))
+            } else {
+                error_response(StatusCode::UNAUTHORIZED, "unauthorized")
+            };
+        }
+        let Some(kind) = kind else {
+            return error_response(StatusCode::NOT_FOUND, "no such endpoint");
+        };
+        match collect_body(req.into_body(), kind.body_limit()).await {
+            Ok(_) => json(StatusCode::OK, serde_json::json!({ "route": path })),
+            Err(()) if openai => openai_error(ApiError::too_large(kind.body_limit())),
+            Err(()) => error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body is too large or could not be read",
+            ),
+        }
+    }
+
+    /// Sends a raw request with a body over the socket and reads the answer
+    /// to the close. The write runs beside the read: a server that answers
+    /// `413` stops reading early, and the rest of the upload fails to write.
+    /// That failure is expected, so it is not an error here.
+    ///
+    /// The write half stays open until the answer is read. Dropping it
+    /// would half-close the socket, and hyper then discards a response it
+    /// has not sent yet, which reads as an empty answer.
+    #[cfg(unix)]
+    async fn send_with_body(path: &std::path::Path, head: String, body: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let stream = tokio::net::UnixStream::connect(path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        let upload = tokio::spawn(async move {
+            let _ = writer.write_all(head.as_bytes()).await;
+            let _ = writer.write_all(&body).await;
+            std::future::pending::<()>().await;
+        });
+        let mut response = Vec::new();
+        reader.read_to_end(&mut response).await.unwrap();
+        upload.abort();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// The body limit, end to end over the socket: a 2 MB body to a chat
+    /// route (1 MB) is a `413` in OpenAI's error shape, and the same body to
+    /// the upload route (25 MB) is accepted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_oversized_model_body_is_a_413_in_openai_shape_over_the_socket() {
+        use hyper_util::rt::TokioIo;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = token::socket_path(dir.path());
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(|req: Request<Incoming>| async {
+                        Ok::<_, Infallible>(body_limit_service(req).await)
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        let payload = vec![b'a'; 2 * 1024 * 1024];
+        let head = |route: &str| {
+            format!(
+                "POST {route} HTTP/1.1\r\nHost: localhost\r\nx-kea-token: {TEST_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            )
+        };
+
+        let too_big = send_with_body(&socket, head("/v1/chat/completions"), payload.clone()).await;
+        assert!(too_big.starts_with("HTTP/1.1 413"), "{too_big}");
+        assert!(
+            too_big.contains("\"type\":\"invalid_request_error\""),
+            "{too_big}"
+        );
+        assert!(
+            too_big.contains("\"code\":\"request_too_large\""),
+            "{too_big}"
+        );
+
+        let upload = send_with_body(&socket, head("/v1/audio/transcriptions"), payload).await;
+        assert!(upload.starts_with("HTTP/1.1 200"), "{upload}");
+    }
+
+    /// An unauthenticated model route is refused in OpenAI's shape too, so an
+    /// SDK can read the reason it got.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_model_route_without_a_token_is_an_openai_401() {
+        use hyper_util::rt::TokioIo;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = token::socket_path(dir.path());
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(|req: Request<Incoming>| async {
+                        Ok::<_, Infallible>(body_limit_service(req).await)
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let anonymous = request(
+            &socket,
+            "GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(anonymous.starts_with("HTTP/1.1 401"), "{anonymous}");
+        assert!(
+            anonymous.contains("\"code\":\"invalid_api_key\""),
+            "{anonymous}"
+        );
     }
 
     #[test]

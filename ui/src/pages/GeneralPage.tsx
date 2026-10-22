@@ -9,11 +9,15 @@ import {
   revealApiToken,
   setApiEnabled,
   setApiRateLimit,
+  setApiTcpEnabled,
+  setApiTcpPort,
   setAutostart,
   setSetting,
   showNotification,
   type ApiSettings,
 } from "../api";
+import Banner from "../components/Banner";
+import ApiUsage from "../components/ApiUsage";
 import PermissionPanel from "../components/PermissionPanel";
 import { Row, RowGroup } from "../components/SettingsRow";
 import Toggle from "../components/Toggle";
@@ -33,6 +37,11 @@ const API_OFF: ApiSettings = {
   token_file: "",
   max_rewrites_per_minute: 20,
   supported: true,
+  unix_socket_supported: true,
+  tcp_enabled: false,
+  tcp_running: false,
+  tcp_error: null,
+  tcp_port: 8765,
 };
 
 /**
@@ -45,9 +54,20 @@ const API_OFF: ApiSettings = {
  */
 const API_THREAT_MODEL =
   "Anything holding this token can type text into whatever app you have focused, read your " +
-  "current selection, open your microphone and spend your LLM API credits. KEA listens on a " +
-  "file-permission-protected socket (not a network port), so no web page can reach it and no " +
-  "other account on this Mac can either — but any program running as you can.";
+  "current selection, open your microphone and spend your LLM API credits. By default KEA " +
+  "listens on a file-permission-protected socket, so no web page can reach it and no other " +
+  "account on this Mac can either — but any program running as you can. The optional " +
+  "localhost port below is covered by its own warning.";
+
+/**
+ * Shown while the localhost port is on, or being turned on. The port is the one
+ * place a browser page can reach the API, so the warning says what the token
+ * buys and that the browser block is not the whole story.
+ */
+const TCP_WARNING =
+  "Holding the token lets a program read your selection, type into the focused app, open " +
+  "the microphone and spend LLM credits. Browsers are blocked from the localhost port, but " +
+  "any program on this computer that has the token can call it.";
 
 export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) {
   const { preference, setPreference } = useTheme();
@@ -82,6 +102,12 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
   const [apiToken, setApiToken] = useState<string | null>(null);
   const [apiTokenBusy, setApiTokenBusy] = useState(false);
   const [rateLimit, setRateLimit] = useState("20");
+  // The port toggle is shown as on the moment it is pressed, so the warning
+  // appears with the decision rather than after the backend answers. Null
+  // means no request is in flight and the saved value is what shows.
+  const [tcpPending, setTcpPending] = useState<boolean | null>(null);
+  const [tcpMessage, setTcpMessage] = useState<string | null>(null);
+  const [portInput, setPortInput] = useState("8765");
   const [cliStatus, setCliStatus] = useState<string | null>(null);
   const [cliBusy, setCliBusy] = useState(false);
 
@@ -106,6 +132,7 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
       .then((settings) => {
         setApiValue(settings);
         setRateLimit(String(settings.max_rewrites_per_minute));
+        setPortInput(String(settings.tcp_port));
       })
       .catch((e) => setApiError(toMessage(e)));
   }, [setApiValue, setApiError]);
@@ -205,6 +232,55 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
     }
   };
 
+  /**
+   * Re-reads the settings after a refused port change, so the toggle and the
+   * port field show what is really listening rather than what was asked for.
+   */
+  const resyncApi = async () => {
+    try {
+      const settings = await getApiSettings();
+      setApiValue(settings);
+      setPortInput(String(settings.tcp_port));
+    } catch {
+      // Nothing better to show than the last known state.
+    }
+  };
+
+  const onTcpToggle = async (enabled: boolean) => {
+    setTcpPending(enabled);
+    setTcpMessage(null);
+    try {
+      setApiValue(await setApiTcpEnabled(enabled));
+      flash("local-api-port");
+    } catch (e) {
+      setTcpMessage(toMessage(e));
+      await resyncApi();
+    } finally {
+      setTcpPending(null);
+    }
+  };
+
+  const onPortCommit = async () => {
+    const parsed = Number(portInput);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+      setPortInput(String(api.value.tcp_port));
+      setTcpMessage("Enter a port between 1 and 65535.");
+      return;
+    }
+    if (parsed === api.value.tcp_port) {
+      setTcpMessage(null);
+      return;
+    }
+    setTcpMessage(null);
+    try {
+      setApiValue(await setApiTcpPort(parsed));
+      flash("local-api-port-number");
+    } catch (e) {
+      setTcpMessage(toMessage(e));
+      await resyncApi();
+    }
+  };
+
   const onRevealToken = async () => {
     setApiTokenBusy(true);
     setApiError(null);
@@ -267,6 +343,9 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
       setSetupBusy(false);
     }
   };
+
+  // The port is on as soon as it is pressed, until the backend answers.
+  const tcpOn = tcpPending ?? api.value.tcp_enabled;
 
   return (
     <div>
@@ -373,7 +452,9 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
               (!api.value.supported
                 ? "The local API needs a unix domain socket, which this platform does not have."
                 : api.value.running
-                  ? `Listening on ${api.value.socket_path}`
+                  ? api.value.unix_socket_supported
+                    ? `Listening on ${api.value.socket_path}`
+                    : "Running. Reach it on the localhost port below."
                   : "Off. Raycast, Alfred, Shortcuts and the shell can still use kea:// links.")
             }
           >
@@ -385,11 +466,67 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
               disabled={api.busy || !api.value.supported}
             />
           </Row>
+        </RowGroup>
+
+        <RowGroup aria-label="Localhost port">
+          <Row
+            label="Allow localhost port"
+            tone={(tcpMessage ?? api.value.tcp_error) ? "danger" : "muted"}
+            hint={
+              tcpMessage ??
+              api.value.tcp_error ??
+              (tcpOn
+                ? api.value.tcp_running
+                  ? `Listening on 127.0.0.1:${api.value.tcp_port}`
+                  : "Switched on, but not listening yet."
+                : api.value.unix_socket_supported
+                  ? "Off. Lets OpenAI-compatible tools reach the API on 127.0.0.1."
+                  : "Off. On this platform the localhost port is the only way to reach the API.")
+            }
+          >
+            {savedKey === "local-api-port" && <span className="kea-saved">Saved ✓</span>}
+            <Toggle
+              checked={tcpOn}
+              onChange={(next) => void onTcpToggle(next)}
+              label="Allow localhost port"
+              disabled={tcpPending !== null}
+            />
+          </Row>
+          <Row
+            label="Port"
+            hint="1 to 65535. Saved when you leave the field or press Enter."
+          >
+            {savedKey === "local-api-port-number" && (
+              <span className="kea-saved">Saved ✓</span>
+            )}
+            <input
+              className="kea-input"
+              type="number"
+              min={1}
+              max={65535}
+              aria-label="Localhost port"
+              value={portInput}
+              onChange={(e) => setPortInput(e.target.value)}
+              onBlur={() => void onPortCommit()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") e.currentTarget.blur();
+              }}
+              style={{ width: 90 }}
+            />
+          </Row>
+        </RowGroup>
+        {tcpOn && (
+          <div style={{ marginTop: 12 }}>
+            <Banner variant="warn">{TCP_WARNING}</Banner>
+          </div>
+        )}
+
+        <RowGroup aria-label="Local API access">
           <Row
             label="Access token"
             hint={
               apiToken ??
-              "Send it as the X-KEA-Token header. Regenerating it stops every script that has the old one."
+              "Send it as the X-KEA-Token header or as a Bearer token. Regenerating it stops every script that has the old one."
             }
           >
             <button
@@ -439,6 +576,12 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
             </button>
           </Row>
         </RowGroup>
+
+        <ApiUsage
+          port={api.value.tcp_port}
+          portOn={api.value.tcp_enabled}
+          socketPath={api.value.unix_socket_supported ? api.value.socket_path : null}
+        />
       </section>
 
       <PermissionPanel />

@@ -1,3 +1,4 @@
+pub mod api;
 pub mod assistant;
 pub mod demo;
 pub mod dictation;
@@ -7,6 +8,7 @@ pub mod registry;
 pub mod rewrite;
 pub mod transcribe;
 pub mod tts;
+pub use api::{ApiFeature, API_FEATURE_ID};
 pub use assistant::{AssistantFeature, ASSISTANT_COMMAND_ID, ASSISTANT_FEATURE_ID};
 pub use dictation::{run_dictation, run_dictation_with_storage, DictationFeature};
 pub use feature::{ActionGuard, CapKind, CapSlot, Command, Feature, ProfileOverrides};
