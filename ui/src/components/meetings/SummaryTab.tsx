@@ -3,12 +3,9 @@ import type {
   ActionItemStatus,
   MeetingActionItem,
   MeetingDetail as MeetingDetailData,
-  TitleSource,
-} from "../api";
-import TranscriptPanel, {
-  speakerDisplayName,
-  type MeetingSpeakerRow,
-} from "./TranscriptPanel";
+  MeetingNotes,
+} from "../../api";
+import type { MeetingSpeakerRow } from "../TranscriptPanel";
 
 /**
  * Which physical source a speaker key stands for.
@@ -22,22 +19,17 @@ const SIDE_LABELS: Record<string, string> = {
   remote: "System audio",
 };
 
-type Props = {
-  detail: MeetingDetailData;
-  onDelete: (id: string) => void;
-  /**
-   * Persist a new name for one side of this meeting. Omitted renders the
-   * legend read-only — the names still show, they just cannot be changed.
-   */
+export type SummaryTabProps = {
+  /** The finished meeting. Null while the meeting is recording or loading. */
+  detail: MeetingDetailData | null;
+  /** This meeting is recording: the tab shows the live notes instead. */
+  live: boolean;
+  liveNotes: MeetingNotes | null;
+  /** The meeting has stopped and its final notes are still being written. */
+  generating: boolean;
+  busy?: boolean;
+  /** Persist a new name for one side of this meeting. */
   onRenameSpeaker?: (speakerKey: string, displayName: string) => void | Promise<void>;
-  /**
-   * Rename the meeting itself. Omitted renders the title as plain text.
-   *
-   * This matters more than renaming a speaker: a calendar title is sometimes
-   * right about the event and wrong about what the recording contains, and the
-   * user needs a one-click way to fix it without deleting anything.
-   */
-  onRenameTitle?: (title: string) => void | Promise<void>;
   /** Tick an action item off, or put it back. */
   onSetActionItemStatus?: (id: number, status: ActionItemStatus) => void | Promise<void>;
   /** Add what the model missed. */
@@ -51,7 +43,8 @@ type Props = {
    * up, so the button never appears as something that will just fail.
    */
   onExportNotion?: () => void | Promise<void>;
-  busy?: boolean;
+  /** Delete the meeting. Omitted while it records, which cannot be deleted. */
+  onDelete?: (id: string) => void;
 };
 
 function NotesSection({ label, content }: { label: string; content: string }) {
@@ -61,71 +54,6 @@ function NotesSection({ label, content }: { label: string; content: string }) {
       <h4 style={{ margin: "0 0 6px", fontSize: 14 }}>{label}</h4>
       <p style={{ margin: 0, whiteSpace: "pre-wrap", color: "var(--text)" }}>{content}</p>
     </section>
-  );
-}
-
-/**
- * The meeting title, with where it came from and a way to fix it.
- *
- * The chip is only shown for a calendar title: "from Calendar" answers the
- * question a surprising title raises, while a chip on every title would be
- * noise.
- */
-function MeetingTitle({
-  title,
-  source,
-  onRename,
-  busy,
-}: {
-  title: string;
-  source?: TitleSource;
-  onRename?: Props["onRenameTitle"];
-  busy: boolean;
-}) {
-  const [draft, setDraft] = useState<string | null>(null);
-
-  const commit = () => {
-    const next = (draft ?? title).trim();
-    setDraft(null);
-    // An empty title is a slip mid-edit, and a title unchanged is not a write.
-    if (!next || next === title) return;
-    void onRename?.(next);
-  };
-
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-      {onRename ? (
-        <input
-          className="kea-input"
-          aria-label="Meeting title"
-          value={draft ?? title}
-          disabled={busy}
-          onChange={(e) => setDraft(e.target.value)}
-          onBlur={commit}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") e.currentTarget.blur();
-          }}
-          style={{ fontSize: 20, fontWeight: 600, flex: 1, minWidth: 0 }}
-        />
-      ) : (
-        <h2 style={{ margin: 0 }}>{title}</h2>
-      )}
-      {source === "calendar" && (
-        <span
-          className="kea-muted"
-          style={{
-            padding: "2px 8px",
-            borderRadius: 999,
-            border: "1px solid var(--border)",
-            background: "var(--surface-2)",
-            fontSize: 11,
-            whiteSpace: "nowrap",
-          }}
-        >
-          from Calendar
-        </span>
-      )}
-    </div>
   );
 }
 
@@ -145,8 +73,8 @@ function ActionItems({
 }: {
   items: MeetingActionItem[];
   prose: string;
-  onSetStatus?: Props["onSetActionItemStatus"];
-  onAdd?: Props["onAddActionItem"];
+  onSetStatus?: SummaryTabProps["onSetActionItemStatus"];
+  onAdd?: SummaryTabProps["onAddActionItem"];
   busy: boolean;
 }) {
   const [draft, setDraft] = useState("");
@@ -226,7 +154,7 @@ function AddItemRow({
 }: {
   draft: string;
   setDraft: (value: string) => void;
-  onAdd: NonNullable<Props["onAddActionItem"]>;
+  onAdd: NonNullable<SummaryTabProps["onAddActionItem"]>;
   busy: boolean;
 }) {
   const submit = () => {
@@ -268,7 +196,7 @@ function SpeakerLegend({
   busy,
 }: {
   speakers: MeetingSpeakerRow[];
-  onRename?: Props["onRenameSpeaker"];
+  onRename?: SummaryTabProps["onRenameSpeaker"];
   busy: boolean;
 }) {
   // Keyed by speaker so an unsaved edit on one side is not wiped by a
@@ -377,49 +305,107 @@ function SpeakerLegend({
   );
 }
 
-export default function MeetingDetail({
+/** The live notes card: interim passes, labelled as unfinished. */
+function LiveNotes({ notes }: { notes: MeetingNotes | null }) {
+  if (!notes) {
+    return (
+      <p className="kea-muted" style={{ margin: 0 }}>
+        Notes appear here as the meeting runs.
+      </p>
+    );
+  }
+  return (
+    <section className="kea-card" style={{ marginBottom: 16 }}>
+      <h2 style={{ margin: "0 0 8px", fontSize: 15 }}>Notes so far</h2>
+      {/*
+        Said plainly, because a stale summary read as a final one is the
+        way this feature misleads: the fold can compress out a point
+        mentioned once, and the full-transcript pass at stop is what
+        fixes it.
+      */}
+      <p className="kea-muted" style={{ margin: "0 0 8px", fontSize: "0.8125rem" }}>
+        Updated every few minutes while the meeting runs. The full notes are
+        written when you stop.
+      </p>
+      {notes.summary.trim() && (
+        <p style={{ margin: "0 0 8px", whiteSpace: "pre-wrap" }}>{notes.summary}</p>
+      )}
+      {notes.action_items.trim() && (
+        <>
+          <h3 style={{ margin: "0 0 4px", fontSize: 14 }}>Action items</h3>
+          <p style={{ margin: 0, whiteSpace: "pre-wrap" }}>{notes.action_items}</p>
+        </>
+      )}
+    </section>
+  );
+}
+
+/**
+ * The Summary tab: the notes, action items and speakers of a finished meeting,
+ * or the live notes of one that is recording.
+ *
+ * Export and delete sit at the foot of the tab. Export is apart from delete on
+ * purpose: the two are adjacent in intent ("I am done with this meeting") and
+ * opposite in consequence, and a mis-click must not be the destructive one.
+ */
+export default function SummaryTab({
   detail,
-  onDelete,
+  live,
+  liveNotes,
+  generating,
+  busy = false,
   onRenameSpeaker,
-  onRenameTitle,
   onSetActionItemStatus,
   onAddActionItem,
   onCopyMarkdown,
   onSaveMarkdown,
   onExportNotion,
-  busy = false,
-}: Props) {
-  const { meeting, segments, notes, speakers, action_items: actionItems } = detail;
+  onDelete,
+}: SummaryTabProps) {
+  if (live) return <LiveNotes notes={liveNotes} />;
+  if (!detail) {
+    // Stopped, and the stored meeting has not been read back yet.
+    return generating ? (
+      <p role="status" className="kea-muted" style={{ margin: 0 }}>
+        Generating notes…
+      </p>
+    ) : null;
+  }
 
+  const { meeting, notes, speakers, action_items: actionItems } = detail;
   const canExport = Boolean(onCopyMarkdown || onSaveMarkdown || onExportNotion);
+  const hasNotes = Boolean(notes) || actionItems.length > 0;
 
   return (
     <div>
-      <header style={{ marginBottom: 16 }}>
-        <MeetingTitle
-          title={meeting.title}
-          source={meeting.title_source}
-          onRename={onRenameTitle}
-          busy={busy}
-        />
-        <p className="kea-muted" style={{ margin: 0 }}>
-          {meeting.started_at}
-          {meeting.ended_at ? ` — ${meeting.ended_at}` : ""}
-          {" · "}
-          {meeting.status}
-          {" · "}
-          {meeting.capture_mode === "mic_and_system" ? "Mic + system" : "Mic only"}
+      {generating && (
+        <p role="status" className="kea-muted" style={{ margin: "0 0 12px" }}>
+          Generating notes…
         </p>
-        {meeting.error && (
-          <p style={{ margin: "8px 0 0", fontSize: 13, color: "var(--danger)" }}>
-            {meeting.error}
-          </p>
-        )}
-      </header>
+      )}
 
-      {(notes || actionItems.length > 0) && (
+      {hasNotes ? (
         <section className="kea-card" style={{ marginBottom: 16 }}>
-          <h3 style={{ margin: "0 0 12px" }}>Notes</h3>
+          <h3 style={{ margin: "0 0 12px", display: "flex", alignItems: "center", gap: 8 }}>
+            Notes
+            {notes?.edited && (
+              <span
+                className="kea-muted"
+                title="You changed these notes after they were generated."
+                style={{
+                  padding: "2px 8px",
+                  borderRadius: 999,
+                  border: "1px solid var(--border)",
+                  background: "var(--surface-2)",
+                  fontSize: 11,
+                  fontWeight: 400,
+                  whiteSpace: "nowrap",
+                }}
+              >
+                edited
+              </span>
+            )}
+          </h3>
           <NotesSection label="Summary" content={notes?.summary ?? ""} />
           <NotesSection label="Decisions" content={notes?.decisions ?? ""} />
           <ActionItems
@@ -432,32 +418,19 @@ export default function MeetingDetail({
           <NotesSection label="Follow-ups" content={notes?.follow_ups ?? ""} />
           <NotesSection label="Open questions" content={notes?.open_questions ?? ""} />
         </section>
+      ) : (
+        !generating && (
+          <p className="kea-muted" style={{ margin: "0 0 16px" }}>
+            No notes were written for this meeting.
+          </p>
+        )
       )}
 
-      <section style={{ marginBottom: 16 }}>
-        <h3 style={{ margin: "0 0 8px" }}>Transcript</h3>
-        <SpeakerLegend
-          speakers={speakers}
-          onRename={onRenameSpeaker}
-          busy={busy}
-        />
-        <TranscriptPanel
-          segments={segments.map((seg) => ({
-            ...seg,
-            speaker: speakerDisplayName(seg.speaker_key, speakers),
-          }))}
-          emptyMessage="No segments recorded for this meeting."
-        />
-      </section>
+      <SpeakerLegend speakers={speakers} onRename={onRenameSpeaker} busy={busy} />
 
-      {/*
-        Export sits apart from delete on purpose: the two are adjacent in
-        intent ("I am done with this meeting") and opposite in consequence, and
-        a mis-click must not be the destructive one.
-      */}
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
         {canExport && (
-          <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             {onCopyMarkdown && (
               <button
                 type="button"
@@ -491,15 +464,17 @@ export default function MeetingDetail({
           </div>
         )}
         <div style={{ flex: 1 }} />
-        <button
-          type="button"
-          className="kea-btn"
-          onClick={() => onDelete(meeting.id)}
-          disabled={busy}
-          style={{ color: "var(--danger)", borderColor: "var(--danger)" }}
-        >
-          Delete meeting
-        </button>
+        {onDelete && (
+          <button
+            type="button"
+            className="kea-btn"
+            onClick={() => onDelete(meeting.id)}
+            disabled={busy}
+            style={{ color: "var(--danger)", borderColor: "var(--danger)" }}
+          >
+            Delete meeting
+          </button>
+        )}
       </div>
     </div>
   );

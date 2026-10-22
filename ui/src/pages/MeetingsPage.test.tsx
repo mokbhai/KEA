@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useState } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   emitTauriEvent,
   invokeCalls,
@@ -132,7 +133,7 @@ describe("MeetingsPage", () => {
     mockWorld({ bindings: readyBindings, extra: { list_meetings: () => [meetingRow] } });
     render(<MeetingsPage />);
 
-    await userEvent.click(await screen.findByRole("button", { name: /Test capture/ }));
+    await userEvent.click(await screen.findByRole("option", { name: /Test capture/ }));
     await screen.findByRole("button", { name: "Copy Markdown" });
     expect(screen.queryByRole("button", { name: "Send to Notion" })).toBeNull();
   });
@@ -148,7 +149,7 @@ describe("MeetingsPage", () => {
     });
     render(<MeetingsPage />);
 
-    await userEvent.click(await screen.findByRole("button", { name: /Test capture/ }));
+    await userEvent.click(await screen.findByRole("option", { name: /Test capture/ }));
     await userEvent.click(await screen.findByRole("button", { name: "Send to Notion" }));
 
     await waitFor(() =>
@@ -291,6 +292,8 @@ describe("MeetingsPage", () => {
       render(<MeetingsPage />);
 
       const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      // The test lives with the other settings, so the panel opens first.
+      await openSettings();
       await user.click(
         await screen.findByRole("button", { name: "Run a 10-second test" }),
       );
@@ -323,6 +326,7 @@ describe("MeetingsPage", () => {
       render(<MeetingsPage />);
 
       const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      await openSettings();
       await user.click(
         await screen.findByRole("button", { name: "Run a 10-second test" }),
       );
@@ -375,6 +379,8 @@ describe("MeetingsPage", () => {
       });
     });
 
+    // Live lines are on the Transcript tab; Summary is the default.
+    await userEvent.click(screen.getByRole("tab", { name: "Transcript" }));
     expect(await screen.findByText("shall we start")).toBeTruthy();
     expect(screen.getByText("You")).toBeTruthy();
     expect(screen.getByText("Others")).toBeTruthy();
@@ -599,6 +605,7 @@ describe("MeetingsPage", () => {
       });
     });
 
+    await userEvent.click(screen.getByRole("tab", { name: "Transcript" }));
     const line = (await screen.findByText("crosstalk")).closest("li");
     expect(line?.textContent).toBe("[00:00]crosstalk");
   });
@@ -691,5 +698,252 @@ describe("MeetingsPage", () => {
     ).toBe("45");
     // Held locally, not written: this field only persists on blur.
     expect(invokeCalls("set_meeting_settings")).toHaveLength(0);
+  });
+});
+
+// --- the workspace: list beside the selected meeting ---
+
+const originalMatchMedia = window.matchMedia;
+
+/** Answers the narrow-window query with `narrow`, and every other query with no match. */
+function setNarrow(narrow: boolean) {
+  window.matchMedia = ((query: string) => ({
+    matches: narrow && query === "(max-width: 720px)",
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  })) as unknown as typeof window.matchMedia;
+}
+
+const older = {
+  ...meetingRow,
+  id: "old",
+  title: "Older review",
+  started_at: "2026-07-10T09:00:00Z",
+  ended_at: "2026-07-10T09:30:00Z",
+};
+const newer = {
+  ...meetingRow,
+  id: "new",
+  title: "Newest sync",
+  started_at: "2026-07-17T10:00:00Z",
+  ended_at: "2026-07-17T10:30:00Z",
+};
+
+/** The title field of the open meeting, which is an input whenever it can be renamed. */
+const titleValue = () => (screen.getByLabelText("Meeting title") as HTMLInputElement).value;
+
+describe("MeetingsPage workspace", () => {
+  beforeEach(() => resetTauriMocks());
+  afterEach(() => {
+    window.matchMedia = originalMatchMedia;
+  });
+
+  it("lays the list beside the selected meeting, both visible at once", async () => {
+    mockWorld({ bindings: readyBindings, extra: { list_meetings: () => [older, newer] } });
+    const { container } = render(<MeetingsPage />);
+
+    await waitFor(() => expect(titleValue()).toBe("Newest sync"));
+    expect(screen.getByRole("listbox", { name: "Meetings" })).toBeTruthy();
+    expect(container.querySelector(".kea-meetings-grid:not(.kea-meetings-grid--narrow)")).not.toBeNull();
+  });
+
+  // Newest is the default: the summary the user most often came for.
+  it("opens on the newest meeting when nothing is recording", async () => {
+    mockWorld({ bindings: readyBindings, extra: { list_meetings: () => [older, newer] } });
+    render(<MeetingsPage />);
+
+    await waitFor(() => expect(titleValue()).toBe("Newest sync"));
+    expect(screen.getByRole("option", { name: /Newest sync/ }).getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByRole("option", { name: /Older review/ }).getAttribute("aria-selected")).toBe("false");
+  });
+
+  // Recording beats newest: the meeting in progress is what the user is after.
+  it("opens on the meeting being recorded when one is", async () => {
+    mockWorld({
+      bindings: readyBindings,
+      extra: {
+        list_meetings: () => [
+          older,
+          { ...newer, id: "live", title: "Live planning", status: "recording", ended_at: null },
+        ],
+        get_meeting_state: () => ({ state: "recording", active_meeting_id: "live" }),
+      },
+    });
+    render(<MeetingsPage />);
+
+    await waitFor(() => expect(titleValue()).toBe("Live planning"));
+    const pinned = screen.getByRole("option", { name: /Live planning/ });
+    expect(pinned.getAttribute("aria-selected")).toBe("true");
+    expect(screen.getAllByRole("option")[0]).toBe(pinned);
+  });
+
+  it("shows the empty state with a Record control when there are no meetings", async () => {
+    mockWorld({ bindings: readyBindings });
+    render(<MeetingsPage />);
+
+    expect(await screen.findByRole("heading", { name: "No meetings yet" })).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Record a meeting" }));
+    await waitFor(() => expect(invokeCalls("start_meeting")).toHaveLength(1));
+  });
+
+  // The selection belongs to the app shell, so the page follows what it is given.
+  it("keeps the selection it is given, and asks for the newest when given none", async () => {
+    mockWorld({ bindings: readyBindings, extra: { list_meetings: () => [older, newer] } });
+    const onSelect = vi.fn();
+    const { rerender } = render(
+      <MeetingsPage selectedMeetingId="old" onSelectMeeting={onSelect} />,
+    );
+
+    await waitFor(() => expect(titleValue()).toBe("Older review"));
+    expect(onSelect).not.toHaveBeenCalled();
+
+    rerender(<MeetingsPage selectedMeetingId={null} onSelectMeeting={onSelect} />);
+    await waitFor(() => expect(onSelect).toHaveBeenCalledWith("new"));
+  });
+
+  // Leaving the page unmounts it; the selection has to survive in the shell.
+  it("restores the selected meeting when the user comes back to Meetings", async () => {
+    mockWorld({ bindings: readyBindings, extra: { list_meetings: () => [older, newer] } });
+    function Shell() {
+      const [selected, setSelected] = useState<string | null>(null);
+      const [onPage, setOnPage] = useState(true);
+      return (
+        <>
+          <button type="button" onClick={() => setOnPage((v) => !v)}>
+            Switch page
+          </button>
+          {onPage && <MeetingsPage selectedMeetingId={selected} onSelectMeeting={setSelected} />}
+        </>
+      );
+    }
+    render(<Shell />);
+
+    await waitFor(() => expect(titleValue()).toBe("Newest sync"));
+    await userEvent.click(screen.getByRole("option", { name: /Older review/ }));
+    await waitFor(() => expect(titleValue()).toBe("Older review"));
+
+    await userEvent.click(screen.getByRole("button", { name: "Switch page" }));
+    expect(screen.queryByRole("listbox")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Switch page" }));
+
+    await waitFor(() => expect(titleValue()).toBe("Older review"));
+  });
+
+  // Below the two-pane width the list and the meeting take turns.
+  it("shows one pane at a time in a narrow window, with Back to the list", async () => {
+    setNarrow(true);
+    mockWorld({ bindings: readyBindings, extra: { list_meetings: () => [older, newer] } });
+    render(<MeetingsPage />);
+
+    expect(await screen.findByRole("listbox", { name: "Meetings" })).toBeTruthy();
+    expect(screen.queryByLabelText("Meeting title")).toBeNull();
+
+    await userEvent.click(screen.getByRole("option", { name: /Older review/ }));
+    expect(await screen.findByLabelText("Meeting title")).toBeTruthy();
+    expect(screen.queryByRole("listbox", { name: "Meetings" })).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(await screen.findByRole("listbox", { name: "Meetings" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: /Older review/ }).getAttribute("aria-selected")).toBe("true");
+    expect(screen.queryByLabelText("Meeting title")).toBeNull();
+  });
+
+  // --- live view through a stop ---
+
+  const notesFor = (meetingId: string, summary: string) => ({
+    meeting_id: meetingId,
+    summary,
+    decisions: "",
+    action_items: "",
+    follow_ups: "",
+    open_questions: "",
+    prompt_version: "meeting-notes-v3",
+    engine_id: "openai",
+    model: "gpt-4o-mini",
+    edited: false,
+  });
+
+  const storedMeeting = (notes: unknown) => ({
+    meeting: {
+      ...meetingRow,
+      id: "live",
+      title: "Planning",
+      started_at: "2026-10-23T09:00:00Z",
+      ended_at: "2026-10-23T09:20:00Z",
+    },
+    segments: [],
+    notes,
+    speakers: [],
+    action_items: [],
+    can_undo: false,
+  });
+
+  it("follows a meeting from its live view through stop to the stored notes", async () => {
+    let finishStop: (value: unknown) => void = () => {};
+    let finalNotesReady = false;
+    const storedRow = { ...meetingRow, id: "live", title: "Planning", started_at: "2026-10-23T09:00:00Z", ended_at: "2026-10-23T09:20:00Z" };
+    mockWorld({
+      bindings: readyBindings,
+      extra: {
+        // The list picks the meeting up once it is stored.
+        list_meetings: () => (finalNotesReady ? [older, storedRow] : [older]),
+        stop_meeting: () => new Promise((resolve) => (finishStop = resolve)),
+        get_meeting: (args) => {
+          const id = (args as { id: string }).id;
+          if (id !== "live") return { ...storedMeeting(null), meeting: older, segments: [] };
+          return storedMeeting(
+            finalNotesReady ? notesFor("live", "Final summary.") : null,
+          );
+        },
+      },
+    });
+    render(<MeetingsPage />);
+    await waitFor(() => expect(titleValue()).toBe("Older review"));
+
+    // Recording starts: the live meeting takes the view and its notes arrive.
+    await act(async () => {
+      emitTauriEvent("meeting:state", { state: "recording" });
+      emitTauriEvent("meeting:notes", notesFor("live", "Early summary."));
+    });
+    expect(await screen.findByText("Early summary.")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Notes so far" })).toBeTruthy();
+
+    await act(async () => {
+      emitTauriEvent("meeting:segment", {
+        meeting_id: "live",
+        sequence: 0,
+        start_offset_ms: 0,
+        end_offset_ms: 4000,
+        text: "kicking off",
+        speaker_key: "local",
+      });
+    });
+    await userEvent.click(screen.getByRole("tab", { name: "Transcript" }));
+    expect(screen.getByText("kicking off")).toBeTruthy();
+
+    // Stop: the backend reports that it is finishing the notes, then returns.
+    await userEvent.click(screen.getByRole("button", { name: "Stop meeting" }));
+    await waitFor(() => expect(invokeCalls("stop_meeting")).toHaveLength(1));
+    await act(async () => {
+      emitTauriEvent("meeting:state", { state: "processing" });
+    });
+    await userEvent.click(screen.getByRole("tab", { name: "Summary" }));
+    expect(await screen.findByText("Generating notes…")).toBeTruthy();
+
+    // The notes are written: the stop returns and the stored meeting is read back.
+    finalNotesReady = true;
+    await act(async () => {
+      emitTauriEvent("meeting:state", { state: "idle" });
+      finishStop(storedMeeting(notesFor("live", "Final summary.")));
+    });
+
+    expect(await screen.findByText("Final summary.")).toBeTruthy();
+    expect(screen.queryByText("Generating notes…")).toBeNull();
+    expect(screen.queryByText("Early summary.")).toBeNull();
   });
 });

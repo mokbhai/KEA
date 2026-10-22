@@ -14,10 +14,10 @@ Ticked items were moved by task 4.2 into `ui/src/components/meetings/MeetingSett
 
 ## Page header and banners (stay on the page)
 
-- [ ] Page heading "Meetings" and the intro line (task 4.4 keeps the header; Record/Stop moves here in 4.6)
-- [ ] FeatureBanner: one warning per unset or blocked slot (speech to text, notes writing), with its action button ("Open Models" or "Choose…")
-- [ ] Banner "Grant permission" for system audio: shown when capture is ScreenCaptureKit and Screen Recording is not granted; disabled while busy
-- [ ] Banner text "System audio — capturing the other side of a call needs Screen Recording permission."
+- [x] Page heading "Meetings" and the intro line (task 4.4 keeps the header; Record/Stop moves here in 4.6)
+- [x] FeatureBanner: one warning per unset or blocked slot (speech to text, notes writing), with its action button ("Open Models" or "Choose…")
+- [x] Banner "Grant permission" for system audio: shown when capture is ScreenCaptureKit and Screen Recording is not granted; disabled while busy
+- [x] Banner text "System audio — capturing the other side of a call needs Screen Recording permission."
 
 ## Added by task 4.2 (new, ticked)
 
@@ -53,76 +53,76 @@ Ticked items were moved by task 4.2 into `ui/src/components/meetings/MeetingSett
 
 ## Try it section (stays until task 4.6 removes it)
 
-- [ ] "Try it" heading
-- [ ] State readout: Idle, Recording or Processing
-- [ ] Level meter (LevelMeter), shown while recording
-- [ ] "Run a 10-second test" button (disabled while busy, recording, processing or testing)
-- [ ] Test capture auto-stops after 10 seconds (behaviour)
-- [ ] "Start meeting" button (same disabling)
-- [ ] "Stop meeting" button (disabled unless recording)
-- [ ] Note "The test is a real capture — it is saved to your meetings like any other."
-- [ ] Status line (`meetingStatus`): recording, saved, error and permission messages
+- [x] "Try it" heading
+- [x] State readout: Idle, Recording or Processing
+- [x] Level meter (LevelMeter), shown while recording
+- [x] "Run a 10-second test" button (disabled while busy, recording, processing or testing)
+- [x] Test capture auto-stops after 10 seconds (behaviour)
+- [x] "Start meeting" button (same disabling)
+- [x] "Stop meeting" button (disabled unless recording)
+- [x] Note "The test is a real capture — it is saved to your meetings like any other."
+- [x] Status line (`meetingStatus`): recording, saved, error and permission messages
 
 ## Live state (stays; moves to MeetingPane in task 4.6)
 
-- [ ] "Notes so far" card, shown when interim notes exist: "Updated every few minutes…" line, summary, action items
-- [ ] Notes so far cleared when a new meeting starts recording (behaviour)
-- [ ] "Live transcript" card: `TranscriptPanel` with the live flag
+- [x] "Notes so far" card, shown when interim notes exist: "Updated every few minutes…" line, summary, action items
+- [x] Notes so far cleared when a new meeting starts recording (behaviour)
+- [x] "Live transcript" card: `TranscriptPanel` with the live flag
 - [ ] Live transcript empty message: "Listening — segments appear every few seconds…" or "Start a meeting to see live transcription."
-- [ ] Live segments labelled You, Others or left unlabelled (`speakerDisplayName`)
-- [ ] Live segments de-duplicated by meeting id and sequence (behaviour)
-- [ ] Segments cleared on recording start and on Start meeting (behaviour)
-- [ ] Recording state restored on mount: `getMeetingState` and the active meeting's segments (behaviour)
-- [ ] Meeting error event: cancels the test stop and shows the error text (behaviour)
-- [ ] Test stop skipped when capture is no longer recording (behaviour)
-- [ ] Voice model download progress drives the pending voice enable (behaviour)
+- [x] Live segments labelled You, Others or left unlabelled (`speakerDisplayName`)
+- [x] Live segments de-duplicated by meeting id and sequence (behaviour)
+- [x] Segments cleared on recording start and on Start meeting (behaviour)
+- [x] Recording state restored on mount: `getMeetingState` and the active meeting's segments (behaviour)
+- [x] Meeting error event: cancels the test stop and shows the error text (behaviour)
+- [x] Test stop skipped when capture is no longer recording (behaviour)
+- [x] Voice model download progress drives the pending voice enable (behaviour)
 
 ## Past meetings list (stays; moves to MeetingList in task 4.3)
 
-- [ ] "Past meetings" heading
-- [ ] "No meetings yet." empty text
-- [ ] Meeting row button per meeting: title, and "started_at · status"
-- [ ] Selected row highlight (border and background)
-- [ ] Newest 50 meetings loaded (`listMeetings(50)`)
-- [ ] List refreshed after a stop (behaviour)
-- [ ] Selecting a meeting loads its detail (behaviour)
-- [ ] After a stop, the stopped meeting becomes the selection (behaviour)
+- [x] "Past meetings" heading
+- [x] "No meetings yet." empty text
+- [x] Meeting row button per meeting: title, and "started_at · status"
+- [x] Selected row highlight (border and background)
+- [x] Newest 50 meetings loaded (`listMeetings(50)`)
+- [x] List refreshed after a stop (behaviour)
+- [x] Selecting a meeting loads its detail (behaviour)
+- [x] After a stop, the stopped meeting becomes the selection (behaviour)
 
 ## Detail area and page status (stays; moves to MeetingPane in task 4.5)
 
-- [ ] "Select a meeting to view notes and transcript." empty state
-- [ ] "Loading meeting…" block while the detail loads
-- [ ] Page status line (`listStatus`): errors, "Copied the meeting to the clipboard as Markdown.", "Saved to …", "Sent to Notion — …"
-- [ ] Delete confirmation ("Delete this meeting and its transcript?") and the selection reset after delete (behaviour)
+- [x] "Select a meeting to view notes and transcript." empty state
+- [x] "Loading meeting…" block while the detail loads
+- [x] Page status line (`listStatus`): errors, "Copied the meeting to the clipboard as Markdown.", "Saved to …", "Sent to Notion — …"
+- [x] Delete confirmation ("Delete this meeting and its transcript?") and the selection reset after delete (behaviour)
 
 ## Meeting detail actions (wired from the page into MeetingDetail)
 
-- [ ] Rename the meeting title (`onRenameTitle`)
-- [ ] Rename a speaker (`onRenameSpeaker`), then re-read the detail
-- [ ] Tick or untick an action item (`onSetActionItemStatus`)
-- [ ] Add an action item (`onAddActionItem`)
-- [ ] "Copy Markdown" button (`onCopyMarkdown`)
-- [ ] "Save as Markdown" button (`onSaveMarkdown`), which reveals the file
-- [ ] "Send to Notion" button (`onExportNotion`), shown only once Notion is set up
-- [ ] "Delete meeting" button (danger), with the confirmation above
+- [x] Rename the meeting title (`onRenameTitle`)
+- [x] Rename a speaker (`onRenameSpeaker`), then re-read the detail
+- [x] Tick or untick an action item (`onSetActionItemStatus`)
+- [x] Add an action item (`onAddActionItem`)
+- [x] "Copy Markdown" button (`onCopyMarkdown`)
+- [x] "Save as Markdown" button (`onSaveMarkdown`), which reveals the file
+- [x] "Send to Notion" button (`onExportNotion`), shown only once Notion is set up
+- [x] "Delete meeting" button (danger), with the confirmation above
 
 ## MeetingDetail (`ui/src/components/MeetingDetail.tsx`)
 
-- [ ] "Meeting title" input: renames on blur or Enter; an empty or unchanged title is ignored
-- [ ] "from Calendar" chip, shown only when the title came from the calendar
-- [ ] Header meta line: started, ended, status and capture mode ("Mic + system" or "Mic only")
-- [ ] Meeting error line (`meeting.error`)
-- [ ] "Notes" card, shown when notes or action items exist
-- [ ] Notes section "Summary" (read-only text; hidden when empty)
-- [ ] Notes section "Decisions" (read-only; hidden when empty)
-- [ ] "Action items" checklist: a checkbox per item (labelled with the item text), with owner and due hint
-- [ ] Action items prose fallback for meetings recorded before the rows existed
-- [ ] "Nobody agreed to do anything." empty state
-- [ ] "Add what the notes missed" input and "Add item" button (also submits on Enter)
-- [ ] Notes section "Follow-ups" (read-only; hidden when empty)
-- [ ] Notes section "Open questions" (read-only; hidden when empty)
-- [ ] "Speakers" legend: side label ("Your mic" or "System audio"), "inferred" chip, "Confirm" button, rename field per speaker
-- [ ] Speakers legend footnote on how speakers are told apart
-- [ ] "Transcript" section: speaker-labelled segments, or "No segments recorded for this meeting."
-- [ ] Export group: "Copy Markdown", "Save as Markdown", "Send to Notion" (each shown only when wired)
-- [ ] "Delete meeting" button, kept apart from export on purpose
+- [x] "Meeting title" input: renames on blur or Enter; an empty or unchanged title is ignored
+- [x] "from Calendar" chip, shown only when the title came from the calendar
+- [x] Header meta line: started, ended, status and capture mode ("Mic + system" or "Mic only")
+- [x] Meeting error line (`meeting.error`)
+- [x] "Notes" card, shown when notes or action items exist
+- [x] Notes section "Summary" (read-only text; hidden when empty)
+- [x] Notes section "Decisions" (read-only; hidden when empty)
+- [x] "Action items" checklist: a checkbox per item (labelled with the item text), with owner and due hint
+- [x] Action items prose fallback for meetings recorded before the rows existed
+- [x] "Nobody agreed to do anything." empty state
+- [x] "Add what the notes missed" input and "Add item" button (also submits on Enter)
+- [x] Notes section "Follow-ups" (read-only; hidden when empty)
+- [x] Notes section "Open questions" (read-only; hidden when empty)
+- [x] "Speakers" legend: side label ("Your mic" or "System audio"), "inferred" chip, "Confirm" button, rename field per speaker
+- [x] Speakers legend footnote on how speakers are told apart
+- [x] "Transcript" section: speaker-labelled segments, or "No segments recorded for this meeting."
+- [x] Export group: "Copy Markdown", "Save as Markdown", "Send to Notion" (each shown only when wired)
+- [x] "Delete meeting" button, kept apart from export on purpose

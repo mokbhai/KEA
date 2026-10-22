@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   addMeetingActionItem,
   deleteMeeting,
@@ -27,10 +27,11 @@ import {
   startMeeting,
   stopMeeting,
   type ActionItemStatus,
+  type CaptureMode,
   type Meeting,
   type MeetingDetail,
-  type MeetingSegmentEvent,
   type MeetingNotes,
+  type MeetingSegmentEvent,
   type MeetingSettings,
   type MeetingState,
   type NotionStatus,
@@ -41,13 +42,12 @@ import Banner from "../components/Banner";
 import FeatureBanner from "../components/FeatureBanner";
 import LevelMeter from "../components/LevelMeter";
 import LoadingBlock from "../components/LoadingBlock";
-import MeetingDetailView from "../components/MeetingDetail";
 import MeetingSettingsPanel from "../components/meetings/MeetingSettingsPanel";
-import TranscriptPanel, {
-  speakerDisplayName,
-  type TranscriptSegment,
-} from "../components/TranscriptPanel";
+import MeetingList from "../components/meetings/MeetingList";
+import MeetingPane, { type MeetingPaneHandle } from "../components/meetings/MeetingPane";
+import { speakerDisplayName, type TranscriptSegment } from "../components/TranscriptPanel";
 import { useFeatureAi } from "../hooks/useFeatureAi";
+import { useMediaQuery, MEETINGS_NARROW_QUERY } from "../hooks/useMediaQuery";
 import { useModelDownloads } from "../hooks/useModelDownloads";
 import { useOptimisticSetting } from "../hooks/useOptimisticSetting";
 import type { SlotSpec } from "../lib/featureSlot";
@@ -75,6 +75,12 @@ const SLOTS: SlotSpec[] = [
 
 type Props = {
   onNavigate?: Navigate;
+  /**
+   * The selected meeting, lifted into the app shell so it survives leaving the
+   * page. Omitted, the page keeps its own selection (used by tests).
+   */
+  selectedMeetingId?: string | null;
+  onSelectMeeting?: (id: string | null) => void;
 };
 
 /**
@@ -94,18 +100,68 @@ const SETTINGS_PLACEHOLDER: MeetingSettings = {
   voice_separation: false,
 };
 
-export default function MeetingsPage({ onNavigate }: Props) {
+/** The meeting that is recording, before the list has caught up with it. */
+function recordingPlaceholder(
+  id: string,
+  startedAt: string,
+  title: string,
+  captureMode: CaptureMode,
+): Meeting {
+  return {
+    id,
+    title,
+    started_at: startedAt,
+    ended_at: null,
+    status: "recording",
+    capture_mode: captureMode,
+    stt_engine_id: null,
+    llm_engine_id: null,
+    error: null,
+    title_source: "llm",
+  };
+}
+
+/** The most recently started meeting, or null for none. */
+function newestMeetingId(list: Meeting[]): string | null {
+  let best: Meeting | null = null;
+  for (const m of list) {
+    if (!best || Date.parse(m.started_at) > Date.parse(best.started_at)) best = m;
+  }
+  return best?.id ?? null;
+}
+
+export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMeeting }: Props) {
   const ai = useFeatureAi(SLOTS);
   const [meetings, setMeetings] = useState<Meeting[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [listLoaded, setListLoaded] = useState(false);
+  const [localSelectedId, setLocalSelectedId] = useState<string | null>(null);
+  const selectionIsControlled = selectedMeetingId !== undefined;
+  const selectedId = selectionIsControlled ? selectedMeetingId : localSelectedId;
+  const setSelectedId = useCallback(
+    (id: string | null) => {
+      if (selectionIsControlled) onSelectMeeting?.(id);
+      else setLocalSelectedId(id);
+    },
+    [selectionIsControlled, onSelectMeeting],
+  );
+
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const detailRequest = useRef(0);
   const [listStatus, setListStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Narrow windows show one pane at a time; this is which one is showing.
+  const narrow = useMediaQuery(MEETINGS_NARROW_QUERY);
+  const [showDetailNarrow, setShowDetailNarrow] = useState(false);
   // Fed by the Notion card below, which is the only thing that reads or writes
   // that setup; the page only needs to know whether to offer the button.
   const [notionStatus, setNotionStatus] = useState<NotionStatus | null>(null);
+  const paneRef = useRef<MeetingPaneHandle>(null);
 
   const [state, setState] = useState<MeetingState>("idle");
+  // The meeting the backend is recording or finishing, once its id is known.
+  const [activeMeetingId, setActiveMeetingId] = useState<string | null>(null);
+  const [recordingSince, setRecordingSince] = useState(() => new Date().toISOString());
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [level, setLevel] = useState(0);
   const [capability, setCapability] = useState<SystemAudioCapability>("mic_only");
@@ -245,6 +301,28 @@ export default function MeetingsPage({ onNavigate }: Props) {
       setMeetings(items);
     } catch (e) {
       setListStatus(toMessage(e));
+    } finally {
+      setListLoaded(true);
+    }
+  }, []);
+
+  /**
+   * Loads one meeting's detail. A newer request wins, so a slow answer for a
+   * meeting the user has already left cannot overwrite the one on screen.
+   */
+  const loadDetail = useCallback(async (id: string) => {
+    const request = ++detailRequest.current;
+    setDetailLoading(true);
+    try {
+      const next = await getMeeting(id);
+      if (request === detailRequest.current) setDetail(next);
+    } catch (e) {
+      if (request === detailRequest.current) {
+        setDetail(null);
+        setListStatus(toMessage(e));
+      }
+    } finally {
+      if (request === detailRequest.current) setDetailLoading(false);
     }
   }, []);
 
@@ -252,21 +330,71 @@ export default function MeetingsPage({ onNavigate }: Props) {
     void refreshList();
   }, [refreshList]);
 
+  // The recording meeting's row, from the list if it is there yet, else a
+  // placeholder built from what the live events have told us.
+  const listedActive = activeMeetingId
+    ? (meetings.find((m) => m.id === activeMeetingId) ?? null)
+    : null;
+  const activeRow: Meeting | null =
+    activeMeetingId && (recording || processing)
+      ? (listedActive ??
+        recordingPlaceholder(
+          activeMeetingId,
+          recordingSince,
+          processing ? "Finishing meeting…" : "Recording…",
+          settings.prefer_system_audio && capability !== "mic_only" && capability !== "unavailable"
+            ? "mic_and_system"
+            : "mic_only",
+        ))
+      : null;
+  // The pinned row is the one being recorded right now; while it finishes it
+  // sits in the list like any other.
+  const pinnedRow = recording ? activeRow : null;
+  const listRows = pinnedRow ? meetings.filter((m) => m.id !== pinnedRow.id) : meetings;
+  const live = recording && activeMeetingId !== null && selectedId === activeMeetingId;
+  const generating = processing && activeMeetingId !== null && selectedId === activeMeetingId;
+
+  // The header reads the list row, or the fetched meeting itself when the list
+  // has not caught up with a meeting that just stopped.
+  const paneMeeting: Meeting | null = !selectedId
+    ? null
+    : selectedId === activeRow?.id
+      ? activeRow
+      : (meetings.find((m) => m.id === selectedId) ??
+        (detail && detail.meeting.id === selectedId ? detail.meeting : null));
+
+  // Opening on a meeting that is no longer in the list (deleted, or a stale
+  // session value) falls back to the default instead of showing nothing.
+  const knownSelection =
+    selectedId !== null &&
+    (selectedId === activeRow?.id || meetings.some((m) => m.id === selectedId));
+
+  useEffect(() => {
+    if (!listLoaded || knownSelection) return;
+    const next = recording && activeMeetingId ? activeMeetingId : newestMeetingId(meetings);
+    if (next !== selectedId) setSelectedId(next);
+  }, [listLoaded, knownSelection, recording, activeMeetingId, meetings, selectedId, setSelectedId]);
+
+  // A meeting that starts recording becomes the selection, so its live view is
+  // what the user sees. Keyed on the id and the state only, so a selection the
+  // user makes during the meeting is left alone.
+  useEffect(() => {
+    if (recording && activeMeetingId) setSelectedId(activeMeetingId);
+  }, [recording, activeMeetingId, setSelectedId]);
+
+  // Loads the open meeting's detail, except while it is the live one, whose
+  // view comes from events. Stopping flips it back to a stored meeting, so the
+  // detail is read again then.
   useEffect(() => {
     if (!selectedId) {
+      detailRequest.current++;
       setDetail(null);
+      setDetailLoading(false);
       return;
     }
-    setBusy(true);
-    setListStatus(null);
-    getMeeting(selectedId)
-      .then(setDetail)
-      .catch((e) => {
-        setDetail(null);
-        setListStatus(toMessage(e));
-      })
-      .finally(() => setBusy(false));
-  }, [selectedId]);
+    if (live) return;
+    void loadDetail(selectedId);
+  }, [selectedId, live, loadDetail]);
 
   useEffect(() => {
     void getSystemAudioCapability().then(setCapability);
@@ -281,6 +409,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
       .then((payload) => {
         setState(payload.state);
         if (payload.active_meeting_id && payload.state === "recording") {
+          setActiveMeetingId(payload.active_meeting_id);
           getMeeting(payload.active_meeting_id)
             .then((d) => {
               setSegments(
@@ -320,10 +449,26 @@ export default function MeetingsPage({ onNavigate }: Props) {
           setSegments([]);
           // Last meeting's notes are not this meeting's notes.
           setLiveNotes(null);
+          // A new meeting: forget the last id until this one's arrives, and
+          // show the list row for it as soon as the list has it.
+          setActiveMeetingId(null);
+          setRecordingSince(new Date().toISOString());
+          void refreshList();
+          getMeetingState()
+            .then((payload) => {
+              if (payload.active_meeting_id) setActiveMeetingId(payload.active_meeting_id);
+            })
+            .catch(() => {});
         }
       }),
-      onMeetingNotes(setLiveNotes),
+      onMeetingNotes((notes) => {
+        // Not gated on the recording state: a state event and the first notes
+        // can land in one batch, and the selection only follows while recording.
+        setActiveMeetingId(notes.meeting_id);
+        setLiveNotes(notes);
+      }),
       onMeetingSegment((seg: MeetingSegmentEvent) => {
+        setActiveMeetingId(seg.meeting_id);
         setSegments((prev) => {
           if (prev.some((s) => s.meeting_id === seg.meeting_id && s.sequence === seg.sequence)) return prev;
           // No speaker rows while recording — the meeting has not been
@@ -345,7 +490,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
     return () => {
       void unsubs.then((fns) => fns.forEach((fn) => fn()));
     };
-  }, []);
+  }, [refreshList]);
 
   useEffect(() => {
     if (state !== "recording") {
@@ -354,11 +499,6 @@ export default function MeetingsPage({ onNavigate }: Props) {
   }, [state]);
 
   useEffect(() => () => clearTimeout(testTimer.current), []);
-
-  const onMeetingStopped = async (meetingId: string) => {
-    await refreshList();
-    setSelectedId(meetingId);
-  };
 
   /**
    * Renames one side of the open meeting, then re-reads it.
@@ -482,6 +622,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
       if (selectedId === id) {
         setSelectedId(null);
         setDetail(null);
+        setShowDetailNarrow(false);
       }
       await refreshList();
     } catch (e) {
@@ -533,7 +674,9 @@ export default function MeetingsPage({ onNavigate }: Props) {
     setMeetingStatus(null);
     setSegments([]);
     try {
-      await startMeeting();
+      const id = await startMeeting();
+      setActiveMeetingId(id);
+      void refreshList();
       setMeetingStatus("Recording — speak into the mic.");
       return true;
     } catch (e) {
@@ -551,7 +694,11 @@ export default function MeetingsPage({ onNavigate }: Props) {
     try {
       const saved = await stopMeeting();
       setMeetingStatus(`Meeting saved: ${saved.meeting.title}`);
-      await onMeetingStopped(saved.meeting.id);
+      await refreshList();
+      setSelectedId(saved.meeting.id);
+      // The same meeting may already be selected, in which case nothing else
+      // reads its notes again: they were written while it finished.
+      await loadDetail(saved.meeting.id);
     } catch (e) {
       setMeetingStatus(toMessage(e));
     } finally {
@@ -584,10 +731,42 @@ export default function MeetingsPage({ onNavigate }: Props) {
     capability === "screen_capture_kit" && screenPerm !== "Granted";
 
   const actionBusy = meetingBusy || busy;
+  const recordDisabled = actionBusy || recording || processing || testing;
+
+  const onSelectRow = (id: string) => {
+    setSelectedId(id);
+    setShowDetailNarrow(true);
+  };
+
+  const hasAnyMeeting = meetings.length > 0 || pinnedRow !== null;
+  // Narrow: one pane at a time. With no meetings the empty state is all there is.
+  const showListPane = !narrow || (hasAnyMeeting && !showDetailNarrow);
+  const showDetailPane = !narrow || showDetailNarrow || !hasAnyMeeting;
+
+  // The test capture lives with the other settings: it checks the setup, and
+  // it is not something to press during a meeting by accident.
+  const checkSection: ReactNode = (
+    <section style={{ marginBottom: 16 }}>
+      <h3 style={{ margin: "0 0 8px", fontSize: 15 }}>Check your setup</h3>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <button
+          type="button"
+          className="kea-btn kea-btn--primary"
+          onClick={() => void runTestCapture()}
+          disabled={recordDisabled}
+        >
+          Run a 10-second test
+        </button>
+      </div>
+      <p className="kea-muted" style={{ margin: "8px 0 0", fontSize: "0.8125rem" }}>
+        The test is a real capture — it is saved to your meetings like any other.
+      </p>
+    </section>
+  );
 
   return (
     <div>
-      <header style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+      <header style={{ display: "flex", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <h1 style={{ marginTop: 0 }}>Meetings</h1>
           <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
@@ -595,19 +774,50 @@ export default function MeetingsPage({ onNavigate }: Props) {
             stop.
           </p>
         </div>
-        <button
-          ref={settingsButtonRef}
-          type="button"
-          className="kea-btn"
-          aria-label="Meeting settings"
-          title="Meeting settings"
-          aria-haspopup="dialog"
-          aria-expanded={settingsOpen}
-          onClick={() => (settingsOpen ? closeSettings() : setSettingsOpen(true))}
-        >
-          ⚙
-        </button>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <span className="kea-muted" style={{ fontSize: 13 }}>
+            State:{" "}
+            <strong style={{ color: "var(--text)" }}>
+              {state === "idle" ? "Idle" : state === "recording" ? "Recording" : "Processing"}
+            </strong>
+          </span>
+          {recording && <LevelMeter level={level} />}
+          <button
+            type="button"
+            className="kea-btn kea-btn--primary"
+            onClick={() => void onStart()}
+            disabled={recordDisabled}
+          >
+            Start meeting
+          </button>
+          <button
+            type="button"
+            className="kea-btn"
+            onClick={() => void onStop()}
+            disabled={actionBusy || !recording}
+          >
+            Stop meeting
+          </button>
+          <button
+            ref={settingsButtonRef}
+            type="button"
+            className="kea-btn"
+            aria-label="Meeting settings"
+            title="Meeting settings"
+            aria-haspopup="dialog"
+            aria-expanded={settingsOpen}
+            onClick={() => (settingsOpen ? closeSettings() : setSettingsOpen(true))}
+          >
+            ⚙
+          </button>
+        </div>
       </header>
+
+      {meetingStatus && (
+        <p className="kea-muted" style={{ margin: "0 0 16px" }}>
+          {meetingStatus}
+        </p>
+      )}
 
       <MeetingSettingsPanel
         open={settingsOpen}
@@ -629,6 +839,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
         downloadVoiceModels={downloadVoiceModels}
         ai={ai}
         onNotionStatusChange={setNotionStatus}
+        checkSection={checkSection}
       />
 
       <FeatureBanner ai={ai} onNavigate={onNavigate} />
@@ -652,183 +863,65 @@ export default function MeetingsPage({ onNavigate }: Props) {
         </Banner>
       )}
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Try it</h2>
-        <div className="kea-card">
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 12,
-              flexWrap: "wrap",
-              marginBottom: 12,
-            }}
-          >
-            <span className="kea-muted" style={{ fontSize: 13 }}>
-              State:{" "}
-              <strong style={{ color: "var(--text)" }}>
-                {state === "idle" ? "Idle" : state === "recording" ? "Recording" : "Processing"}
-              </strong>
-            </span>
-            {recording && <LevelMeter level={level} />}
-          </div>
-
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button
-              type="button"
-              className="kea-btn kea-btn--primary"
-              onClick={() => void runTestCapture()}
-              disabled={actionBusy || recording || processing || testing}
-            >
-              Run a 10-second test
-            </button>
-            <button
-              type="button"
-              className="kea-btn"
-              onClick={() => void onStart()}
-              disabled={actionBusy || recording || processing || testing}
-            >
-              Start meeting
-            </button>
-            <button
-              type="button"
-              className="kea-btn"
-              onClick={() => void onStop()}
-              disabled={actionBusy || !recording}
-            >
-              Stop meeting
-            </button>
-          </div>
-          <p className="kea-muted" style={{ margin: "8px 0 0", fontSize: "0.8125rem" }}>
-            The test is a real capture — it is saved to your meetings like any other.
-          </p>
-          {meetingStatus && (
-            <p className="kea-muted" style={{ marginTop: 12, marginBottom: 0 }}>
-              {meetingStatus}
-            </p>
-          )}
-        </div>
-      </section>
-
-      {liveNotes && (
-        <section style={{ marginBottom: 24 }}>
-          <h2 style={{ margin: "0 0 12px" }}>Notes so far</h2>
-          <div className="kea-card">
-            {/*
-              Said plainly, because a stale summary read as a final one is the
-              way this feature misleads: the fold can compress out a point
-              mentioned once, and the full-transcript pass at stop is what
-              fixes it.
-            */}
-            <p className="kea-muted" style={{ margin: "0 0 8px", fontSize: "0.8125rem" }}>
-              Updated every few minutes while the meeting runs. The full notes are
-              written when you stop.
-            </p>
-            {liveNotes.summary.trim() && (
-              <p style={{ margin: "0 0 8px", whiteSpace: "pre-wrap" }}>{liveNotes.summary}</p>
-            )}
-            {liveNotes.action_items.trim() && (
-              <>
-                <h3 style={{ margin: "0 0 4px", fontSize: 14 }}>Action items</h3>
-                <p style={{ margin: 0, whiteSpace: "pre-wrap" }}>{liveNotes.action_items}</p>
-              </>
-            )}
-          </div>
-        </section>
-      )}
-
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Live transcript</h2>
-        <div className="kea-card">
-          <TranscriptPanel
-            segments={segments}
-            live={recording}
-            emptyMessage={
-              recording
-                ? "Listening — segments appear every few seconds…"
-                : "Start a meeting to see live transcription."
-            }
+      <div className={`kea-meetings-grid${narrow ? " kea-meetings-grid--narrow" : ""}`}>
+        {showListPane && (
+          <MeetingList
+            meetings={listRows}
+            recording={pinnedRow}
+            selectedId={selectedId}
+            onSelect={onSelectRow}
           />
-        </div>
-      </section>
+        )}
 
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "minmax(200px, 280px) 1fr",
-          gap: 16,
-          alignItems: "start",
-        }}
-      >
-        <aside
-          className="kea-card"
-          style={{
-            padding: 12,
-            maxHeight: 480,
-            overflowY: "auto",
-          }}
-        >
-          <h2 style={{ margin: "0 0 12px", fontSize: 15 }}>Past meetings</h2>
-          {meetings.length === 0 ? (
-            <p className="kea-muted" style={{ margin: 0 }}>
-              No meetings yet.
-            </p>
-          ) : (
-            <ul style={{ margin: 0, padding: 0, listStyle: "none" }}>
-              {meetings.map((m) => (
-                <li key={m.id} style={{ marginBottom: 4 }}>
-                  <button
-                    type="button"
-                    onClick={() => setSelectedId(m.id)}
-                    style={{
-                      width: "100%",
-                      textAlign: "left",
-                      padding: "8px 10px",
-                      border:
-                        selectedId === m.id
-                          ? "2px solid var(--accent)"
-                          : "1px solid var(--border)",
-                      borderRadius: 6,
-                      background:
-                        selectedId === m.id ? "var(--surface-2)" : "var(--surface)",
-                      color: "var(--text)",
-                      cursor: "pointer",
-                      fontFamily: "inherit",
-                    }}
-                  >
-                    <div style={{ fontWeight: 600, fontSize: 13 }}>{m.title}</div>
-                    <div className="kea-muted" style={{ fontSize: 11, marginTop: 2 }}>
-                      {m.started_at} · {m.status}
-                    </div>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </aside>
-
-        <section className="kea-card" style={{ minHeight: 200 }}>
-          {selectedId && detail ? (
-            <MeetingDetailView
-              detail={detail}
-              onDelete={onDelete}
-              busy={busy}
-              onRenameSpeaker={onRenameSpeaker}
-              onRenameTitle={onRenameTitle}
-              onSetActionItemStatus={onSetActionItemStatus}
-              onAddActionItem={onAddActionItem}
-              onCopyMarkdown={onCopyMarkdown}
-              onSaveMarkdown={onSaveMarkdown}
-              onExportNotion={notionReady ? onExportNotion : undefined}
-            />
-          ) : selectedId && busy ? (
-            <LoadingBlock label="Loading meeting…" />
-          ) : (
-            <p className="kea-muted" style={{ margin: 0 }}>
-              Select a meeting to view notes and transcript.
-            </p>
-          )}
-        </section>
+        {showDetailPane && (
+          <section className="kea-card" style={{ minHeight: 200, minWidth: 0 }}>
+            {paneMeeting ? (
+              <MeetingPane
+                key={paneMeeting.id}
+                ref={paneRef}
+                meeting={paneMeeting}
+                detail={detail}
+                live={live}
+                liveSegments={segments}
+                liveNotes={liveNotes}
+                generating={generating}
+                loading={detailLoading}
+                busy={busy}
+                onBack={narrow ? () => setShowDetailNarrow(false) : undefined}
+                onDelete={live ? undefined : onDelete}
+                onRenameTitle={onRenameTitle}
+                onRenameSpeaker={onRenameSpeaker}
+                onSetActionItemStatus={onSetActionItemStatus}
+                onAddActionItem={onAddActionItem}
+                onCopyMarkdown={onCopyMarkdown}
+                onSaveMarkdown={onSaveMarkdown}
+                onExportNotion={notionReady ? onExportNotion : undefined}
+              />
+            ) : !hasAnyMeeting ? (
+              <div>
+                <h2 style={{ marginTop: 0, fontSize: 18 }}>No meetings yet</h2>
+                <p className="kea-muted" style={{ margin: "0 0 16px" }}>
+                  Record one and its transcript appears here as it happens, with notes
+                  when you stop.
+                </p>
+                <button
+                  type="button"
+                  className="kea-btn kea-btn--primary"
+                  onClick={() => void onStart()}
+                  disabled={recordDisabled}
+                >
+                  Record a meeting
+                </button>
+              </div>
+            ) : selectedId && detailLoading ? (
+              <LoadingBlock label="Loading meeting…" />
+            ) : (
+              <p className="kea-muted" style={{ margin: 0 }}>
+                Select a meeting to view notes and transcript.
+              </p>
+            )}
+          </section>
+        )}
       </div>
 
       {listStatus && (

@@ -23,10 +23,10 @@
 
 - [ ] 4.1 Inventory every action and setting on the current Meetings page and `MeetingDetail` into a checklist in this change's folder (`ui-inventory.md`); verify each later UI task ticks its items and none is left unticked at the end
 - [x] 4.2 Move the settings into `MeetingSettingsPanel` (slide-over; ⚙, close, Escape and outside-click; focus returns to ⚙; unsaved state kept); verify retargeted `MeetingsPage` settings tests pass and new tests for Escape and focus return
-- [ ] 4.3 `MeetingList` with grouping (local time), the pinned recording row, row details, the debounced search via `search_meetings`, and the no-match state; verify component tests for grouping across midnight, the pinned row and search
-- [ ] 4.4 Page shell: grid layout, default selection (recording, else newest), selection kept across page switches in the app session, empty state, and the one-pane narrow layout with Back; verify tests for each default-selection case and the narrow layout
-- [ ] 4.5 `MeetingPane` with Summary/Transcript/Ask AI tabs and per-tab scroll memory; split `MeetingDetail` into `SummaryTab` and `TranscriptTab` keeping rename, speaker rename/confirm, action items, copy, export and delete; verify retargeted `MeetingDetail` tests and the inventory
-- [ ] 4.6 Live view in the pane (live notes and transcript from events, follow-unless-scrolled-up, "Generating notes…" on stop, then refetch); remove "Try it" and move Record/Stop to the header; verify tests driving fake segment and notes events through a stop
+- [x] 4.3 `MeetingList` with grouping (local time), the pinned recording row, row details, the debounced search via `search_meetings`, and the no-match state; verify component tests for grouping across midnight, the pinned row and search
+- [x] 4.4 Page shell: grid layout, default selection (recording, else newest), selection kept across page switches in the app session, empty state, and the one-pane narrow layout with Back; verify tests for each default-selection case and the narrow layout
+- [x] 4.5 `MeetingPane` with Summary/Transcript/Ask AI tabs and per-tab scroll memory; split `MeetingDetail` into `SummaryTab` and `TranscriptTab` keeping rename, speaker rename/confirm, action items, copy, export and delete; verify retargeted `MeetingDetail` tests and the inventory
+- [x] 4.6 Live view in the pane (live notes and transcript from events, follow-unless-scrolled-up, "Generating notes…" on stop, then refetch); remove "Try it" and move Record/Stop to the header; verify tests driving fake segment and notes events through a stop
 
 ## 5. Ask AI and editing UI
 

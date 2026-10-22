@@ -1,4 +1,4 @@
-import { useEffect, useRef, type RefObject } from "react";
+import { useEffect, useRef, type ReactNode, type RefObject } from "react";
 import type {
   MeetingSettings,
   NotionStatus,
@@ -112,6 +112,11 @@ type Props = {
   downloadVoiceModels: () => void | Promise<void>;
   ai: FeatureAi;
   onNotionStatusChange: (status: NotionStatus) => void;
+  /**
+   * Extra controls the page places under the behaviour settings: the 10-second
+   * test capture, which is a check of the setup rather than a setting.
+   */
+  checkSection?: ReactNode;
 };
 
 /**
@@ -142,6 +147,7 @@ export default function MeetingSettingsPanel({
   downloadVoiceModels,
   ai,
   onNotionStatusChange,
+  checkSection,
 }: Props) {
   const panelRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -345,6 +351,8 @@ export default function MeetingSettingsPanel({
             </p>
           )}
         </section>
+
+        {checkSection}
 
         <FeatureAiCard ai={ai} featureLabel="Meetings" />
 

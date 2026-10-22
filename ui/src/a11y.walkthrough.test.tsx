@@ -100,7 +100,14 @@ function mockWholeApp() {
         // Seeded, not empty: an empty table sweeps no rows, and the row
         // controls are exactly what needs covering.
         list_meetings: () => [MEETING],
-        get_meeting: () => ({ meeting: MEETING, segments: [], notes: null }),
+        get_meeting: () => ({
+          meeting: MEETING,
+          segments: [],
+          notes: null,
+          speakers: [],
+          action_items: [],
+          can_undo: false,
+        }),
         get_meeting_state: () => ({ state: "idle", active_meeting_id: null }),
         get_meeting_settings: () => ({
           segment_duration_secs: 30,
@@ -155,11 +162,19 @@ function operableControls(): HTMLElement[] {
   );
 }
 
+/**
+ * A tab in a tablist, which is a roving-tabindex group: only the selected tab
+ * is a tab stop, and the others are reached with the arrow keys.
+ */
+function isRovingTab(el: HTMLElement): boolean {
+  return el.getAttribute("role") === "tab" && el.closest("[role='tablist']") !== null;
+}
+
 /** Controls a mouse can reach but a keyboard cannot. */
 function hiddenFromKeyboard(): HTMLElement[] {
   return operableControls().filter(
     (el) =>
-      el.getAttribute("tabindex") === "-1" ||
+      (el.getAttribute("tabindex") === "-1" && !isRovingTab(el)) ||
       el.closest("[aria-hidden='true']") !== null ||
       el.closest("[inert]") !== null,
   );
@@ -177,6 +192,7 @@ async function tabSweep(): Promise<HTMLElement[]> {
   const controls = operableControls();
   const seen = new Set<Element>();
   const seenRadioGroups = new Set<string>();
+  const seenTablists = new Set<Element>();
   document.body.focus();
   // One extra pass so a wrap-around still visits everything.
   for (let i = 0; i < controls.length + 2; i += 1) {
@@ -185,6 +201,8 @@ async function tabSweep(): Promise<HTMLElement[]> {
     if (!active || active === document.body) continue;
     seen.add(active);
     if (active.type === "radio" && active.name) seenRadioGroups.add(active.name);
+    const tablist = active.closest("[role='tablist']");
+    if (tablist) seenTablists.add(tablist);
   }
   return controls.filter((el) => {
     if (seen.has(el)) return false;
@@ -192,6 +210,8 @@ async function tabSweep(): Promise<HTMLElement[]> {
     // reached with the arrow keys, so the group counts as covered.
     const input = el as HTMLInputElement;
     if (input.type === "radio" && input.name) return !seenRadioGroups.has(input.name);
+    // The same for a tablist: its other tabs are reached with the arrow keys.
+    if (isRovingTab(el)) return !seenTablists.has(el.closest("[role='tablist']") as Element);
     return true;
   });
 }
@@ -200,7 +220,9 @@ async function tabSweep(): Promise<HTMLElement[]> {
 const PAGES: [string, () => JSX.Element, RegExp[]][] = [
   ["Rewrite", () => <RewritePage />, []],
   ["Dictation", () => <DictationPage />, []],
-  ["Meetings", () => <MeetingsPage />, [/Test capture/]],
+  // The meeting rows are a listbox, keyed by the arrow keys and covered by the
+  // list's own tests, so the seeded check here is the header control.
+  ["Meetings", () => <MeetingsPage />, [/^Start meeting$/]],
   ["Read aloud", () => <ReadAloudPage />, []],
   ["AI Providers", () => <AiProvidersPage />, []],
   ["Models", () => <ModelsPage />, []],
