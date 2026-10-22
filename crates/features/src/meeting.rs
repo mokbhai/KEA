@@ -728,7 +728,8 @@ fn changed_section_names(proposal: &NotesProposal) -> Vec<String> {
         ("open_questions", proposal.open_questions.is_some()),
     ]
     .into_iter()
-    .filter_map(|(name, changed)| changed.then(|| name.to_string()))
+    .filter(|(_, changed)| *changed)
+    .map(|(name, _)| name.to_string())
     .collect()
 }
 

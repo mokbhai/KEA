@@ -68,7 +68,7 @@ Ticked items were moved by task 4.2 into `ui/src/components/meetings/MeetingSett
 - [x] "Notes so far" card, shown when interim notes exist: "Updated every few minutes…" line, summary, action items
 - [x] Notes so far cleared when a new meeting starts recording (behaviour)
 - [x] "Live transcript" card: `TranscriptPanel` with the live flag
-- [ ] Live transcript empty message: "Listening — segments appear every few seconds…" or "Start a meeting to see live transcription."
+- [x] Live transcript empty message: "Listening — segments appear every few seconds…" or "Start a meeting to see live transcription." — the first is kept while recording; the second is superseded, since the live transcript now exists only for a recording meeting (a stored meeting with no lines says "No segments recorded for this meeting.", and an empty page offers Record)
 - [x] Live segments labelled You, Others or left unlabelled (`speakerDisplayName`)
 - [x] Live segments de-duplicated by meeting id and sequence (behaviour)
 - [x] Segments cleared on recording start and on Start meeting (behaviour)

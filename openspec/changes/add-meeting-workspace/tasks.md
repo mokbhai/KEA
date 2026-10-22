@@ -21,7 +21,7 @@
 
 ## 4. Workspace UI
 
-- [ ] 4.1 Inventory every action and setting on the current Meetings page and `MeetingDetail` into a checklist in this change's folder (`ui-inventory.md`); verify each later UI task ticks its items and none is left unticked at the end
+- [x] 4.1 Inventory every action and setting on the current Meetings page and `MeetingDetail` into a checklist in this change's folder (`ui-inventory.md`); verify each later UI task ticks its items and none is left unticked at the end
 - [x] 4.2 Move the settings into `MeetingSettingsPanel` (slide-over; ⚙, close, Escape and outside-click; focus returns to ⚙; unsaved state kept); verify retargeted `MeetingsPage` settings tests pass and new tests for Escape and focus return
 - [x] 4.3 `MeetingList` with grouping (local time), the pinned recording row, row details, the debounced search via `search_meetings`, and the no-match state; verify component tests for grouping across midnight, the pinned row and search
 - [x] 4.4 Page shell: grid layout, default selection (recording, else newest), selection kept across page switches in the app session, empty state, and the one-pane narrow layout with Back; verify tests for each default-selection case and the narrow layout
@@ -37,5 +37,5 @@
 
 ## 6. Verification
 
-- [ ] 6.1 Run `cargo test --workspace`, `cargo clippy --workspace --all-targets`, `cargo fmt --check`, and the UI test and typecheck scripts; all pass, and `ui-inventory.md` is fully ticked
+- [x] 6.1 Run `cargo test --workspace`, `cargo clippy --workspace --all-targets`, `cargo fmt --check`, and the UI test and typecheck scripts; all pass, and `ui-inventory.md` is fully ticked
 - [ ] 6.2 In the running app: open Meetings with several past meetings and confirm the newest summary shows without scrolling; search by a word from a summary; record a short meeting and watch it live in the pane; ask a question and follow a citation; apply a "shorter" proposal, undo it, and edit a section by hand
