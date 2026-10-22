@@ -78,6 +78,19 @@ const TranscriptTab = forwardRef<TranscriptTabHandle, TranscriptTabProps>(functi
     return () => el.removeEventListener("scroll", onScroll);
   }, [scrollRef]);
 
+  // A tab coming back keeps the place it was left at: the pane restores the
+  // scroll position before this runs, and anywhere but the bottom means the
+  // reader had scrolled up, so the follow starts off.
+  useEffect(() => {
+    const el = scrollRef?.current;
+    if (el && el.scrollTop > 0) {
+      followingRef.current =
+        el.scrollHeight - el.scrollTop - el.clientHeight < FOLLOW_SLACK_PX;
+    }
+    // Mount only: afterwards the scroll listener keeps it current.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Runs after mount and after every new line. Our own scroll then re-enters
   // the follow zone, which is what keeps the next line following too.
   useEffect(() => {

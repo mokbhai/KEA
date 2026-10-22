@@ -261,6 +261,13 @@ describe("SummaryTab", () => {
     expect(screen.getByText(/The full notes are written when you stop/)).toBeTruthy();
   });
 
+  // With live notes off nothing arrives until stop; the placeholder must say so.
+  it("does not promise live notes when they are switched off", () => {
+    renderSummary({ detail: null, live: true, liveNotes: null, interimNotes: false });
+    expect(screen.getByText(/Notes are written when the meeting ends/)).toBeTruthy();
+    expect(screen.queryByText("Notes appear here as the meeting runs.")).toBeNull();
+  });
+
   // A recording meeting has no stored record to export or delete yet.
   it("offers no export or delete while the meeting is still recording", () => {
     renderSummary({

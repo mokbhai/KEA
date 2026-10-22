@@ -43,6 +43,8 @@ export type MeetingPaneProps = {
   live: boolean;
   liveSegments: TranscriptSegment[];
   liveNotes: MeetingNotes | null;
+  /** Whether live (interim) notes are switched on. */
+  interimNotes?: boolean;
   /** The meeting has stopped and its final notes are still being written. */
   generating: boolean;
   /** The detail is being fetched. */
@@ -140,6 +142,7 @@ const MeetingPane = forwardRef<MeetingPaneHandle, MeetingPaneProps>(function Mee
     live,
     liveSegments,
     liveNotes,
+    interimNotes = true,
     generating,
     loading,
     busy,
@@ -236,6 +239,7 @@ const MeetingPane = forwardRef<MeetingPaneHandle, MeetingPaneProps>(function Mee
           detail={live ? null : current}
           live={live}
           liveNotes={liveNotes}
+          interimNotes={interimNotes}
           generating={generating}
           busy={busy}
           onRenameSpeaker={onRenameSpeaker}

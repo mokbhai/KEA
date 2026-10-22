@@ -25,6 +25,8 @@ export type SummaryTabProps = {
   /** This meeting is recording: the tab shows the live notes instead. */
   live: boolean;
   liveNotes: MeetingNotes | null;
+  /** Whether live (interim) notes are switched on; decides the placeholder. */
+  interimNotes?: boolean;
   /** The meeting has stopped and its final notes are still being written. */
   generating: boolean;
   busy?: boolean;
@@ -306,11 +308,15 @@ function SpeakerLegend({
 }
 
 /** The live notes card: interim passes, labelled as unfinished. */
-function LiveNotes({ notes }: { notes: MeetingNotes | null }) {
+function LiveNotes({ notes, interimNotes }: { notes: MeetingNotes | null; interimNotes: boolean }) {
   if (!notes) {
+    // With live notes off, nothing will arrive until the meeting stops, and
+    // the placeholder must not promise otherwise.
     return (
       <p className="kea-muted" style={{ margin: 0 }}>
-        Notes appear here as the meeting runs.
+        {interimNotes
+          ? "Notes appear here as the meeting runs."
+          : "Notes are written when the meeting ends. Turn on live notes in ⚙ to see them as it runs."}
       </p>
     );
   }
@@ -352,6 +358,7 @@ export default function SummaryTab({
   detail,
   live,
   liveNotes,
+  interimNotes = true,
   generating,
   busy = false,
   onRenameSpeaker,
@@ -362,7 +369,7 @@ export default function SummaryTab({
   onExportNotion,
   onDelete,
 }: SummaryTabProps) {
-  if (live) return <LiveNotes notes={liveNotes} />;
+  if (live) return <LiveNotes notes={liveNotes} interimNotes={interimNotes} />;
   if (!detail) {
     // Stopped, and the stored meeting has not been read back yet.
     return generating ? (

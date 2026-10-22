@@ -161,6 +161,10 @@ export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMe
   const [state, setState] = useState<MeetingState>("idle");
   // The meeting the backend is recording or finishing, once its id is known.
   const [activeMeetingId, setActiveMeetingId] = useState<string | null>(null);
+  // Read by the state listener, which is subscribed once and would otherwise
+  // see the id from its first render.
+  const activeMeetingRef = useRef<string | null>(null);
+  activeMeetingRef.current = activeMeetingId;
   const [recordingSince, setRecordingSince] = useState(() => new Date().toISOString());
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [level, setLevel] = useState(0);
@@ -310,9 +314,15 @@ export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMe
    * Loads one meeting's detail. A newer request wins, so a slow answer for a
    * meeting the user has already left cannot overwrite the one on screen.
    */
-  const loadDetail = useCallback(async (id: string) => {
+  /**
+   * Reads one meeting's detail. Every read goes through here, with the
+   * request counter, so a slow answer for a meeting the user has since left
+   * cannot overwrite the one now open. `quiet` skips the loading state, for a
+   * re-read after a write where the pane should not flash.
+   */
+  const loadDetail = useCallback(async (id: string, quiet = false) => {
     const request = ++detailRequest.current;
-    setDetailLoading(true);
+    if (!quiet) setDetailLoading(true);
     try {
       const next = await getMeeting(id);
       if (request === detailRequest.current) setDetail(next);
@@ -445,6 +455,15 @@ export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMe
     const unsubs = Promise.all([
       onMeetingState((next: MeetingState) => {
         setState(next);
+        // Finishing ends in idle however the stop was asked for — the button,
+        // the hotkey, the tray or a script. Only here is the finished meeting
+        // re-read for all of them; the button path alone used to do it, so a
+        // hotkey stop left the pane saying no notes were written.
+        if (next === "idle" && activeMeetingRef.current) {
+          const finished = activeMeetingRef.current;
+          void refreshList();
+          void loadDetail(finished, true);
+        }
         if (next === "recording") {
           setSegments([]);
           // Last meeting's notes are not this meeting's notes.
@@ -490,7 +509,7 @@ export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMe
     return () => {
       void unsubs.then((fns) => fns.forEach((fn) => fn()));
     };
-  }, [refreshList]);
+  }, [refreshList, loadDetail]);
 
   useEffect(() => {
     if (state !== "recording") {
@@ -512,7 +531,7 @@ export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMe
     setBusy(true);
     try {
       await setMeetingSpeakerName(selectedId, speakerKey, displayName);
-      setDetail(await getMeeting(selectedId));
+      await loadDetail(selectedId, true);
     } catch (e) {
       setListStatus(toMessage(e));
     } finally {
@@ -534,7 +553,7 @@ export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMe
     setListStatus(null);
     try {
       await write(selectedId);
-      setDetail(await getMeeting(selectedId));
+      await loadDetail(selectedId, true);
     } catch (e) {
       setListStatus(toMessage(e));
     } finally {
@@ -548,8 +567,12 @@ export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMe
   const onAddActionItem = (text: string) =>
     mutateMeeting((meetingId) => addMeetingActionItem(meetingId, text));
 
-  const onRenameTitle = (title: string) =>
-    mutateMeeting((meetingId) => setMeetingTitle(meetingId, title));
+  // The header and the list row read the title from the list, so a rename
+  // re-reads the list as well as the detail, or the old name would stand.
+  const onRenameTitle = async (title: string) => {
+    await mutateMeeting((meetingId) => setMeetingTitle(meetingId, title));
+    await refreshList();
+  };
 
   /**
    * Copy in the webview rather than through the Rust clipboard path.
@@ -884,6 +907,7 @@ export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMe
                 live={live}
                 liveSegments={segments}
                 liveNotes={liveNotes}
+                interimNotes={settings.interim_notes}
                 generating={generating}
                 loading={detailLoading}
                 busy={busy}

@@ -219,6 +219,24 @@ describe("MeetingList search", () => {
     expect(screen.queryByText(/No meeting matches/)).toBeNull();
   });
 
+  // Found in review: a search hid the meeting being recorded unless it
+  // matched the query.
+  it("keeps the recording meeting pinned while searching", async () => {
+    vi.useFakeTimers();
+    onInvoke({ search_meetings: () => [] });
+    const live = row("live", "Standup", new Date(), { status: "recording", ended_at: null });
+    render(<MeetingList meetings={recent} recording={live} selectedId={null} onSelect={noop} />);
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search meetings" }), {
+      target: { value: "unicorn" },
+    });
+    act(() => vi.advanceTimersByTime(200));
+    await act(async () => {});
+
+    expect(screen.getByText("Standup")).toBeTruthy();
+    expect(screen.getByText("No meeting matches “unicorn”.")).toBeTruthy();
+  });
+
   it("reports a failed search rather than showing a stale list", async () => {
     vi.useFakeTimers();
     onInvoke({ search_meetings: () => { throw new Error("database is locked"); } });

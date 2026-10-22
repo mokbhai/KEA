@@ -946,4 +946,42 @@ describe("MeetingsPage workspace", () => {
     expect(screen.queryByText("Generating notes…")).toBeNull();
     expect(screen.queryByText("Early summary.")).toBeNull();
   });
+
+  // Found in review: only the Stop button re-read the finished meeting, so a
+  // stop from the hotkey (no stop_meeting call from this page) left the pane
+  // without its notes until the user reselected the meeting.
+  it("shows the final notes after a stop that did not come from the button", async () => {
+    let finalNotesReady = false;
+    const storedRow = { ...meetingRow, id: "live", title: "Planning", started_at: "2026-10-23T09:00:00Z", ended_at: "2026-10-23T09:20:00Z" };
+    mockWorld({
+      bindings: readyBindings,
+      extra: {
+        list_meetings: () => (finalNotesReady ? [older, storedRow] : [older]),
+        get_meeting: (args) => {
+          const id = (args as { id: string }).id;
+          if (id !== "live") return { ...storedMeeting(null), meeting: older, segments: [] };
+          return storedMeeting(finalNotesReady ? notesFor("live", "Final summary.") : null);
+        },
+      },
+    });
+    render(<MeetingsPage />);
+    await waitFor(() => expect(titleValue()).toBe("Older review"));
+
+    await act(async () => {
+      emitTauriEvent("meeting:state", { state: "recording" });
+      emitTauriEvent("meeting:notes", notesFor("live", "Early summary."));
+    });
+    expect(await screen.findByText("Early summary.")).toBeTruthy();
+
+    await act(async () => {
+      emitTauriEvent("meeting:state", { state: "processing" });
+    });
+    finalNotesReady = true;
+    await act(async () => {
+      emitTauriEvent("meeting:state", { state: "idle" });
+    });
+
+    expect(await screen.findByText("Final summary.")).toBeTruthy();
+    expect(invokeCalls("stop_meeting")).toHaveLength(0);
+  });
 });

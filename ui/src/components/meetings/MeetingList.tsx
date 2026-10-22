@@ -84,6 +84,17 @@ export default function MeetingList({ meetings, recording, selectedId, onSelect 
   const [activeIndex, setActiveIndex] = useState(0);
   const optionRefs = useRef(new Map<string, HTMLElement>());
 
+  // Groups are relative to today, so the list re-renders at local midnight:
+  // a page left open overnight must move yesterday's meetings out of Today
+  // without waiting for something unrelated to change.
+  const [, setDay] = useState(0);
+  useEffect(() => {
+    const next = new Date();
+    next.setHours(24, 0, 1, 0);
+    const timer = setTimeout(() => setDay((d) => d + 1), next.getTime() - Date.now());
+    return () => clearTimeout(timer);
+  });
+
   // A cleared box shows the normal list at once; typing waits for a pause.
   useEffect(() => {
     const trimmed = query.trim();
@@ -114,12 +125,16 @@ export default function MeetingList({ meetings, recording, selectedId, onSelect 
   const searching = debounced !== "";
   // Results for a query still being typed would show the previous answer.
   const searchItems = searching && results?.query === debounced ? results.items : null;
-  const pinned = searching ? null : recording;
+  // Pinned through a search too: the meeting being recorded is the one row
+  // that must never disappear because the query does not match it.
+  const pinned = recording;
 
   // Grouped on every render, not memoised on the list: the day changes under a
   // list nobody has re-fetched, and a meeting must move groups at midnight.
   const now = new Date();
-  const source = searching ? (searchItems ?? []) : meetings;
+  const source = (searching ? (searchItems ?? []) : meetings).filter(
+    (m) => m.id !== pinned?.id,
+  );
   const byLabel = new Map<MeetingGroupLabel, Meeting[]>();
   for (const m of source) {
     const started = new Date(m.started_at);
@@ -271,20 +286,11 @@ export default function MeetingList({ meetings, recording, selectedId, onSelect 
         <p style={{ margin: 0, fontSize: 13, color: "var(--danger)" }}>{searchError}</p>
       )}
 
-      {noMatch ? (
-        <div>
-          <p className="kea-muted" style={{ margin: "0 0 8px" }}>
-            No meeting matches “{debounced}”.
-          </p>
-          <button type="button" className="kea-btn" onClick={clearSearch}>
-            Clear search
-          </button>
-        </div>
-      ) : !hasAnything && !searching ? (
+      {!hasAnything && !searching ? (
         <p className="kea-muted" style={{ margin: 0 }}>
           No meetings yet.
         </p>
-      ) : (
+      ) : (noMatch && !pinned) ? null : (
         <div
           role="listbox"
           aria-label="Meetings"
@@ -304,6 +310,19 @@ export default function MeetingList({ meetings, recording, selectedId, onSelect 
               {group.items.map(renderRow)}
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Below the pinned row rather than instead of it: the meeting being
+          recorded stays reachable whatever the query. */}
+      {noMatch && (
+        <div>
+          <p className="kea-muted" style={{ margin: "0 0 8px" }}>
+            No meeting matches “{debounced}”.
+          </p>
+          <button type="button" className="kea-btn" onClick={clearSearch}>
+            Clear search
+          </button>
         </div>
       )}
     </div>
