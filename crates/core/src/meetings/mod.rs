@@ -20,9 +20,10 @@ pub use notion::{
 pub use settings::{MeetingSettings, MeetingSettingsRepo};
 pub use synthesis::{
     build_interim_notes_request, build_meeting_notes_request, build_meeting_title_request,
-    build_notes_repair_request, first_json_object, format_transcript_for_synthesis,
-    parse_meeting_notes_json, render_action_items_prose, sanitize_meeting_title,
-    split_action_item_prose, strip_markdown_fence, ParsedActionItem, ParsedMeetingNotes,
+    build_notes_repair_request, build_speaker_names_request, first_json_object,
+    format_transcript_for_synthesis, parse_meeting_notes_json, parse_speaker_names,
+    render_action_items_prose, sanitize_meeting_title, split_action_item_prose,
+    strip_markdown_fence, ParsedActionItem, ParsedMeetingNotes, SpeakerNameProposal,
     MEETING_INTERIM_PROMPT_VERSION, MEETING_NOTES_PROMPT_VERSION, MEETING_TITLE_PROMPT_VERSION,
 };
 pub use voices::{
