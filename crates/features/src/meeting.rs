@@ -648,7 +648,11 @@ impl MeetingChatTurns {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn claim(&self, meeting_id: &str) -> Result<ChatTurnClaim<'_>, String> {
+    /// Takes the meeting's slot, or refuses if a turn holds it. Public so a
+    /// chat clear can hold the same slot for its delete: checking "is a turn
+    /// running" and then deleting left a window in which a turn could start
+    /// and its reply land in the freshly cleared chat.
+    pub fn claim(&self, meeting_id: &str) -> Result<ChatTurnClaim<'_>, String> {
         if !self.set().insert(meeting_id.to_string()) {
             return Err(CHAT_TURN_BUSY.into());
         }
@@ -661,7 +665,7 @@ impl MeetingChatTurns {
 
 /// Holds a meeting's turn slot and gives it back on Drop, so an error or a
 /// dropped future cannot leave the meeting marked busy for good.
-struct ChatTurnClaim<'a> {
+pub struct ChatTurnClaim<'a> {
     turns: &'a MeetingChatTurns,
     meeting_id: String,
 }
@@ -712,6 +716,20 @@ fn proposed_notes(current: &MeetingNotes, proposal: &NotesProposal) -> NotesText
             .clone()
             .unwrap_or_else(|| current.open_questions.clone()),
     }
+}
+
+/// The sections a proposal changes, by their stored names. See
+/// `ProposalMeta::changed` for why Apply needs them.
+fn changed_section_names(proposal: &NotesProposal) -> Vec<String> {
+    [
+        ("summary", proposal.summary.is_some()),
+        ("decisions", proposal.decisions.is_some()),
+        ("follow_ups", proposal.follow_ups.is_some()),
+        ("open_questions", proposal.open_questions.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, changed)| changed.then(|| name.to_string()))
+    .collect()
 }
 
 /// Run one Ask AI turn for `meeting_id` and store the exchange.
@@ -787,19 +805,11 @@ pub async fn run_chat_turn(
     let proposal = parsed.proposal.as_ref().map(|changes| ProposalMeta {
         proposal: proposed_notes(&notes, changes),
         state: ProposalState::Pending,
+        changed: changed_section_names(changes),
     });
 
-    meetings
-        .append_chat_message(meeting_id, MessageRole::User, message, None)
-        .await
-        .map_err(|e| e.to_string())?;
     let id = meetings
-        .append_chat_message(
-            meeting_id,
-            MessageRole::Assistant,
-            &parsed.reply,
-            proposal.as_ref(),
-        )
+        .append_chat_exchange(meeting_id, message, &parsed.reply, proposal.as_ref())
         .await
         .map_err(|e| e.to_string())?;
 
@@ -3739,6 +3749,42 @@ mod item_16_17_tests {
         assert!(matches!(chat[0].role, MessageRole::User));
         assert_eq!(chat[0].content, "When was it agreed?");
         assert!(!turns.is_in_flight("c1"));
+    }
+
+    /// Every reply is a billed call, so each one lands in the usage ledger
+    /// under the meetings feature — including a prose reply with no proposal.
+    #[tokio::test]
+    async fn each_chat_reply_is_recorded_in_the_usage_ledger() {
+        let llm = RecordingLlm::new(&[
+            r#"{"reply":"One.","notes":null}"#,
+            "plain prose, not the JSON shape",
+        ]);
+        let (reg, bindings, _, meetings) = world(llm).await;
+        chatted_meeting(&meetings, "c9", MeetingStatus::Completed).await;
+        let turns = MeetingChatTurns::default();
+        let data = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&data).await.unwrap();
+        let usage = UsageRepo::new(data.clone());
+
+        for question in ["first?", "second?"] {
+            run_chat_turn(
+                &reg,
+                &bindings,
+                &meetings,
+                &turns,
+                Some(&usage),
+                "c9",
+                question,
+            )
+            .await
+            .unwrap();
+        }
+
+        let rows: Vec<String> = sqlx::query_scalar("SELECT feature_id FROM usage_events")
+            .fetch_all(&data)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec!["meetings", "meetings"]);
     }
 
     /// The proposal is stored whole, with the sections it does not change

@@ -889,6 +889,8 @@ export type ProposalState = "pending" | "applied" | "discarded";
 export type ProposalMeta = {
   proposal: NotesText;
   state: ProposalState;
+  /** The sections the model changed; Apply writes only these. */
+  changed: NotesSection[];
 };
 
 /**

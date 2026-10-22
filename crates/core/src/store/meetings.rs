@@ -335,6 +335,13 @@ impl ProposalState {
 pub struct ProposalMeta {
     pub proposal: NotesText,
     pub state: ProposalState,
+    /// The sections the model actually changed: `summary`, `decisions`,
+    /// `follow_ups`, `open_questions`. Apply writes only these, onto the notes
+    /// as they are *then*, so a hand edit made to another section after the
+    /// proposal arrived is not silently reverted by applying it. Empty reads
+    /// as "every section", for a proposal stored without the list.
+    #[serde(default)]
+    pub changed: Vec<String>,
 }
 
 /// One message of a meeting's chat, with its proposal when it has one.
@@ -1167,15 +1174,34 @@ impl MeetingRepo {
                 due_hint: row.due_hint.clone(),
             })
             .collect();
-        let action_items = if parsed.is_empty() {
+        // Only a meeting with no rows at all keeps its prose: one whose rows
+        // were all dropped renders to nothing, rather than resurrecting the
+        // stale prose that still lists them.
+        let action_items = if rows.is_empty() {
             current.action_items.clone()
         } else {
             render_action_items_prose(&parsed)
         };
 
+        let changes =
+            |section: &str| meta.changed.is_empty() || meta.changed.iter().any(|s| s == section);
+        let pick = |section: &str, proposed: &str, now: &str| {
+            if changes(section) {
+                proposed.to_string()
+            } else {
+                now.to_string()
+            }
+        };
         let text = NotesText {
+            summary: pick("summary", &meta.proposal.summary, &current.summary),
+            decisions: pick("decisions", &meta.proposal.decisions, &current.decisions),
             action_items,
-            ..meta.proposal.clone()
+            follow_ups: pick("follow_ups", &meta.proposal.follow_ups, &current.follow_ups),
+            open_questions: pick(
+                "open_questions",
+                &meta.proposal.open_questions,
+                &current.open_questions,
+            ),
         };
         write_user_notes(&mut tx, meeting_id, &text).await?;
 
@@ -1279,44 +1305,75 @@ impl MeetingRepo {
         content: &str,
         proposal: Option<&ProposalMeta>,
     ) -> Result<i64, KeaError> {
-        let meta = proposal.map(serde_json::to_string).transpose()?;
         let mut tx = self.pool.begin().await?;
+        let id = append_message_tx(&mut tx, meeting_id, role, content, proposal).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
 
-        let existing: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM conversations WHERE meeting_id = ? ORDER BY id DESC LIMIT 1",
-        )
-        .bind(meeting_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let conversation_id = match existing {
-            Some(id) => id,
-            None => sqlx::query_scalar(
-                "INSERT INTO conversations (feature_id, engine_id, meeting_id)
+    /// One Ask AI exchange — the question and its reply — in one transaction,
+    /// returning the reply's id. Written apart, a failure between the two left
+    /// a question with no answer that every later turn then carried in its
+    /// history.
+    pub async fn append_chat_exchange(
+        &self,
+        meeting_id: &str,
+        question: &str,
+        reply: &str,
+        proposal: Option<&ProposalMeta>,
+    ) -> Result<i64, KeaError> {
+        let mut tx = self.pool.begin().await?;
+        append_message_tx(&mut tx, meeting_id, MessageRole::User, question, None).await?;
+        let id =
+            append_message_tx(&mut tx, meeting_id, MessageRole::Assistant, reply, proposal).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+}
+
+async fn append_message_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    meeting_id: &str,
+    role: MessageRole,
+    content: &str,
+    proposal: Option<&ProposalMeta>,
+) -> Result<i64, KeaError> {
+    let meta = proposal.map(serde_json::to_string).transpose()?;
+
+    let existing: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM conversations WHERE meeting_id = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(meeting_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let conversation_id = match existing {
+        Some(id) => id,
+        None => sqlx::query_scalar(
+            "INSERT INTO conversations (feature_id, engine_id, meeting_id)
                  SELECT 'meetings', COALESCE(llm_engine_id, ''), id
                  FROM meetings WHERE id = ?
                  RETURNING id",
-            )
-            .bind(meeting_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| KeaError::NotFound(format!("meeting {meeting_id}")))?,
-        };
-
-        let message_id: i64 = sqlx::query_scalar(
-            "INSERT INTO messages (conversation_id, role, content, meta)
-             VALUES (?, ?, ?, ?) RETURNING id",
         )
-        .bind(conversation_id)
-        .bind(role.as_str())
-        .bind(content)
-        .bind(meta)
-        .fetch_one(&mut *tx)
-        .await?;
+        .bind(meeting_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| KeaError::NotFound(format!("meeting {meeting_id}")))?,
+    };
 
-        tx.commit().await?;
-        Ok(message_id)
-    }
+    let message_id: i64 = sqlx::query_scalar(
+        "INSERT INTO messages (conversation_id, role, content, meta)
+             VALUES (?, ?, ?, ?) RETURNING id",
+    )
+    .bind(conversation_id)
+    .bind(role.as_str())
+    .bind(content)
+    .bind(meta)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(message_id)
+}
 
+impl MeetingRepo {
     /// Deletes the meeting's chat and its messages. Clearing a chat that does
     /// not exist is not an error: the end state is the same.
     pub async fn clear_chat(&self, meeting_id: &str) -> Result<(), KeaError> {
@@ -2409,6 +2466,7 @@ mod tests {
         ProposalMeta {
             proposal: text(summary),
             state,
+            changed: vec!["summary".into()],
         }
     }
 
@@ -2847,6 +2905,82 @@ mod tests {
 
         let notes = repo.get("a3").await.unwrap().unwrap().notes.unwrap();
         assert_eq!(notes.action_items, "Send the deck — Priya (by Friday)");
+    }
+
+    /// The reviewer's case: the user hand-edits decisions after a summary
+    /// proposal arrived. Applying the proposal changes the summary only.
+    #[tokio::test]
+    async fn applying_a_proposal_keeps_a_later_hand_edit_to_another_section() {
+        let (_pool, repo) = with_generated_notes("a5", "Sync", "Generated").await;
+        let id = repo
+            .append_chat_message(
+                "a5",
+                MessageRole::Assistant,
+                "Shorter.",
+                Some(&proposal("Short", ProposalState::Pending)),
+            )
+            .await
+            .unwrap();
+        repo.apply_user_notes(
+            "a5",
+            &NotesText {
+                decisions: "Decided by hand".into(),
+                ..text("Generated")
+            },
+        )
+        .await
+        .unwrap();
+
+        repo.apply_proposal("a5", id).await.unwrap();
+
+        let notes = repo.get("a5").await.unwrap().unwrap().notes.unwrap();
+        assert_eq!(notes.summary, "Short");
+        assert_eq!(notes.decisions, "Decided by hand");
+    }
+
+    /// Every row dropped is an empty list, not a cue to restore the old prose
+    /// that still names them.
+    #[tokio::test]
+    async fn applying_with_every_row_dropped_writes_no_action_items() {
+        let (_pool, repo) = with_generated_notes("a6", "Sync", "Generated").await;
+        let row = repo
+            .add_action_item(
+                "a6",
+                &NewActionItem {
+                    text: "Send the deck".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        repo.set_action_item_status(row, ActionItemStatus::Dropped)
+            .await
+            .unwrap();
+        let mut stale = proposal("Short", ProposalState::Pending);
+        stale.proposal.action_items = "Send the deck".into();
+        let id = repo
+            .append_chat_message("a6", MessageRole::Assistant, "Shorter.", Some(&stale))
+            .await
+            .unwrap();
+
+        repo.apply_proposal("a6", id).await.unwrap();
+
+        let notes = repo.get("a6").await.unwrap().unwrap().notes.unwrap();
+        assert_eq!(notes.action_items, "");
+    }
+
+    #[tokio::test]
+    async fn an_exchange_stores_the_question_and_the_reply_together() {
+        let (_pool, repo) = seeded("c8").await;
+        let reply = repo
+            .append_chat_exchange("c8", "What was decided?", "The launch slips.", None)
+            .await
+            .unwrap();
+        let chat = repo.chat_messages("c8").await.unwrap();
+        assert_eq!(chat.len(), 2);
+        assert_eq!(chat[0].role, MessageRole::User);
+        assert_eq!(chat[1].id, reply);
+        assert_eq!(chat[1].content, "The launch slips.");
     }
 
     #[tokio::test]

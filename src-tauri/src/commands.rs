@@ -4804,9 +4804,11 @@ pub async fn clear_meeting_chat(
     state: State<'_, Arc<AppState>>,
     meeting_id: String,
 ) -> Result<(), String> {
-    if state.meeting_chat_turns.is_in_flight(&meeting_id) {
-        return Err("a reply is still being written; clear the chat once it lands".into());
-    }
+    // Held across the delete, so no turn can start between the check and it.
+    let _slot = state
+        .meeting_chat_turns
+        .claim(&meeting_id)
+        .map_err(|_| "a reply is still being written; clear the chat once it lands".to_string())?;
     state
         .meeting_repo
         .clear_chat(&meeting_id)
@@ -4923,13 +4925,19 @@ async fn edit_notes_section_inner(
         follow_ups: notes.follow_ups,
         open_questions: notes.open_questions,
     };
-    match section {
-        "summary" => next.summary = text.to_string(),
-        "decisions" => next.decisions = text.to_string(),
-        "follow_ups" => next.follow_ups = text.to_string(),
-        "open_questions" => next.open_questions = text.to_string(),
+    let slot = match section {
+        "summary" => &mut next.summary,
+        "decisions" => &mut next.decisions,
+        "follow_ups" => &mut next.follow_ups,
+        "open_questions" => &mut next.open_questions,
         other => return Err(format!("unknown notes section {other}")),
+    };
+    // A save that changes nothing is not an edit: it must not mark the notes
+    // edited or push an undo step the user would then click through.
+    if slot.as_str() == text {
+        return load_meeting(meetings, meeting_id).await;
     }
+    *slot = text.to_string();
     meetings
         .apply_user_notes(meeting_id, &next)
         .await
@@ -9887,6 +9895,7 @@ mod meeting_notes_commands {
                 ..Default::default()
             },
             state: ProposalState::Pending,
+            changed: vec!["summary".into()],
         }
     }
 
@@ -9985,6 +9994,19 @@ mod meeting_notes_commands {
             .is_err());
 
         assert_eq!(version_count(&pool).await, 1);
+    }
+
+    /// Saving a section without changing it is not an edit.
+    #[tokio::test]
+    async fn an_unchanged_save_marks_nothing_and_pushes_no_undo() {
+        let (pool, meetings) = recording_workspace().await;
+        stop(&meetings).await;
+        let detail = edit_notes_section_inner(&meetings, "m1", "decisions", "Launch on the 14th.")
+            .await
+            .unwrap();
+        assert!(!detail.notes.unwrap().edited);
+        assert!(!detail.can_undo);
+        assert_eq!(version_count(&pool).await, 0);
     }
 
     #[tokio::test]
