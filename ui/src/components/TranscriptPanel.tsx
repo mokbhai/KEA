@@ -62,7 +62,8 @@ type Props = {
   emptyMessage?: string;
 };
 
-function formatOffset(ms: number): string {
+/** `mm:ss` for a segment's offset from the start of the meeting. */
+export function formatOffset(ms: number): string {
   const totalSec = Math.floor(ms / 1000);
   const min = Math.floor(totalSec / 60);
   const sec = totalSec % 60;

@@ -85,6 +85,9 @@ function useInertRef<T extends HTMLElement>(
 
 function AppShell() {
   const [page, setPage] = useState<Page>("rewrite");
+  // The meeting selected on the Meetings page. It lives here rather than in the
+  // page so that leaving Meetings and coming back restores it.
+  const [selectedMeetingId, setSelectedMeetingId] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [statusVariant, setStatusVariant] = useState<"progress" | "error" | null>(null);
@@ -279,7 +282,13 @@ function AppShell() {
       case "dictation":
         return <DictationPage onNavigate={navigate} />;
       case "meetings":
-        return <MeetingsPage onNavigate={navigate} />;
+        return (
+          <MeetingsPage
+            onNavigate={navigate}
+            selectedMeetingId={selectedMeetingId}
+            onSelectMeeting={setSelectedMeetingId}
+          />
+        );
       case "transcribe":
         return <TranscribePage onNavigate={navigate} />;
       case "read-aloud":

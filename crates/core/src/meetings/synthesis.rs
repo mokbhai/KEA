@@ -112,6 +112,18 @@ pub fn format_transcript_for_synthesis(
     segments: &[MeetingSegment],
     speakers: &[MeetingSpeaker],
 ) -> String {
+    format_transcript_capped(segments, speakers).0
+}
+
+/// The same transcript as [`format_transcript_for_synthesis`], plus whether
+/// the [`MAX_TRANSCRIPT_CHARS`] cap cut it.
+///
+/// The chat needs the flag so it can tell the user that an answer rests on the
+/// first part of a long meeting. Notes do not, so they keep the plain string.
+pub(crate) fn format_transcript_capped(
+    segments: &[MeetingSegment],
+    speakers: &[MeetingSpeaker],
+) -> (String, bool) {
     let mut sorted: Vec<&MeetingSegment> = segments.iter().collect();
     sorted.sort_by(|a, b| {
         a.sequence
@@ -136,7 +148,7 @@ pub fn format_transcript_for_synthesis(
         .to_string();
 
     if transcript.len() <= MAX_TRANSCRIPT_CHARS {
-        return transcript;
+        return (transcript, false);
     }
 
     // Truncate on a UTF-8 char boundary: a raw byte slice at MAX_TRANSCRIPT_CHARS
@@ -147,9 +159,12 @@ pub fn format_transcript_for_synthesis(
         end -= 1;
     }
 
-    format!(
-        "{}\n[Transcript truncated for summary generation.]",
-        &transcript[..end]
+    (
+        format!(
+            "{}\n[Transcript truncated for summary generation.]",
+            &transcript[..end]
+        ),
+        true,
     )
 }
 

@@ -5,6 +5,7 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use crate::error::KeaError;
 use crate::meetings::{render_action_items_prose, ParsedActionItem, SpeakerChannel};
+use crate::store::conversations::MessageRole;
 
 /// Where a meeting stands, as persisted in `meetings.status`.
 ///
@@ -288,6 +289,69 @@ pub struct MeetingNotes {
     pub prompt_version: String,
     pub engine_id: Option<String>,
     pub model: Option<String>,
+    /// Whether a user changed these notes since generation. Set by
+    /// [`MeetingRepo::apply_user_notes`]; generation clears it. Read as an
+    /// integer column, so a row written before migration 0009 decodes as
+    /// `false`.
+    pub edited: bool,
+}
+
+/// The editable text of a meeting's notes: what a user change replaces, and
+/// what a chat proposal carries. The prompt version and engine stay with the
+/// generation that wrote them, so they are not part of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotesText {
+    pub summary: String,
+    pub decisions: String,
+    pub action_items: String,
+    pub follow_ups: String,
+    pub open_questions: String,
+}
+
+/// Where a notes proposal stands. A proposal starts `Pending` and leaves it
+/// once, for `Applied` or `Discarded`; [`MeetingRepo::set_proposal_state`]
+/// refuses anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalState {
+    Pending,
+    Applied,
+    Discarded,
+}
+
+impl ProposalState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProposalState::Pending => "pending",
+            ProposalState::Applied => "applied",
+            ProposalState::Discarded => "discarded",
+        }
+    }
+}
+
+/// The proposal an assistant message carried, and what became of it. This is
+/// the JSON stored in `messages.meta`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalMeta {
+    pub proposal: NotesText,
+    pub state: ProposalState,
+    /// The sections the model actually changed: `summary`, `decisions`,
+    /// `follow_ups`, `open_questions`. Apply writes only these, onto the notes
+    /// as they are *then*, so a hand edit made to another section after the
+    /// proposal arrived is not silently reverted by applying it. Empty reads
+    /// as "every section", for a proposal stored without the list.
+    #[serde(default)]
+    pub changed: Vec<String>,
+}
+
+/// One message of a meeting's chat, with its proposal when it has one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingChatMessage {
+    pub id: i64,
+    pub role: MessageRole,
+    pub content: String,
+    pub proposal: Option<ProposalMeta>,
+    pub created_at: String,
 }
 
 /// One thing somebody agreed to do, as a row rather than a line of prose.
@@ -330,6 +394,9 @@ pub struct MeetingDetail {
     /// Action items as rows, oldest first. Empty for meetings recorded before
     /// this table existed — `notes.action_items` still carries their prose.
     pub action_items: Vec<ActionItem>,
+    /// Whether [`MeetingRepo::undo_notes`] has anything to restore. Read from
+    /// the undo stack, so it is false while the notes are as generated.
+    pub can_undo: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -488,6 +555,119 @@ fn majority_target(
         .map(|(key, _)| key)
 }
 
+/// A chat message row before its `meta` is decoded. Kept private so the
+/// public [`MeetingChatMessage`] is the only shape callers see.
+#[derive(sqlx::FromRow)]
+struct ChatRow {
+    id: i64,
+    #[sqlx(try_from = "String")]
+    role: MessageRole,
+    content: String,
+    meta: Option<String>,
+    created_at: String,
+}
+
+impl ChatRow {
+    fn into_message(self) -> Result<MeetingChatMessage, KeaError> {
+        let proposal = self
+            .meta
+            .as_deref()
+            .map(serde_json::from_str::<ProposalMeta>)
+            .transpose()?;
+        Ok(MeetingChatMessage {
+            id: self.id,
+            role: self.role,
+            content: self.content,
+            proposal,
+            created_at: self.created_at,
+        })
+    }
+}
+
+/// How many versions the notes undo stack keeps per meeting. Past this the
+/// oldest *edit* is dropped, which bounds the table for a user who keeps
+/// iterating on one meeting. The bottom of the stack — the notes as
+/// generated — is never dropped: Undo must always be able to get back there
+/// and clear the edited mark, however many changes came in between.
+pub const NOTES_UNDO_LIMIT: i64 = 50;
+
+const NOTES_SELECT: &str = "SELECT meeting_id, summary, decisions, action_items, follow_ups,
+            open_questions, prompt_version, engine_id, model, edited
+     FROM meeting_notes WHERE meeting_id = ?";
+
+/// `LIKE` treats `%` and `_` as wildcards, so a user's query has to escape
+/// them, and the escape character itself, before it is wrapped in `%…%`.
+fn escape_like(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The write behind every user change to the notes, inside the caller's
+/// transaction.
+///
+/// Pushes the current notes onto the undo stack, trims the stack to its cap,
+/// then writes the new text with `edited = 1`. Kept separate from the public
+/// methods so an applied proposal can do its state change in the same
+/// transaction. Fails with `NotFound` when there are no notes to replace.
+async fn write_user_notes(
+    tx: &mut Transaction<'_, Sqlite>,
+    meeting_id: &str,
+    text: &NotesText,
+) -> Result<(), KeaError> {
+    let current = sqlx::query_as::<_, MeetingNotes>(NOTES_SELECT)
+        .bind(meeting_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| KeaError::NotFound(format!("notes for meeting {meeting_id}")))?;
+
+    sqlx::query(
+        "INSERT INTO meeting_notes_versions (meeting_id, notes_json, edited)
+         VALUES (?, ?, ?)",
+    )
+    .bind(meeting_id)
+    .bind(serde_json::to_string(&current)?)
+    .bind(i64::from(current.edited))
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "DELETE FROM meeting_notes_versions
+         WHERE meeting_id = ?
+           AND id <> (SELECT MIN(id) FROM meeting_notes_versions WHERE meeting_id = ?)
+           AND id NOT IN (
+               SELECT id FROM meeting_notes_versions
+               WHERE meeting_id = ? ORDER BY id DESC LIMIT ?
+           )",
+    )
+    .bind(meeting_id)
+    .bind(meeting_id)
+    .bind(meeting_id)
+    .bind(NOTES_UNDO_LIMIT - 1)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE meeting_notes SET summary = ?, decisions = ?, action_items = ?,
+                follow_ups = ?, open_questions = ?, edited = 1
+         WHERE meeting_id = ?",
+    )
+    .bind(&text.summary)
+    .bind(&text.decisions)
+    .bind(&text.action_items)
+    .bind(&text.follow_ups)
+    .bind(&text.open_questions)
+    .bind(meeting_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub struct MeetingRepo {
     pool: SqlitePool,
 }
@@ -527,6 +707,44 @@ impl MeetingRepo {
         Ok(rows)
     }
 
+    /// Meetings whose title or notes contain `query`, newest first.
+    ///
+    /// Notes means the summary, decisions, action items, follow-ups and open
+    /// questions. Matching is case-insensitive for ASCII (SQLite's `LIKE`),
+    /// which is the accepted limit: a full-text index would need a virtual
+    /// table and backfill for a list that rarely passes a few hundred rows.
+    /// A blank query is the plain list.
+    pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<Meeting>, KeaError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return self.list(limit).await;
+        }
+        let pattern = format!("%{}%", escape_like(query));
+        let rows = sqlx::query_as::<_, Meeting>(
+            r"SELECT m.id, m.title, m.started_at, m.ended_at, m.status, m.capture_mode,
+                     m.stt_engine_id, m.llm_engine_id, m.error,
+                     COALESCE(m.title_source, 'llm') AS title_source
+              FROM meetings m LEFT JOIN meeting_notes n ON n.meeting_id = m.id
+              WHERE m.title LIKE ? ESCAPE '\'
+                 OR n.summary LIKE ? ESCAPE '\'
+                 OR n.decisions LIKE ? ESCAPE '\'
+                 OR n.action_items LIKE ? ESCAPE '\'
+                 OR n.follow_ups LIKE ? ESCAPE '\'
+                 OR n.open_questions LIKE ? ESCAPE '\'
+              ORDER BY m.started_at DESC LIMIT ?",
+        )
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     pub async fn get(&self, id: &str) -> Result<Option<MeetingDetail>, KeaError> {
         let meeting = sqlx::query_as::<_, Meeting>(
             "SELECT id, title, started_at, ended_at, status, capture_mode,
@@ -552,16 +770,18 @@ impl MeetingRepo {
 
         let speakers = self.speakers(id).await?;
 
-        let notes = sqlx::query_as::<_, MeetingNotes>(
-            "SELECT meeting_id, summary, decisions, action_items, follow_ups, open_questions,
-                    prompt_version, engine_id, model
-             FROM meeting_notes WHERE meeting_id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let notes = sqlx::query_as::<_, MeetingNotes>(NOTES_SELECT)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
 
         let action_items = self.action_items(id).await?;
+
+        let undo_depth: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM meeting_notes_versions WHERE meeting_id = ?")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?;
 
         Ok(Some(MeetingDetail {
             meeting,
@@ -569,6 +789,7 @@ impl MeetingRepo {
             notes,
             speakers,
             action_items,
+            can_undo: undo_depth > 0,
         }))
     }
 
@@ -834,12 +1055,15 @@ impl MeetingRepo {
         Ok(id)
     }
 
+    /// Writes generated notes. Generation is not a user change, so this clears
+    /// the `edited` mark and pushes nothing onto the undo stack; `notes.edited`
+    /// is ignored here.
     pub async fn upsert_notes(&self, notes: &MeetingNotes) -> Result<(), KeaError> {
         sqlx::query(
             "INSERT INTO meeting_notes(
                 meeting_id, summary, decisions, action_items, follow_ups, open_questions,
-                prompt_version, engine_id, model
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                prompt_version, engine_id, model, edited
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             ON CONFLICT(meeting_id) DO UPDATE SET
                 summary = excluded.summary,
                 decisions = excluded.decisions,
@@ -848,7 +1072,8 @@ impl MeetingRepo {
                 open_questions = excluded.open_questions,
                 prompt_version = excluded.prompt_version,
                 engine_id = excluded.engine_id,
-                model = excluded.model",
+                model = excluded.model,
+                edited = 0",
         )
         .bind(&notes.meeting_id)
         .bind(&notes.summary)
@@ -861,6 +1086,357 @@ impl MeetingRepo {
         .bind(&notes.model)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Replaces the notes with a user's edit, keeping what they replaced so
+    /// [`Self::undo_notes`] can restore it.
+    ///
+    /// The current notes, with their `edited` mark, go onto the undo stack in
+    /// the same transaction as the write, so a change is never stored without
+    /// its undo. The stack is capped at [`NOTES_UNDO_LIMIT`]. Fails with
+    /// `NotFound` when the meeting has no notes, since there is nothing to
+    /// undo back to. `prompt_version`, engine and model are left as generated.
+    pub async fn apply_user_notes(
+        &self,
+        meeting_id: &str,
+        text: &NotesText,
+    ) -> Result<(), KeaError> {
+        let mut tx = self.pool.begin().await?;
+        write_user_notes(&mut tx, meeting_id, text).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Applies a pending chat proposal to the notes, in one transaction with
+    /// the proposal's move to `Applied`.
+    ///
+    /// The action-item prose is re-rendered from the rows here, not taken from
+    /// the proposal: the rows are the source of truth and the proposal never
+    /// carries them. A meeting with no rows keeps the notes' current prose, the
+    /// same fallback the generated notes use, so a meeting recorded before the
+    /// table does not lose its list.
+    ///
+    /// The whole thing is one transaction so a proposal is never half applied:
+    /// the state check, the version push, the notes write and the state write
+    /// commit together or not at all. Applying a proposal that is not pending is
+    /// refused before anything is written, so a second apply pushes no second
+    /// version.
+    pub async fn apply_proposal(&self, meeting_id: &str, message_id: i64) -> Result<(), KeaError> {
+        let mut tx = self.pool.begin().await?;
+
+        let stored: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT m.meta FROM messages m JOIN conversations c ON c.id = m.conversation_id
+             WHERE m.id = ? AND c.meeting_id = ?",
+        )
+        .bind(message_id)
+        .bind(meeting_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(old_meta) = stored else {
+            return Err(KeaError::NotFound(format!("chat message {message_id}")));
+        };
+        let Some(old_json) = old_meta else {
+            return Err(KeaError::Other(format!(
+                "chat message {message_id} has no proposal"
+            )));
+        };
+        let mut meta: ProposalMeta = serde_json::from_str(&old_json)?;
+        if meta.state != ProposalState::Pending {
+            return Err(KeaError::Other(format!(
+                "proposal {message_id} is already {}",
+                meta.state.as_str()
+            )));
+        }
+
+        let current = sqlx::query_as::<_, MeetingNotes>(NOTES_SELECT)
+            .bind(meeting_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| KeaError::NotFound(format!("notes for meeting {meeting_id}")))?;
+
+        // Dropped rows are left out, as they are in the prompt the model
+        // answered from: the prose should describe the list the user sees as
+        // open, not what they struck off.
+        let rows = sqlx::query_as::<_, ActionItem>(
+            "SELECT id, meeting_id, text, owner, due_hint, source_seq, status
+             FROM meeting_action_items WHERE meeting_id = ? ORDER BY id ASC",
+        )
+        .bind(meeting_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let parsed: Vec<ParsedActionItem> = rows
+            .iter()
+            .filter(|row| row.status != ActionItemStatus::Dropped)
+            .map(|row| ParsedActionItem {
+                text: row.text.clone(),
+                owner: row.owner.clone(),
+                due_hint: row.due_hint.clone(),
+            })
+            .collect();
+        // Only a meeting with no rows at all keeps its prose: one whose rows
+        // were all dropped renders to nothing, rather than resurrecting the
+        // stale prose that still lists them.
+        let action_items = if rows.is_empty() {
+            current.action_items.clone()
+        } else {
+            render_action_items_prose(&parsed)
+        };
+
+        let changes =
+            |section: &str| meta.changed.is_empty() || meta.changed.iter().any(|s| s == section);
+        let pick = |section: &str, proposed: &str, now: &str| {
+            if changes(section) {
+                proposed.to_string()
+            } else {
+                now.to_string()
+            }
+        };
+        let text = NotesText {
+            summary: pick("summary", &meta.proposal.summary, &current.summary),
+            decisions: pick("decisions", &meta.proposal.decisions, &current.decisions),
+            action_items,
+            follow_ups: pick("follow_ups", &meta.proposal.follow_ups, &current.follow_ups),
+            open_questions: pick(
+                "open_questions",
+                &meta.proposal.open_questions,
+                &current.open_questions,
+            ),
+        };
+        write_user_notes(&mut tx, meeting_id, &text).await?;
+
+        meta.state = ProposalState::Applied;
+        let result = sqlx::query("UPDATE messages SET meta = ? WHERE id = ? AND meta = ?")
+            .bind(serde_json::to_string(&meta)?)
+            .bind(message_id)
+            .bind(&old_json)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(KeaError::Other(format!(
+                "proposal {message_id} changed while it was being applied"
+            )));
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Restores the newest version on the undo stack and returns the notes as
+    /// they now stand, `edited` included. Returns `None` when the stack is
+    /// empty, which is the state of notes that are still as generated. A
+    /// restored generated version comes back with `edited = false`, so undoing
+    /// every change clears the mark.
+    pub async fn undo_notes(&self, meeting_id: &str) -> Result<Option<MeetingNotes>, KeaError> {
+        let mut tx = self.pool.begin().await?;
+        let newest: Option<(i64, String, i64)> = sqlx::query_as(
+            "SELECT id, notes_json, edited FROM meeting_notes_versions
+             WHERE meeting_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(meeting_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((version_id, notes_json, edited)) = newest else {
+            return Ok(None);
+        };
+
+        let mut restored: MeetingNotes = serde_json::from_str(&notes_json)?;
+        restored.edited = edited != 0;
+
+        let result = sqlx::query(
+            "UPDATE meeting_notes SET summary = ?, decisions = ?, action_items = ?,
+                    follow_ups = ?, open_questions = ?, prompt_version = ?,
+                    engine_id = ?, model = ?, edited = ?
+             WHERE meeting_id = ?",
+        )
+        .bind(&restored.summary)
+        .bind(&restored.decisions)
+        .bind(&restored.action_items)
+        .bind(&restored.follow_ups)
+        .bind(&restored.open_questions)
+        .bind(&restored.prompt_version)
+        .bind(&restored.engine_id)
+        .bind(&restored.model)
+        .bind(i64::from(restored.edited))
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(KeaError::NotFound(format!(
+                "notes for meeting {meeting_id}"
+            )));
+        }
+
+        sqlx::query("DELETE FROM meeting_notes_versions WHERE id = ?")
+            .bind(version_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(Some(restored))
+    }
+
+    /// The meeting's chat, oldest first. Empty when nothing has been asked yet,
+    /// since the conversation is created on the first message.
+    pub async fn chat_messages(
+        &self,
+        meeting_id: &str,
+    ) -> Result<Vec<MeetingChatMessage>, KeaError> {
+        let rows = sqlx::query_as::<_, ChatRow>(
+            "SELECT m.id, m.role, m.content, m.meta, m.created_at
+             FROM messages m JOIN conversations c ON c.id = m.conversation_id
+             WHERE c.meeting_id = ? ORDER BY m.id",
+        )
+        .bind(meeting_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(ChatRow::into_message).collect()
+    }
+
+    /// Appends a message to the meeting's chat, creating the chat on the first
+    /// one. The chat takes the meeting's LLM engine, so it reads back against
+    /// the engine that answered. `proposal` is stored in `meta` and is only
+    /// set on an assistant message. Fails with `NotFound` if the meeting does
+    /// not exist.
+    pub async fn append_chat_message(
+        &self,
+        meeting_id: &str,
+        role: MessageRole,
+        content: &str,
+        proposal: Option<&ProposalMeta>,
+    ) -> Result<i64, KeaError> {
+        let mut tx = self.pool.begin().await?;
+        let id = append_message_tx(&mut tx, meeting_id, role, content, proposal).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// One Ask AI exchange — the question and its reply — in one transaction,
+    /// returning the reply's id. Written apart, a failure between the two left
+    /// a question with no answer that every later turn then carried in its
+    /// history.
+    pub async fn append_chat_exchange(
+        &self,
+        meeting_id: &str,
+        question: &str,
+        reply: &str,
+        proposal: Option<&ProposalMeta>,
+    ) -> Result<i64, KeaError> {
+        let mut tx = self.pool.begin().await?;
+        append_message_tx(&mut tx, meeting_id, MessageRole::User, question, None).await?;
+        let id =
+            append_message_tx(&mut tx, meeting_id, MessageRole::Assistant, reply, proposal).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+}
+
+async fn append_message_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    meeting_id: &str,
+    role: MessageRole,
+    content: &str,
+    proposal: Option<&ProposalMeta>,
+) -> Result<i64, KeaError> {
+    let meta = proposal.map(serde_json::to_string).transpose()?;
+
+    let existing: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM conversations WHERE meeting_id = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(meeting_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let conversation_id = match existing {
+        Some(id) => id,
+        None => sqlx::query_scalar(
+            "INSERT INTO conversations (feature_id, engine_id, meeting_id)
+                 SELECT 'meetings', COALESCE(llm_engine_id, ''), id
+                 FROM meetings WHERE id = ?
+                 RETURNING id",
+        )
+        .bind(meeting_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| KeaError::NotFound(format!("meeting {meeting_id}")))?,
+    };
+
+    let message_id: i64 = sqlx::query_scalar(
+        "INSERT INTO messages (conversation_id, role, content, meta)
+             VALUES (?, ?, ?, ?) RETURNING id",
+    )
+    .bind(conversation_id)
+    .bind(role.as_str())
+    .bind(content)
+    .bind(meta)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(message_id)
+}
+
+impl MeetingRepo {
+    /// Deletes the meeting's chat and its messages. Clearing a chat that does
+    /// not exist is not an error: the end state is the same.
+    pub async fn clear_chat(&self, meeting_id: &str) -> Result<(), KeaError> {
+        sqlx::query("DELETE FROM conversations WHERE meeting_id = ?")
+            .bind(meeting_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Moves a proposal from `Pending` to `Applied` or `Discarded`. Any other
+    /// move is refused, which is what keeps a double-clicked Apply from
+    /// applying twice.
+    ///
+    /// The write is compare-and-set on the `meta` it read, so two racing
+    /// callers cannot both leave `Pending`. Applying the notes is the caller's
+    /// job and is not part of this transaction.
+    pub async fn set_proposal_state(
+        &self,
+        meeting_id: &str,
+        message_id: i64,
+        to: ProposalState,
+    ) -> Result<(), KeaError> {
+        if to == ProposalState::Pending {
+            return Err(KeaError::Other(
+                "a proposal can only move out of pending".into(),
+            ));
+        }
+        let stored: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT m.meta FROM messages m JOIN conversations c ON c.id = m.conversation_id
+             WHERE m.id = ? AND c.meeting_id = ?",
+        )
+        .bind(message_id)
+        .bind(meeting_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(old_meta) = stored else {
+            return Err(KeaError::NotFound(format!("chat message {message_id}")));
+        };
+        let Some(old_json) = old_meta else {
+            return Err(KeaError::Other(format!(
+                "chat message {message_id} has no proposal"
+            )));
+        };
+        let mut meta: ProposalMeta = serde_json::from_str(&old_json)?;
+        if meta.state != ProposalState::Pending {
+            return Err(KeaError::Other(format!(
+                "proposal {message_id} is already {}",
+                meta.state.as_str()
+            )));
+        }
+        meta.state = to;
+        let result = sqlx::query("UPDATE messages SET meta = ? WHERE id = ? AND meta = ?")
+            .bind(serde_json::to_string(&meta)?)
+            .bind(message_id)
+            .bind(&old_json)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(KeaError::Other(format!(
+                "proposal {message_id} changed while it was being updated"
+            )));
+        }
         Ok(())
     }
 
@@ -1146,6 +1722,7 @@ mod tests {
             prompt_version: "meeting-notes-v1".into(),
             engine_id: Some("openai".into()),
             model: Some("gpt-4o-mini".into()),
+            edited: false,
         })
         .await
         .unwrap();
@@ -1430,6 +2007,7 @@ mod tests {
             prompt_version: "test".into(),
             engine_id: None,
             model: None,
+            edited: false,
         })
         .await
         .unwrap();
@@ -1845,6 +2423,586 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    /// A seeded meeting with a title and generated notes, for the workspace
+    /// tests. The notes are written with `edited: true` on purpose: generation
+    /// has to clear that mark, so every test starts from generated notes.
+    async fn with_generated_notes(
+        id: &str,
+        title: &str,
+        summary: &str,
+    ) -> (SqlitePool, MeetingRepo) {
+        let (pool, repo) = seeded(id).await;
+        repo.set_title(id, title).await.unwrap();
+        repo.upsert_notes(&MeetingNotes {
+            meeting_id: id.into(),
+            summary: summary.into(),
+            decisions: String::new(),
+            action_items: String::new(),
+            follow_ups: String::new(),
+            open_questions: String::new(),
+            prompt_version: "meeting-notes-v1".into(),
+            engine_id: Some("openai".into()),
+            model: Some("gpt-4o-mini".into()),
+            edited: true,
+        })
+        .await
+        .unwrap();
+        (pool, repo)
+    }
+
+    fn text(summary: &str) -> NotesText {
+        NotesText {
+            summary: summary.into(),
+            decisions: String::new(),
+            action_items: String::new(),
+            follow_ups: String::new(),
+            open_questions: String::new(),
+        }
+    }
+
+    fn proposal(summary: &str, state: ProposalState) -> ProposalMeta {
+        ProposalMeta {
+            proposal: text(summary),
+            state,
+            changed: vec!["summary".into()],
+        }
+    }
+
+    /// Deleting a meeting removes its chat, its messages and its undo stack,
+    /// which is what the cascade on each new table is for.
+    #[tokio::test]
+    async fn deleting_a_meeting_cascades_to_chat_and_notes_versions() {
+        let (pool, repo) = with_generated_notes("m20", "Planning", "Generated").await;
+        repo.apply_user_notes("m20", &text("Edited")).await.unwrap();
+        repo.append_chat_message("m20", MessageRole::User, "hi", None)
+            .await
+            .unwrap();
+
+        repo.delete("m20").await.unwrap();
+
+        for table in [
+            "conversations",
+            "messages",
+            "meeting_notes_versions",
+            "meeting_notes",
+        ] {
+            let left: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(left, 0, "{table} should be empty after the cascade");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_matches_a_title() {
+        let (_pool, repo) = with_generated_notes("s1", "Quarterly planning", "Budget talk").await;
+        let hits = repo.search("planning", 20).await.unwrap();
+        assert_eq!(
+            hits.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["s1"]
+        );
+    }
+
+    /// The title says nothing about Confluence; only the summary does.
+    #[tokio::test]
+    async fn search_matches_a_summary_only_word() {
+        let (_pool, repo) = with_generated_notes("s2", "Standup", "We picked Confluence").await;
+        let hits = repo.search("confluence", 20).await.unwrap();
+        assert_eq!(
+            hits.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["s2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_is_case_insensitive() {
+        let (_pool, repo) = with_generated_notes("s3", "Standup", "We picked Confluence").await;
+        assert_eq!(repo.search("CONFLUENCE", 20).await.unwrap().len(), 1);
+        assert_eq!(repo.search("confluence", 20).await.unwrap().len(), 1);
+    }
+
+    /// A bare `%` is a wildcard in `LIKE`. Escaped, it only matches a literal
+    /// percent sign, so the meeting without one must not come back.
+    #[tokio::test]
+    async fn search_treats_percent_literally() {
+        let (_pool, repo) = with_generated_notes("s4", "Revenue 100% up", "").await;
+        repo.create(&NewMeeting {
+            id: "s5".into(),
+            title: "Revenue 100 up".into(),
+            capture_mode: CaptureMode::MicOnly,
+            stt_engine_id: None,
+            llm_engine_id: None,
+        })
+        .await
+        .unwrap();
+        let hits = repo.search("%", 20).await.unwrap();
+        assert_eq!(
+            hits.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["s4"]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_treats_underscore_literally() {
+        let (_pool, repo) = with_generated_notes("s6", "snake_case review", "").await;
+        repo.create(&NewMeeting {
+            id: "s8".into(),
+            title: "snakeXcase review".into(),
+            capture_mode: CaptureMode::MicOnly,
+            stt_engine_id: None,
+            llm_engine_id: None,
+        })
+        .await
+        .unwrap();
+        let hits = repo.search("_", 20).await.unwrap();
+        assert_eq!(
+            hits.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["s6"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blank_search_is_the_plain_list() {
+        let (_pool, repo) = with_generated_notes("s7", "Anything", "").await;
+        assert_eq!(repo.search("   ", 20).await.unwrap().len(), 1);
+    }
+
+    /// Generation writes the notes and clears the edited mark without a version,
+    /// so the first thing a user can undo is their own change.
+    #[tokio::test]
+    async fn generation_clears_the_edited_mark_and_pushes_no_version() {
+        let (_pool, repo) = with_generated_notes("u1", "Sync", "Generated").await;
+        let detail = repo.get("u1").await.unwrap().unwrap();
+        assert!(!detail.notes.unwrap().edited);
+        assert!(!detail.can_undo);
+    }
+
+    #[tokio::test]
+    async fn apply_then_undo_restores_the_generated_notes_and_clears_edited() {
+        let (_pool, repo) = with_generated_notes("u2", "Sync", "Generated").await;
+
+        repo.apply_user_notes("u2", &text("Shorter")).await.unwrap();
+        let edited = repo.get("u2").await.unwrap().unwrap();
+        assert!(edited.notes.as_ref().unwrap().edited);
+        assert_eq!(edited.notes.unwrap().summary, "Shorter");
+        assert!(edited.can_undo);
+
+        let restored = repo.undo_notes("u2").await.unwrap().unwrap();
+        assert_eq!(restored.summary, "Generated");
+        assert!(!restored.edited);
+
+        let after = repo.get("u2").await.unwrap().unwrap();
+        assert!(!after.notes.unwrap().edited);
+        assert!(!after.can_undo);
+    }
+
+    #[tokio::test]
+    async fn undo_steps_back_one_change_at_a_time() {
+        let (_pool, repo) = with_generated_notes("u3", "Sync", "Generated").await;
+        repo.apply_user_notes("u3", &text("First")).await.unwrap();
+        repo.apply_user_notes("u3", &text("Second")).await.unwrap();
+
+        assert_eq!(
+            repo.undo_notes("u3").await.unwrap().unwrap().summary,
+            "First"
+        );
+        assert_eq!(
+            repo.undo_notes("u3").await.unwrap().unwrap().summary,
+            "Generated"
+        );
+        assert!(repo.undo_notes("u3").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn undo_with_an_empty_stack_changes_nothing() {
+        let (_pool, repo) = with_generated_notes("u4", "Sync", "Generated").await;
+        assert!(repo.undo_notes("u4").await.unwrap().is_none());
+        let detail = repo.get("u4").await.unwrap().unwrap();
+        assert_eq!(detail.notes.unwrap().summary, "Generated");
+    }
+
+    /// Applying with no notes row has nothing to restore to, so it is refused
+    /// rather than storing a change without its undo.
+    #[tokio::test]
+    async fn applying_to_a_meeting_without_notes_is_refused() {
+        let (_pool, repo) = seeded("u5").await;
+        let err = repo.apply_user_notes("u5", &text("x")).await.unwrap_err();
+        assert!(matches!(err, KeaError::NotFound(_)));
+    }
+
+    /// Past the cap the oldest version goes, so the stack walks back through
+    /// fifty edits and stops at the first one, not at the generated notes.
+    #[tokio::test]
+    async fn the_undo_stack_is_capped_but_keeps_the_generated_notes() {
+        let (pool, repo) = with_generated_notes("u6", "Sync", "Generated").await;
+        for n in 1..=(NOTES_UNDO_LIMIT + 1) {
+            repo.apply_user_notes("u6", &text(&format!("edit {n}")))
+                .await
+                .unwrap();
+        }
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meeting_notes_versions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, NOTES_UNDO_LIMIT);
+
+        // The oldest *edits* went; the generated notes at the bottom did not,
+        // so undoing everything still lands on them with the mark cleared.
+        let mut last = None;
+        for _ in 0..NOTES_UNDO_LIMIT {
+            last = repo.undo_notes("u6").await.unwrap();
+        }
+        let last = last.unwrap();
+        assert_eq!(last.summary, "Generated");
+        assert!(!last.edited);
+        assert!(repo.undo_notes("u6").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_meeting_has_no_chat_until_the_first_message() {
+        let (pool, repo) = seeded("c1").await;
+        assert!(repo.chat_messages("c1").await.unwrap().is_empty());
+        let conversations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(conversations, 0);
+    }
+
+    #[tokio::test]
+    async fn chat_messages_round_trip_with_their_proposal() {
+        let (_pool, repo) = seeded("c2").await;
+        repo.append_chat_message("c2", MessageRole::User, "shorter?", None)
+            .await
+            .unwrap();
+        let meta = proposal("Three bullets", ProposalState::Pending);
+        repo.append_chat_message("c2", MessageRole::Assistant, "Here.", Some(&meta))
+            .await
+            .unwrap();
+
+        let chat = repo.chat_messages("c2").await.unwrap();
+        assert_eq!(chat.len(), 2);
+        assert_eq!(chat[0].role, MessageRole::User);
+        assert_eq!(chat[0].proposal, None);
+        assert_eq!(chat[1].role, MessageRole::Assistant);
+        assert_eq!(chat[1].proposal, Some(meta));
+    }
+
+    #[tokio::test]
+    async fn a_chat_message_for_a_missing_meeting_is_refused() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&pool).await.unwrap();
+        let repo = MeetingRepo::new(pool);
+        let err = repo
+            .append_chat_message("nope", MessageRole::User, "hi", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KeaError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn a_proposal_moves_from_pending_to_applied_once() {
+        let (_pool, repo) = seeded("c3").await;
+        let id = repo
+            .append_chat_message(
+                "c3",
+                MessageRole::Assistant,
+                "Here.",
+                Some(&proposal("Short", ProposalState::Pending)),
+            )
+            .await
+            .unwrap();
+
+        repo.set_proposal_state("c3", id, ProposalState::Applied)
+            .await
+            .unwrap();
+        let state = repo.chat_messages("c3").await.unwrap()[0]
+            .proposal
+            .as_ref()
+            .unwrap()
+            .state;
+        assert_eq!(state, ProposalState::Applied);
+
+        let again = repo
+            .set_proposal_state("c3", id, ProposalState::Applied)
+            .await
+            .unwrap_err();
+        assert!(matches!(again, KeaError::Other(_)));
+        let switch = repo
+            .set_proposal_state("c3", id, ProposalState::Discarded)
+            .await
+            .unwrap_err();
+        assert!(matches!(switch, KeaError::Other(_)));
+    }
+
+    #[tokio::test]
+    async fn a_proposal_moves_from_pending_to_discarded_once() {
+        let (_pool, repo) = seeded("c4").await;
+        let id = repo
+            .append_chat_message(
+                "c4",
+                MessageRole::Assistant,
+                "Here.",
+                Some(&proposal("Short", ProposalState::Pending)),
+            )
+            .await
+            .unwrap();
+
+        repo.set_proposal_state("c4", id, ProposalState::Discarded)
+            .await
+            .unwrap();
+        let state = repo.chat_messages("c4").await.unwrap()[0]
+            .proposal
+            .as_ref()
+            .unwrap()
+            .state;
+        assert_eq!(state, ProposalState::Discarded);
+
+        let applied = repo
+            .set_proposal_state("c4", id, ProposalState::Applied)
+            .await
+            .unwrap_err();
+        assert!(matches!(applied, KeaError::Other(_)));
+    }
+
+    #[tokio::test]
+    async fn a_proposal_cannot_go_back_to_pending_or_belong_to_another_meeting() {
+        let (_pool, repo) = seeded("c5").await;
+        repo.create(&NewMeeting {
+            id: "c6".into(),
+            title: "Other".into(),
+            capture_mode: CaptureMode::MicOnly,
+            stt_engine_id: None,
+            llm_engine_id: None,
+        })
+        .await
+        .unwrap();
+        let id = repo
+            .append_chat_message(
+                "c5",
+                MessageRole::Assistant,
+                "Here.",
+                Some(&proposal("Short", ProposalState::Pending)),
+            )
+            .await
+            .unwrap();
+
+        let back = repo
+            .set_proposal_state("c5", id, ProposalState::Pending)
+            .await
+            .unwrap_err();
+        assert!(matches!(back, KeaError::Other(_)));
+        let wrong = repo
+            .set_proposal_state("c6", id, ProposalState::Applied)
+            .await
+            .unwrap_err();
+        assert!(matches!(wrong, KeaError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn clearing_a_chat_removes_it_and_a_new_message_starts_a_fresh_one() {
+        let (_pool, repo) = seeded("c7").await;
+        repo.append_chat_message("c7", MessageRole::User, "one", None)
+            .await
+            .unwrap();
+        repo.clear_chat("c7").await.unwrap();
+        assert!(repo.chat_messages("c7").await.unwrap().is_empty());
+        repo.clear_chat("c7").await.unwrap();
+
+        repo.append_chat_message("c7", MessageRole::User, "two", None)
+            .await
+            .unwrap();
+        let chat = repo.chat_messages("c7").await.unwrap();
+        assert_eq!(chat.len(), 1);
+        assert_eq!(chat[0].content, "two");
+    }
+
+    /// A second Apply must be refused before it writes anything: no second
+    /// version on the undo stack, and the notes stay as the first Apply left
+    /// them. This is what makes a double click safe.
+    #[tokio::test]
+    async fn applying_a_proposal_twice_pushes_one_version() {
+        let (pool, repo) = with_generated_notes("a1", "Sync", "Generated").await;
+        let id = repo
+            .append_chat_message(
+                "a1",
+                MessageRole::Assistant,
+                "Shorter.",
+                Some(&proposal("Short", ProposalState::Pending)),
+            )
+            .await
+            .unwrap();
+
+        repo.apply_proposal("a1", id).await.unwrap();
+        let second = repo.apply_proposal("a1", id).await.unwrap_err();
+        assert!(matches!(second, KeaError::Other(_)));
+
+        let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meeting_notes_versions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(versions, 1);
+        let detail = repo.get("a1").await.unwrap().unwrap();
+        assert_eq!(detail.notes.unwrap().summary, "Short");
+    }
+
+    #[tokio::test]
+    async fn applying_a_proposal_marks_it_applied_and_the_notes_edited() {
+        let (_pool, repo) = with_generated_notes("a2", "Sync", "Generated").await;
+        let id = repo
+            .append_chat_message(
+                "a2",
+                MessageRole::Assistant,
+                "Shorter.",
+                Some(&proposal("Short", ProposalState::Pending)),
+            )
+            .await
+            .unwrap();
+
+        repo.apply_proposal("a2", id).await.unwrap();
+
+        let detail = repo.get("a2").await.unwrap().unwrap();
+        let notes = detail.notes.unwrap();
+        assert_eq!(notes.summary, "Short");
+        assert!(notes.edited);
+        assert!(detail.can_undo);
+        let state = repo.chat_messages("a2").await.unwrap()[0]
+            .proposal
+            .as_ref()
+            .unwrap()
+            .state;
+        assert_eq!(state, ProposalState::Applied);
+    }
+
+    /// The rows are the source of truth, so the action-item prose written by
+    /// an apply is rendered from them, not copied from the proposal (which
+    /// carries whatever prose it was made against).
+    #[tokio::test]
+    async fn applying_rerenders_the_action_items_from_the_rows() {
+        let (_pool, repo) = with_generated_notes("a3", "Sync", "Generated").await;
+        repo.add_action_item(
+            "a3",
+            &NewActionItem {
+                text: "Send the deck".into(),
+                owner: Some("Priya".into()),
+                due_hint: Some("by Friday".into()),
+                source_seq: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut stale = proposal("Short", ProposalState::Pending);
+        stale.proposal.action_items = "stale prose".into();
+        let id = repo
+            .append_chat_message("a3", MessageRole::Assistant, "Shorter.", Some(&stale))
+            .await
+            .unwrap();
+
+        repo.apply_proposal("a3", id).await.unwrap();
+
+        let notes = repo.get("a3").await.unwrap().unwrap().notes.unwrap();
+        assert_eq!(notes.action_items, "Send the deck — Priya (by Friday)");
+    }
+
+    /// The reviewer's case: the user hand-edits decisions after a summary
+    /// proposal arrived. Applying the proposal changes the summary only.
+    #[tokio::test]
+    async fn applying_a_proposal_keeps_a_later_hand_edit_to_another_section() {
+        let (_pool, repo) = with_generated_notes("a5", "Sync", "Generated").await;
+        let id = repo
+            .append_chat_message(
+                "a5",
+                MessageRole::Assistant,
+                "Shorter.",
+                Some(&proposal("Short", ProposalState::Pending)),
+            )
+            .await
+            .unwrap();
+        repo.apply_user_notes(
+            "a5",
+            &NotesText {
+                decisions: "Decided by hand".into(),
+                ..text("Generated")
+            },
+        )
+        .await
+        .unwrap();
+
+        repo.apply_proposal("a5", id).await.unwrap();
+
+        let notes = repo.get("a5").await.unwrap().unwrap().notes.unwrap();
+        assert_eq!(notes.summary, "Short");
+        assert_eq!(notes.decisions, "Decided by hand");
+    }
+
+    /// Every row dropped is an empty list, not a cue to restore the old prose
+    /// that still names them.
+    #[tokio::test]
+    async fn applying_with_every_row_dropped_writes_no_action_items() {
+        let (_pool, repo) = with_generated_notes("a6", "Sync", "Generated").await;
+        let row = repo
+            .add_action_item(
+                "a6",
+                &NewActionItem {
+                    text: "Send the deck".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        repo.set_action_item_status(row, ActionItemStatus::Dropped)
+            .await
+            .unwrap();
+        let mut stale = proposal("Short", ProposalState::Pending);
+        stale.proposal.action_items = "Send the deck".into();
+        let id = repo
+            .append_chat_message("a6", MessageRole::Assistant, "Shorter.", Some(&stale))
+            .await
+            .unwrap();
+
+        repo.apply_proposal("a6", id).await.unwrap();
+
+        let notes = repo.get("a6").await.unwrap().unwrap().notes.unwrap();
+        assert_eq!(notes.action_items, "");
+    }
+
+    #[tokio::test]
+    async fn an_exchange_stores_the_question_and_the_reply_together() {
+        let (_pool, repo) = seeded("c8").await;
+        let reply = repo
+            .append_chat_exchange("c8", "What was decided?", "The launch slips.", None)
+            .await
+            .unwrap();
+        let chat = repo.chat_messages("c8").await.unwrap();
+        assert_eq!(chat.len(), 2);
+        assert_eq!(chat[0].role, MessageRole::User);
+        assert_eq!(chat[1].id, reply);
+        assert_eq!(chat[1].content, "The launch slips.");
+    }
+
+    #[tokio::test]
+    async fn a_discarded_proposal_cannot_be_applied() {
+        let (_pool, repo) = with_generated_notes("a4", "Sync", "Generated").await;
+        let id = repo
+            .append_chat_message(
+                "a4",
+                MessageRole::Assistant,
+                "Shorter.",
+                Some(&proposal("Short", ProposalState::Pending)),
+            )
+            .await
+            .unwrap();
+        repo.set_proposal_state("a4", id, ProposalState::Discarded)
+            .await
+            .unwrap();
+
+        assert!(repo.apply_proposal("a4", id).await.is_err());
+        let notes = repo.get("a4").await.unwrap().unwrap().notes.unwrap();
+        assert_eq!(notes.summary, "Generated");
+        assert!(!notes.edited);
     }
 
     #[test]

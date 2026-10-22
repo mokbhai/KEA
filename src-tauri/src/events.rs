@@ -711,6 +711,7 @@ mod tests {
             prompt_version: "interim-v1".into(),
             engine_id: Some("openai".into()),
             model: Some("gpt-4o-mini".into()),
+            edited: false,
         })
         .unwrap();
         assert!(json.contains(r#""meeting_id":"m1""#), "{json}");

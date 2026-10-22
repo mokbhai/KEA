@@ -28,7 +28,8 @@ use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_core::store::conversations::{ConversationRepo, ConversationSummary, Message};
 use kea_core::store::hotkeys::{HotkeyBindingRepo, HotkeyBindingRow};
 use kea_core::store::meetings::{
-    ActionItemStatus, Meeting, MeetingDetail, NewActionItem, TitleSource,
+    ActionItemStatus, Meeting, MeetingChatMessage, MeetingDetail, MeetingRepo, MeetingStatus,
+    NewActionItem, NotesText, ProposalState, TitleSource,
 };
 use kea_core::store::rates::{priced, LlmRate, RateRepo, UsageSpend};
 use kea_core::store::settings::SettingsRepo;
@@ -4740,6 +4741,223 @@ pub async fn set_meeting_title(
         .set_title_with_source(&meeting_id, &title, TitleSource::User)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Meeting search for the list, over titles and notes.
+///
+/// `limit` defaults to the same 50 the plain list uses, so a blank search
+/// returns what the list shows.
+#[tauri::command]
+pub async fn search_meetings(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+    limit: Option<i64>,
+) -> Result<Vec<Meeting>, String> {
+    state
+        .meeting_repo
+        .search(&query, limit.unwrap_or(50))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The meeting's chat, oldest first, with any proposals and their states.
+#[tauri::command]
+pub async fn get_meeting_chat(
+    state: State<'_, Arc<AppState>>,
+    meeting_id: String,
+) -> Result<Vec<MeetingChatMessage>, String> {
+    state
+        .meeting_repo
+        .chat_messages(&meeting_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Ask AI: one question, one stored exchange.
+///
+/// Refused by the feature when another turn is still running for this meeting,
+/// so a double Send cannot store two replies to the same question.
+#[tauri::command]
+pub async fn send_meeting_chat(
+    state: State<'_, Arc<AppState>>,
+    meeting_id: String,
+    message: String,
+) -> Result<kea_features::meeting::MeetingChatReply, String> {
+    let bindings = BindingRepo::new(state.config_pool.clone());
+    let usage = UsageRepo::new(state.data_pool.clone());
+    kea_features::meeting::run_chat_turn(
+        &state.engines,
+        &bindings,
+        &state.meeting_repo,
+        &state.meeting_chat_turns,
+        Some(&usage),
+        &meeting_id,
+        &message,
+    )
+    .await
+}
+
+/// Deletes the meeting's chat. Refused while a reply is being written, since
+/// that reply would otherwise land in a fresh chat with no question above it.
+#[tauri::command]
+pub async fn clear_meeting_chat(
+    state: State<'_, Arc<AppState>>,
+    meeting_id: String,
+) -> Result<(), String> {
+    // Held across the delete, so no turn can start between the check and it.
+    let _slot = state
+        .meeting_chat_turns
+        .claim(&meeting_id)
+        .map_err(|_| "a reply is still being written; clear the chat once it lands".to_string())?;
+    state
+        .meeting_repo
+        .clear_chat(&meeting_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Applies a pending proposal. Returns the fresh detail so the summary can
+/// re-render without a second call.
+#[tauri::command]
+pub async fn apply_notes_proposal(
+    state: State<'_, Arc<AppState>>,
+    meeting_id: String,
+    message_id: i64,
+) -> Result<MeetingDetail, String> {
+    apply_notes_proposal_inner(&state.meeting_repo, &meeting_id, message_id).await
+}
+
+/// Discards a pending proposal. The notes do not change, so this returns
+/// nothing; the chat shows the proposal as discarded.
+#[tauri::command]
+pub async fn discard_notes_proposal(
+    state: State<'_, Arc<AppState>>,
+    meeting_id: String,
+    message_id: i64,
+) -> Result<(), String> {
+    state
+        .meeting_repo
+        .set_proposal_state(&meeting_id, message_id, ProposalState::Discarded)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Replaces one notes section by hand. Returns the fresh detail.
+#[tauri::command]
+pub async fn edit_notes_section(
+    state: State<'_, Arc<AppState>>,
+    meeting_id: String,
+    section: String,
+    text: String,
+) -> Result<MeetingDetail, String> {
+    edit_notes_section_inner(&state.meeting_repo, &meeting_id, &section, &text).await
+}
+
+/// Steps the notes back one change. Returns the fresh detail, which is the
+/// same as before when there is nothing to undo.
+#[tauri::command]
+pub async fn undo_notes_edit(
+    state: State<'_, Arc<AppState>>,
+    meeting_id: String,
+) -> Result<MeetingDetail, String> {
+    undo_notes_edit_inner(&state.meeting_repo, &meeting_id).await
+}
+
+/// Loads one meeting for a notes command, where not found is an error.
+async fn load_meeting(meetings: &MeetingRepo, meeting_id: &str) -> Result<MeetingDetail, String> {
+    meetings
+        .get(meeting_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("meeting {meeting_id} not found"))
+}
+
+/// Refuses a notes change while the meeting records.
+///
+/// This is the backend check, not the UI hiding the controls: a window that
+/// was showing the meeting as finished can still send Apply as a new recording
+/// starts. The interim and final passes rewrite the notes until the meeting
+/// stops, so a change made mid-recording would be overwritten or would
+/// overwrite a pass.
+fn refuse_notes_change_while_recording(detail: &MeetingDetail) -> Result<(), String> {
+    if detail.meeting.status == MeetingStatus::Recording {
+        return Err("editing is available when the meeting ends".into());
+    }
+    Ok(())
+}
+
+/// Applies a pending proposal, once. The store checks the proposal is still
+/// pending and writes the notes and the state in one transaction, so a second
+/// call is refused and pushes no second version.
+async fn apply_notes_proposal_inner(
+    meetings: &MeetingRepo,
+    meeting_id: &str,
+    message_id: i64,
+) -> Result<MeetingDetail, String> {
+    refuse_notes_change_while_recording(&load_meeting(meetings, meeting_id).await?)?;
+    meetings
+        .apply_proposal(meeting_id, message_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    load_meeting(meetings, meeting_id).await
+}
+
+/// Replaces one notes section, versioned like an applied proposal.
+///
+/// The section names are the four prose sections. Action items are rows, the
+/// user changes them through their own controls, so they are refused here
+/// rather than written as text the rows would never see.
+async fn edit_notes_section_inner(
+    meetings: &MeetingRepo,
+    meeting_id: &str,
+    section: &str,
+    text: &str,
+) -> Result<MeetingDetail, String> {
+    let detail = load_meeting(meetings, meeting_id).await?;
+    refuse_notes_change_while_recording(&detail)?;
+    let notes = detail
+        .notes
+        .ok_or_else(|| format!("meeting {meeting_id} has no notes to edit"))?;
+    let mut next = NotesText {
+        summary: notes.summary,
+        decisions: notes.decisions,
+        action_items: notes.action_items,
+        follow_ups: notes.follow_ups,
+        open_questions: notes.open_questions,
+    };
+    let slot = match section {
+        "summary" => &mut next.summary,
+        "decisions" => &mut next.decisions,
+        "follow_ups" => &mut next.follow_ups,
+        "open_questions" => &mut next.open_questions,
+        other => return Err(format!("unknown notes section {other}")),
+    };
+    // A save that changes nothing is not an edit: it must not mark the notes
+    // edited or push an undo step the user would then click through.
+    if slot.as_str() == text {
+        return load_meeting(meetings, meeting_id).await;
+    }
+    *slot = text.to_string();
+    meetings
+        .apply_user_notes(meeting_id, &next)
+        .await
+        .map_err(|e| e.to_string())?;
+    load_meeting(meetings, meeting_id).await
+}
+
+/// Steps back one notes change. Refused while recording for the same reason as
+/// the other notes commands: an undo mid-recording would restore notes that the
+/// next pass then rewrites.
+async fn undo_notes_edit_inner(
+    meetings: &MeetingRepo,
+    meeting_id: &str,
+) -> Result<MeetingDetail, String> {
+    refuse_notes_change_while_recording(&load_meeting(meetings, meeting_id).await?)?;
+    meetings
+        .undo_notes(meeting_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    load_meeting(meetings, meeting_id).await
 }
 
 /// Show a file KEA just wrote in the system file manager.
@@ -9616,5 +9834,214 @@ mod tests {
         assert_eq!(usage_window(0), 1);
         assert_eq!(usage_window(-7), 1);
         assert_eq!(usage_window(i64::MAX), 3650);
+    }
+}
+
+/// The notes commands behind the Ask AI tab: the recording refusal, apply
+/// once, and the section edit and undo. These run against a real in-memory
+/// store, since the refusals and the single apply are decided by the data.
+#[cfg(test)]
+mod meeting_notes_commands {
+    use super::*;
+    use kea_core::store::conversations::MessageRole;
+    use kea_core::store::db::{open_pool, run_data_migrations};
+    use kea_core::store::meetings::{CaptureMode, MeetingNotes, NewMeeting, ProposalMeta};
+    use sqlx::SqlitePool;
+
+    /// One meeting, `m1`, still recording, with generated notes.
+    async fn recording_workspace() -> (SqlitePool, MeetingRepo) {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&pool).await.unwrap();
+        let meetings = MeetingRepo::new(pool.clone());
+        meetings
+            .create(&NewMeeting {
+                id: "m1".into(),
+                title: "Sync".into(),
+                capture_mode: CaptureMode::MicOnly,
+                stt_engine_id: None,
+                llm_engine_id: None,
+            })
+            .await
+            .unwrap();
+        meetings
+            .upsert_notes(&MeetingNotes {
+                meeting_id: "m1".into(),
+                summary: "Generated".into(),
+                decisions: "Launch on the 14th.".into(),
+                action_items: String::new(),
+                follow_ups: String::new(),
+                open_questions: String::new(),
+                prompt_version: "meeting-notes-v3".into(),
+                engine_id: None,
+                model: None,
+                edited: false,
+            })
+            .await
+            .unwrap();
+        (pool, meetings)
+    }
+
+    async fn stop(meetings: &MeetingRepo) {
+        meetings
+            .complete("m1", MeetingStatus::Completed, None)
+            .await
+            .unwrap();
+    }
+
+    fn pending(summary: &str) -> ProposalMeta {
+        ProposalMeta {
+            proposal: NotesText {
+                summary: summary.into(),
+                ..Default::default()
+            },
+            state: ProposalState::Pending,
+            changed: vec!["summary".into()],
+        }
+    }
+
+    async fn version_count(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM meeting_notes_versions")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn apply_is_refused_while_the_meeting_records() {
+        let (pool, meetings) = recording_workspace().await;
+        let id = meetings
+            .append_chat_message(
+                "m1",
+                MessageRole::Assistant,
+                "Short.",
+                Some(&pending("Short")),
+            )
+            .await
+            .unwrap();
+
+        let err = apply_notes_proposal_inner(&meetings, "m1", id)
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("available when the meeting ends"));
+        let stored = meetings.get("m1").await.unwrap().unwrap();
+        assert_eq!(stored.notes.unwrap().summary, "Generated");
+        assert_eq!(version_count(&pool).await, 0);
+        let state = meetings.chat_messages("m1").await.unwrap()[0]
+            .proposal
+            .as_ref()
+            .unwrap()
+            .state;
+        assert_eq!(state, ProposalState::Pending);
+    }
+
+    #[tokio::test]
+    async fn a_section_edit_is_refused_while_the_meeting_records() {
+        let (pool, meetings) = recording_workspace().await;
+
+        let err = edit_notes_section_inner(&meetings, "m1", "summary", "Hand edit")
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("available when the meeting ends"));
+        let stored = meetings.get("m1").await.unwrap().unwrap();
+        assert_eq!(stored.notes.unwrap().summary, "Generated");
+        assert_eq!(version_count(&pool).await, 0);
+    }
+
+    /// An undo is refused even with a version on the stack: restoring from it
+    /// mid-recording would be rewritten by the next pass anyway.
+    #[tokio::test]
+    async fn an_undo_is_refused_while_the_meeting_records() {
+        let (pool, meetings) = recording_workspace().await;
+        meetings
+            .apply_user_notes(
+                "m1",
+                &NotesText {
+                    summary: "Hand edit".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let err = undo_notes_edit_inner(&meetings, "m1").await.unwrap_err();
+
+        assert!(err.contains("available when the meeting ends"));
+        assert_eq!(version_count(&pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn applying_a_proposal_twice_is_refused_and_pushes_one_version() {
+        let (pool, meetings) = recording_workspace().await;
+        stop(&meetings).await;
+        let id = meetings
+            .append_chat_message(
+                "m1",
+                MessageRole::Assistant,
+                "Short.",
+                Some(&pending("Short")),
+            )
+            .await
+            .unwrap();
+
+        let detail = apply_notes_proposal_inner(&meetings, "m1", id)
+            .await
+            .unwrap();
+        assert_eq!(detail.notes.unwrap().summary, "Short");
+        assert!(apply_notes_proposal_inner(&meetings, "m1", id)
+            .await
+            .is_err());
+
+        assert_eq!(version_count(&pool).await, 1);
+    }
+
+    /// Saving a section without changing it is not an edit.
+    #[tokio::test]
+    async fn an_unchanged_save_marks_nothing_and_pushes_no_undo() {
+        let (pool, meetings) = recording_workspace().await;
+        stop(&meetings).await;
+        let detail = edit_notes_section_inner(&meetings, "m1", "decisions", "Launch on the 14th.")
+            .await
+            .unwrap();
+        assert!(!detail.notes.unwrap().edited);
+        assert!(!detail.can_undo);
+        assert_eq!(version_count(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_edit_saves_one_section_and_undo_restores_it() {
+        let (_pool, meetings) = recording_workspace().await;
+        stop(&meetings).await;
+
+        let edited = edit_notes_section_inner(&meetings, "m1", "decisions", "Ship Friday.")
+            .await
+            .unwrap();
+        let notes = edited.notes.unwrap();
+        assert_eq!(notes.decisions, "Ship Friday.");
+        assert_eq!(notes.summary, "Generated");
+        assert!(notes.edited);
+        assert!(edited.can_undo);
+
+        let restored = undo_notes_edit_inner(&meetings, "m1").await.unwrap();
+        let notes = restored.notes.unwrap();
+        assert_eq!(notes.decisions, "Launch on the 14th.");
+        assert!(!notes.edited);
+        assert!(!restored.can_undo);
+    }
+
+    /// Action items are rows and the prose follows them, so a section edit
+    /// cannot name them. Refused before anything is written.
+    #[tokio::test]
+    async fn an_unknown_section_is_refused_and_writes_nothing() {
+        let (pool, meetings) = recording_workspace().await;
+        stop(&meetings).await;
+
+        let err = edit_notes_section_inner(&meetings, "m1", "action_items", "Do it")
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("unknown notes section"));
+        assert_eq!(version_count(&pool).await, 0);
     }
 }

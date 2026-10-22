@@ -866,6 +866,51 @@ export type MeetingNotes = {
   prompt_version: string;
   engine_id: string | null;
   model: string | null;
+  /** Set by an applied proposal or a hand edit; cleared when undo reaches the generated notes. */
+  edited: boolean;
+};
+
+/** Mirrors `kea_core::store::meetings::NotesText`: the editable text of the notes. */
+export type NotesText = {
+  summary: string;
+  decisions: string;
+  action_items: string;
+  follow_ups: string;
+  open_questions: string;
+};
+
+/** The four prose sections a user can edit by hand. Action items are rows, so they are not one. */
+export type NotesSection = "summary" | "decisions" | "follow_ups" | "open_questions";
+
+/** Mirrors `kea_core::store::meetings::ProposalState`. */
+export type ProposalState = "pending" | "applied" | "discarded";
+
+/** Mirrors `kea_core::store::meetings::ProposalMeta`, stored on an assistant message. */
+export type ProposalMeta = {
+  proposal: NotesText;
+  state: ProposalState;
+  /** The sections the model changed; Apply writes only these. */
+  changed: NotesSection[];
+};
+
+/**
+ * Mirrors `kea_core::store::meetings::MeetingChatMessage`. `proposal` is
+ * `null` on the wire when the reply carried none, and absent on a message
+ * written before proposals existed, so both read as "no proposal".
+ */
+export type MeetingChatMessage = {
+  id: number;
+  role: MessageRole;
+  content: string;
+  proposal?: ProposalMeta | null;
+  created_at: string;
+};
+
+/** Mirrors `kea_features::meeting::MeetingChatReply`. */
+export type SendMeetingChatResult = {
+  message: MeetingChatMessage;
+  /** The transcript was cut at the context cap, so the answer may miss the end. */
+  truncated: boolean;
 };
 
 /** Mirrors `kea_core::store::meetings::ActionItem`. */
@@ -890,6 +935,8 @@ export type MeetingDetail = {
    * both renderings stay correct.
    */
   action_items: MeetingActionItem[];
+  /** Whether undo has anything to restore; false while the notes are as generated. */
+  can_undo: boolean;
 };
 
 export type MeetingSettings = {
@@ -1030,6 +1077,38 @@ export const addMeetingActionItem = (meetingId: string, text: string) =>
  */
 export const setMeetingTitle = (meetingId: string, title: string) =>
   invoke<void>("set_meeting_title", { meetingId, title });
+
+/** Meetings whose title or notes match `query`. A blank query is the plain list. */
+export const searchMeetings = (query: string, limit?: number) =>
+  invoke<Meeting[]>("search_meetings", { query, limit });
+
+/** The meeting's Ask AI chat, oldest first. */
+export const getMeetingChat = (meetingId: string) =>
+  invoke<MeetingChatMessage[]>("get_meeting_chat", { meetingId });
+
+/** Sends one question and returns the stored reply, with any proposal it carries. */
+export const sendMeetingChat = (meetingId: string, message: string) =>
+  invoke<SendMeetingChatResult>("send_meeting_chat", { meetingId, message });
+
+/** Deletes the meeting's chat. Refused while a reply is still being written. */
+export const clearMeetingChat = (meetingId: string) =>
+  invoke<void>("clear_meeting_chat", { meetingId });
+
+/** Applies a pending proposal once, and returns the meeting with its new notes. */
+export const applyNotesProposal = (meetingId: string, messageId: number) =>
+  invoke<MeetingDetail>("apply_notes_proposal", { meetingId, messageId });
+
+/** Marks a pending proposal discarded. The notes do not change. */
+export const discardNotesProposal = (meetingId: string, messageId: number) =>
+  invoke<void>("discard_notes_proposal", { meetingId, messageId });
+
+/** Replaces one notes section by hand, and returns the meeting with its new notes. */
+export const editNotesSection = (meetingId: string, section: NotesSection, text: string) =>
+  invoke<MeetingDetail>("edit_notes_section", { meetingId, section, text });
+
+/** Steps the notes back one change, and returns the meeting as it now stands. */
+export const undoNotesEdit = (meetingId: string) =>
+  invoke<MeetingDetail>("undo_notes_edit", { meetingId });
 
 /** Show a file KEA just wrote in the system file manager. */
 export const revealPath = (path: string) =>

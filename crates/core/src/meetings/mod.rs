@@ -1,4 +1,5 @@
 pub mod attribution;
+pub mod chat;
 pub mod export;
 pub mod interim;
 pub mod notion;
@@ -7,6 +8,10 @@ pub mod synthesis;
 pub mod voices;
 
 pub use attribution::{attribute_segment, SpeakerChannel};
+pub use chat::{
+    build_chat_request, parse_chat_reply, ChatReply, ChatRole, ChatTurn, NotesProposal,
+    CHAT_HISTORY_WINDOW,
+};
 pub use export::{markdown_file_name, meeting_to_markdown};
 pub use interim::{
     should_run_interim, InterimCadence, MAX_CONSECUTIVE_INTERIM_FAILURES, MIN_INTERIM_GAP_SECS,

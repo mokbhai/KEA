@@ -118,10 +118,14 @@ impl ConversationRepo {
         Ok(id)
     }
 
+    /// The rewrite History. Meeting chats are conversations too, but they
+    /// belong to their meeting's Ask AI tab, so the `meeting_id IS NULL` filter
+    /// keeps them off this list.
     pub async fn list_recent(&self, limit: i64) -> Result<Vec<ConversationSummary>, KeaError> {
         let rows = sqlx::query_as::<_, ConversationSummary>(
             "SELECT id, action_id, feature_id, engine_id, model, provider_ref, created_at
-             FROM conversations ORDER BY created_at DESC LIMIT ?",
+             FROM conversations WHERE meeting_id IS NULL
+             ORDER BY created_at DESC LIMIT ?",
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -151,9 +155,13 @@ impl ConversationRepo {
         Ok(())
     }
 
+    /// Rewrite history only. A meeting's chat lives and dies with its meeting
+    /// (the `meeting_id` cascade), so it is kept for as long as the meeting is,
+    /// under the meetings' own retention rather than this one.
     pub async fn prune_older_than_days(&self, days: i64) -> Result<u64, KeaError> {
         let result = sqlx::query(
-            "DELETE FROM conversations WHERE created_at < datetime('now', printf('-%d days', ?))",
+            "DELETE FROM conversations
+             WHERE meeting_id IS NULL AND created_at < datetime('now', printf('-%d days', ?))",
         )
         .bind(days)
         .execute(&self.pool)
@@ -273,6 +281,56 @@ mod tests {
 
         let messages = repo.list_messages(conv_id).await.unwrap();
         assert!(messages.is_empty());
+    }
+
+    /// A meeting's chat shares the conversations table, so the History query
+    /// has to filter it out or every Ask AI thread would show up as a rewrite.
+    #[tokio::test]
+    async fn list_recent_leaves_out_meeting_chats() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&pool).await.unwrap();
+        sqlx::query("INSERT INTO meetings (id,title,capture_mode,status,started_at) VALUES ('m1','t','mic_only','completed',datetime('now'))")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO conversations (feature_id, engine_id, meeting_id) VALUES ('meetings','openai','m1')")
+            .execute(&pool).await.unwrap();
+        let repo = ConversationRepo::new(pool.clone());
+        repo.start(&NewConversation {
+            action_id: None,
+            feature_id: "rewrite".into(),
+            engine_id: "openai".into(),
+            model: None,
+            provider_ref: None,
+        })
+        .await
+        .unwrap();
+
+        let recent = repo.list_recent(10).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].feature_id, "rewrite");
+    }
+
+    /// Rewrite-history retention must not reach into a meeting's chat.
+    #[tokio::test]
+    async fn pruning_history_keeps_meeting_chats() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&pool).await.unwrap();
+        sqlx::query("INSERT INTO meetings (id,title,capture_mode,status,started_at) VALUES ('m1','t','mic_only','completed',datetime('now'))")
+            .execute(&pool).await.unwrap();
+        for (feature, meeting) in [("meetings", Some("m1")), ("rewrite", None)] {
+            sqlx::query("INSERT INTO conversations (feature_id, engine_id, meeting_id, created_at) VALUES (?, 'openai', ?, datetime('now', '-90 days'))")
+                .bind(feature)
+                .bind(meeting)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let repo = ConversationRepo::new(pool.clone());
+        assert_eq!(repo.prune_older_than_days(30).await.unwrap(), 1);
+        let left: String = sqlx::query_scalar("SELECT feature_id FROM conversations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, "meetings");
     }
 
     #[tokio::test]

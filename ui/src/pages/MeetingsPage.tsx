@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { parseStoredTime } from "../lib/meetingTime";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   addMeetingActionItem,
   deleteMeeting,
@@ -27,10 +28,11 @@ import {
   startMeeting,
   stopMeeting,
   type ActionItemStatus,
+  type CaptureMode,
   type Meeting,
   type MeetingDetail,
-  type MeetingSegmentEvent,
   type MeetingNotes,
+  type MeetingSegmentEvent,
   type MeetingSettings,
   type MeetingState,
   type NotionStatus,
@@ -38,28 +40,20 @@ import {
   type SystemAudioCapability,
 } from "../api";
 import Banner from "../components/Banner";
-import FeatureAiCard from "../components/FeatureAiCard";
 import FeatureBanner from "../components/FeatureBanner";
-import HotkeyRow from "../components/HotkeyRow";
 import LevelMeter from "../components/LevelMeter";
 import LoadingBlock from "../components/LoadingBlock";
-import MeetingDetailView from "../components/MeetingDetail";
-import NotionSettings from "../components/NotionSettings";
-import { Row, RowGroup } from "../components/SettingsRow";
-import Toggle from "../components/Toggle";
-import TranscriptPanel, {
-  speakerDisplayName,
-  type TranscriptSegment,
-} from "../components/TranscriptPanel";
+import MeetingSettingsPanel from "../components/meetings/MeetingSettingsPanel";
+import MeetingList from "../components/meetings/MeetingList";
+import MeetingPane, { type MeetingPaneHandle } from "../components/meetings/MeetingPane";
+import { speakerDisplayName, type TranscriptSegment } from "../components/TranscriptPanel";
 import { useFeatureAi } from "../hooks/useFeatureAi";
+import { useMediaQuery, MEETINGS_NARROW_QUERY } from "../hooks/useMediaQuery";
 import { useModelDownloads } from "../hooks/useModelDownloads";
 import { useOptimisticSetting } from "../hooks/useOptimisticSetting";
 import type { SlotSpec } from "../lib/featureSlot";
 import { toMessage } from "../lib/format";
 import type { Navigate } from "../lib/nav";
-
-const MEETINGS_FEATURE = "meetings";
-const MEETINGS_COMMAND = "toggle_meeting";
 
 /**
  * The two speaker models voice separation needs, by their catalog ids. Both
@@ -80,44 +74,15 @@ const SLOTS: SlotSpec[] = [
   { feature: "meetings", slot: "llm", capability: "llm", label: "Notes writing" },
 ];
 
-const capabilityLabels: Record<SystemAudioCapability, string> = {
-  unavailable: "Mic only (system audio unavailable)",
-  mic_only: "Mic only",
-  loopback_device: "Mic + system (loopback device)",
-  screen_capture_kit: "Mic + system (ScreenCaptureKit)",
-};
-
 type Props = {
   onNavigate?: Navigate;
+  /**
+   * The selected meeting, lifted into the app shell so it survives leaving the
+   * page. Omitted, the page keeps its own selection (used by tests).
+   */
+  selectedMeetingId?: string | null;
+  onSelectMeeting?: (id: string | null) => void;
 };
-
-/**
- * The cost note that sits next to the interim-notes toggle.
- *
- * Spelled out rather than left as "uses AI": this spends the user's tokens on
- * a schedule they did not press a button for, and somebody who turns it on and
- * leaves a four-hour meeting running should not be surprised by the bill.
- */
-function interimHint(settings: MeetingSettings): string {
-  const everyMinutes = settings.interim_every_minutes;
-  const everySegments = settings.interim_every_segments;
-  return (
-    `Writes notes every ${everySegments} segments or ${everyMinutes} minutes, ` +
-    `whichever comes first — about ${Math.round(60 / Math.max(1, everyMinutes))} AI ` +
-    "calls an hour, billed to your notes provider. Off by default."
-  );
-}
-
-/**
- * The hint beside the voice-separation toggle.
- *
- * Says what the feature does with the audio, because turning it on means the
- * user's microphone and system audio are analysed for voices, and that is the
- * kind of thing somebody wants to read before they flip it.
- */
-const VOICE_HINT =
-  "Tells remote participants apart by voice, labelled Person 1, Person 2 and so on. " +
-  "Runs on this Mac and nothing about voices is saved. Needs two speaker models.";
 
 /**
  * What the page shows before the first `get_meeting_settings` resolves.
@@ -136,18 +101,72 @@ const SETTINGS_PLACEHOLDER: MeetingSettings = {
   voice_separation: false,
 };
 
-export default function MeetingsPage({ onNavigate }: Props) {
+/** The meeting that is recording, before the list has caught up with it. */
+function recordingPlaceholder(
+  id: string,
+  startedAt: string,
+  title: string,
+  captureMode: CaptureMode,
+): Meeting {
+  return {
+    id,
+    title,
+    started_at: startedAt,
+    ended_at: null,
+    status: "recording",
+    capture_mode: captureMode,
+    stt_engine_id: null,
+    llm_engine_id: null,
+    error: null,
+    title_source: "llm",
+  };
+}
+
+/** The most recently started meeting, or null for none. */
+function newestMeetingId(list: Meeting[]): string | null {
+  let best: Meeting | null = null;
+  for (const m of list) {
+    if (!best || parseStoredTime(m.started_at) > parseStoredTime(best.started_at)) best = m;
+  }
+  return best?.id ?? null;
+}
+
+export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMeeting }: Props) {
   const ai = useFeatureAi(SLOTS);
   const [meetings, setMeetings] = useState<Meeting[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [listLoaded, setListLoaded] = useState(false);
+  const [localSelectedId, setLocalSelectedId] = useState<string | null>(null);
+  const selectionIsControlled = selectedMeetingId !== undefined;
+  const selectedId = selectionIsControlled ? selectedMeetingId : localSelectedId;
+  const setSelectedId = useCallback(
+    (id: string | null) => {
+      if (selectionIsControlled) onSelectMeeting?.(id);
+      else setLocalSelectedId(id);
+    },
+    [selectionIsControlled, onSelectMeeting],
+  );
+
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const detailRequest = useRef(0);
   const [listStatus, setListStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Narrow windows show one pane at a time; this is which one is showing.
+  const narrow = useMediaQuery(MEETINGS_NARROW_QUERY);
+  const [showDetailNarrow, setShowDetailNarrow] = useState(false);
   // Fed by the Notion card below, which is the only thing that reads or writes
   // that setup; the page only needs to know whether to offer the button.
   const [notionStatus, setNotionStatus] = useState<NotionStatus | null>(null);
+  const paneRef = useRef<MeetingPaneHandle>(null);
 
   const [state, setState] = useState<MeetingState>("idle");
+  // The meeting the backend is recording or finishing, once its id is known.
+  const [activeMeetingId, setActiveMeetingId] = useState<string | null>(null);
+  // Read by the state listener, which is subscribed once and would otherwise
+  // see the id from its first render.
+  const activeMeetingRef = useRef<string | null>(null);
+  activeMeetingRef.current = activeMeetingId;
+  const [recordingSince, setRecordingSince] = useState(() => new Date().toISOString());
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [level, setLevel] = useState(0);
   const [capability, setCapability] = useState<SystemAudioCapability>("mic_only");
@@ -181,6 +200,18 @@ export default function MeetingsPage({ onNavigate }: Props) {
   // Set once the user edits a setting, so the mount fetch can't clobber input
   // typed before it resolves.
   const settingsTouchedRef = useRef(false);
+  const onSegmentDurationChange = (seconds: number) => {
+    settingsTouchedRef.current = true;
+    setSettings({ ...settings, segment_duration_secs: seconds });
+  };
+  // The panel's state lives here, so closing it only hides it. Focus goes back
+  // to the ⚙ that opened it, whichever way it was closed.
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsButtonRef = useRef<HTMLButtonElement>(null);
+  const closeSettings = useCallback(() => {
+    setSettingsOpen(false);
+    settingsButtonRef.current?.focus();
+  }, []);
 
   const recording = state === "recording";
   const processing = state === "processing";
@@ -275,28 +306,130 @@ export default function MeetingsPage({ onNavigate }: Props) {
       setMeetings(items);
     } catch (e) {
       setListStatus(toMessage(e));
+    } finally {
+      setListLoaded(true);
     }
+  }, []);
+
+  /**
+   * Loads one meeting's detail. A newer request wins, so a slow answer for a
+   * meeting the user has already left cannot overwrite the one on screen.
+   */
+  /**
+   * Reads one meeting's detail. Every read goes through here, with the
+   * request counter, so a slow answer for a meeting the user has since left
+   * cannot overwrite the one now open. `quiet` skips the loading state, for a
+   * re-read after a write where the pane should not flash.
+   */
+  const loadDetail = useCallback(async (id: string, quiet = false) => {
+    const request = ++detailRequest.current;
+    if (!quiet) setDetailLoading(true);
+    try {
+      const next = await getMeeting(id);
+      if (request === detailRequest.current) setDetail(next);
+    } catch (e) {
+      if (request === detailRequest.current) {
+        setDetail(null);
+        setListStatus(toMessage(e));
+      }
+    } finally {
+      if (request === detailRequest.current) setDetailLoading(false);
+    }
+  }, []);
+
+  // Read by applyDetail, which can be called after the selection has moved on.
+  const selectedIdRef = useRef<string | null>(null);
+  selectedIdRef.current = selectedId;
+
+  /**
+   * Takes a fresh detail that a notes write returned (apply, edit, undo). It
+   * goes through the same request counter as loadDetail, so a read still in
+   * flight for this meeting cannot land after it and put back older notes, and
+   * a reply for a meeting the user has left is dropped.
+   */
+  const applyDetail = useCallback((next: MeetingDetail) => {
+    if (next.meeting.id !== selectedIdRef.current) return;
+    detailRequest.current++;
+    setDetail(next);
+    // The read this supersedes can no longer clear its own loading flag.
+    setDetailLoading(false);
   }, []);
 
   useEffect(() => {
     void refreshList();
   }, [refreshList]);
 
+  // The recording meeting's row, from the list if it is there yet, else a
+  // placeholder built from what the live events have told us.
+  const listedActive = activeMeetingId
+    ? (meetings.find((m) => m.id === activeMeetingId) ?? null)
+    : null;
+  const activeRow: Meeting | null =
+    activeMeetingId && (recording || processing)
+      ? (listedActive ??
+        recordingPlaceholder(
+          activeMeetingId,
+          recordingSince,
+          processing ? "Finishing meeting…" : "Recording…",
+          settings.prefer_system_audio && capability !== "mic_only" && capability !== "unavailable"
+            ? "mic_and_system"
+            : "mic_only",
+        ))
+      : null;
+  // The pinned row is the one being recorded right now; while it finishes it
+  // sits in the list like any other.
+  const pinnedRow = recording ? activeRow : null;
+  const listRows = pinnedRow ? meetings.filter((m) => m.id !== pinnedRow.id) : meetings;
+  const live = recording && activeMeetingId !== null && selectedId === activeMeetingId;
+  const generating = processing && activeMeetingId !== null && selectedId === activeMeetingId;
+
+  // Whether the Ask AI tab can send: the notes-writing LLM is bound and usable.
+  // null while the first status check is still running.
+  const llmStatus = ai.statuses?.find((s) => s.spec.slot === "llm") ?? null;
+  const aiReady: boolean | null = ai.statuses === null ? null : !llmStatus?.blocked;
+  const aiBlockedReason = llmStatus?.blocked?.message ?? null;
+
+  // The header reads the list row, or the fetched meeting itself when the list
+  // has not caught up with a meeting that just stopped.
+  const paneMeeting: Meeting | null = !selectedId
+    ? null
+    : selectedId === activeRow?.id
+      ? activeRow
+      : (meetings.find((m) => m.id === selectedId) ??
+        (detail && detail.meeting.id === selectedId ? detail.meeting : null));
+
+  // Opening on a meeting that is no longer in the list (deleted, or a stale
+  // session value) falls back to the default instead of showing nothing.
+  const knownSelection =
+    selectedId !== null &&
+    (selectedId === activeRow?.id || meetings.some((m) => m.id === selectedId));
+
+  useEffect(() => {
+    if (!listLoaded || knownSelection) return;
+    const next = recording && activeMeetingId ? activeMeetingId : newestMeetingId(meetings);
+    if (next !== selectedId) setSelectedId(next);
+  }, [listLoaded, knownSelection, recording, activeMeetingId, meetings, selectedId, setSelectedId]);
+
+  // A meeting that starts recording becomes the selection, so its live view is
+  // what the user sees. Keyed on the id and the state only, so a selection the
+  // user makes during the meeting is left alone.
+  useEffect(() => {
+    if (recording && activeMeetingId) setSelectedId(activeMeetingId);
+  }, [recording, activeMeetingId, setSelectedId]);
+
+  // Loads the open meeting's detail, except while it is the live one, whose
+  // view comes from events. Stopping flips it back to a stored meeting, so the
+  // detail is read again then.
   useEffect(() => {
     if (!selectedId) {
+      detailRequest.current++;
       setDetail(null);
+      setDetailLoading(false);
       return;
     }
-    setBusy(true);
-    setListStatus(null);
-    getMeeting(selectedId)
-      .then(setDetail)
-      .catch((e) => {
-        setDetail(null);
-        setListStatus(toMessage(e));
-      })
-      .finally(() => setBusy(false));
-  }, [selectedId]);
+    if (live) return;
+    void loadDetail(selectedId);
+  }, [selectedId, live, loadDetail]);
 
   useEffect(() => {
     void getSystemAudioCapability().then(setCapability);
@@ -311,6 +444,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
       .then((payload) => {
         setState(payload.state);
         if (payload.active_meeting_id && payload.state === "recording") {
+          setActiveMeetingId(payload.active_meeting_id);
           getMeeting(payload.active_meeting_id)
             .then((d) => {
               setSegments(
@@ -346,14 +480,39 @@ export default function MeetingsPage({ onNavigate }: Props) {
     const unsubs = Promise.all([
       onMeetingState((next: MeetingState) => {
         setState(next);
+        // Finishing ends in idle however the stop was asked for — the button,
+        // the hotkey, the tray or a script. Only here is the finished meeting
+        // re-read for all of them; the button path alone used to do it, so a
+        // hotkey stop left the pane saying no notes were written.
+        if (next === "idle" && activeMeetingRef.current) {
+          const finished = activeMeetingRef.current;
+          void refreshList();
+          void loadDetail(finished, true);
+        }
         if (next === "recording") {
           setSegments([]);
           // Last meeting's notes are not this meeting's notes.
           setLiveNotes(null);
+          // A new meeting: forget the last id until this one's arrives, and
+          // show the list row for it as soon as the list has it.
+          setActiveMeetingId(null);
+          setRecordingSince(new Date().toISOString());
+          void refreshList();
+          getMeetingState()
+            .then((payload) => {
+              if (payload.active_meeting_id) setActiveMeetingId(payload.active_meeting_id);
+            })
+            .catch(() => {});
         }
       }),
-      onMeetingNotes(setLiveNotes),
+      onMeetingNotes((notes) => {
+        // Not gated on the recording state: a state event and the first notes
+        // can land in one batch, and the selection only follows while recording.
+        setActiveMeetingId(notes.meeting_id);
+        setLiveNotes(notes);
+      }),
       onMeetingSegment((seg: MeetingSegmentEvent) => {
+        setActiveMeetingId(seg.meeting_id);
         setSegments((prev) => {
           if (prev.some((s) => s.meeting_id === seg.meeting_id && s.sequence === seg.sequence)) return prev;
           // No speaker rows while recording — the meeting has not been
@@ -375,7 +534,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
     return () => {
       void unsubs.then((fns) => fns.forEach((fn) => fn()));
     };
-  }, []);
+  }, [refreshList, loadDetail]);
 
   useEffect(() => {
     if (state !== "recording") {
@@ -384,11 +543,6 @@ export default function MeetingsPage({ onNavigate }: Props) {
   }, [state]);
 
   useEffect(() => () => clearTimeout(testTimer.current), []);
-
-  const onMeetingStopped = async (meetingId: string) => {
-    await refreshList();
-    setSelectedId(meetingId);
-  };
 
   /**
    * Renames one side of the open meeting, then re-reads it.
@@ -402,7 +556,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
     setBusy(true);
     try {
       await setMeetingSpeakerName(selectedId, speakerKey, displayName);
-      setDetail(await getMeeting(selectedId));
+      await loadDetail(selectedId, true);
     } catch (e) {
       setListStatus(toMessage(e));
     } finally {
@@ -424,7 +578,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
     setListStatus(null);
     try {
       await write(selectedId);
-      setDetail(await getMeeting(selectedId));
+      await loadDetail(selectedId, true);
     } catch (e) {
       setListStatus(toMessage(e));
     } finally {
@@ -438,8 +592,12 @@ export default function MeetingsPage({ onNavigate }: Props) {
   const onAddActionItem = (text: string) =>
     mutateMeeting((meetingId) => addMeetingActionItem(meetingId, text));
 
-  const onRenameTitle = (title: string) =>
-    mutateMeeting((meetingId) => setMeetingTitle(meetingId, title));
+  // The header and the list row read the title from the list, so a rename
+  // re-reads the list as well as the detail, or the old name would stand.
+  const onRenameTitle = async (title: string) => {
+    await mutateMeeting((meetingId) => setMeetingTitle(meetingId, title));
+    await refreshList();
+  };
 
   /**
    * Copy in the webview rather than through the Rust clipboard path.
@@ -512,6 +670,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
       if (selectedId === id) {
         setSelectedId(null);
         setDetail(null);
+        setShowDetailNarrow(false);
       }
       await refreshList();
     } catch (e) {
@@ -563,7 +722,9 @@ export default function MeetingsPage({ onNavigate }: Props) {
     setMeetingStatus(null);
     setSegments([]);
     try {
-      await startMeeting();
+      const id = await startMeeting();
+      setActiveMeetingId(id);
+      void refreshList();
       setMeetingStatus("Recording — speak into the mic.");
       return true;
     } catch (e) {
@@ -581,7 +742,11 @@ export default function MeetingsPage({ onNavigate }: Props) {
     try {
       const saved = await stopMeeting();
       setMeetingStatus(`Meeting saved: ${saved.meeting.title}`);
-      await onMeetingStopped(saved.meeting.id);
+      await refreshList();
+      setSelectedId(saved.meeting.id);
+      // The same meeting may already be selected, in which case nothing else
+      // reads its notes again: they were written while it finished.
+      await loadDetail(saved.meeting.id);
     } catch (e) {
       setMeetingStatus(toMessage(e));
     } finally {
@@ -614,16 +779,119 @@ export default function MeetingsPage({ onNavigate }: Props) {
     capability === "screen_capture_kit" && screenPerm !== "Granted";
 
   const actionBusy = meetingBusy || busy;
+  const recordDisabled = actionBusy || recording || processing || testing;
+
+  const onSelectRow = (id: string) => {
+    setSelectedId(id);
+    setShowDetailNarrow(true);
+  };
+
+  const hasAnyMeeting = meetings.length > 0 || pinnedRow !== null;
+  // Narrow: one pane at a time. With no meetings the empty state is all there is.
+  const showListPane = !narrow || (hasAnyMeeting && !showDetailNarrow);
+  const showDetailPane = !narrow || showDetailNarrow || !hasAnyMeeting;
+
+  // The test capture lives with the other settings: it checks the setup, and
+  // it is not something to press during a meeting by accident.
+  const checkSection: ReactNode = (
+    <section style={{ marginBottom: 16 }}>
+      <h3 style={{ margin: "0 0 8px", fontSize: 15 }}>Check your setup</h3>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <button
+          type="button"
+          className="kea-btn kea-btn--primary"
+          onClick={() => void runTestCapture()}
+          disabled={recordDisabled}
+        >
+          Run a 10-second test
+        </button>
+      </div>
+      <p className="kea-muted" style={{ margin: "8px 0 0", fontSize: "0.8125rem" }}>
+        The test is a real capture — it is saved to your meetings like any other.
+      </p>
+    </section>
+  );
 
   return (
     <div>
-      <header>
-        <h1 style={{ marginTop: 0 }}>Meetings</h1>
-        <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
-          Record a meeting, watch the transcript appear live, and get notes when you
-          stop.
-        </p>
+      <header style={{ display: "flex", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
+        {/* A basis, not min-width 0: when the controls grow (the level meter
+            while recording) they wrap below instead of squeezing the title
+            to a sliver and painting over it. */}
+        <div style={{ flex: "1 1 280px", minWidth: 0 }}>
+          <h1 style={{ marginTop: 0 }}>Meetings</h1>
+          <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
+            Record a meeting, watch the transcript appear live, and get notes when you
+            stop.
+          </p>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <span className="kea-muted" style={{ fontSize: 13 }}>
+            State:{" "}
+            <strong style={{ color: "var(--text)" }}>
+              {state === "idle" ? "Idle" : state === "recording" ? "Recording" : "Processing"}
+            </strong>
+          </span>
+          {recording && <LevelMeter level={level} />}
+          <button
+            type="button"
+            className="kea-btn kea-btn--primary"
+            onClick={() => void onStart()}
+            disabled={recordDisabled}
+          >
+            Start meeting
+          </button>
+          <button
+            type="button"
+            className="kea-btn"
+            onClick={() => void onStop()}
+            disabled={actionBusy || !recording}
+          >
+            Stop meeting
+          </button>
+          <button
+            ref={settingsButtonRef}
+            type="button"
+            className="kea-btn"
+            aria-label="Meeting settings"
+            title="Meeting settings"
+            aria-haspopup="dialog"
+            aria-expanded={settingsOpen}
+            onClick={() => (settingsOpen ? closeSettings() : setSettingsOpen(true))}
+          >
+            ⚙
+          </button>
+        </div>
       </header>
+
+      {meetingStatus && (
+        <p className="kea-muted" style={{ margin: "0 0 16px" }}>
+          {meetingStatus}
+        </p>
+      )}
+
+      <MeetingSettingsPanel
+        open={settingsOpen}
+        onClose={closeSettings}
+        anchorRef={settingsButtonRef}
+        settings={settings}
+        meetingSettings={meetingSettings}
+        saveSettings={saveSettings}
+        onSegmentDurationChange={onSegmentDurationChange}
+        capability={capability}
+        calendarPerm={calendarPerm}
+        requestCalendar={requestCalendar}
+        actionBusy={actionBusy}
+        voiceEnablePending={voiceEnablePending}
+        voiceModelsReady={voiceModelsReady}
+        voiceDownloading={voiceDownloading}
+        voiceStatus={voiceStatus}
+        toggleVoiceSeparation={toggleVoiceSeparation}
+        downloadVoiceModels={downloadVoiceModels}
+        ai={ai}
+        onNotionStatusChange={setNotionStatus}
+        checkSection={checkSection}
+      />
 
       <FeatureBanner ai={ai} onNavigate={onNavigate} />
 
@@ -646,331 +914,70 @@ export default function MeetingsPage({ onNavigate }: Props) {
         </Banner>
       )}
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Behavior</h2>
-        <RowGroup aria-label="Meeting behavior">
-          <HotkeyRow
-            feature={MEETINGS_FEATURE}
-            command={MEETINGS_COMMAND}
-            label="Shortcut"
-            hint="Starts or stops meeting notes."
-            checkRegistration
+      <div className={`kea-meetings-grid${narrow ? " kea-meetings-grid--narrow" : ""}`}>
+        {showListPane && (
+          <MeetingList
+            meetings={listRows}
+            recording={pinnedRow}
+            selectedId={selectedId}
+            onSelect={onSelectRow}
           />
-          <Row
-            label="Record system audio too"
-            hint={`Right now: ${capabilityLabels[capability]}.`}
-          >
-            {meetingSettings.savedKey === "prefer_system_audio" && (
-              <span className="kea-saved">Saved ✓</span>
-            )}
-            <Toggle
-              label="Record system audio too"
-              checked={settings.prefer_system_audio}
-              disabled={meetingSettings.busy}
-              onChange={(next) =>
-                void saveSettings({ prefer_system_audio: next }, "prefer_system_audio")
-              }
-            />
-          </Row>
-          <Row
-            label="Notes while the meeting runs"
-            hint={interimHint(settings)}
-          >
-            {meetingSettings.savedKey === "interim_notes" && (
-              <span className="kea-saved">Saved ✓</span>
-            )}
-            <Toggle
-              label="Notes while the meeting runs"
-              checked={settings.interim_notes ?? false}
-              disabled={meetingSettings.busy}
-              onChange={(next) => void saveSettings({ interim_notes: next }, "interim_notes")}
-            />
-          </Row>
-          <Row
-            label="Name meetings from your calendar"
-            hint="Uses the title of the calendar event you were in. Your calendar is read on this Mac and never sent to an AI provider."
-          >
-            {meetingSettings.savedKey === "calendar_titles" && (
-              <span className="kea-saved">Saved ✓</span>
-            )}
-            {settings.calendar_titles && calendarPerm !== "Granted" && (
-              <button
-                type="button"
-                className="kea-btn"
-                onClick={() => void requestCalendar()}
-                disabled={actionBusy}
-              >
-                Grant access
-              </button>
-            )}
-            <Toggle
-              label="Name meetings from your calendar"
-              checked={settings.calendar_titles ?? false}
-              disabled={meetingSettings.busy}
-              onChange={(next) => {
-                void saveSettings({ calendar_titles: next }, "calendar_titles");
-                // Asking on the toggle rather than on the first recording: the
-                // prompt is the point at which the user has said yes to this,
-                // and interrupting a meeting to ask would be the opposite.
-                if (next && calendarPerm !== "Granted") void requestCalendar();
-              }}
-            />
-          </Row>
-          <Row label="Separate speakers by voice" hint={VOICE_HINT}>
-            {meetingSettings.savedKey === "voice_separation" && (
-              <span className="kea-saved">Saved ✓</span>
-            )}
-            {voiceEnablePending && !voiceModelsReady && (
-              <button
-                type="button"
-                className="kea-btn"
-                onClick={() => void downloadVoiceModels()}
-                disabled={voiceDownloading || meetingSettings.busy}
-              >
-                {voiceDownloading ? "Downloading…" : "Download speaker models"}
-              </button>
-            )}
-            <Toggle
-              label="Separate speakers by voice"
-              checked={settings.voice_separation ?? false}
-              disabled={meetingSettings.busy}
-              onChange={(next) => void toggleVoiceSeparation(next)}
-            />
-          </Row>
-          {voiceEnablePending && !voiceModelsReady && (
-            <p className="kea-muted" role="status" style={{ margin: "0 0 12px", fontSize: "0.8125rem" }}>
-              Turning this on needs two speaker models, which are not installed yet.
-              {" "}Download them and voice separation turns on when they are ready.
-            </p>
-          )}
-          {voiceStatus && (
-            <p className="kea-muted" role="alert" style={{ margin: "0 0 12px", fontSize: "0.8125rem" }}>
-              {voiceStatus}
-            </p>
-          )}
-          <Row
-            label="Transcribe every"
-            hint="How often live transcript segments appear. Applies from the next meeting."
-          >
-            {meetingSettings.savedKey === "segment_duration_secs" && (
-              <span className="kea-saved">Saved ✓</span>
-            )}
-            <input
-              className="kea-input"
-              type="number"
-              aria-label="Seconds per transcript segment"
-              min={5}
-              max={120}
-              step={5}
-              value={settings.segment_duration_secs}
-              disabled={meetingSettings.busy}
-              onChange={(e) => {
-                settingsTouchedRef.current = true;
-                const v = parseInt(e.target.value, 10);
-                if (!isNaN(v)) setSettings({ ...settings, segment_duration_secs: v });
-              }}
-              onBlur={(e) => {
-                const v = parseInt(e.target.value, 10);
-                if (isNaN(v)) return;
-                // Clamp on persist: the backend takes any u32, so keep the
-                // value inside the advisory 5-120s range (negatives would
-                // fail u32 deserialization outright).
-                const clamped = Math.min(120, Math.max(5, v));
-                void saveSettings({ segment_duration_secs: clamped }, "segment_duration_secs");
-              }}
-              style={{ width: 88 }}
-            />
-            <span className="kea-muted">seconds</span>
-          </Row>
-        </RowGroup>
-        {meetingSettings.error && (
-          <p style={{ marginTop: 8, fontSize: "0.8125rem", color: "var(--danger)" }}>
-            {meetingSettings.error}
-          </p>
         )}
-      </section>
 
-      <FeatureAiCard ai={ai} featureLabel="Meetings" />
-
-      <NotionSettings onStatusChange={setNotionStatus} />
-
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Try it</h2>
-        <div className="kea-card">
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 12,
-              flexWrap: "wrap",
-              marginBottom: 12,
-            }}
-          >
-            <span className="kea-muted" style={{ fontSize: 13 }}>
-              State:{" "}
-              <strong style={{ color: "var(--text)" }}>
-                {state === "idle" ? "Idle" : state === "recording" ? "Recording" : "Processing"}
-              </strong>
-            </span>
-            {recording && <LevelMeter level={level} />}
-          </div>
-
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button
-              type="button"
-              className="kea-btn kea-btn--primary"
-              onClick={() => void runTestCapture()}
-              disabled={actionBusy || recording || processing || testing}
-            >
-              Run a 10-second test
-            </button>
-            <button
-              type="button"
-              className="kea-btn"
-              onClick={() => void onStart()}
-              disabled={actionBusy || recording || processing || testing}
-            >
-              Start meeting
-            </button>
-            <button
-              type="button"
-              className="kea-btn"
-              onClick={() => void onStop()}
-              disabled={actionBusy || !recording}
-            >
-              Stop meeting
-            </button>
-          </div>
-          <p className="kea-muted" style={{ margin: "8px 0 0", fontSize: "0.8125rem" }}>
-            The test is a real capture — it is saved to your meetings like any other.
-          </p>
-          {meetingStatus && (
-            <p className="kea-muted" style={{ marginTop: 12, marginBottom: 0 }}>
-              {meetingStatus}
-            </p>
-          )}
-        </div>
-      </section>
-
-      {liveNotes && (
-        <section style={{ marginBottom: 24 }}>
-          <h2 style={{ margin: "0 0 12px" }}>Notes so far</h2>
-          <div className="kea-card">
-            {/*
-              Said plainly, because a stale summary read as a final one is the
-              way this feature misleads: the fold can compress out a point
-              mentioned once, and the full-transcript pass at stop is what
-              fixes it.
-            */}
-            <p className="kea-muted" style={{ margin: "0 0 8px", fontSize: "0.8125rem" }}>
-              Updated every few minutes while the meeting runs. The full notes are
-              written when you stop.
-            </p>
-            {liveNotes.summary.trim() && (
-              <p style={{ margin: "0 0 8px", whiteSpace: "pre-wrap" }}>{liveNotes.summary}</p>
+        {showDetailPane && (
+          <section className="kea-card" style={{ minHeight: 200, minWidth: 0 }}>
+            {paneMeeting ? (
+              <MeetingPane
+                key={paneMeeting.id}
+                ref={paneRef}
+                meeting={paneMeeting}
+                detail={detail}
+                live={live}
+                liveSegments={segments}
+                liveNotes={liveNotes}
+                interimNotes={settings.interim_notes}
+                generating={generating}
+                loading={detailLoading}
+                busy={busy}
+                onBack={narrow ? () => setShowDetailNarrow(false) : undefined}
+                onDelete={live ? undefined : onDelete}
+                onRenameTitle={onRenameTitle}
+                onRenameSpeaker={onRenameSpeaker}
+                onSetActionItemStatus={onSetActionItemStatus}
+                onAddActionItem={onAddActionItem}
+                onCopyMarkdown={onCopyMarkdown}
+                onSaveMarkdown={onSaveMarkdown}
+                onExportNotion={notionReady ? onExportNotion : undefined}
+                aiReady={aiReady}
+                aiBlockedReason={aiBlockedReason}
+                onOpenModels={onNavigate ? () => onNavigate("models") : undefined}
+                onNotesChanged={applyDetail}
+              />
+            ) : !hasAnyMeeting ? (
+              <div>
+                <h2 style={{ marginTop: 0, fontSize: 18 }}>No meetings yet</h2>
+                <p className="kea-muted" style={{ margin: "0 0 16px" }}>
+                  Record one and its transcript appears here as it happens, with notes
+                  when you stop.
+                </p>
+                <button
+                  type="button"
+                  className="kea-btn kea-btn--primary"
+                  onClick={() => void onStart()}
+                  disabled={recordDisabled}
+                >
+                  Record a meeting
+                </button>
+              </div>
+            ) : selectedId && detailLoading ? (
+              <LoadingBlock label="Loading meeting…" />
+            ) : (
+              <p className="kea-muted" style={{ margin: 0 }}>
+                Select a meeting to view notes and transcript.
+              </p>
             )}
-            {liveNotes.action_items.trim() && (
-              <>
-                <h3 style={{ margin: "0 0 4px", fontSize: 14 }}>Action items</h3>
-                <p style={{ margin: 0, whiteSpace: "pre-wrap" }}>{liveNotes.action_items}</p>
-              </>
-            )}
-          </div>
-        </section>
-      )}
-
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Live transcript</h2>
-        <div className="kea-card">
-          <TranscriptPanel
-            segments={segments}
-            live={recording}
-            emptyMessage={
-              recording
-                ? "Listening — segments appear every few seconds…"
-                : "Start a meeting to see live transcription."
-            }
-          />
-        </div>
-      </section>
-
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "minmax(200px, 280px) 1fr",
-          gap: 16,
-          alignItems: "start",
-        }}
-      >
-        <aside
-          className="kea-card"
-          style={{
-            padding: 12,
-            maxHeight: 480,
-            overflowY: "auto",
-          }}
-        >
-          <h2 style={{ margin: "0 0 12px", fontSize: 15 }}>Past meetings</h2>
-          {meetings.length === 0 ? (
-            <p className="kea-muted" style={{ margin: 0 }}>
-              No meetings yet.
-            </p>
-          ) : (
-            <ul style={{ margin: 0, padding: 0, listStyle: "none" }}>
-              {meetings.map((m) => (
-                <li key={m.id} style={{ marginBottom: 4 }}>
-                  <button
-                    type="button"
-                    onClick={() => setSelectedId(m.id)}
-                    style={{
-                      width: "100%",
-                      textAlign: "left",
-                      padding: "8px 10px",
-                      border:
-                        selectedId === m.id
-                          ? "2px solid var(--accent)"
-                          : "1px solid var(--border)",
-                      borderRadius: 6,
-                      background:
-                        selectedId === m.id ? "var(--surface-2)" : "var(--surface)",
-                      color: "var(--text)",
-                      cursor: "pointer",
-                      fontFamily: "inherit",
-                    }}
-                  >
-                    <div style={{ fontWeight: 600, fontSize: 13 }}>{m.title}</div>
-                    <div className="kea-muted" style={{ fontSize: 11, marginTop: 2 }}>
-                      {m.started_at} · {m.status}
-                    </div>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </aside>
-
-        <section className="kea-card" style={{ minHeight: 200 }}>
-          {selectedId && detail ? (
-            <MeetingDetailView
-              detail={detail}
-              onDelete={onDelete}
-              busy={busy}
-              onRenameSpeaker={onRenameSpeaker}
-              onRenameTitle={onRenameTitle}
-              onSetActionItemStatus={onSetActionItemStatus}
-              onAddActionItem={onAddActionItem}
-              onCopyMarkdown={onCopyMarkdown}
-              onSaveMarkdown={onSaveMarkdown}
-              onExportNotion={notionReady ? onExportNotion : undefined}
-            />
-          ) : selectedId && busy ? (
-            <LoadingBlock label="Loading meeting…" />
-          ) : (
-            <p className="kea-muted" style={{ margin: 0 }}>
-              Select a meeting to view notes and transcript.
-            </p>
-          )}
-        </section>
+          </section>
+        )}
       </div>
 
       {listStatus && (

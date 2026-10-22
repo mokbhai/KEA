@@ -461,6 +461,57 @@ a:hover {
   }
 }
 
+/* ── Settings slide-over ───────────────────────────────────────────── */
+/* The scrim dims the page and takes the press that closes the panel. It sits
+   under the panel, and is hidden with the panel rather than unmounted. */
+.kea-slideover-scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 150;
+}
+
+.kea-slideover {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 160;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  width: min(440px, 100vw);
+  padding: 16px;
+  overflow-y: auto;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  box-shadow: -4px 0 16px rgba(0, 0, 0, 0.15);
+  animation: kea-slideover-in 0.2s ease;
+}
+
+/* The author's display rule above would otherwise override the hidden attribute. */
+.kea-slideover[hidden],
+.kea-slideover-scrim[hidden] {
+  display: none;
+}
+
+.kea-slideover__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+@keyframes kea-slideover-in {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
 /* ── Settings rows ─────────────────────────────────────────────────── */
 .kea-rows {
   background: var(--surface);
@@ -1238,5 +1289,77 @@ a:hover {
 
   .kea-waveform__bar {
     transition: none;
+  }
+}
+
+/* Meetings workspace: a meeting list beside the selected meeting, one pane at
+   a time in a narrow window (see MEETINGS_NARROW_QUERY in hooks/useMediaQuery). */
+.kea-meetings-grid {
+  display: grid;
+  grid-template-columns: minmax(200px, 280px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.kea-meetings-grid--narrow {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.kea-meeting-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+  overflow-x: auto;
+}
+
+.kea-meeting-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  padding: 8px 12px;
+  margin-bottom: -1px;
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.kea-meeting-tab:hover {
+  color: var(--text);
+}
+
+.kea-meeting-tab[aria-selected="true"] {
+  color: var(--text);
+  border-bottom-color: var(--underline);
+}
+
+/* The body scrolls on its own, so the title and tabs stay in view. Each tab's
+   position is remembered by MeetingPane. */
+.kea-meeting-body {
+  max-height: min(70vh, 760px);
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+/* A segment jumped to from a citation: a highlight that fades out. */
+.kea-transcript-line--flash {
+  animation: kea-transcript-flash 2s ease-out;
+}
+
+@keyframes kea-transcript-flash {
+  from {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+  to {
+    background: transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kea-transcript-line--flash {
+    animation: none;
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
   }
 }

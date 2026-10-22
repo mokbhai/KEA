@@ -15,8 +15,9 @@ pub use store::conversations::{
     ConversationRepo, ConversationSummary, Message, MessageRole, NewConversation, NewMessage,
 };
 pub use store::meetings::{
-    CaptureMode, Meeting, MeetingDetail, MeetingNotes, MeetingRepo, MeetingSegment, MeetingStatus,
-    NewMeeting, NewSegment,
+    CaptureMode, Meeting, MeetingChatMessage, MeetingDetail, MeetingNotes, MeetingRepo,
+    MeetingSegment, MeetingStatus, NewMeeting, NewSegment, NotesText, ProposalMeta, ProposalState,
+    NOTES_UNDO_LIMIT,
 };
 pub use tts::{TtsSettings, TtsSettingsRepo};
 
