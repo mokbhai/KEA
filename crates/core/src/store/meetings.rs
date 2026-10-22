@@ -578,8 +578,10 @@ impl ChatRow {
 }
 
 /// How many versions the notes undo stack keeps per meeting. Past this the
-/// oldest version is dropped, which bounds the table for a user who keeps
-/// iterating on one meeting.
+/// oldest *edit* is dropped, which bounds the table for a user who keeps
+/// iterating on one meeting. The bottom of the stack — the notes as
+/// generated — is never dropped: Undo must always be able to get back there
+/// and clear the edited mark, however many changes came in between.
 pub const NOTES_UNDO_LIMIT: i64 = 50;
 
 const NOTES_SELECT: &str = "SELECT meeting_id, summary, decisions, action_items, follow_ups,
@@ -1052,14 +1054,17 @@ impl MeetingRepo {
 
         sqlx::query(
             "DELETE FROM meeting_notes_versions
-             WHERE meeting_id = ? AND id NOT IN (
-                 SELECT id FROM meeting_notes_versions
-                 WHERE meeting_id = ? ORDER BY id DESC LIMIT ?
-             )",
+             WHERE meeting_id = ?
+               AND id <> (SELECT MIN(id) FROM meeting_notes_versions WHERE meeting_id = ?)
+               AND id NOT IN (
+                   SELECT id FROM meeting_notes_versions
+                   WHERE meeting_id = ? ORDER BY id DESC LIMIT ?
+               )",
         )
         .bind(meeting_id)
         .bind(meeting_id)
-        .bind(NOTES_UNDO_LIMIT)
+        .bind(meeting_id)
+        .bind(NOTES_UNDO_LIMIT - 1)
         .execute(&mut *tx)
         .await?;
 
@@ -2463,7 +2468,7 @@ mod tests {
     /// Past the cap the oldest version goes, so the stack walks back through
     /// fifty edits and stops at the first one, not at the generated notes.
     #[tokio::test]
-    async fn the_undo_stack_is_capped_and_drops_the_oldest_version() {
+    async fn the_undo_stack_is_capped_but_keeps_the_generated_notes() {
         let (pool, repo) = with_generated_notes("u6", "Sync", "Generated").await;
         for n in 1..=(NOTES_UNDO_LIMIT + 1) {
             repo.apply_user_notes("u6", &text(&format!("edit {n}")))
@@ -2476,11 +2481,15 @@ mod tests {
             .unwrap();
         assert_eq!(stored, NOTES_UNDO_LIMIT);
 
+        // The oldest *edits* went; the generated notes at the bottom did not,
+        // so undoing everything still lands on them with the mark cleared.
         let mut last = None;
         for _ in 0..NOTES_UNDO_LIMIT {
             last = repo.undo_notes("u6").await.unwrap();
         }
-        assert_eq!(last.unwrap().summary, "edit 1");
+        let last = last.unwrap();
+        assert_eq!(last.summary, "Generated");
+        assert!(!last.edited);
         assert!(repo.undo_notes("u6").await.unwrap().is_none());
     }
 
