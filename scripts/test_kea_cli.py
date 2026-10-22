@@ -425,6 +425,19 @@ class SttTests(ShimTestCase):
         self.assertEqual(r.stdout, b"")
         self.assertIn("kea: could not decode the uploaded audio", r.stderr.decode())
 
+    def test_a_path_with_separators_curl_would_split_is_uploaded_whole(self):
+        for name in ("a;b.wav", "c,d.wav", 'quote"d.wav'):
+            path, sha = self.write_audio(name=name)
+            r = self.shim("stt", path)
+            self.assertEqual(r.returncode, 0, (name, r.stderr))
+            self.assertEqual(self.last()["fields"]["file"]["sha256"], sha)
+
+    def test_a_file_that_does_not_exist_exits_66_without_blaming_the_api(self):
+        r = self.shim("stt", os.path.join(self.work, "nope.m4a"))
+        self.assertEqual(r.returncode, 66)
+        self.assertIn("cannot read", r.stderr.decode())
+        self.assertNotIn("not running", r.stderr.decode())
+
     def test_missing_file_argument_is_a_usage_error(self):
         self.assertEqual(self.shim("stt").returncode, 64)
 
@@ -611,6 +624,16 @@ class TransportTests(ShimTestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("kea: Invalid or missing token", r.stderr.decode())
         self.assertEqual(self.last()["authorization"], "Bearer not-the-token")
+
+    def test_older_verbs_keep_their_error_contract(self):
+        # `kea transcribe` predates the model commands: an API error still
+        # prints the body on stdout and exits 22, as it did with --fail-with-body.
+        wrong = os.path.join(self.work, "wrong-token-legacy")
+        with open(wrong, "w") as f:
+            f.write("not-the-token\n")
+        r = self.shim("status", env={"KEA_API_TOKEN_FILE": wrong})
+        self.assertEqual(r.returncode, 22)
+        self.assertIn("error", r.stdout.decode())
 
     def test_status_still_works_over_the_socket(self):
         r = self.shim("status", env={"KEA_API_URL": None})

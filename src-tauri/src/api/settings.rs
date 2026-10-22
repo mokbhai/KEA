@@ -40,11 +40,14 @@ pub struct ApiSettings {
     /// Whether this OS has unix sockets, the default transport. False on
     /// Windows, where the port is the only way in.
     pub unix_socket_supported: bool,
-    /// Whether the loopback port is switched on. Only meaningful on unix: the
-    /// non-unix build always runs the port.
+    /// Whether the loopback port is switched on. Off by default on every OS;
+    /// on one without unix sockets the API cannot start until it is on.
     pub tcp_enabled: bool,
     /// Whether the port is listening right now.
     pub tcp_running: bool,
+    /// Why the port is switched on but not listening — typically another
+    /// process holding it. `None` when it is listening or switched off.
+    pub tcp_error: Option<String>,
     /// The port the listener uses, or would use the next time it starts.
     pub tcp_port: u16,
 }
@@ -109,9 +112,10 @@ pub async fn start_server(state: &Arc<AppState>, app: &AppHandle) -> Result<(), 
     }
     let dir = app_data_dir(app)?;
     let secret = token::load_or_mint(state.credentials.as_ref()).await?;
-    // Without unix sockets the port is the only way in, so it runs whatever
-    // the setting says. Elsewhere it runs only when the setting is on.
-    let tcp_on = !cfg!(unix) || tcp_enabled(&state.config_pool).await;
+    // The port is opt-in everywhere, Windows included: a browser-reachable
+    // listener must never start because of the platform. Where it is the only
+    // transport, `server::start` refuses to start without it and says so.
+    let tcp_on = tcp_enabled(&state.config_pool).await;
     let tcp = tcp_on.then_some(LoopbackPort::new(tcp_port(&state.config_pool).await));
     let handle = server::start(
         state.clone(),
@@ -160,9 +164,9 @@ pub async fn get_api_settings(
     let state = state.inner().clone();
     let dir = app_data_dir(&app)?;
     let server = running_server(&state);
-    let tcp_running = match &server {
-        Some(server) => server.tcp_addr().await.is_some(),
-        None => false,
+    let (tcp_running, tcp_error) = match &server {
+        Some(server) => (server.tcp_addr().await.is_some(), server.tcp_error()),
+        None => (false, None),
     };
     Ok(ApiSettings {
         enabled: crate::commands::read_bool_setting(&state.config_pool, ENABLED_SETTING, false)
@@ -179,6 +183,7 @@ pub async fn get_api_settings(
         unix_socket_supported: cfg!(unix),
         tcp_enabled: tcp_enabled(&state.config_pool).await,
         tcp_running,
+        tcp_error,
         tcp_port: tcp_port(&state.config_pool).await,
     })
 }

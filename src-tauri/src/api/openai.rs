@@ -441,11 +441,9 @@ pub fn render_transcription(
                 TranscriptionFormat::Srt => (SubtitleFormat::Srt, CONTENT_TYPE_SRT),
                 _ => (SubtitleFormat::Vtt, CONTENT_TYPE_VTT),
             };
-            let cues: Vec<SttSegment> = segments
-                .iter()
-                .map(|s| SttSegment::new(s.start_ms, s.end_ms, labelled_text(s)))
-                .collect();
-            let body = subtitle.render(&cues, &SubtitleOpts::default());
+            let opts = SubtitleOpts::default();
+            let cues = labelled_cues(segments, &opts);
+            let body = subtitle.render(&cues, &opts);
             (content_type, body.into_bytes())
         }
     }
@@ -483,13 +481,50 @@ fn seconds(ms: u64) -> f64 {
 /// A segment's text with its speaker label in front, for the subtitle
 /// formats. An empty segment stays empty, so the subtitle writer still drops
 /// it rather than showing a cue that is only a name.
-fn labelled_text(segment: &TranscriptSegment) -> String {
-    match &segment.speaker {
-        Some(speaker) if !segment.text.trim().is_empty() => {
-            format!("{speaker}: {}", segment.text)
+/// The segments to hand the subtitle writer, with every cue of a speaker's
+/// turn labelled — not only the first.
+///
+/// The writer splits a long segment into several cues, and a label written
+/// into the segment's text would survive on the first of them only. So a
+/// labelled segment is split here first, with the line width narrowed by the
+/// label's length, and each piece is labelled; the pieces already fit, so the
+/// writer's own pass leaves them whole.
+fn labelled_cues(segments: &[TranscriptSegment], opts: &SubtitleOpts) -> Vec<SttSegment> {
+    let mut out = Vec::new();
+    for segment in segments {
+        let Some(speaker) = segment.speaker.as_deref() else {
+            out.push(SttSegment::new(
+                segment.start_ms,
+                segment.end_ms,
+                segment.text.clone(),
+            ));
+            continue;
+        };
+        let prefix = format!("{speaker}: ");
+        let narrowed = SubtitleOpts {
+            max_line_chars: opts
+                .max_line_chars
+                .saturating_sub(prefix.chars().count())
+                .max(8),
+            ..*opts
+        };
+        let pieces = kea_core::transcript::build_cues(
+            &[SttSegment::new(
+                segment.start_ms,
+                segment.end_ms,
+                segment.text.clone(),
+            )],
+            &narrowed,
+        );
+        for cue in pieces {
+            out.push(SttSegment::new(
+                cue.start_ms,
+                cue.end_ms,
+                format!("{prefix}{}", cue.lines.join(" ")),
+            ));
         }
-        _ => segment.text.clone(),
     }
+    out
 }
 
 fn to_vec(value: &Value) -> Vec<u8> {
@@ -1350,5 +1385,28 @@ mod tests {
             )
         );
         assert_eq!(SSE_CONTENT_TYPE, "text/event-stream");
+    }
+
+    /// A speaker turn long enough to split must carry its label on every cue.
+    #[test]
+    fn every_cue_of_a_long_turn_is_labelled() {
+        let text = "word ".repeat(60);
+        let segments = vec![TranscriptSegment {
+            start_ms: 0,
+            end_ms: 20_000,
+            text: text.trim().to_string(),
+            speaker: Some("Person 1".into()),
+        }];
+        let (_, body) = render_transcription(TranscriptionFormat::Srt, &text, &segments);
+        let body = String::from_utf8(body).unwrap();
+        let cues: Vec<&str> = body
+            .split("\n\n")
+            .filter(|c| !c.trim().is_empty())
+            .collect();
+        assert!(cues.len() > 1, "expected the turn to split: {body}");
+        for cue in cues {
+            let text_line = cue.lines().nth(2).unwrap_or("");
+            assert!(text_line.starts_with("Person 1: "), "unlabelled cue: {cue}");
+        }
     }
 }

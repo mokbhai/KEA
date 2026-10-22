@@ -265,6 +265,10 @@ pub struct ServerHandle {
     /// Behind an async lock because the port is bound and released while the
     /// settings page waits on it, and a std lock cannot be held across that.
     tcp: tokio::sync::Mutex<Option<TcpHandle>>,
+    /// Why the port asked for is not open, for the settings page. Kept on the
+    /// handle rather than returned once, because the API can come up at launch
+    /// with nobody waiting on the result.
+    tcp_error: std::sync::Mutex<Option<String>>,
 }
 
 impl ServerHandle {
@@ -284,6 +288,21 @@ impl ServerHandle {
         }
     }
 
+    /// Why the requested port is not open, if it is not.
+    pub fn tcp_error(&self) -> Option<String> {
+        match self.tcp_error.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn set_tcp_error(&self, error: Option<String>) {
+        match self.tcp_error.lock() {
+            Ok(mut slot) => *slot = error,
+            Err(poisoned) => *poisoned.into_inner() = error,
+        }
+    }
+
     /// The address the TCP port is listening on, or `None` if it is off.
     pub async fn tcp_addr(&self) -> Option<SocketAddr> {
         self.tcp.lock().await.as_ref().map(|tcp| tcp.addr)
@@ -300,10 +319,23 @@ impl ServerHandle {
         if let Some(previous) = slot.take() {
             previous.stop().await;
         }
+        self.set_tcp_error(None);
         let Some(port) = port else {
             return Ok(None);
         };
-        let listener = bind_tcp(port).await?;
+        // Checked under the lock `stop` also takes: a stop that lands first is
+        // seen here, and one that lands after waits and then closes what this
+        // bound. Either way no port outlives a stopped API.
+        if *self.shutdown.borrow() {
+            return Err("the local API is stopped".into());
+        }
+        let listener = match bind_tcp(port).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                self.set_tcp_error(Some(e.clone()));
+                return Err(e);
+            }
+        };
         let rt = self.rt.clone();
         let tcp = spawn_tcp_loop(listener, move |req| handle(rt.clone(), req))?;
         let addr = tcp.addr;
@@ -614,9 +646,10 @@ fn start_socket(
 /// Bind the transports the caller asks for and start accepting on them.
 ///
 /// The unix socket is always bound where there is one. `tcp` adds the loopback
-/// port, and a bind failure there is returned to the caller. Nothing is left
-/// running when that happens, so a half-started API never reaches the settings
-/// page.
+/// port. A bind failure there does not take the socket down with it — a busy
+/// port at launch must not cost the user the API they already had — so the
+/// handle comes back with the reason in [`ServerHandle::tcp_error`]. Without a
+/// unix socket the port is the only transport, and its failure is the start's.
 ///
 /// Returns once every requested listener is up, so the settings page can report
 /// a bind failure rather than claiming the API is on.
@@ -660,10 +693,14 @@ pub async fn start(
         socket_path,
         rt,
         tcp: tokio::sync::Mutex::new(None),
+        tcp_error: std::sync::Mutex::new(None),
     };
     if let Err(e) = handle.set_tcp(tcp).await {
-        handle.stop().await;
-        return Err(e);
+        if handle.socket_path.is_none() {
+            handle.stop().await;
+            return Err(e);
+        }
+        tracing::warn!(error = %e, "local API: the localhost port did not open; the socket is serving");
     }
     Ok(handle)
 }

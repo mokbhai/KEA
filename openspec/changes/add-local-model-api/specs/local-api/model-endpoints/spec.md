@@ -91,8 +91,8 @@ play audio on the machine.
 `temperature` and `max_tokens`. It SHALL send the conversation to the LLM bound for API
 use and return an OpenAI-shaped completion with one choice, and `usage` when the
 provider reported it. When `stream` is `true`, the response SHALL be a server-sent-event
-stream that carries the whole reply in one `chat.completion.chunk` followed by
-`data: [DONE]`. Fields the bound provider can't honour MUST be ignored, not refused, so
+stream that carries the whole reply in one content `chat.completion.chunk`, then a
+final chunk with `finish_reason: "stop"`, then `data: [DONE]`. Fields the bound provider can't honour MUST be ignored, not refused, so
 that common clients keep working. Tool calls and non-text content parts MUST be refused
 with `400`.
 
@@ -102,7 +102,7 @@ with `400`.
 
 #### Scenario: Streaming client
 - **WHEN** `stream: true` is sent
-- **THEN** the response is `text/event-stream` containing one chunk with the full reply and then `data: [DONE]`
+- **THEN** the response is `text/event-stream` containing one content chunk with the full reply, a `finish_reason: "stop"` chunk, and then `data: [DONE]`
 
 #### Scenario: Image content
 - **WHEN** a message's content is an array that contains an image part

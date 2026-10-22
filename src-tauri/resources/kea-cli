@@ -367,10 +367,17 @@ api() {
       echo "kea: the local API is not running. Turn it on in KEA > General." >&2
     fi
     exit 69
+  elif [ "$rc" -eq 26 ]; then
+    # curl could not read what it was asked to upload. The API is fine; the
+    # input is not, and saying "not running" would send the user to the wrong
+    # place.
+    rm -f "$body_file"
+    echo "kea: could not read the input to upload." >&2
+    exit 66
   elif [ "$rc" -ne 0 ]; then
     rm -f "$body_file"
-    echo "kea: could not reach the local API (curl exit $rc)." >&2
-    exit 69
+    echo "kea: the request to the local API failed (curl exit $rc)." >&2
+    exit 1
   fi
 
   case "$http_status" in
@@ -379,6 +386,14 @@ api() {
       rm -f "$body_file"
       ;;
     *)
+      if [ "$LEGACY_ERRORS" -eq 1 ]; then
+        # The verbs that predate the model commands printed KEA's error body
+        # on stdout and exited 22, as `curl --fail-with-body` does. Scripts
+        # written against them keep that contract.
+        cat "$body_file"
+        rm -f "$body_file"
+        exit 22
+      fi
       message=$(awk "$(awk_json_lib)
 $(awk_error_message)" < "$body_file" || true)
       rm -f "$body_file"
@@ -414,6 +429,12 @@ done
 
 [ $# -ge 1 ] || usage
 command="$1"; shift
+
+# See `api`: only the model commands use the newer error contract.
+case "$command" in
+  stt|tts|llm|models) LEGACY_ERRORS=0 ;;
+  *) LEGACY_ERRORS=1 ;;
+esac
 
 case "$command" in
   rewrite)
@@ -499,7 +520,19 @@ case "$command" in
     else
       api_format="$format"
     fi
-    set -- -F "file=@${file}" --form-string "response_format=${api_format}"
+    if [ "$file" != "-" ] && [ ! -r "$file" ]; then
+      echo "kea: cannot read $file" >&2
+      exit 66
+    fi
+    # Quoted inside the form spec: unquoted, curl reads `;` and `,` in a path
+    # as the start of a field option and cuts the name there.
+    quoted_file=$(printf %s "$file" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    if [ "$file" = "-" ]; then
+      set -- -F "file=@-;filename=stdin"
+    else
+      set -- -F "file=@\"${quoted_file}\""
+    fi
+    set -- "$@" --form-string "response_format=${api_format}"
     [ -z "$language" ] || set -- "$@" --form-string "language=${language}"
     [ -z "$model" ] || set -- "$@" --form-string "model=${model}"
     [ "$speakers" -eq 0 ] || set -- "$@" --form-string "speakers=true"
