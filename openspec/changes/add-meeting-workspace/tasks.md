@@ -38,4 +38,4 @@
 ## 6. Verification
 
 - [x] 6.1 Run `cargo test --workspace`, `cargo clippy --workspace --all-targets`, `cargo fmt --check`, and the UI test and typecheck scripts; all pass, and `ui-inventory.md` is fully ticked
-- [ ] 6.2 In the running app: open Meetings with several past meetings and confirm the newest summary shows without scrolling; search by a word from a summary; record a short meeting and watch it live in the pane; ask a question and follow a citation; apply a "shorter" proposal, undo it, and edit a section by hand
+- [x] 6.2 In the running app: open Meetings with several past meetings and confirm the newest summary shows without scrolling; search by a word from a summary; record a short meeting and watch it live in the pane; ask a question and follow a citation; apply a "shorter" proposal, undo it, and edit a section by hand
