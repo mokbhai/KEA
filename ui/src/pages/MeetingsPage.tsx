@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   addMeetingActionItem,
   deleteMeeting,
+  downloadOnnxModel,
   exportMeetingMarkdown,
   exportMeetingToNotion,
   getMeeting,
@@ -9,6 +10,7 @@ import {
   getMeetingState,
   getPermissionStatus,
   getSystemAudioCapability,
+  listInstalledOnnxModels,
   listMeetings,
   meetingMarkdown,
   onMeetingError,
@@ -50,6 +52,7 @@ import TranscriptPanel, {
   type TranscriptSegment,
 } from "../components/TranscriptPanel";
 import { useFeatureAi } from "../hooks/useFeatureAi";
+import { useModelDownloads } from "../hooks/useModelDownloads";
 import { useOptimisticSetting } from "../hooks/useOptimisticSetting";
 import type { SlotSpec } from "../lib/featureSlot";
 import { toMessage } from "../lib/format";
@@ -57,6 +60,17 @@ import type { Navigate } from "../lib/nav";
 
 const MEETINGS_FEATURE = "meetings";
 const MEETINGS_COMMAND = "toggle_meeting";
+
+/**
+ * The two speaker models voice separation needs, by their catalog ids. Both
+ * are required even though only the embedding model runs per window, so the
+ * toggle treats diarization as one bundle the user downloads once.
+ */
+const DIARIZATION_MODEL_IDS = [
+  "pyannote-segmentation-3-0",
+  "campplus-sv-en-voxceleb-16k",
+] as const;
+const VOICE_MODEL_SET: Set<string> = new Set(DIARIZATION_MODEL_IDS);
 
 /** How long the "Try it" capture runs before it stops itself. */
 const TEST_CAPTURE_MS = 10_000;
@@ -95,6 +109,17 @@ function interimHint(settings: MeetingSettings): string {
 }
 
 /**
+ * The hint beside the voice-separation toggle.
+ *
+ * Says what the feature does with the audio, because turning it on means the
+ * user's microphone and system audio are analysed for voices, and that is the
+ * kind of thing somebody wants to read before they flip it.
+ */
+const VOICE_HINT =
+  "Tells remote participants apart by voice, labelled Person 1, Person 2 and so on. " +
+  "Runs on this Mac and nothing about voices is saved. Needs two speaker models.";
+
+/**
  * What the page shows before the first `get_meeting_settings` resolves.
  *
  * Mirrors `MeetingSettings::default()` in
@@ -108,6 +133,7 @@ const SETTINGS_PLACEHOLDER: MeetingSettings = {
   interim_every_segments: 8,
   interim_every_minutes: 5,
   calendar_titles: false,
+  voice_separation: false,
 };
 
 export default function MeetingsPage({ onNavigate }: Props) {
@@ -133,6 +159,15 @@ export default function MeetingsPage({ onNavigate }: Props) {
 
   const [liveNotes, setLiveNotes] = useState<MeetingNotes | null>(null);
   const [calendarPerm, setCalendarPerm] = useState<PermStatus>("Unknown");
+  // Ids of the diarization models already on disk. Null until the first read
+  // lands, so the toggle does not offer a download for models it has not
+  // checked yet.
+  const [installedVoiceModels, setInstalledVoiceModels] = useState<Set<string> | null>(null);
+  // Set when the user asked for voice separation without the models: the
+  // setting is only written once they are all here, so it never reads "on" for
+  // a feature that cannot run.
+  const [voiceEnablePending, setVoiceEnablePending] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState<string | null>(null);
 
   const meetingSettings = useOptimisticSetting<MeetingSettings>({
     initial: SETTINGS_PLACEHOLDER,
@@ -158,6 +193,68 @@ export default function MeetingsPage({ onNavigate }: Props) {
   const saveSettings = (patch: Partial<MeetingSettings>, key: string) => {
     settingsTouchedRef.current = true;
     return meetingSettings.save(patch, key);
+  };
+
+  const missingVoiceModels = DIARIZATION_MODEL_IDS.filter(
+    (id) => !installedVoiceModels?.has(id),
+  );
+  const voiceModelsReady = installedVoiceModels !== null && missingVoiceModels.length === 0;
+
+  const refreshVoiceModels = useCallback(async (): Promise<Set<string>> => {
+    const ids = new Set(await listInstalledOnnxModels("diarization"));
+    setInstalledVoiceModels(ids);
+    return ids;
+  }, []);
+
+  // A download finishing is the only moment a pending enable can complete, so
+  // the check runs from the download event rather than on a timer. The pending
+  // flag is read through a ref because the event listener holds the render it
+  // was registered in.
+  const voiceEnablePendingRef = useRef(voiceEnablePending);
+  voiceEnablePendingRef.current = voiceEnablePending;
+  const { progressById: voiceProgress } = useModelDownloads({
+    catalogIds: VOICE_MODEL_SET,
+    onComplete: () => {
+      refreshVoiceModels()
+        .then((ids) => {
+          if (!voiceEnablePendingRef.current) return;
+          if (DIARIZATION_MODEL_IDS.every((id) => ids.has(id))) {
+            setVoiceEnablePending(false);
+            setVoiceStatus(null);
+            void saveSettings({ voice_separation: true }, "voice_separation");
+          }
+        })
+        .catch((e) => setVoiceStatus(toMessage(e)));
+    },
+    onError: (modelId, message) => setVoiceStatus(`${modelId}: ${message}`),
+  });
+  const voiceDownloading = DIARIZATION_MODEL_IDS.some((id) => voiceProgress.has(id));
+
+  const toggleVoiceSeparation = (next: boolean) => {
+    setVoiceStatus(null);
+    if (!next) {
+      setVoiceEnablePending(false);
+      void saveSettings({ voice_separation: false }, "voice_separation");
+      return;
+    }
+    if (voiceModelsReady) {
+      void saveSettings({ voice_separation: true }, "voice_separation");
+      return;
+    }
+    // Models missing: offer the download and enable once they land, instead of
+    // saving a setting that would silently do nothing at the next meeting.
+    setVoiceEnablePending(true);
+  };
+
+  const downloadVoiceModels = async () => {
+    setVoiceStatus(null);
+    try {
+      for (const id of missingVoiceModels) {
+        await downloadOnnxModel("diarization", id);
+      }
+    } catch (e) {
+      setVoiceStatus(toMessage(e));
+    }
   };
 
   const refreshList = useCallback(async () => {
@@ -220,6 +317,10 @@ export default function MeetingsPage({ onNavigate }: Props) {
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    refreshVoiceModels().catch(() => setInstalledVoiceModels(new Set()));
+  }, [refreshVoiceModels]);
 
   useEffect(() => {
     getMeetingSettings()
@@ -603,6 +704,38 @@ export default function MeetingsPage({ onNavigate }: Props) {
               }}
             />
           </Row>
+          <Row label="Separate speakers by voice" hint={VOICE_HINT}>
+            {meetingSettings.savedKey === "voice_separation" && (
+              <span className="kea-saved">Saved ✓</span>
+            )}
+            {voiceEnablePending && !voiceModelsReady && (
+              <button
+                type="button"
+                className="kea-btn"
+                onClick={() => void downloadVoiceModels()}
+                disabled={voiceDownloading || meetingSettings.busy}
+              >
+                {voiceDownloading ? "Downloading…" : "Download speaker models"}
+              </button>
+            )}
+            <Toggle
+              label="Separate speakers by voice"
+              checked={settings.voice_separation ?? false}
+              disabled={meetingSettings.busy}
+              onChange={toggleVoiceSeparation}
+            />
+          </Row>
+          {voiceEnablePending && !voiceModelsReady && (
+            <p className="kea-muted" role="status" style={{ margin: "0 0 12px", fontSize: "0.8125rem" }}>
+              Turning this on needs two speaker models, which are not installed yet.
+              {" "}Download them and voice separation turns on when they are ready.
+            </p>
+          )}
+          {voiceStatus && (
+            <p className="kea-muted" role="alert" style={{ margin: "0 0 12px", fontSize: "0.8125rem" }}>
+              {voiceStatus}
+            </p>
+          )}
           <Row
             label="Transcribe every"
             hint="How often live transcript segments appear. Applies from the next meeting."

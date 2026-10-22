@@ -9,7 +9,8 @@ export type MeetingSpeakerRow = {
   meeting_id: string;
   speaker_key: string;
   display_name: string;
-  source: "channel" | "user";
+  /** "inferred" is a name proposed from the transcript and not yet confirmed. */
+  source: "channel" | "user" | "inferred";
 };
 
 /**

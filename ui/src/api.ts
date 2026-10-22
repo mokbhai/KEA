@@ -901,6 +901,11 @@ export type MeetingSettings = {
   interim_every_minutes: number;
   /** Name a meeting after the calendar event it happened during. */
   calendar_titles: boolean;
+  /**
+   * Tell remote participants apart by voice. Needs both diarization models
+   * (`DIARIZATION_*_ID` in the backend registry) installed to take effect.
+   */
+  voice_separation: boolean;
 };
 
 export const getMeetingSettings = () =>
@@ -1211,8 +1216,12 @@ export type SystemVoice = {
  * `"streaming"` is a catalog, not a bindable engine: nothing resolves to it
  * and it has no `Binding`. It is here so the generic model commands —
  * list/installed/download/cancel/delete — serve it for free.
+ *
+ * `"diarization"` is the same kind of catalog: the speaker models that meeting
+ * voice separation runs on. Nothing binds to it either, so the Models page does
+ * not list it; the meetings page asks for it directly.
  */
-export type OnnxModelKindParam = "parakeet" | "streaming" | "tts";
+export type OnnxModelKindParam = "parakeet" | "streaming" | "tts" | "diarization";
 
 export const listTtsEngines = () => invoke<EngineInfo[]>("list_tts_engines");
 

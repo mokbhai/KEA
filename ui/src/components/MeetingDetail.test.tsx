@@ -125,6 +125,45 @@ describe("MeetingDetail", () => {
     expect(onRenameSpeaker).not.toHaveBeenCalled();
   });
 
+  // A name the transcript proposed is marked as such, and confirming it is the
+  // same write as renaming it to what it already says.
+  it("marks an inferred name and confirms it as the same name", async () => {
+    const onRenameSpeaker = vi.fn();
+    const inferred = detail({
+      speakers: [
+        { meeting_id: "m1", speaker_key: "local", display_name: "You", source: "channel" },
+        { meeting_id: "m1", speaker_key: "remote", display_name: "Priya", source: "inferred" },
+      ],
+    });
+    render(
+      <MeetingDetail
+        detail={inferred}
+        onDelete={() => {}}
+        onRenameSpeaker={onRenameSpeaker}
+      />,
+    );
+    expect(screen.getByText("inferred")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    expect(onRenameSpeaker).toHaveBeenCalledTimes(1);
+    expect(onRenameSpeaker).toHaveBeenCalledWith("remote", "Priya");
+  });
+
+  // Only a proposal needs confirming: a channel default or a name someone typed
+  // gets neither the badge nor the button.
+  it("offers no badge or confirm for a channel or user name", () => {
+    const userNamed = detail({
+      speakers: [
+        { meeting_id: "m1", speaker_key: "local", display_name: "You", source: "channel" },
+        { meeting_id: "m1", speaker_key: "remote", display_name: "Dan", source: "user" },
+      ],
+    });
+    render(
+      <MeetingDetail detail={userNamed} onDelete={() => {}} onRenameSpeaker={() => {}} />,
+    );
+    expect(screen.queryByText("inferred")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Confirm" })).toBeNull();
+  });
+
   // A meeting that recorded one source has one side; there is no second
   // speaker to invent, and nothing to rename it to.
   it("shows a single speaker for a mic-only meeting", () => {
