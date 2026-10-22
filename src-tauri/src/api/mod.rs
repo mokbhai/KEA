@@ -7,6 +7,7 @@
 //!
 //! - [`actions`] — the grammar, and the only parser for it.
 //! - [`auth`] — who may call, and the threat model, written down.
+//! - [`openai`] — the OpenAI wire shapes the model routes speak; pure.
 //! - [`ratelimit`] — a token bucket over the verbs that spend LLM credits.
 //! - [`server`] — the unix socket, the route table and the accept loop.
 //! - [`token`] — the bearer token, the socket path, the CLI shim's token file.
@@ -15,6 +16,7 @@
 pub mod actions;
 pub mod auth;
 pub mod exec;
+pub mod openai;
 pub mod ratelimit;
 pub mod server;
 pub mod settings;

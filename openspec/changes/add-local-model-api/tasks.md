@@ -8,10 +8,10 @@
 
 ## 2. OpenAI shapes (`src-tauri/src/api/openai.rs`, pure)
 
-- [ ] 2.1 Request types for transcriptions (form fields), speech, and chat (ignoring unknown fields), plus the error type with the status mapping (400/401/404/409/413/429/502); verify unit tests for each status and that error bodies never contain the token
-- [ ] 2.2 Model-name resolution (omitted/`default`/aliases/listed id/`model_not_found`) and the `<engine_id>/<model>` id format; verify unit tests including the wrong-capability case
-- [ ] 2.3 Response renderers: transcription `json`/`text`/`verbose_json`/`srt`/`vtt` (via `SubtitleFormat`, with optional `speaker`), the chat completion, and the single-chunk SSE stream; verify golden-string tests for each format
-- [ ] 2.4 Message flattening (system/user/assistant → role-tagged prompt) that refuses tool calls and non-text parts; verify unit tests
+- [x] 2.1 Request types for transcriptions (form fields), speech, and chat (ignoring unknown fields), plus the error type with the status mapping (400/401/404/409/413/429/502); verify unit tests for each status and that error bodies never contain the token
+- [x] 2.2 Model-name resolution (omitted/`default`/aliases/listed id/`model_not_found`) and the `<engine_id>/<model>` id format; verify unit tests including the wrong-capability case
+- [x] 2.3 Response renderers: transcription `json`/`text`/`verbose_json`/`srt`/`vtt` (via `SubtitleFormat`, with optional `speaker`), the chat completion, and the single-chunk SSE stream; verify golden-string tests for each format
+- [x] 2.4 Message flattening (system/user/assistant → role-tagged prompt) that refuses tool calls and non-text parts; verify unit tests
 
 ## 3. Model execution
 
