@@ -324,13 +324,26 @@ impl TcpHandle {
     }
 }
 
+/// What answers one request, for every transport.
+///
+/// Boxed so the handle does not carry the app runtime: production wraps
+/// [`handle`] over a [`Runtime`], and a test passes a stand-in, which is what
+/// lets the socket-and-port lifecycle be tested without an `AppState`.
+type Service = Arc<
+    dyn Fn(
+            Request<Incoming>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Response<Full<Bytes>>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// A running server. Dropping the handle does not stop it; [`Self::stop`]
 /// does, so turning the API off is an explicit act with a tidy-up.
 pub struct ServerHandle {
     shutdown: watch::Sender<bool>,
     /// `None` only in the non-unix build, which runs the TCP port alone.
     pub socket_path: Option<PathBuf>,
-    rt: Runtime,
+    service: Service,
     /// Behind an async lock because the port is bound and released while the
     /// settings page waits on it, and a std lock cannot be held across that.
     tcp: tokio::sync::Mutex<Option<TcpHandle>>,
@@ -405,8 +418,8 @@ impl ServerHandle {
                 return Err(e);
             }
         };
-        let rt = self.rt.clone();
-        let tcp = spawn_tcp_loop(listener, move |req| handle(rt.clone(), req))?;
+        let service = self.service.clone();
+        let tcp = spawn_tcp_loop(listener, move |req| service(req))?;
         let addr = tcp.addr;
         *slot = Some(tcp);
         Ok(Some(addr))
@@ -793,7 +806,7 @@ fn model_reply(reply: Reply) -> Response<Full<Bytes>> {
 /// it with the TCP port.
 #[cfg(unix)]
 fn start_socket(
-    rt: &Runtime,
+    service: &Service,
     shutdown: &watch::Sender<bool>,
     app_data_dir: &std::path::Path,
 ) -> Result<PathBuf, String> {
@@ -810,7 +823,7 @@ fn start_socket(
         .map_err(|e| format!("could not restrict {}: {e}", socket_path.display()))?;
 
     let mut stop_rx = shutdown.subscribe();
-    let rt = rt.clone();
+    let service = service.clone();
     let listen_path = socket_path.clone();
     tauri::async_runtime::spawn(async move {
         tracing::info!(path = %listen_path.display(), "local API listening");
@@ -827,11 +840,11 @@ fn start_socket(
                             continue;
                         }
                     };
-                    let rt = rt.clone();
+                    let service = service.clone();
                     tauri::async_runtime::spawn(async move {
                         let service = hyper::service::service_fn(move |req| {
-                            let rt = rt.clone();
-                            async move { Ok::<_, Infallible>(handle(rt, req).await) }
+                            let service = service.clone();
+                            async move { Ok::<_, Infallible>(service(req).await) }
                         });
                         if let Err(e) = hyper::server::conn::http1::Builder::new()
                             .serve_connection(TokioIo::new(stream), service)
@@ -879,10 +892,21 @@ pub async fn start(
             Instant::now(),
         ))),
     };
+    let service: Service = Arc::new(move |req| Box::pin(handle(rt.clone(), req)));
+    start_with_service(service, app_data_dir, tcp).await
+}
+
+/// The transport half of [`start`], over any service. See there for what a
+/// bind failure on each transport does.
+async fn start_with_service(
+    service: Service,
+    app_data_dir: &std::path::Path,
+    tcp: Option<LoopbackPort>,
+) -> Result<ServerHandle, String> {
     let (shutdown, _) = watch::channel(false);
 
     #[cfg(unix)]
-    let socket_path = Some(start_socket(&rt, &shutdown, app_data_dir)?);
+    let socket_path = Some(start_socket(&service, &shutdown, app_data_dir)?);
     // Without unix sockets the TCP port is the only transport, so a start
     // with no port would be an API that cannot be reached.
     #[cfg(not(unix))]
@@ -900,7 +924,7 @@ pub async fn start(
     let handle = ServerHandle {
         shutdown,
         socket_path,
-        rt,
+        service,
         tcp: tokio::sync::Mutex::new(None),
         tcp_error: std::sync::Mutex::new(None),
     };
@@ -1163,6 +1187,70 @@ mod tests {
         let err = bind_tcp(LoopbackPort::new(taken)).await.unwrap_err();
         assert!(err.contains(&taken.to_string()), "{err}");
         drop(first);
+    }
+
+    fn test_service() -> Service {
+        Arc::new(|req| Box::pin(tcp_test_service(req)))
+    }
+
+    const STATUS_REQUEST: &str = "GET /v1/status HTTP/1.1\r\nHost: localhost\r\n\
+        Authorization: Bearer 0123456789abcdef0123456789abcdef\r\nConnection: close\r\n\r\n";
+
+    /// Task 4.4's scenario, end to end over real listeners: the port asked
+    /// for is taken at start. The socket must come up and serve anyway, the
+    /// reason must be on the handle for the settings page, and freeing the
+    /// port must let a live retry open it without touching the socket.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_taken_port_at_start_leaves_the_socket_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let squatter = bind_tcp(LoopbackPort::new(0)).await.unwrap();
+        let port = squatter.local_addr().unwrap().port();
+
+        let handle = start_with_service(test_service(), dir.path(), Some(LoopbackPort::new(port)))
+            .await
+            .expect("a busy port must not fail the start");
+        let socket = handle.socket_path.clone().unwrap();
+        assert!(request(&socket, STATUS_REQUEST)
+            .await
+            .starts_with("HTTP/1.1 200"));
+        assert_eq!(handle.tcp_addr().await, None);
+        let reason = handle.tcp_error().expect("the reason is kept for the UI");
+        assert!(reason.contains(&port.to_string()), "{reason}");
+
+        drop(squatter);
+        let addr = handle
+            .set_tcp(Some(LoopbackPort::new(port)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle.tcp_error(), None);
+        assert!(tcp_exchange(addr, STATUS_REQUEST)
+            .await
+            .starts_with("HTTP/1.1 200"));
+        assert!(request(&socket, STATUS_REQUEST)
+            .await
+            .starts_with("HTTP/1.1 200"));
+
+        handle.stop().await;
+    }
+
+    /// The race the review found: a port switched on after the API stopped
+    /// must not bind a listener nobody will close.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stopped_server_refuses_to_open_the_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = start_with_service(test_service(), dir.path(), None)
+            .await
+            .unwrap();
+        handle.stop().await;
+        let err = handle
+            .set_tcp(Some(LoopbackPort::new(0)))
+            .await
+            .unwrap_err();
+        assert!(err.contains("stopped"), "{err}");
+        assert_eq!(handle.tcp_addr().await, None);
     }
 
     #[test]

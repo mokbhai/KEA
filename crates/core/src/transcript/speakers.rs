@@ -65,6 +65,9 @@ pub fn assign_speakers(segments: &[SttSegment], spans: &[SpeakerSpan]) -> Vec<Sp
 ///
 /// First-appearance rather than numeric order, because that is the order a
 /// reader meets them in and therefore the order a legend should list them.
+/// The *names* follow that order too: the diarizer's index is arbitrary, and
+/// naming by it opened transcripts on "Speaker 2". The keys keep the index, so
+/// a stored assignment and its legend still join.
 pub fn speaker_legend(spans: &[SpeakerSpan]) -> Vec<(String, String)> {
     let mut seen: Vec<u32> = Vec::new();
     for span in spans {
@@ -73,7 +76,8 @@ pub fn speaker_legend(spans: &[SpeakerSpan]) -> Vec<(String, String)> {
         }
     }
     seen.into_iter()
-        .map(|index| (speaker_key(index), speaker_display_name(index)))
+        .enumerate()
+        .map(|(position, index)| (speaker_key(index), speaker_display_name(position as u32)))
         .collect()
 }
 
@@ -140,8 +144,10 @@ mod tests {
         assert_eq!(
             speaker_legend(&spans),
             vec![
-                ("spk2".to_string(), "Speaker 3".to_string()),
-                ("spk0".to_string(), "Speaker 1".to_string()),
+                // Named in the order heard, so the first voice is "Speaker 1"
+                // whatever index the diarizer gave it.
+                ("spk2".to_string(), "Speaker 1".to_string()),
+                ("spk0".to_string(), "Speaker 2".to_string()),
             ]
         );
         assert!(speaker_legend(&[]).is_empty());
