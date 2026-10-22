@@ -1,11 +1,22 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Meeting } from "../../api";
+import { invokeCalls, onInvoke, resetTauriMocks } from "../../test-utils/tauri";
 import { meetingDetail, meetingNotes } from "../../test-utils/meetingFixtures";
 import type { TranscriptSegment } from "../TranscriptPanel";
 import MeetingPane, { type MeetingPaneHandle, type MeetingPaneProps } from "./MeetingPane";
+
+// The Ask AI tab loads its chat over IPC, so the pane tests route commands too.
+vi.mock("@tauri-apps/api/core", async () => (await import("../../test-utils/tauri")).coreModule);
+vi.mock("@tauri-apps/api/event", async () => (await import("../../test-utils/tauri")).eventModule);
+
+beforeEach(() => {
+  resetTauriMocks();
+  // Any test that opens the Ask AI tab gets an empty saved chat unless it says otherwise.
+  onInvoke({ get_meeting_chat: () => [] });
+});
 
 const liveMeeting: Meeting = {
   id: "m-live",
@@ -93,13 +104,58 @@ describe("MeetingPane tabs", () => {
     expect(tab("Ask AI").tabIndex).toBe(-1);
   });
 
-  // The next change replaces this tab's body. Until then it must not offer
-  // anything that looks usable.
-  it("shows the Ask AI placeholder with nothing interactive", async () => {
+  // The Ask AI tab loads the meeting's saved chat the first time it opens.
+  it("opens the Ask AI tab, loading the saved chat for this meeting", async () => {
+    onInvoke({ get_meeting_chat: () => [] });
     renderPane();
     await userEvent.click(tab("Ask AI"));
-    expect(screen.getByText("Ask questions about this meeting.")).toBeTruthy();
-    expect(screen.getByRole("tabpanel").querySelectorAll("button, input, textarea")).toHaveLength(0);
+    expect(await screen.findByLabelText("Ask about this meeting")).toBeTruthy();
+    expect(invokeCalls("get_meeting_chat")).toEqual([{ meetingId: "m1" }]);
+  });
+
+  it("keeps a half-typed question when the reader visits the transcript and comes back", async () => {
+    onInvoke({ get_meeting_chat: () => [] });
+    renderPane();
+    await userEvent.click(tab("Ask AI"));
+    const input = await screen.findByLabelText("Ask about this meeting");
+    await userEvent.type(input, "what did Priya say");
+
+    await userEvent.click(tab("Transcript"));
+    await userEvent.click(tab("Ask AI"));
+
+    expect((screen.getByLabelText("Ask about this meeting") as HTMLTextAreaElement).value).toBe(
+      "what did Priya say",
+    );
+  });
+
+  // A citation is a button in the chat. Clicking it must land on the transcript
+  // line covering that time, and a time past the end must stay plain text.
+  it("follows a citation to its transcript line through the pane", async () => {
+    onInvoke({
+      get_meeting_chat: () => [
+        {
+          id: 2,
+          role: "assistant",
+          content: "Priya covered it at [00:07]. It came back at [45:00].",
+          proposal: null,
+          created_at: "2026-09-19T10:20:00Z",
+        },
+      ],
+    });
+    renderPane();
+    await userEvent.click(tab("Ask AI"));
+
+    await userEvent.click(await screen.findByRole("button", { name: "[00:07]" }));
+
+    expect(tab("Transcript").getAttribute("aria-selected")).toBe("true");
+    await waitFor(() =>
+      expect(screen.getByText("yes go ahead").closest("li")?.getAttribute("data-highlighted")).toBe(
+        "true",
+      ),
+    );
+    expect(screen.getByText("shall we start").closest("li")?.getAttribute("data-highlighted")).toBeNull();
+    expect(screen.queryByRole("button", { name: "[45:00]" })).toBeNull();
+    expect(screen.getByText("[45:00]").tagName).toBe("SPAN");
   });
 
   // --- per-tab scroll memory ---

@@ -336,6 +336,22 @@ export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMe
     }
   }, []);
 
+  // Read by applyDetail, which can be called after the selection has moved on.
+  const selectedIdRef = useRef<string | null>(null);
+  selectedIdRef.current = selectedId;
+
+  /**
+   * Takes a fresh detail that a notes write returned (apply, edit, undo). It
+   * goes through the same request counter as loadDetail, so a read still in
+   * flight for this meeting cannot land after it and put back older notes, and
+   * a reply for a meeting the user has left is dropped.
+   */
+  const applyDetail = useCallback((next: MeetingDetail) => {
+    if (next.meeting.id !== selectedIdRef.current) return;
+    detailRequest.current++;
+    setDetail(next);
+  }, []);
+
   useEffect(() => {
     void refreshList();
   }, [refreshList]);
@@ -363,6 +379,12 @@ export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMe
   const listRows = pinnedRow ? meetings.filter((m) => m.id !== pinnedRow.id) : meetings;
   const live = recording && activeMeetingId !== null && selectedId === activeMeetingId;
   const generating = processing && activeMeetingId !== null && selectedId === activeMeetingId;
+
+  // Whether the Ask AI tab can send: the notes-writing LLM is bound and usable.
+  // null while the first status check is still running.
+  const llmStatus = ai.statuses?.find((s) => s.spec.slot === "llm") ?? null;
+  const aiReady: boolean | null = ai.statuses === null ? null : !llmStatus?.blocked;
+  const aiBlockedReason = llmStatus?.blocked?.message ?? null;
 
   // The header reads the list row, or the fetched meeting itself when the list
   // has not caught up with a meeting that just stopped.
@@ -920,6 +942,10 @@ export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMe
                 onCopyMarkdown={onCopyMarkdown}
                 onSaveMarkdown={onSaveMarkdown}
                 onExportNotion={notionReady ? onExportNotion : undefined}
+                aiReady={aiReady}
+                aiBlockedReason={aiBlockedReason}
+                onOpenModels={onNavigate ? () => onNavigate("models") : undefined}
+                onNotesChanged={applyDetail}
               />
             ) : !hasAnyMeeting ? (
               <div>

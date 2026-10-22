@@ -30,10 +30,10 @@
 
 ## 5. Ask AI and editing UI
 
-- [ ] 5.1 `AskAiTab`: history load, send with a pending bubble and Send disabled, plain-text rendering, a truncated-transcript notice, a no-LLM-bound state, Clear chat, and quick prompts (Translate asks for a language); verify component tests for each
-- [ ] 5.2 Citations: parse `[mm:ss]`, link in-range times, `jumpTo` switches to Transcript, scrolls and highlights the containing segment; verify a test with a fake transcript that a click lands on the right segment and that an out-of-range time is text
-- [ ] 5.3 Proposal card: before/after per changed section, Apply and Discard, the state shown in history, Apply disabled once applied; verify tests that the notes change only on Apply and that a double click applies once
-- [ ] 5.4 Direct section edit (Edit → textarea → Save/Cancel), the edited badge, and Undo on the Summary tab; all hidden with an explanation while recording; verify tests for edit→undo and for the hidden state during recording
+- [x] 5.1 `AskAiTab`: history load, send with a pending bubble and Send disabled, plain-text rendering, a truncated-transcript notice, a no-LLM-bound state, Clear chat, and quick prompts (Translate asks for a language); verify component tests for each
+- [x] 5.2 Citations: parse `[mm:ss]`, link in-range times, `jumpTo` switches to Transcript, scrolls and highlights the containing segment; verify a test with a fake transcript that a click lands on the right segment and that an out-of-range time is text
+- [x] 5.3 Proposal card: before/after per changed section, Apply and Discard, the state shown in history, Apply disabled once applied; verify tests that the notes change only on Apply and that a double click applies once
+- [x] 5.4 Direct section edit (Edit → textarea → Save/Cancel), the edited badge, and Undo on the Summary tab; all hidden with an explanation while recording; verify tests for edit→undo and for the hidden state during recording
 
 ## 6. Verification
 

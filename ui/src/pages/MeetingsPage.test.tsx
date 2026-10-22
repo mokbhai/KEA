@@ -985,3 +985,75 @@ describe("MeetingsPage workspace", () => {
     expect(invokeCalls("stop_meeting")).toHaveLength(0);
   });
 });
+
+describe("MeetingsPage notes changes", () => {
+  beforeEach(() => resetTauriMocks());
+
+  // Apply on the Ask AI tab returns the fresh detail, which the page must hand
+  // to the pane so the Summary shows the new notes without a reload.
+  it("shows an applied proposal on the Summary tab, passed up through the page", async () => {
+    const generatedNotes = {
+      meeting_id: "new",
+      summary: "The launch slips a week.",
+      decisions: "",
+      action_items: "",
+      follow_ups: "",
+      open_questions: "",
+      prompt_version: "meeting-notes-v3",
+      engine_id: "openai",
+      model: "gpt-4o-mini",
+      edited: false,
+    };
+    let detail = {
+      meeting: newer,
+      segments: [],
+      notes: generatedNotes,
+      speakers: [],
+      action_items: [],
+      can_undo: false,
+    };
+    const proposalState = { state: "pending" as "pending" | "applied" };
+    const chat = () => [
+      {
+        id: 2,
+        role: "assistant",
+        content: "Here is a shorter summary.",
+        created_at: "2026-07-17T10:31:00Z",
+        proposal: {
+          proposal: { ...generatedNotes, summary: "Launch slips a week." },
+          state: proposalState.state,
+          changed: ["summary"],
+        },
+      },
+    ];
+    mockWorld({
+      bindings: readyBindings,
+      extra: {
+        list_meetings: () => [newer],
+        get_meeting: () => detail,
+        get_meeting_chat: chat,
+        apply_notes_proposal: () => {
+          proposalState.state = "applied";
+          detail = {
+            ...detail,
+            notes: { ...generatedNotes, summary: "Launch slips a week.", edited: true },
+            can_undo: true,
+          };
+          return detail;
+        },
+      },
+    });
+    render(<MeetingsPage />);
+    await waitFor(() => expect(titleValue()).toBe("Newest sync"));
+
+    await userEvent.click(screen.getByRole("tab", { name: "Ask AI" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Apply" }));
+    expect(await screen.findByText("Applied to the notes.")).toBeTruthy();
+    expect(invokeCalls("apply_notes_proposal")).toEqual([{ meetingId: "new", messageId: 2 }]);
+
+    await userEvent.click(screen.getByRole("tab", { name: "Summary" }));
+    expect(await screen.findByText("Launch slips a week.")).toBeTruthy();
+    expect(screen.queryByText("The launch slips a week.")).toBeNull();
+    expect(screen.getByText("edited")).toBeTruthy();
+  });
+});

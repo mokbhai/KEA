@@ -1,7 +1,16 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
-import type { MeetingNotes } from "../../api";
+import { useState } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { MeetingDetail as MeetingDetailData, MeetingNotes } from "../../api";
+import { invokeCalls, onInvoke, resetTauriMocks } from "../../test-utils/tauri";
+
+vi.mock("@tauri-apps/api/core", async () => (await import("../../test-utils/tauri")).coreModule);
+vi.mock("@tauri-apps/api/event", async () => (await import("../../test-utils/tauri")).eventModule);
+
+beforeEach(() => {
+  resetTauriMocks();
+});
 import { meetingActionItems, meetingDetail, meetingNotes } from "../../test-utils/meetingFixtures";
 import SummaryTab, { type SummaryTabProps } from "./SummaryTab";
 
@@ -280,5 +289,128 @@ describe("SummaryTab", () => {
     expect(screen.queryByRole("button", { name: "Copy Markdown" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Delete meeting" })).toBeNull();
     expect(screen.getByText("Notes appear here as the meeting runs.")).toBeTruthy();
+  });
+
+  // --- direct editing (task 5.4) ---
+
+  /**
+   * The page's wiring in miniature: the tab's detail lives in state, and
+   * onNotesChanged replaces it, as MeetingsPage does with applyDetail.
+   */
+  function EditHarness({ start, live = false }: { start: MeetingDetailData; live?: boolean }) {
+    const [detail, setDetail] = useState<MeetingDetailData>(start);
+    return (
+      <SummaryTab
+        detail={live ? null : detail}
+        live={live}
+        liveNotes={null}
+        generating={false}
+        onNotesChanged={setDetail}
+      />
+    );
+  }
+
+  /** A stored notes row the backend would keep: edits add a version, undo pops it. */
+  function storeWithUndo(initial: MeetingDetailData) {
+    let stored = initial;
+    const history: MeetingNotes[] = [];
+    onInvoke({
+      edit_notes_section: (args) => {
+        const { section, text } = args as { section: keyof MeetingNotes; text: string };
+        history.push({ ...stored.notes! });
+        stored = {
+          ...stored,
+          notes: { ...stored.notes!, [section]: text, edited: true },
+          can_undo: true,
+        };
+        return stored;
+      },
+      undo_notes_edit: () => {
+        const previous = history.pop();
+        stored = {
+          ...stored,
+          notes: previous ?? { ...stored.notes!, edited: false },
+          can_undo: history.length > 0,
+        };
+        return stored;
+      },
+    });
+  }
+
+  it("edits a section, saves it through the backend, and undoes it back to the generated text", async () => {
+    storeWithUndo(meetingDetail({ notes: meetingNotes }));
+    render(<EditHarness start={meetingDetail({ notes: meetingNotes })} />);
+
+    // Decisions is empty in the fixture but still editable.
+    await userEvent.click(screen.getByRole("button", { name: "Edit decisions" }));
+    const box = screen.getByLabelText("Decisions text");
+    await userEvent.type(box, "Ship on Friday");
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(invokeCalls("edit_notes_section")).toHaveLength(1));
+    expect(invokeCalls("edit_notes_section")[0]).toEqual({
+      meetingId: "m1",
+      section: "decisions",
+      text: "Ship on Friday",
+    });
+    expect(await screen.findByText("Ship on Friday")).toBeTruthy();
+    expect(screen.getByText("edited")).toBeTruthy();
+    expect(screen.queryByLabelText("Decisions text")).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "Undo" }));
+
+    await waitFor(() => expect(screen.queryByText("Ship on Friday")).toBeNull());
+    expect(screen.getByRole("button", { name: "Edit decisions" })).toBeTruthy();
+    expect(screen.queryByText("edited")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+    expect(invokeCalls("undo_notes_edit")).toEqual([{ meetingId: "m1" }]);
+  });
+
+  it("cancel restores the section without saving anything", async () => {
+    storeWithUndo(meetingDetail({ notes: meetingNotes }));
+    render(<EditHarness start={meetingDetail({ notes: meetingNotes })} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit summary" }));
+    const box = screen.getByLabelText("Summary text") as HTMLTextAreaElement;
+    await userEvent.type(box, " Really.");
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(invokeCalls("edit_notes_section")).toHaveLength(0);
+    expect(screen.getByText("The launch slips a week.")).toBeTruthy();
+    expect(screen.queryByLabelText("Summary text")).toBeNull();
+  });
+
+  it("does not save an edit that changed nothing, so the undo stack gets no empty step", async () => {
+    storeWithUndo(meetingDetail({ notes: meetingNotes }));
+    render(<EditHarness start={meetingDetail({ notes: meetingNotes })} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit summary" }));
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(invokeCalls("edit_notes_section")).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+  });
+
+  it("offers no Edit or Undo while the meeting records, and says why", () => {
+    render(
+      <EditHarness
+        start={meetingDetail({ notes: meetingNotes, can_undo: true })}
+        live
+      />,
+    );
+    expect(screen.queryByRole("button", { name: /^Edit / })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+    expect(screen.getByText("Editing is available when the meeting ends.")).toBeTruthy();
+  });
+
+  it("offers no Edit while the meeting is recording even when it has notes", () => {
+    renderSummary({
+      detail: null,
+      live: true,
+      liveNotes: meetingNotes,
+      onNotesChanged: vi.fn(),
+    });
+    expect(screen.queryByRole("button", { name: /^Edit / })).toBeNull();
+    expect(screen.getByText("Editing is available when the meeting ends.")).toBeTruthy();
   });
 });

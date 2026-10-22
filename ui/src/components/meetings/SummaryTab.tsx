@@ -1,10 +1,14 @@
 import { useState } from "react";
-import type {
-  ActionItemStatus,
-  MeetingActionItem,
-  MeetingDetail as MeetingDetailData,
-  MeetingNotes,
+import {
+  editNotesSection,
+  undoNotesEdit,
+  type ActionItemStatus,
+  type MeetingActionItem,
+  type MeetingDetail as MeetingDetailData,
+  type MeetingNotes,
+  type NotesSection as NotesSectionKey,
 } from "../../api";
+import { toMessage } from "../../lib/format";
 import type { MeetingSpeakerRow } from "../TranscriptPanel";
 
 /**
@@ -47,14 +51,93 @@ export type SummaryTabProps = {
   onExportNotion?: () => void | Promise<void>;
   /** Delete the meeting. Omitted while it records, which cannot be deleted. */
   onDelete?: (id: string) => void;
+  /**
+   * An edit, or an undo, returned the fresh detail. Its presence is what offers
+   * Edit and Undo on a finished meeting.
+   */
+  onNotesChanged?: (detail: MeetingDetailData) => void;
 };
 
-function NotesSection({ label, content }: { label: string; content: string }) {
-  if (!content.trim()) return null;
+/** What a prose section needs to offer and run an edit. */
+type SectionEdit = {
+  section: NotesSectionKey;
+  editing: boolean;
+  draft: string;
+  busy: boolean;
+  onStart: (section: NotesSectionKey) => void;
+  onDraftChange: (value: string) => void;
+  onSave: () => void;
+  onCancel: () => void;
+};
+
+/**
+ * One prose section of the notes. Without `edit` it is the read-only text it
+ * always was, hidden when empty; with it, an Edit button is offered and the
+ * section stays visible when empty so there is something to edit.
+ */
+function NotesSection({
+  label,
+  content,
+  edit,
+}: {
+  label: string;
+  content: string;
+  edit?: SectionEdit;
+}) {
+  if (edit?.editing) {
+    return (
+      <section style={{ marginBottom: 16 }}>
+        <h4 style={{ margin: "0 0 6px", fontSize: 14 }}>{label}</h4>
+        <textarea
+          className="kea-input"
+          aria-label={`${label} text`}
+          value={edit.draft}
+          rows={4}
+          disabled={edit.busy}
+          onChange={(e) => edit.onDraftChange(e.target.value)}
+          style={{ width: "100%", resize: "vertical" }}
+        />
+        <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+          <button
+            type="button"
+            className="kea-btn kea-btn--primary"
+            onClick={edit.onSave}
+            disabled={edit.busy}
+          >
+            Save
+          </button>
+          <button type="button" className="kea-btn" onClick={edit.onCancel} disabled={edit.busy}>
+            Cancel
+          </button>
+        </div>
+      </section>
+    );
+  }
+  if (!content.trim() && !edit) return null;
   return (
     <section style={{ marginBottom: 16 }}>
-      <h4 style={{ margin: "0 0 6px", fontSize: 14 }}>{label}</h4>
-      <p style={{ margin: 0, whiteSpace: "pre-wrap", color: "var(--text)" }}>{content}</p>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "0 0 6px" }}>
+        <h4 style={{ margin: 0, fontSize: 14 }}>{label}</h4>
+        {edit && (
+          <button
+            type="button"
+            className="kea-btn"
+            aria-label={`Edit ${label.toLowerCase()}`}
+            disabled={edit.busy}
+            onClick={() => edit.onStart(edit.section)}
+            style={{ fontSize: 12, padding: "2px 8px" }}
+          >
+            Edit
+          </button>
+        )}
+      </div>
+      {content.trim() ? (
+        <p style={{ margin: 0, whiteSpace: "pre-wrap", color: "var(--text)" }}>{content}</p>
+      ) : (
+        <p className="kea-muted" style={{ margin: 0, fontSize: 13 }}>
+          Nothing written.
+        </p>
+      )}
     </section>
   );
 }
@@ -368,8 +451,25 @@ export default function SummaryTab({
   onSaveMarkdown,
   onExportNotion,
   onDelete,
+  onNotesChanged,
 }: SummaryTabProps) {
-  if (live) return <LiveNotes notes={liveNotes} interimNotes={interimNotes} />;
+  const [editing, setEditing] = useState<NotesSectionKey | null>(null);
+  const [draft, setDraft] = useState("");
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+
+  if (live) {
+    return (
+      <div>
+        <LiveNotes notes={liveNotes} interimNotes={interimNotes} />
+        {onNotesChanged && (
+          <p className="kea-muted" style={{ margin: "0 0 16px", fontSize: 13 }}>
+            Editing is available when the meeting ends.
+          </p>
+        )}
+      </div>
+    );
+  }
   if (!detail) {
     // Stopped, and the stored meeting has not been read back yet.
     return generating ? (
@@ -382,6 +482,68 @@ export default function SummaryTab({
   const { meeting, notes, speakers, action_items: actionItems } = detail;
   const canExport = Boolean(onCopyMarkdown || onSaveMarkdown || onExportNotion);
   const hasNotes = Boolean(notes) || actionItems.length > 0;
+  const canEdit = Boolean(onNotesChanged) && Boolean(notes);
+  const editBusyNow = busy || editBusy;
+
+  const startEdit = (section: NotesSectionKey) => {
+    setDraft(notes?.[section] ?? "");
+    setEditError(null);
+    setEditing(section);
+  };
+
+  const cancelEdit = () => {
+    setEditing(null);
+    setEditError(null);
+  };
+
+  // A save that changes nothing is not a version: it would fill the undo stack
+  // with a no-op, so it just closes the editor.
+  const saveEdit = async () => {
+    if (!editing) return;
+    if (draft === (notes?.[editing] ?? "")) {
+      cancelEdit();
+      return;
+    }
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      const next = await editNotesSection(meeting.id, editing, draft);
+      setEditing(null);
+      onNotesChanged?.(next);
+    } catch (e) {
+      setEditError(toMessage(e));
+    } finally {
+      setEditBusy(false);
+    }
+  };
+
+  const undoEdit = async () => {
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      const next = await undoNotesEdit(meeting.id);
+      setEditing(null);
+      onNotesChanged?.(next);
+    } catch (e) {
+      setEditError(toMessage(e));
+    } finally {
+      setEditBusy(false);
+    }
+  };
+
+  const sectionEdit = (section: NotesSectionKey): SectionEdit | undefined =>
+    canEdit
+      ? {
+          section,
+          editing: editing === section,
+          draft,
+          busy: editBusyNow,
+          onStart: startEdit,
+          onDraftChange: setDraft,
+          onSave: () => void saveEdit(),
+          onCancel: cancelEdit,
+        }
+      : undefined;
 
   return (
     <div>
@@ -412,9 +574,30 @@ export default function SummaryTab({
                 edited
               </span>
             )}
+            {canEdit && detail.can_undo && (
+              <button
+                type="button"
+                className="kea-btn"
+                title="Restore the notes as they were before the last change."
+                disabled={editBusyNow}
+                onClick={() => void undoEdit()}
+                style={{ fontSize: 12, padding: "2px 8px", fontWeight: 400 }}
+              >
+                Undo
+              </button>
+            )}
           </h3>
-          <NotesSection label="Summary" content={notes?.summary ?? ""} />
-          <NotesSection label="Decisions" content={notes?.decisions ?? ""} />
+          {editError && (
+            <p role="alert" style={{ margin: "0 0 12px", fontSize: 13, color: "var(--danger)" }}>
+              {editError}
+            </p>
+          )}
+          <NotesSection label="Summary" content={notes?.summary ?? ""} edit={sectionEdit("summary")} />
+          <NotesSection
+            label="Decisions"
+            content={notes?.decisions ?? ""}
+            edit={sectionEdit("decisions")}
+          />
           <ActionItems
             items={actionItems}
             prose={notes?.action_items ?? ""}
@@ -422,8 +605,16 @@ export default function SummaryTab({
             onAdd={onAddActionItem}
             busy={busy}
           />
-          <NotesSection label="Follow-ups" content={notes?.follow_ups ?? ""} />
-          <NotesSection label="Open questions" content={notes?.open_questions ?? ""} />
+          <NotesSection
+            label="Follow-ups"
+            content={notes?.follow_ups ?? ""}
+            edit={sectionEdit("follow_ups")}
+          />
+          <NotesSection
+            label="Open questions"
+            content={notes?.open_questions ?? ""}
+            edit={sectionEdit("open_questions")}
+          />
         </section>
       ) : (
         !generating && (

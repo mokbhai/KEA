@@ -126,3 +126,31 @@ Ticked items were moved by task 4.2 into `ui/src/components/meetings/MeetingSett
 - [x] "Transcript" section: speaker-labelled segments, or "No segments recorded for this meeting."
 - [x] Export group: "Copy Markdown", "Save as Markdown", "Send to Notion" (each shown only when wired)
 - [x] "Delete meeting" button, kept apart from export on purpose
+
+## Added by tasks 5.1–5.4 (new, ticked)
+
+Ask AI tab (`AskAiTab.tsx`):
+- [x] Saved chat loaded per meeting; a reply for a meeting the user has left is dropped
+- [x] Message list: user right, assistant left, plain text with line breaks
+- [x] Pending bubble ("Thinking…") and Send disabled while a reply is written
+- [x] Enter sends, Shift+Enter is a new line
+- [x] Typed text kept when a send fails, with the error shown inline
+- [x] Truncated-transcript notice after a reply that was cut at the cap
+- [x] No-LLM state: explanation and "Open Models" button, no input
+- [x] Clear chat, behind an inline confirmation
+- [x] Quick prompts: Shorter, Email-ready, Only decisions, Translate (asks for a language first)
+- [x] "Editing is available when the meeting ends." under the input while recording
+- [x] Citations `[mm:ss]`: in-range times are buttons that jump to the transcript line; later times stay text
+- [x] Proposal card: before and after per changed section, with Apply and Discard
+- [x] Apply and Discard disabled while in flight; a double click applies once
+- [x] Applied and discarded proposals shown as a label, with no buttons; none while recording
+
+Summary tab direct editing (`SummaryTab.tsx`):
+- [x] Edit per prose section (summary, decisions, follow-ups, open questions), with Save and Cancel
+- [x] Save with no change does not write a version
+- [x] "edited" badge follows the saved notes
+- [x] Undo, shown when the detail reports `can_undo`
+- [x] No Edit or Undo while recording, with the explanation instead
+
+Page wiring (`MeetingsPage.tsx`):
+- [x] Fresh details from apply, edit and undo go through the page's request guard

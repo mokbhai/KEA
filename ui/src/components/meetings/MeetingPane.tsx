@@ -61,7 +61,27 @@ export type MeetingPaneProps = {
   onCopyMarkdown?: () => void | Promise<void>;
   onSaveMarkdown?: () => void | Promise<void>;
   onExportNotion?: () => void | Promise<void>;
+  /** Whether an LLM is bound for meetings. null while the check runs. */
+  aiReady?: boolean | null;
+  /** Why the LLM is not ready, shown on the Ask AI tab. */
+  aiBlockedReason?: string | null;
+  /** Opens the Models page from the Ask AI tab. */
+  onOpenModels?: () => void;
+  /** An applied proposal, a hand edit or an undo returned the fresh detail. */
+  onNotesChanged?: (detail: MeetingDetailData) => void;
 };
+
+/**
+ * How far into the meeting a citation may point: the longer of the wall-clock
+ * span (once it has ended) and the last line spoken. A recording meeting has
+ * no end yet, so only its spoken lines count.
+ */
+function meetingDurationMs(meeting: Meeting, segments: TranscriptSegment[]): number {
+  const spoken = segments.reduce((max, seg) => Math.max(max, seg.end_offset_ms), 0);
+  if (!meeting.ended_at) return spoken;
+  const wall = Date.parse(meeting.ended_at) - Date.parse(meeting.started_at);
+  return Number.isFinite(wall) ? Math.max(wall, spoken) : spoken;
+}
 
 /**
  * The meeting title, with where it came from and a way to fix it.
@@ -155,10 +175,18 @@ const MeetingPane = forwardRef<MeetingPaneHandle, MeetingPaneProps>(function Mee
     onCopyMarkdown,
     onSaveMarkdown,
     onExportNotion,
+    aiReady = true,
+    aiBlockedReason,
+    onOpenModels,
+    onNotesChanged,
   },
   ref,
 ) {
   const [tab, setTab] = useState<PaneTab>("summary");
+  // The Ask AI tab mounts on first open and then stays mounted (hidden when
+  // another tab shows), so a draft or a reply in progress survives a trip to
+  // the transcript for a citation.
+  const [askMounted, setAskMounted] = useState(false);
   const tabRef = useRef<PaneTab>("summary");
   const tabButtons = useRef<Partial<Record<PaneTab, HTMLButtonElement | null>>>({});
   const bodyRef = useRef<HTMLDivElement>(null);
@@ -195,19 +223,27 @@ const MeetingPane = forwardRef<MeetingPaneHandle, MeetingPaneProps>(function Mee
     transcriptRef.current?.jumpTo(ms);
   }, [tab]);
 
+  // Switches to the Transcript tab and lands on the line covering `ms`. Used by
+  // the page's handle and by the Ask AI citations; touches refs and state only.
+  const jumpTo = (ms: number) => {
+    if (tabRef.current === "transcript") {
+      transcriptRef.current?.jumpTo(ms);
+    } else {
+      pendingJump.current = ms;
+      selectTab("transcript");
+    }
+  };
+
+  useEffect(() => {
+    if (tab === "ask") setAskMounted(true);
+  }, [tab]);
+
   useImperativeHandle(
     ref,
     () => ({
-      jumpTo: (ms: number) => {
-        if (tabRef.current === "transcript") {
-          transcriptRef.current?.jumpTo(ms);
-        } else {
-          pendingJump.current = ms;
-          selectTab("transcript");
-        }
-      },
+      jumpTo,
     }),
-    // selectTab only touches refs and setState, so the handle never goes stale.
+    // jumpTo only touches refs and setState, so the handle never goes stale.
     [],
   );
 
@@ -249,6 +285,7 @@ const MeetingPane = forwardRef<MeetingPaneHandle, MeetingPaneProps>(function Mee
           onSaveMarkdown={onSaveMarkdown}
           onExportNotion={onExportNotion}
           onDelete={live ? undefined : onDelete}
+          onNotesChanged={live ? undefined : onNotesChanged}
         />
       );
     }
@@ -268,8 +305,25 @@ const MeetingPane = forwardRef<MeetingPaneHandle, MeetingPaneProps>(function Mee
         />
       );
     }
-    return <AskAiTab meetingId={meeting.id} recording={live} />;
+    return null;
   };
+
+  // Rendered outside renderTab so it can stay mounted while hidden.
+  const askTab = askMounted ? (
+    <div hidden={tab !== "ask"}>
+      <AskAiTab
+        meetingId={meeting.id}
+        recording={live}
+        durationMs={meetingDurationMs(meeting, transcriptSegments)}
+        notes={current?.notes ?? null}
+        onJumpTo={jumpTo}
+        onNotesChanged={live ? undefined : onNotesChanged}
+        aiReady={aiReady}
+        aiBlockedReason={aiBlockedReason}
+        onOpenModels={onOpenModels}
+      />
+    </div>
+  ) : null;
 
   const started = meeting.started_at;
   const ended = meeting.ended_at;
@@ -341,6 +395,7 @@ const MeetingPane = forwardRef<MeetingPaneHandle, MeetingPaneProps>(function Mee
         onScroll={onBodyScroll}
       >
         {renderTab()}
+        {askTab}
       </div>
     </div>
   );
