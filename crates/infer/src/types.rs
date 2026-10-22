@@ -255,6 +255,22 @@ const NON_SPEECH_WORDS: &[&str] = &[
 /// parentheses (`(silence)`, `[ Music ]`). Anything else in brackets is left
 /// alone: "(see page 4)" is speech.
 pub fn strip_non_speech(text: &str) -> String {
+    // A segment that is nothing but one wrapped phrase — "*Sounds of the
+    // wind*", "(wind blowing)", "[keyboard clicking]" — is whisper describing
+    // the room, not anyone speaking: real speech is practically never a whole
+    // segment in brackets. Seen live: the assistant answered "*Sounds of the
+    // wind*" as if it were a question.
+    let whole = text.trim();
+    for (open, close) in [('*', '*'), ('(', ')'), ('[', ']')] {
+        if whole.len() > 2
+            && whole.starts_with(open)
+            && whole.ends_with(close)
+            && !whole[1..whole.len() - 1].contains([open, close])
+        {
+            return String::new();
+        }
+    }
+
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find(['[', '(']) {
@@ -509,6 +525,10 @@ mod non_speech_tests {
             "Thanks everyone"
         );
         assert_eq!(strip_non_speech("[ Applause ]"), "");
+        // A whole segment that only describes the room.
+        assert_eq!(strip_non_speech(" *Sounds of the wind*"), "");
+        assert_eq!(strip_non_speech("(wind blowing)"), "");
+        assert_eq!(strip_non_speech("[keyboard clicking]"), "");
     }
 
     /// Brackets that are speech stay: only annotations go.
@@ -524,5 +544,10 @@ mod non_speech_tests {
         );
         assert_eq!(strip_non_speech("an unclosed [note"), "an unclosed [note");
         assert_eq!(strip_non_speech("ship the API (v2)"), "ship the API (v2)");
+        // Emphasis inside speech is speech.
+        assert_eq!(
+            strip_non_speech("that was *really* good"),
+            "that was *really* good"
+        );
     }
 }
