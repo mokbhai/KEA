@@ -54,7 +54,7 @@ use kea_features::tts::run_tts_with_player;
 use kea_features::ProfileOverrides;
 use kea_features::{
     drain_and_stop_meeting, run_meeting_poll_segment, run_meeting_start, ActionGuard,
-    ActiveMeeting, AssistantFeature, CapKind, ContentStorageOpts, DictationFeature,
+    ActiveMeeting, ApiFeature, AssistantFeature, CapKind, ContentStorageOpts, DictationFeature,
     FeatureRegistry, MeetingFeature, MeetingRunContext, RewriteFeature, TranscribeFeature,
     TtsFeature, ASSISTANT_COMMAND_ID, ASSISTANT_FEATURE_ID,
 };
@@ -387,6 +387,9 @@ pub fn feature_registry() -> &'static FeatureRegistry {
         reg.register(Arc::new(TtsFeature));
         reg.register(Arc::new(TranscribeFeature));
         reg.register(Arc::new(AssistantFeature));
+        // Declares the stt/tts/llm slots the local model API resolves under,
+        // so the Models page can offer an "API" row and the user can bind it.
+        reg.register(Arc::new(ApiFeature));
         reg
     })
 }
@@ -7821,6 +7824,16 @@ mod tests {
             None,
             "a mode with no parameter must not inherit another mode's"
         );
+    }
+
+    #[test]
+    fn the_api_is_registered_as_a_feature_with_no_hotkey() {
+        // Without a registration the slot pickers never offer an "api" row,
+        // and the API routes would be pinned to nothing the user can change.
+        let id = kea_features::API_FEATURE_ID;
+        let reg = feature_registry();
+        assert!(reg.list_ids().contains(&id.to_string()));
+        assert!(reg.get(id).unwrap().commands().is_empty());
     }
 
     #[test]

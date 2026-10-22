@@ -101,6 +101,16 @@ url = "2"
 # transitively; named here because minting a bearer token from anything less
 # than the platform entropy source is the kind of shortcut that ages badly.
 getrandom = "0.3"
+# Parses the `multipart/form-data` body of `POST /v1/audio/transcriptions` in
+# memory. Its own dependencies (bytes, http, httparse, encoding_rs, ...) are
+# already in the lockfile, so it adds one crate and no new major versions. It
+# needs no feature flags: the stream it reads is the body hyper already gives us.
+multer = "3.1.0"
+# Encodes the WAV that `POST /v1/audio/speech` returns. Already in the lockfile
+# through rodio (the playback path in kea-platform), so this names the version
+# rather than adding one. The encoder writes to any `Write + Seek`, which lets the response be
+# built in a `Cursor<Vec<u8>>` without touching disk.
+hound = "3.5"
 
 [dev-dependencies]
 # A real HTTP server for the Notion client's tests: the headers Notion demands

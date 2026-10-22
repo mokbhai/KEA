@@ -2562,6 +2562,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "getrandom 0.3.4",
+ "hound",
  "http",
  "http-body-util",
  "hyper",
@@ -2571,6 +2572,7 @@ dependencies = [
  "kea-features",
  "kea-infer",
  "kea-platform",
+ "multer",
  "objc2",
  "reqwest 0.12.28",
  "serde",
@@ -3023,6 +3025,23 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "multer"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b"
+dependencies = [
+ "bytes",
+ "encoding_rs",
+ "futures-util",
+ "http",
+ "httparse",
+ "memchr",
+ "mime",
+ "spin",
+ "version_check",
 ]
 
 [[package]]

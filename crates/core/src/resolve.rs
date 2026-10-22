@@ -543,6 +543,45 @@ mod tests {
         assert_eq!(b.provider_ref, None);
     }
 
+    /// The local API has no binding of its own until the user pins one, so an
+    /// unbound `api` slot must take the capability default exactly as a
+    /// feature with no override does. That is what makes "use whatever KEA is
+    /// set up with" work on day one, before the Models page has an API row.
+    #[tokio::test]
+    async fn unbound_api_slot_falls_back_to_the_capability_default() {
+        let (bindings, mut reg) = setup().await;
+        reg.register_stt(Arc::new(NoopSttEngine));
+        reg.register_stt(Arc::new(SecondNoopStt));
+        reg.register_llm(Arc::new(NoopLlmEngine));
+        reg.register_llm(Arc::new(SecondNoop));
+        for (cap, engine) in [("stt", "noop-stt2"), ("llm", "noop2")] {
+            bindings
+                .set(
+                    DEFAULT_FEATURE_ID,
+                    cap,
+                    Binding {
+                        engine_id: engine.into(),
+                        model: None,
+                        provider_ref: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let stt = SlotResolver::new(&reg, &bindings)
+            .resolve("api", CapKind::Stt)
+            .await
+            .unwrap();
+        assert!(matches!(stt, Resolution::Bound(b) if b.engine_id == "noop-stt2"));
+
+        let llm = SlotResolver::new(&reg, &bindings)
+            .resolve("api", CapKind::Llm)
+            .await
+            .unwrap();
+        assert!(matches!(llm, Resolution::Bound(b) if b.engine_id == "noop2"));
+    }
+
     #[tokio::test]
     async fn require_names_the_feature_and_capability_in_its_message() {
         let (bindings, mut reg) = setup().await;

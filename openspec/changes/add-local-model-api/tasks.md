@@ -2,9 +2,9 @@
 
 ## 1. Foundations
 
-- [ ] 1.1 Add `decode_bytes(&[u8], target_rate_hz)` beside `decode_file_at` in `crates/platform/src/audio/decode.rs` (symphonia over a `Cursor`); verify unit tests decode a WAV fixture from bytes identically to the path decoder and reject garbage bytes with a decode error
-- [ ] 1.2 Register an `api` feature id for bindings (stt/tts/llm slots) so the Models page can show it; verify a `SlotResolver` test that an unbound `api` falls back to the capability default
-- [ ] 1.3 Add `multer` (multipart) and `hound` (WAV) as `kea-app` dependencies; verify `cargo build -p kea-app` and `cargo tree -d` shows no new duplicate major versions
+- [x] 1.1 Add `decode_bytes(&[u8], target_rate_hz)` beside `decode_file_at` in `crates/platform/src/audio/decode.rs` (symphonia over a `Cursor`); verify unit tests decode a WAV fixture from bytes identically to the path decoder and reject garbage bytes with a decode error
+- [x] 1.2 Register an `api` feature id for bindings (stt/tts/llm slots) so the Models page can show it; verify a `SlotResolver` test that an unbound `api` falls back to the capability default
+- [x] 1.3 Add `multer` (multipart) and `hound` (WAV) as `kea-app` dependencies; verify `cargo build -p kea-app` and `cargo tree -d` shows no new duplicate major versions
 
 ## 2. OpenAI shapes (`src-tauri/src/api/openai.rs`, pure)
 
