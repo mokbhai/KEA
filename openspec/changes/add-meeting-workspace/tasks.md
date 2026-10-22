@@ -15,9 +15,9 @@
 
 ## 3. Feature and commands
 
-- [ ] 3.1 `run_chat_turn` in `crates/features/src/meeting.rs` (meetings binding, usage recorded, messages appended, proposals discarded while recording, nothing stored on provider failure, one turn in flight per meeting); verify feature tests with a scripted LLM for a question, a proposal on a stopped meeting, a proposal dropped while recording, a failure, and a concurrent second turn refused
-- [ ] 3.2 Tauri commands from design.md decision 7, with the backend recording refusal on apply/edit/undo; verify `cargo test -p kea-app` tests for refusal while recording and idempotent apply
-- [ ] 3.3 Expose the commands and types in `ui/src/api.ts`; verify the ui typecheck and api tests
+- [x] 3.1 `run_chat_turn` in `crates/features/src/meeting.rs` (meetings binding, usage recorded, messages appended, proposals discarded while recording, nothing stored on provider failure, one turn in flight per meeting); verify feature tests with a scripted LLM for a question, a proposal on a stopped meeting, a proposal dropped while recording, a failure, and a concurrent second turn refused
+- [x] 3.2 Tauri commands from design.md decision 7, with the backend recording refusal on apply/edit/undo; verify `cargo test -p kea-app` tests for refusal while recording and idempotent apply
+- [x] 3.3 Expose the commands and types in `ui/src/api.ts`; verify the ui typecheck and api tests
 
 ## 4. Workspace UI
 

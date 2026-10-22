@@ -4,21 +4,24 @@ use std::time::{Duration, Instant};
 
 use kea_core::dictation::{apply_vocabulary, hint_terms};
 use kea_core::meetings::{
-    attribute_segment, build_interim_notes_request, build_meeting_notes_request,
-    build_meeting_title_request, build_notes_repair_request, build_speaker_names_request,
-    embedding_windows, format_transcript_for_synthesis, parse_meeting_notes_json,
-    parse_speaker_names, person_display_name, render_action_items_prose, sanitize_meeting_title,
-    should_run_interim, InterimCadence, MeetingSettings, ParsedMeetingNotes, SpeakerChannel,
+    attribute_segment, build_chat_request, build_interim_notes_request,
+    build_meeting_notes_request, build_meeting_title_request, build_notes_repair_request,
+    build_speaker_names_request, embedding_windows, format_transcript_for_synthesis,
+    parse_chat_reply, parse_meeting_notes_json, parse_speaker_names, person_display_name,
+    render_action_items_prose, sanitize_meeting_title, should_run_interim, ChatRole, ChatTurn,
+    InterimCadence, MeetingSettings, NotesProposal, ParsedMeetingNotes, SpeakerChannel,
     SpeakerNameProposal, VoiceClusters, MAX_CONSECUTIVE_INTERIM_FAILURES,
     MEETING_INTERIM_PROMPT_VERSION, MEETING_NOTES_PROMPT_VERSION, MIN_WINDOWS,
 };
 use kea_core::resolve::SlotResolver;
 use kea_core::store::actions::{ActionRepo, ActionStatus, NewAction};
 use kea_core::store::bindings::{Binding, BindingRepo};
+use kea_core::store::conversations::MessageRole;
 use kea_core::store::meetings::{
-    ActionItem, ActionItemStatus, CaptureMode, Meeting, MeetingDetail, MeetingNotes, MeetingRepo,
-    MeetingSegment, MeetingSpeaker, MeetingStatus, NewActionItem, NewMeeting, NewSegment,
-    SegmentRelabel, SpeakerSource, TitleSource,
+    ActionItem, ActionItemStatus, CaptureMode, Meeting, MeetingChatMessage, MeetingDetail,
+    MeetingNotes, MeetingRepo, MeetingSegment, MeetingSpeaker, MeetingStatus, NewActionItem,
+    NewMeeting, NewSegment, NotesText, ProposalMeta, ProposalState, SegmentRelabel, SpeakerSource,
+    TitleSource,
 };
 use kea_core::store::usage::{NewUsageEvent, UsageRepo};
 use kea_core::store::vocabulary::VocabularyEntry;
@@ -29,6 +32,7 @@ use kea_infer::{SpeakerEmbedder, SPEAKER_EMBEDDING_SAMPLE_RATE_HZ};
 use kea_platform::audio::util::resample_linear;
 use kea_platform::audio::SpeechSegment;
 use kea_platform::{AudioIo, PcmFrame, SystemAudioCapability};
+use serde::Serialize;
 
 use crate::feature::{CapKind, CapSlot, Command, Feature};
 
@@ -602,6 +606,213 @@ pub async fn synthesize_meeting_notes(
         engine_id: Some(binding.engine_id.clone()),
         model: binding.model.clone(),
         edited: false,
+    })
+}
+
+/// What one Ask AI turn stored, as the tab renders it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MeetingChatReply {
+    /// The assistant message just stored, with its proposal when it has one.
+    pub message: MeetingChatMessage,
+    /// Whether the transcript sent with this turn was cut at the context cap,
+    /// so the tab can say the answer rests on the start of a long meeting.
+    pub truncated: bool,
+}
+
+const CHAT_TURN_BUSY: &str = "a reply is already being written for this meeting";
+
+/// Which meetings have a chat turn in flight.
+///
+/// A turn is a full LLM call the user waits on. Two at once for one meeting
+/// would both read the same history, answer the same question and store two
+/// replies, so the second is refused here. The UI also disables Send while a
+/// turn is pending, but this is the check that holds when a stale window or a
+/// double press gets through. Held once in app state, so it covers every window.
+#[derive(Debug, Default)]
+pub struct MeetingChatTurns {
+    in_flight: std::sync::Mutex<BTreeSet<String>>,
+}
+
+impl MeetingChatTurns {
+    /// Whether a turn is running for `meeting_id`. Used to refuse a chat clear
+    /// that would otherwise land under a reply still being written.
+    pub fn is_in_flight(&self, meeting_id: &str) -> bool {
+        self.set().contains(meeting_id)
+    }
+
+    fn set(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+        // A panic while the lock was held leaves a set of ids, which is still
+        // a correct answer to "is this meeting busy", so poisoning is ignored.
+        self.in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn claim(&self, meeting_id: &str) -> Result<ChatTurnClaim<'_>, String> {
+        if !self.set().insert(meeting_id.to_string()) {
+            return Err(CHAT_TURN_BUSY.into());
+        }
+        Ok(ChatTurnClaim {
+            turns: self,
+            meeting_id: meeting_id.to_string(),
+        })
+    }
+}
+
+/// Holds a meeting's turn slot and gives it back on Drop, so an error or a
+/// dropped future cannot leave the meeting marked busy for good.
+struct ChatTurnClaim<'a> {
+    turns: &'a MeetingChatTurns,
+    meeting_id: String,
+}
+
+impl Drop for ChatTurnClaim<'_> {
+    fn drop(&mut self) {
+        self.turns.set().remove(&self.meeting_id);
+    }
+}
+
+/// The notes a meeting with none yet is chatted against: empty sections, so
+/// the prompt reads the same either way.
+fn empty_notes(meeting_id: &str) -> MeetingNotes {
+    MeetingNotes {
+        meeting_id: meeting_id.to_string(),
+        summary: String::new(),
+        decisions: String::new(),
+        action_items: String::new(),
+        follow_ups: String::new(),
+        open_questions: String::new(),
+        prompt_version: String::new(),
+        engine_id: None,
+        model: None,
+        edited: false,
+    }
+}
+
+/// The notes as they would read with `proposal` applied. Stored whole with
+/// the message, so the card can show before and after and Apply does not
+/// depend on the notes still reading the same when the user presses it.
+fn proposed_notes(current: &MeetingNotes, proposal: &NotesProposal) -> NotesText {
+    NotesText {
+        summary: proposal
+            .summary
+            .clone()
+            .unwrap_or_else(|| current.summary.clone()),
+        decisions: proposal
+            .decisions
+            .clone()
+            .unwrap_or_else(|| current.decisions.clone()),
+        action_items: current.action_items.clone(),
+        follow_ups: proposal
+            .follow_ups
+            .clone()
+            .unwrap_or_else(|| current.follow_ups.clone()),
+        open_questions: proposal
+            .open_questions
+            .clone()
+            .unwrap_or_else(|| current.open_questions.clone()),
+    }
+}
+
+/// Run one Ask AI turn for `meeting_id` and store the exchange.
+///
+/// The reply is computed before anything is written, so a provider failure
+/// stores nothing and a retry sends the same history again. Only then are the
+/// user's message and the reply appended, in that order.
+///
+/// `allow_edits` is `status != Recording`. A live meeting's notes are rewritten
+/// by the interim and final passes, so a proposal made now would be stale by
+/// the time it was applied, and the spec rules it out. That is enforced twice:
+/// the prompt leaves the edit instructions out, and [`parse_chat_reply`] drops
+/// any proposal the model sends anyway. The second is the one that holds.
+///
+/// Usage is recorded once per reply, as the other meeting calls are, even when
+/// the reply turns out to be prose with no proposal.
+pub async fn run_chat_turn(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    meetings: &MeetingRepo,
+    turns: &MeetingChatTurns,
+    usage: Option<&UsageRepo>,
+    meeting_id: &str,
+    message: &str,
+) -> Result<MeetingChatReply, String> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err("type a question first".into());
+    }
+    let _claim = turns.claim(meeting_id)?;
+
+    let detail = meetings
+        .get(meeting_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("meeting {meeting_id} not found"))?;
+    let allow_edits = detail.meeting.status != MeetingStatus::Recording;
+    let notes = detail
+        .notes
+        .clone()
+        .unwrap_or_else(|| empty_notes(meeting_id));
+
+    let history: Vec<ChatTurn> = meetings
+        .chat_messages(meeting_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|stored| ChatTurn {
+            role: match stored.role {
+                MessageRole::User => ChatRole::User,
+                MessageRole::Assistant => ChatRole::Assistant,
+            },
+            content: stored.content,
+        })
+        .collect();
+
+    let (mut req, truncated) = build_chat_request(
+        &notes,
+        &detail.action_items,
+        &detail.segments,
+        &detail.speakers,
+        &history,
+        message,
+        allow_edits,
+    );
+    let (engine, binding) = meetings_llm(engines, bindings).await?;
+    req.model = binding.model.clone();
+    req.provider_ref = binding.provider_ref.clone();
+    let reply = engine.complete(req).await.map_err(|e| e.to_string())?;
+    record_meeting_usage(usage, &binding, reply.usage).await;
+
+    let parsed = parse_chat_reply(&reply.text, &notes, allow_edits);
+    let proposal = parsed.proposal.as_ref().map(|changes| ProposalMeta {
+        proposal: proposed_notes(&notes, changes),
+        state: ProposalState::Pending,
+    });
+
+    meetings
+        .append_chat_message(meeting_id, MessageRole::User, message, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    let id = meetings
+        .append_chat_message(
+            meeting_id,
+            MessageRole::Assistant,
+            &parsed.reply,
+            proposal.as_ref(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let stored = meetings
+        .chat_messages(meeting_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|stored| stored.id == id)
+        .ok_or_else(|| "the reply was not stored".to_string())?;
+    Ok(MeetingChatReply {
+        message: stored,
+        truncated,
     })
 }
 
@@ -3447,6 +3658,192 @@ mod item_16_17_tests {
             error: None,
             title_source: TitleSource::Llm,
         }
+    }
+
+    // --- 3.1: the Ask AI turn ---
+
+    /// A meeting with one transcript line and generated notes, in the status
+    /// the test needs. A recording meeting keeps the status `create` gave it.
+    async fn chatted_meeting(meetings: &MeetingRepo, id: &str, status: MeetingStatus) {
+        recording_meeting(meetings, id, &["we should ship on the 14th"]).await;
+        meetings
+            .upsert_notes(&MeetingNotes {
+                meeting_id: id.into(),
+                summary: "The launch slips a week.".into(),
+                decisions: "Launch moves to the 14th.".into(),
+                action_items: String::new(),
+                follow_ups: "Confirm the venue".into(),
+                open_questions: String::new(),
+                prompt_version: "meeting-notes-v3".into(),
+                engine_id: Some("fake-llm".into()),
+                model: None,
+                edited: false,
+            })
+            .await
+            .unwrap();
+        if status != MeetingStatus::Recording {
+            meetings.complete(id, status, None).await.unwrap();
+        }
+    }
+
+    /// Answers only once the test releases it, and says when it was called,
+    /// so a test can hold one turn open while it sends a second.
+    struct GatedLlm {
+        called: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl LlmEngine for GatedLlm {
+        fn id(&self) -> &str {
+            "fake-llm"
+        }
+
+        fn capabilities(&self) -> EngineCaps {
+            EngineCaps { models: vec![] }
+        }
+
+        async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse, EngineError> {
+            self.called.notify_one();
+            self.release.notified().await;
+            Ok(LlmResponse::untracked(r#"{"reply":"Done.","notes":null}"#))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_question_is_answered_and_both_messages_are_stored() {
+        let llm =
+            RecordingLlm::new(&[r#"{"reply":"It was agreed on the 14th [00:30].","notes":null}"#]);
+        let (reg, bindings, _, meetings) = world(llm).await;
+        chatted_meeting(&meetings, "c1", MeetingStatus::Completed).await;
+        let turns = MeetingChatTurns::default();
+
+        let reply = run_chat_turn(
+            &reg,
+            &bindings,
+            &meetings,
+            &turns,
+            None,
+            "c1",
+            "  When was it agreed?  ",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reply.message.content, "It was agreed on the 14th [00:30].");
+        assert!(matches!(reply.message.role, MessageRole::Assistant));
+        assert_eq!(reply.message.proposal, None);
+        assert!(!reply.truncated);
+        let chat = meetings.chat_messages("c1").await.unwrap();
+        assert_eq!(chat.len(), 2);
+        assert!(matches!(chat[0].role, MessageRole::User));
+        assert_eq!(chat[0].content, "When was it agreed?");
+        assert!(!turns.is_in_flight("c1"));
+    }
+
+    /// The proposal is stored whole, with the sections it does not change
+    /// carried over, and the notes themselves do not move until Apply.
+    #[tokio::test]
+    async fn a_proposal_on_a_stopped_meeting_is_stored_pending_with_the_full_notes() {
+        let llm = RecordingLlm::new(&[
+            r#"{"reply":"Here is a shorter summary.","notes":{"summary":"Launch slips to the 14th."}}"#,
+        ]);
+        let (reg, bindings, _, meetings) = world(llm).await;
+        chatted_meeting(&meetings, "c2", MeetingStatus::Completed).await;
+
+        let reply = run_chat_turn(
+            &reg,
+            &bindings,
+            &meetings,
+            &MeetingChatTurns::default(),
+            None,
+            "c2",
+            "make the summary shorter",
+        )
+        .await
+        .unwrap();
+
+        let proposal = reply.message.proposal.expect("a proposal");
+        assert_eq!(proposal.state, ProposalState::Pending);
+        assert_eq!(proposal.proposal.summary, "Launch slips to the 14th.");
+        assert_eq!(proposal.proposal.decisions, "Launch moves to the 14th.");
+        assert_eq!(proposal.proposal.follow_ups, "Confirm the venue");
+
+        let detail = meetings.get("c2").await.unwrap().unwrap();
+        assert_eq!(detail.notes.unwrap().summary, "The launch slips a week.");
+        assert!(!detail.can_undo);
+    }
+
+    /// The model proposed an edit while the meeting is live. The prompt left
+    /// the edit instructions out, and the reply parser drops the proposal even
+    /// though the model sent one, so nothing is stored to be applied later.
+    #[tokio::test]
+    async fn a_proposal_is_dropped_while_the_meeting_is_recording() {
+        let llm = RecordingLlm::new(&[r#"{"reply":"Shorter now.","notes":{"summary":"Short."}}"#]);
+        let (reg, bindings, _, meetings) = world(llm.clone()).await;
+        chatted_meeting(&meetings, "c3", MeetingStatus::Recording).await;
+
+        let reply = run_chat_turn(
+            &reg,
+            &bindings,
+            &meetings,
+            &MeetingChatTurns::default(),
+            None,
+            "c3",
+            "make the summary shorter",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reply.message.content, "Shorter now.");
+        assert_eq!(reply.message.proposal, None);
+        assert!(llm.prompts()[0].contains("not available while the meeting is still recording"));
+    }
+
+    /// A provider failure stores nothing, so the user can send the same
+    /// question again without the failed one sitting in the history.
+    #[tokio::test]
+    async fn a_provider_failure_stores_nothing_and_frees_the_meeting() {
+        let (reg, bindings, _, meetings) = world(RecordingLlm::failing()).await;
+        chatted_meeting(&meetings, "c4", MeetingStatus::Completed).await;
+        let turns = MeetingChatTurns::default();
+
+        let err = run_chat_turn(&reg, &bindings, &meetings, &turns, None, "c4", "anything")
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("provider is down"));
+        assert!(meetings.chat_messages("c4").await.unwrap().is_empty());
+        assert!(!turns.is_in_flight("c4"));
+    }
+
+    /// The first turn is parked inside the provider call. The second, for the
+    /// same meeting, is refused, and the first still stores its own pair.
+    #[tokio::test]
+    async fn a_second_turn_for_the_same_meeting_is_refused_while_one_is_in_flight() {
+        let llm = Arc::new(GatedLlm {
+            called: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let (reg, bindings, _, meetings) = world(llm.clone()).await;
+        chatted_meeting(&meetings, "c5", MeetingStatus::Completed).await;
+        let turns = MeetingChatTurns::default();
+
+        let first = run_chat_turn(&reg, &bindings, &meetings, &turns, None, "c5", "first");
+        let second = async {
+            llm.called.notified().await;
+            assert!(turns.is_in_flight("c5"));
+            let refused =
+                run_chat_turn(&reg, &bindings, &meetings, &turns, None, "c5", "second").await;
+            llm.release.notify_one();
+            refused
+        };
+        let (first, refused) = tokio::join!(first, second);
+
+        assert_eq!(first.unwrap().message.content, "Done.");
+        assert_eq!(refused.unwrap_err(), CHAT_TURN_BUSY);
+        assert_eq!(meetings.chat_messages("c5").await.unwrap().len(), 2);
+        assert!(!turns.is_in_flight("c5"));
     }
 
     // --- 16b: reliable JSON out of a provider that promises nothing ---

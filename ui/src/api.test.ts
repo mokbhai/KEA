@@ -1,10 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   addMeetingActionItem,
+  applyNotesProposal,
+  clearMeetingChat,
+  discardNotesProposal,
   discoverLocalLlms,
+  editNotesSection,
   exportMeetingMarkdown,
+  getMeetingChat,
   getPermissionStatus,
   meetingMarkdown,
+  searchMeetings,
+  sendMeetingChat,
+  undoNotesEdit,
   onApiOpenPage,
   onAssistantAnswer,
   onAssistantPartial,
@@ -46,6 +54,23 @@ describe("meeting commands", () => {
       set_meeting_action_item_status: () => undefined,
       add_meeting_action_item: () => undefined,
       set_meeting_title: () => undefined,
+      search_meetings: () => [],
+      get_meeting_chat: () => [],
+      send_meeting_chat: () => ({
+        message: {
+          id: 2,
+          role: "assistant",
+          content: "Launch moves to the 14th.",
+          proposal: { proposal: { summary: "Short." }, state: "pending" },
+          created_at: "2026-09-19 10:01:00",
+        },
+        truncated: true,
+      }),
+      clear_meeting_chat: () => undefined,
+      apply_notes_proposal: () => undefined,
+      discard_notes_proposal: () => undefined,
+      edit_notes_section: () => undefined,
+      undo_notes_edit: () => undefined,
       open_path_in_file_manager: () => undefined,
       get_permission_status: () => "Granted",
       request_permission: () => "Denied",
@@ -85,6 +110,53 @@ describe("meeting commands", () => {
     expect(invokeCalls("set_meeting_title")).toEqual([
       { meetingId: "m1", title: "Budget review" },
     ]);
+  });
+
+  it("searches meetings by the query and the row limit", async () => {
+    expect(await searchMeetings("confluence", 20)).toEqual([]);
+    expect(invokeCalls("search_meetings")).toEqual([
+      { query: "confluence", limit: 20 },
+    ]);
+  });
+
+  it("sends a chat turn and gets back the stored reply and its truncation flag", async () => {
+    const result = await sendMeetingChat("m1", "When was it agreed?");
+    expect(result.truncated).toBe(true);
+    expect(result.message.role).toBe("assistant");
+    expect(result.message.proposal?.state).toBe("pending");
+    expect(invokeCalls("send_meeting_chat")).toEqual([
+      { meetingId: "m1", message: "When was it agreed?" },
+    ]);
+  });
+
+  it("reads and clears a meeting's chat", async () => {
+    expect(await getMeetingChat("m1")).toEqual([]);
+    await clearMeetingChat("m1");
+    expect(invokeCalls("get_meeting_chat")).toEqual([{ meetingId: "m1" }]);
+    expect(invokeCalls("clear_meeting_chat")).toEqual([{ meetingId: "m1" }]);
+  });
+
+  // Proposal and section commands take the message id and the section name
+  // exactly as the backend spells them; a renamed key would reach the backend
+  // as undefined and be refused there.
+  it("applies and discards a proposal by message id", async () => {
+    await applyNotesProposal("m1", 2);
+    await discardNotesProposal("m1", 3);
+    expect(invokeCalls("apply_notes_proposal")).toEqual([
+      { meetingId: "m1", messageId: 2 },
+    ]);
+    expect(invokeCalls("discard_notes_proposal")).toEqual([
+      { meetingId: "m1", messageId: 3 },
+    ]);
+  });
+
+  it("edits one notes section and undoes the last change", async () => {
+    await editNotesSection("m1", "decisions", "Ship Friday.");
+    await undoNotesEdit("m1");
+    expect(invokeCalls("edit_notes_section")).toEqual([
+      { meetingId: "m1", section: "decisions", text: "Ship Friday." },
+    ]);
+    expect(invokeCalls("undo_notes_edit")).toEqual([{ meetingId: "m1" }]);
   });
 
   // The kind is the string `PERM_KINDS` in src-tauri/src/commands.rs spells.
@@ -144,6 +216,7 @@ describe("meeting note events", () => {
     prompt_version: "interim-v1",
     engine_id: "openai",
     model: "gpt-4o-mini",
+    edited: false,
   };
 
   it("hands the interim notes row straight to the handler", async () => {
