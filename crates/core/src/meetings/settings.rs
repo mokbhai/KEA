@@ -10,6 +10,7 @@ const KEY_INTERIM_NOTES: &str = "meetings.interim_notes";
 const KEY_INTERIM_EVERY_SEGMENTS: &str = "meetings.interim_every_segments";
 const KEY_INTERIM_EVERY_MINUTES: &str = "meetings.interim_every_minutes";
 const KEY_CALENDAR_TITLES: &str = "meetings.calendar_titles";
+const KEY_VOICE_SEPARATION: &str = "meetings.voice_separation";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeetingSettings {
@@ -35,6 +36,14 @@ pub struct MeetingSettings {
     /// to improve.
     #[serde(default)]
     pub calendar_titles: bool,
+    /// Tell remote participants apart by voice during a meeting.
+    ///
+    /// Off by default and `#[serde(default)]` on the way in, for the same reasons
+    /// as `interim_notes`. It also needs two diarization models on disk, which
+    /// the caller checks when a meeting starts. Turning it on without them
+    /// must not look like it is working, so that check is not this struct's job.
+    #[serde(default)]
+    pub voice_separation: bool,
 }
 
 fn default_interim_every_segments() -> u32 {
@@ -55,6 +64,7 @@ impl Default for MeetingSettings {
             interim_every_segments: cadence.every_segments,
             interim_every_minutes: cadence.every_minutes,
             calendar_titles: false,
+            voice_separation: false,
         }
     }
 }
@@ -115,6 +125,11 @@ impl MeetingSettingsRepo {
                 .get(KEY_CALENDAR_TITLES)
                 .await?
                 .unwrap_or(defaults.calendar_titles),
+            voice_separation: self
+                .settings
+                .get(KEY_VOICE_SEPARATION)
+                .await?
+                .unwrap_or(defaults.voice_separation),
         })
     }
 
@@ -137,6 +152,9 @@ impl MeetingSettingsRepo {
         self.settings
             .set(KEY_CALENDAR_TITLES, &cfg.calendar_titles)
             .await?;
+        self.settings
+            .set(KEY_VOICE_SEPARATION, &cfg.voice_separation)
+            .await?;
         Ok(())
     }
 }
@@ -158,6 +176,7 @@ mod tests {
             interim_every_segments: 12,
             interim_every_minutes: 7,
             calendar_titles: true,
+            voice_separation: true,
         };
         repo.set(&cfg).await.unwrap();
         assert_eq!(repo.get().await.unwrap(), cfg);
@@ -178,6 +197,7 @@ mod tests {
         let cfg = MeetingSettings::default();
         assert!(!cfg.interim_notes);
         assert!(!cfg.calendar_titles);
+        assert!(!cfg.voice_separation);
     }
 
     /// A settings payload from a frontend that predates these fields must
@@ -189,6 +209,18 @@ mod tests {
             serde_json::from_str(r#"{"segment_duration_secs":30,"prefer_system_audio":true}"#)
                 .unwrap();
         assert_eq!(cfg, MeetingSettings::default());
+    }
+
+    /// A payload that predates `voice_separation` deserializes it as `false`,
+    /// the same way it reads every other field the frontend did not send.
+    #[test]
+    fn a_payload_without_voice_separation_reads_it_as_off() {
+        let cfg: MeetingSettings = serde_json::from_str(
+            r#"{"segment_duration_secs":30,"prefer_system_audio":true,"calendar_titles":true}"#,
+        )
+        .unwrap();
+        assert!(!cfg.voice_separation);
+        assert!(cfg.calendar_titles);
     }
 
     #[test]

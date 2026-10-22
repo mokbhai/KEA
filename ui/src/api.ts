@@ -840,8 +840,11 @@ export type MeetingSpeaker = {
   meeting_id: string;
   speaker_key: string;
   display_name: string;
-  /** "channel" is the default KEA assigned; "user" is a name someone typed. */
-  source: "channel" | "user";
+  /**
+   * "channel" is the default KEA assigned; "user" is a name someone typed;
+   * "inferred" is a name the LLM proposed from the transcript, pending confirm.
+   */
+  source: "channel" | "user" | "inferred";
 };
 
 export type MeetingSegmentEvent = {
@@ -898,6 +901,11 @@ export type MeetingSettings = {
   interim_every_minutes: number;
   /** Name a meeting after the calendar event it happened during. */
   calendar_titles: boolean;
+  /**
+   * Tell remote participants apart by voice. Needs both diarization models
+   * (`DIARIZATION_*_ID` in the backend registry) installed to take effect.
+   */
+  voice_separation: boolean;
 };
 
 export const getMeetingSettings = () =>
@@ -1085,6 +1093,18 @@ export const onMeetingNotesError = (
     handler(event.payload.message),
   );
 
+/**
+ * Voice separation is on but could not start for this meeting (a model is
+ * missing, or the runtime failed to load). The meeting still records, with
+ * "You"/"Others" labels, so this is a notice rather than `onMeetingError`.
+ */
+export const onMeetingVoiceSeparationUnavailable = (
+  handler: (reason: string) => void,
+): Promise<UnlistenFn> =>
+  listen<{ reason: string }>("meeting:voice_separation_unavailable", (event) =>
+    handler(event.payload.reason),
+  );
+
 /** Mirrors `kea_core::store::actions::ActionStatus`. */
 export type ActionStatus = "started" | "ok" | "error" | "cancelled";
 
@@ -1208,8 +1228,12 @@ export type SystemVoice = {
  * `"streaming"` is a catalog, not a bindable engine: nothing resolves to it
  * and it has no `Binding`. It is here so the generic model commands —
  * list/installed/download/cancel/delete — serve it for free.
+ *
+ * `"diarization"` is the same kind of catalog: the speaker models that meeting
+ * voice separation runs on. Nothing binds to it either, so the Models page does
+ * not list it; the meetings page asks for it directly.
  */
-export type OnnxModelKindParam = "parakeet" | "streaming" | "tts";
+export type OnnxModelKindParam = "parakeet" | "streaming" | "tts" | "diarization";
 
 export const listTtsEngines = () => invoke<EngineInfo[]>("list_tts_engines");
 

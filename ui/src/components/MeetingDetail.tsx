@@ -312,6 +312,37 @@ function SpeakerLegend({
               <span className="kea-muted" style={{ fontSize: 12 }}>
                 {side}
               </span>
+              {speaker.source === "inferred" && (
+                <>
+                  <span
+                    className="kea-muted"
+                    title="Proposed from something said in the meeting. Confirm it or rename it."
+                    style={{
+                      padding: "2px 8px",
+                      borderRadius: 999,
+                      border: "1px solid var(--border)",
+                      background: "var(--surface-2)",
+                      fontSize: 11,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    inferred
+                  </span>
+                  {onRename && (
+                    // Confirming saves the name as typed: the same write as a
+                    // rename, which is what makes it a user name the transcript
+                    // will never overwrite.
+                    <button
+                      type="button"
+                      className="kea-btn"
+                      disabled={busy}
+                      onClick={() => void onRename(speaker.speaker_key, speaker.display_name)}
+                    >
+                      Confirm
+                    </button>
+                  )}
+                </>
+              )}
               {onRename ? (
                 <input
                   className="kea-input"

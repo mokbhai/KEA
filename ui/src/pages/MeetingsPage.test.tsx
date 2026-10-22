@@ -29,8 +29,12 @@ const meetingHandlers = {
     interim_every_segments: 8,
     interim_every_minutes: 5,
     calendar_titles: false,
+    voice_separation: false,
   }),
   set_meeting_settings: () => undefined,
+  // Neither speaker model is installed, the default a fresh install is in.
+  list_installed_onnx_models: () => [],
+  download_onnx_model: () => undefined,
   // Not set up, which is the default a fresh install is in.
   get_notion_status: () => ({
     has_token: false,
@@ -442,6 +446,83 @@ describe("MeetingsPage", () => {
     expect(saved.settings.interim_notes).toBe(true);
     // The fields this page does not know about must survive the write.
     expect(saved.settings.segment_duration_secs).toBe(30);
+  });
+
+  // --- speaker separation ---
+
+  it("offers the speaker models instead of enabling voice separation without them", async () => {
+    mockWorld({ bindings: readyBindings });
+    render(<MeetingsPage />);
+
+    const toggle = await screen.findByRole("switch", {
+      name: "Separate speakers by voice",
+    });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    await userEvent.click(toggle);
+
+    // Nothing is written: a setting that cannot run must not read as on.
+    expect(invokeCalls("set_meeting_settings")).toHaveLength(0);
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    const download = await screen.findByRole("button", { name: "Download speaker models" });
+
+    await userEvent.click(download);
+    await waitFor(() => expect(invokeCalls("download_onnx_model")).toHaveLength(2));
+    expect(invokeCalls("download_onnx_model")).toEqual([
+      { kind: "diarization", modelId: "pyannote-segmentation-3-0" },
+      { kind: "diarization", modelId: "campplus-sv-en-voxceleb-16k" },
+    ]);
+  });
+
+  it("turns voice separation on once the downloads land", async () => {
+    let installed: string[] = [];
+    mockWorld({
+      bindings: readyBindings,
+      extra: { list_installed_onnx_models: () => installed },
+    });
+    render(<MeetingsPage />);
+
+    await userEvent.click(
+      await screen.findByRole("switch", { name: "Separate speakers by voice" }),
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "Download speaker models" }));
+    await waitFor(() => expect(invokeCalls("download_onnx_model")).toHaveLength(2));
+
+    installed = ["pyannote-segmentation-3-0", "campplus-sv-en-voxceleb-16k"];
+    await act(async () => {
+      emitTauriEvent("model:download:complete", { model_id: "pyannote-segmentation-3-0" });
+    });
+    await act(async () => {
+      emitTauriEvent("model:download:complete", { model_id: "campplus-sv-en-voxceleb-16k" });
+    });
+
+    await waitFor(() => expect(invokeCalls("set_meeting_settings")).toHaveLength(1));
+    const saved = invokeCalls("set_meeting_settings")[0] as {
+      settings: Record<string, unknown>;
+    };
+    expect(saved.settings.voice_separation).toBe(true);
+  });
+
+  it("enables voice separation directly when both models are already installed", async () => {
+    mockWorld({
+      bindings: readyBindings,
+      extra: {
+        list_installed_onnx_models: () => [
+          "pyannote-segmentation-3-0",
+          "campplus-sv-en-voxceleb-16k",
+        ],
+      },
+    });
+    render(<MeetingsPage />);
+
+    await userEvent.click(
+      await screen.findByRole("switch", { name: "Separate speakers by voice" }),
+    );
+    await waitFor(() => expect(invokeCalls("set_meeting_settings")).toHaveLength(1));
+    const saved = invokeCalls("set_meeting_settings")[0] as {
+      settings: Record<string, unknown>;
+    };
+    expect(saved.settings.voice_separation).toBe(true);
+    expect(invokeCalls("download_onnx_model")).toHaveLength(0);
   });
 
   // --- item 17: calendar titles ---

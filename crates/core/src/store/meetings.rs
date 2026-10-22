@@ -1,8 +1,10 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use crate::error::KeaError;
-use crate::meetings::SpeakerChannel;
+use crate::meetings::{render_action_items_prose, ParsedActionItem, SpeakerChannel};
 
 /// Where a meeting stands, as persisted in `meetings.status`.
 ///
@@ -90,13 +92,21 @@ impl TryFrom<String> for CaptureMode {
 ///
 /// The distinction is load-bearing rather than informational: a name a human
 /// typed must survive anything attribution decides afterwards.
+///
+/// Precedence is `User` > `Inferred` > `Channel`. Inference may replace a
+/// default but never a typed name, which is why it is its own value rather
+/// than a second `Channel`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeakerSource {
-    /// The default this feature wrote when the meeting started.
+    /// The default this feature wrote when the meeting started, or when a
+    /// participant's voice first appeared.
     Channel,
     /// A name the user typed.
     User,
+    /// A name the LLM proposed from the transcript at stop. Shown with a
+    /// confirm action, and replaced by any name the user types.
+    Inferred,
 }
 
 impl SpeakerSource {
@@ -104,6 +114,7 @@ impl SpeakerSource {
         match self {
             SpeakerSource::Channel => "channel",
             SpeakerSource::User => "user",
+            SpeakerSource::Inferred => "inferred",
         }
     }
 
@@ -113,6 +124,7 @@ impl SpeakerSource {
         match s {
             "channel" => Some(SpeakerSource::Channel),
             "user" => Some(SpeakerSource::User),
+            "inferred" => Some(SpeakerSource::Inferred),
             _ => None,
         }
     }
@@ -335,9 +347,14 @@ pub struct NewSegment {
     pub start_offset_ms: i64,
     pub end_offset_ms: i64,
     pub text: String,
-    /// `None` when the sources could not be told apart — an honest "unknown",
-    /// never a default side.
-    pub speaker: Option<SpeakerChannel>,
+    /// The `meeting_speakers.speaker_key` this line belongs to. `None` when the
+    /// sources could not be told apart — an honest "unknown", never a default
+    /// side.
+    ///
+    /// A plain key rather than a [`SpeakerChannel`] because voice separation
+    /// writes `spk0`, `spk1`, … into the same column. Channel segments pass
+    /// [`SpeakerChannel::as_str`].
+    pub speaker_key: Option<String>,
 }
 
 /// The identity of an action item for deduplication purposes.
@@ -369,6 +386,106 @@ pub fn same_action(a: &str, b: &str) -> bool {
     }
     long.strip_prefix(short)
         .is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_alphanumeric()))
+}
+
+/// One segment's place after the stop-time re-cluster: the participant key it
+/// now carries. Addressed by `sequence`, which is unique within a meeting.
+///
+/// Per-segment rather than per-key because the pass can split one live key in
+/// two as well as merge two into one, and a key-to-key map cannot express the
+/// first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentRelabel {
+    pub sequence: i32,
+    pub speaker_key: String,
+}
+
+/// The name a participant currently carries, read inside the caller's
+/// transaction so the rename and the owner carry-over see the same state.
+async fn speaker_name_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    meeting_id: &str,
+    speaker_key: &str,
+) -> Result<Option<String>, KeaError> {
+    let name = sqlx::query_scalar(
+        "SELECT display_name FROM meeting_speakers WHERE meeting_id = ? AND speaker_key = ?",
+    )
+    .bind(meeting_id)
+    .bind(speaker_key)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(name)
+}
+
+/// Point every action-item owner that quoted `old` at `new`, then re-render the
+/// prose column from the rows.
+///
+/// Exact match on purpose: "Dan" must not rewrite an owner that says "Daniel",
+/// because nobody renamed that one. The prose is re-rendered with the same
+/// function `persist_notes` uses, so the column reads identically whichever
+/// path wrote it last. No LLM call is involved; this only rewrites text.
+async fn carry_owner_rename(
+    tx: &mut Transaction<'_, Sqlite>,
+    meeting_id: &str,
+    old: &str,
+    new: &str,
+) -> Result<(), KeaError> {
+    let changed =
+        sqlx::query("UPDATE meeting_action_items SET owner = ? WHERE meeting_id = ? AND owner = ?")
+            .bind(new)
+            .bind(meeting_id)
+            .bind(old)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+    if changed == 0 {
+        return Ok(());
+    }
+
+    let rows = sqlx::query_as::<_, ActionItem>(
+        "SELECT id, meeting_id, text, owner, due_hint, source_seq, status
+         FROM meeting_action_items WHERE meeting_id = ? ORDER BY id ASC",
+    )
+    .bind(meeting_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let parsed: Vec<ParsedActionItem> = rows
+        .into_iter()
+        .map(|row| ParsedActionItem {
+            text: row.text,
+            owner: row.owner,
+            due_hint: row.due_hint,
+        })
+        .collect();
+
+    sqlx::query("UPDATE meeting_notes SET action_items = ? WHERE meeting_id = ?")
+        .bind(render_action_items_prose(&parsed))
+        .bind(meeting_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// The key that most of `from`'s segments now carry, with ties going to the
+/// smaller key so the result does not depend on row order.
+fn majority_target(
+    before: &[(i32, Option<String>)],
+    after: &HashMap<i32, Option<String>>,
+    from: &str,
+) -> Option<String> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for (sequence, key) in before {
+        if key.as_deref() != Some(from) {
+            continue;
+        }
+        if let Some(Some(target)) = after.get(sequence) {
+            *counts.entry(target.clone()).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        .map(|(key, _)| key)
 }
 
 pub struct MeetingRepo {
@@ -478,13 +595,29 @@ impl MeetingRepo {
         channel: SpeakerChannel,
         display_name: &str,
     ) -> Result<(), KeaError> {
+        self.ensure_participant(meeting_id, channel.as_str(), display_name)
+            .await
+    }
+
+    /// Record the default name for a participant key, leaving any existing row
+    /// alone. The keyed form of [`MeetingRepo::ensure_speaker`], for voices that
+    /// are not one of the two channels (`spk0`, `spk1`, …).
+    ///
+    /// Participant rows appear lazily, when a voice first shows up, so this is
+    /// the call that creates them mid-meeting.
+    pub async fn ensure_participant(
+        &self,
+        meeting_id: &str,
+        key: &str,
+        display_name: &str,
+    ) -> Result<(), KeaError> {
         sqlx::query(
             "INSERT INTO meeting_speakers(meeting_id, speaker_key, display_name, source)
              VALUES (?, ?, ?, ?)
              ON CONFLICT(meeting_id, speaker_key) DO NOTHING",
         )
         .bind(meeting_id)
-        .bind(channel.as_str())
+        .bind(key)
         .bind(display_name)
         .bind(SpeakerSource::Channel.as_str())
         .execute(&self.pool)
@@ -494,12 +627,17 @@ impl MeetingRepo {
 
     /// Rename one side of a meeting. Always wins over the default, and marks
     /// the row `user` so nothing written by attribution overwrites it later.
+    ///
+    /// Action-item owners that quoted the old name are carried over in the same
+    /// transaction; see [`MeetingRepo::rename_speaker`].
     pub async fn set_speaker_name(
         &self,
         meeting_id: &str,
         speaker_key: &str,
         display_name: &str,
     ) -> Result<(), KeaError> {
+        let mut tx = self.pool.begin().await?;
+        let old = speaker_name_in(&mut tx, meeting_id, speaker_key).await?;
         sqlx::query(
             "INSERT INTO meeting_speakers(meeting_id, speaker_key, display_name, source)
              VALUES (?, ?, ?, ?)
@@ -511,8 +649,167 @@ impl MeetingRepo {
         .bind(speaker_key)
         .bind(display_name)
         .bind(SpeakerSource::User.as_str())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if let Some(old) = old.filter(|old| old.as_str() != display_name) {
+            carry_owner_rename(&mut tx, meeting_id, &old, display_name).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Set a name the LLM proposed at stop. Writes only where the row is not
+    /// `user`, so a name the user typed is never replaced by inference.
+    ///
+    /// The `WHERE` on the upsert is the guard, and `rows_affected` tells the
+    /// caller whether it fired. When nothing was written there is nothing to
+    /// carry over, so owners and prose are left alone.
+    pub async fn set_inferred_speaker_name(
+        &self,
+        meeting_id: &str,
+        speaker_key: &str,
+        display_name: &str,
+    ) -> Result<(), KeaError> {
+        let mut tx = self.pool.begin().await?;
+        let old = speaker_name_in(&mut tx, meeting_id, speaker_key).await?;
+        let written = sqlx::query(
+            "INSERT INTO meeting_speakers(meeting_id, speaker_key, display_name, source)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(meeting_id, speaker_key) DO UPDATE SET
+                 display_name = excluded.display_name,
+                 source = excluded.source
+             WHERE meeting_speakers.source != 'user'",
+        )
+        .bind(meeting_id)
+        .bind(speaker_key)
+        .bind(display_name)
+        .bind(SpeakerSource::Inferred.as_str())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if written > 0 {
+            if let Some(old) = old.filter(|old| old.as_str() != display_name) {
+                carry_owner_rename(&mut tx, meeting_id, &old, display_name).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Rewrite the participant rows and segment keys after the stop-time
+    /// re-cluster, in one transaction.
+    ///
+    /// - `relabels` gives the key each segment carries after the pass, by
+    ///   `sequence`. Only segments that change are written. Keys are not
+    ///   assumed to map one-to-one, because a voice split across two live keys
+    ///   can end up as one, and one live key can split into two.
+    /// - Participant rows for keys that no segment carries any more are
+    ///   deleted. A user-typed name on such a row is moved onto the key that
+    ///   most of its segments went to, so the person keeps the name the user
+    ///   gave them. If that key already has a user name, the user's existing
+    ///   name is kept and the orphan's is dropped.
+    /// - `new_names` gives each surviving key its default display name, which is
+    ///   how renumbering to "Person N" by first appearance reaches the row. Only
+    ///   `channel` rows are renamed, and a missing row is created.
+    pub async fn remap_segment_speakers(
+        &self,
+        meeting_id: &str,
+        relabels: &[SegmentRelabel],
+        new_names: &[(String, String)],
+    ) -> Result<(), KeaError> {
+        let mut tx = self.pool.begin().await?;
+
+        let before: Vec<(i32, Option<String>)> = sqlx::query_as(
+            "SELECT sequence, speaker_key FROM meeting_segments WHERE meeting_id = ?",
+        )
+        .bind(meeting_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let rows = sqlx::query_as::<_, MeetingSpeaker>(
+            "SELECT meeting_id, speaker_key, display_name, source
+             FROM meeting_speakers WHERE meeting_id = ?",
+        )
+        .bind(meeting_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut after: HashMap<i32, Option<String>> = before.iter().cloned().collect();
+        for relabel in relabels {
+            let key = Some(relabel.speaker_key.clone());
+            if let Some(slot) = after.get_mut(&relabel.sequence) {
+                if *slot != key {
+                    sqlx::query(
+                        "UPDATE meeting_segments SET speaker_key = ?
+                         WHERE meeting_id = ? AND sequence = ?",
+                    )
+                    .bind(&relabel.speaker_key)
+                    .bind(meeting_id)
+                    .bind(relabel.sequence)
+                    .execute(&mut *tx)
+                    .await?;
+                    *slot = key;
+                }
+            }
+        }
+
+        let live: HashSet<String> = after.values().flatten().cloned().collect();
+        let mut user_keys: HashSet<String> = rows
+            .iter()
+            .filter(|row| row.source == SpeakerSource::User)
+            .map(|row| row.speaker_key.clone())
+            .collect();
+
+        for orphan in rows.iter().filter(|row| !live.contains(&row.speaker_key)) {
+            if orphan.source == SpeakerSource::User {
+                // A user name with no segments left and nowhere to go is kept
+                // rather than silently dropped.
+                let Some(target) = majority_target(&before, &after, &orphan.speaker_key) else {
+                    continue;
+                };
+                if !user_keys.contains(&target) {
+                    sqlx::query(
+                        "INSERT INTO meeting_speakers(meeting_id, speaker_key, display_name, source)
+                         VALUES (?, ?, ?, ?)
+                         ON CONFLICT(meeting_id, speaker_key) DO UPDATE SET
+                             display_name = excluded.display_name,
+                             source = excluded.source",
+                    )
+                    .bind(meeting_id)
+                    .bind(&target)
+                    .bind(&orphan.display_name)
+                    .bind(SpeakerSource::User.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+                    user_keys.insert(target);
+                }
+            }
+            sqlx::query("DELETE FROM meeting_speakers WHERE meeting_id = ? AND speaker_key = ?")
+                .bind(meeting_id)
+                .bind(&orphan.speaker_key)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        for (key, name) in new_names {
+            if !live.contains(key) {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO meeting_speakers(meeting_id, speaker_key, display_name, source)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(meeting_id, speaker_key) DO UPDATE SET
+                     display_name = excluded.display_name
+                 WHERE meeting_speakers.source = 'channel'",
+            )
+            .bind(meeting_id)
+            .bind(key)
+            .bind(name)
+            .bind(SpeakerSource::Channel.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -531,7 +828,7 @@ impl MeetingRepo {
         .bind(seg.start_offset_ms)
         .bind(seg.end_offset_ms)
         .bind(&seg.text)
-        .bind(seg.speaker.map(|c| c.as_str()))
+        .bind(seg.speaker_key.as_deref())
         .fetch_one(&self.pool)
         .await?;
         Ok(id)
@@ -832,7 +1129,7 @@ mod tests {
                     start_offset_ms: 0,
                     end_offset_ms: 30_000,
                     text: "Hello everyone".into(),
-                    speaker: Some(SpeakerChannel::Local),
+                    speaker_key: Some(SpeakerChannel::Local.as_str().into()),
                 },
             )
             .await
@@ -962,7 +1259,7 @@ mod tests {
                     start_offset_ms: sequence as i64 * 1000,
                     end_offset_ms: sequence as i64 * 1000 + 1000,
                     text: format!("line {sequence}"),
-                    speaker,
+                    speaker_key: speaker.map(|c| c.as_str().to_string()),
                 },
             )
             .await
@@ -1047,6 +1344,257 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    /// A second call must not overwrite a name the user typed in between. The
+    /// re-attribution path calls this for every participant it sees again.
+    #[tokio::test]
+    async fn a_second_ensure_participant_keeps_a_typed_name() {
+        let (_pool, repo) = seeded("m11").await;
+        repo.ensure_participant("m11", "spk1", "Person 2")
+            .await
+            .unwrap();
+        repo.set_speaker_name("m11", "spk1", "Dan").await.unwrap();
+        repo.ensure_participant("m11", "spk1", "Person 2")
+            .await
+            .unwrap();
+
+        let speakers = repo.speakers("m11").await.unwrap();
+        assert_eq!(speakers.len(), 1);
+        assert_eq!(speakers[0].display_name, "Dan");
+        assert_eq!(speakers[0].source, SpeakerSource::User);
+    }
+
+    /// Inference fills a default, and a name the user typed is never replaced
+    /// by it. A later user rename always wins over an earlier inference.
+    #[tokio::test]
+    async fn an_inferred_name_never_replaces_a_typed_one() {
+        let (_pool, repo) = seeded("m10").await;
+        repo.ensure_participant("m10", "spk0", "Person 1")
+            .await
+            .unwrap();
+
+        repo.set_inferred_speaker_name("m10", "spk0", "Dan")
+            .await
+            .unwrap();
+        let speakers = repo.speakers("m10").await.unwrap();
+        assert_eq!(speakers[0].display_name, "Dan");
+        assert_eq!(speakers[0].source, SpeakerSource::Inferred);
+
+        repo.set_speaker_name("m10", "spk0", "Sam").await.unwrap();
+        repo.set_inferred_speaker_name("m10", "spk0", "Samuel")
+            .await
+            .unwrap();
+        let speakers = repo.speakers("m10").await.unwrap();
+        assert_eq!(speakers[0].display_name, "Sam");
+        assert_eq!(speakers[0].source, SpeakerSource::User);
+    }
+
+    /// Renaming a participant rewrites the owners that quoted the old name, in
+    /// this meeting only, and re-renders the prose column to match.
+    #[tokio::test]
+    async fn a_rename_rewrites_owners_in_this_meeting_only() {
+        let (_pool, repo) = seeded("m8").await;
+        repo.create(&NewMeeting {
+            id: "m9".into(),
+            title: "Other".into(),
+            capture_mode: CaptureMode::MicOnly,
+            stt_engine_id: None,
+            llm_engine_id: None,
+        })
+        .await
+        .unwrap();
+        repo.ensure_participant("m8", "spk1", "Person 2")
+            .await
+            .unwrap();
+        for id in ["m8", "m9"] {
+            repo.add_action_item(
+                id,
+                &NewActionItem {
+                    text: "Send the deck".into(),
+                    owner: Some("Person 2".into()),
+                    due_hint: Some("by Friday".into()),
+                    source_seq: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        repo.upsert_notes(&MeetingNotes {
+            meeting_id: "m8".into(),
+            summary: String::new(),
+            decisions: String::new(),
+            action_items: "Send the deck — Person 2 (by Friday)".into(),
+            follow_ups: String::new(),
+            open_questions: String::new(),
+            prompt_version: "test".into(),
+            engine_id: None,
+            model: None,
+        })
+        .await
+        .unwrap();
+
+        repo.set_speaker_name("m8", "spk1", "Dan").await.unwrap();
+
+        let here = repo.action_items("m8").await.unwrap();
+        assert_eq!(here[0].owner.as_deref(), Some("Dan"));
+        let there = repo.action_items("m9").await.unwrap();
+        assert_eq!(there[0].owner.as_deref(), Some("Person 2"));
+        let notes = repo.get("m8").await.unwrap().unwrap().notes.unwrap();
+        assert_eq!(notes.action_items, "Send the deck — Dan (by Friday)");
+    }
+
+    /// Two live keys that are one person become one key. The emptied row is
+    /// dropped, and the surviving row takes the renumbered default name.
+    #[tokio::test]
+    async fn a_split_voice_merges_into_one_participant_on_remap() {
+        let (_pool, repo) = seeded("m6").await;
+        repo.ensure_participant("m6", "spk1", "Person 2")
+            .await
+            .unwrap();
+        repo.ensure_participant("m6", "spk3", "Person 4")
+            .await
+            .unwrap();
+        for (sequence, key) in [(0, "spk1"), (1, "spk3"), (2, "spk1"), (3, "spk3")] {
+            repo.append_segment(
+                "m6",
+                &NewSegment {
+                    sequence,
+                    start_offset_ms: sequence as i64 * 1000,
+                    end_offset_ms: sequence as i64 * 1000 + 1000,
+                    text: format!("line {sequence}"),
+                    speaker_key: Some(key.into()),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        repo.remap_segment_speakers(
+            "m6",
+            &[
+                SegmentRelabel {
+                    sequence: 1,
+                    speaker_key: "spk1".into(),
+                },
+                SegmentRelabel {
+                    sequence: 3,
+                    speaker_key: "spk1".into(),
+                },
+            ],
+            &[("spk1".into(), "Person 1".into())],
+        )
+        .await
+        .unwrap();
+
+        let detail = repo.get("m6").await.unwrap().unwrap();
+        let keys: Vec<&str> = detail
+            .segments
+            .iter()
+            .map(|s| s.speaker_key.as_deref().unwrap())
+            .collect();
+        assert_eq!(keys, vec!["spk1"; 4]);
+        assert_eq!(detail.speakers.len(), 1);
+        assert_eq!(detail.speakers[0].speaker_key, "spk1");
+        assert_eq!(detail.speakers[0].display_name, "Person 1");
+        assert_eq!(detail.speakers[0].source, SpeakerSource::Channel);
+    }
+
+    /// A user's name follows its voice when the pass folds that voice into
+    /// another key, and the default name on the surviving key does not
+    /// overwrite it.
+    #[tokio::test]
+    async fn a_user_name_is_carried_onto_the_key_its_segments_moved_to() {
+        let (_pool, repo) = seeded("m7").await;
+        repo.ensure_participant("m7", "spk0", "Person 1")
+            .await
+            .unwrap();
+        repo.ensure_participant("m7", "spk2", "Person 3")
+            .await
+            .unwrap();
+        repo.set_speaker_name("m7", "spk2", "Dan").await.unwrap();
+        for (sequence, key) in [(0, "spk0"), (1, "spk2"), (2, "spk2")] {
+            repo.append_segment(
+                "m7",
+                &NewSegment {
+                    sequence,
+                    start_offset_ms: sequence as i64 * 1000,
+                    end_offset_ms: sequence as i64 * 1000 + 1000,
+                    text: format!("line {sequence}"),
+                    speaker_key: Some(key.into()),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        repo.remap_segment_speakers(
+            "m7",
+            &[
+                SegmentRelabel {
+                    sequence: 1,
+                    speaker_key: "spk0".into(),
+                },
+                SegmentRelabel {
+                    sequence: 2,
+                    speaker_key: "spk0".into(),
+                },
+            ],
+            &[("spk0".into(), "Person 1".into())],
+        )
+        .await
+        .unwrap();
+
+        let speakers = repo.speakers("m7").await.unwrap();
+        assert_eq!(speakers.len(), 1);
+        assert_eq!(speakers[0].speaker_key, "spk0");
+        assert_eq!(speakers[0].display_name, "Dan");
+        assert_eq!(speakers[0].source, SpeakerSource::User);
+    }
+
+    /// When both keys were typed by the user, the surviving key keeps its own
+    /// name and the other is dropped. Nothing the user typed is overwritten.
+    #[tokio::test]
+    async fn a_typed_name_on_the_surviving_key_is_not_replaced() {
+        let (_pool, repo) = seeded("m12").await;
+        repo.ensure_participant("m12", "spk0", "Person 1")
+            .await
+            .unwrap();
+        repo.ensure_participant("m12", "spk2", "Person 3")
+            .await
+            .unwrap();
+        repo.set_speaker_name("m12", "spk0", "Sam").await.unwrap();
+        repo.set_speaker_name("m12", "spk2", "Dan").await.unwrap();
+        for (sequence, key) in [(0, "spk0"), (1, "spk2")] {
+            repo.append_segment(
+                "m12",
+                &NewSegment {
+                    sequence,
+                    start_offset_ms: sequence as i64 * 1000,
+                    end_offset_ms: sequence as i64 * 1000 + 1000,
+                    text: format!("line {sequence}"),
+                    speaker_key: Some(key.into()),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        repo.remap_segment_speakers(
+            "m12",
+            &[SegmentRelabel {
+                sequence: 1,
+                speaker_key: "spk0".into(),
+            }],
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let speakers = repo.speakers("m12").await.unwrap();
+        assert_eq!(speakers.len(), 1);
+        assert_eq!(speakers[0].display_name, "Sam");
+        assert_eq!(speakers[0].source, SpeakerSource::User);
     }
 
     async fn seeded(id: &str) -> (SqlitePool, MeetingRepo) {
@@ -1304,6 +1852,7 @@ mod tests {
         for (source, text) in [
             (SpeakerSource::Channel, "channel"),
             (SpeakerSource::User, "user"),
+            (SpeakerSource::Inferred, "inferred"),
         ] {
             assert_eq!(source.as_str(), text);
             assert_eq!(SpeakerSource::from_str(text), Some(source));

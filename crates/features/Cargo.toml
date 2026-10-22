@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 kea-core = { path = "../core" }
 kea-engines = { path = "../engines" }
+kea-infer = { path = "../infer" }
 kea-platform = { path = "../platform" }
 tokio.workspace = true
 async-trait.workspace = true
@@ -20,3 +21,4 @@ keyring.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+kea-infer = { path = "../infer", features = ["test-util"] }

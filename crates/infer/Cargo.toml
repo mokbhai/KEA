@@ -7,6 +7,8 @@ edition = "2021"
 default = []
 whisper = ["dep:whisper-rs"]
 sherpa = ["dep:sherpa-onnx"]
+# Exposes test doubles (ScriptedEmbedder) to other crates' test builds.
+test-util = []
 # whisper.cpp GPU/accelerator backends. Deliberately NOT in `default`: `metal`
 # links macOS-only frameworks and the workspace is built for Linux and Windows
 # in CI, so the selection is made by the host (Makefile) or the runner

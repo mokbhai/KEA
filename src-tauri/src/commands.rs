@@ -46,6 +46,7 @@ use kea_features::demo::{run_ping, DemoFeature};
 use kea_features::dictation::{run_dictation_with_commands, spawn_partials, DictationRunOpts};
 use kea_features::meeting::{
     run_interim_notes_pass, run_meeting_stop_with, InterimSchedule, MeetingStopOptions,
+    MeetingVoices,
 };
 use kea_features::rewrite::{complete_rewrite, OCR_COMMAND, PALETTE_COMMAND, UNDO_COMMAND};
 use kea_features::run_rewrite_with_storage;
@@ -82,8 +83,8 @@ use crate::events::{
     dictation_state_wire, emit_device_fallback, emit_dictation_error, emit_dictation_level,
     emit_dictation_partial, emit_dictation_preview, emit_dictation_state, emit_meeting_error,
     emit_meeting_level, emit_meeting_notes, emit_meeting_notes_error, emit_meeting_segment,
-    emit_meeting_state, emit_model_download_complete, emit_model_download_error,
-    emit_model_download_progress, emit_palette_close, emit_palette_open,
+    emit_meeting_state, emit_meeting_voice_separation_unavailable, emit_model_download_complete,
+    emit_model_download_error, emit_model_download_progress, emit_palette_close, emit_palette_open,
     emit_transcribe_file_complete, emit_transcribe_file_error, emit_transcribe_file_progress,
     emit_transcribe_file_segment, emit_tts_state, meeting_state_wire, MeetingSegmentPayload,
     PartialThrottle, TranscribeFileProgressPayload, TranscribeFileSegmentPayload, TtsState,
@@ -500,6 +501,11 @@ pub struct ActiveMeetingSession {
     /// in it is about *this* meeting: taking the session out of the slot at
     /// stop is what retires the schedule, with nothing to reset by hand.
     pub interim: InterimSchedule,
+    /// Voice separation for this meeting, or `None` when it is off or could not
+    /// start. Behind a mutex because the segment poll and the stop both use it,
+    /// from different tasks. Dropped with the session, so the embeddings are
+    /// gone when the meeting is.
+    pub voices: Option<Arc<tokio::sync::Mutex<MeetingVoices>>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -2433,10 +2439,11 @@ fn spawn_segment_poll(
                             active.session.meeting_id.clone(),
                             active.sequence,
                             active.elapsed_ms,
+                            active.voices.clone(),
                         )
                     })
                 };
-                let Some((meeting_id, mut sequence, mut elapsed_ms)) = poll_state else {
+                let Some((meeting_id, mut sequence, mut elapsed_ms, voices)) = poll_state else {
                     return ControlFlow::Break(());
                 };
 
@@ -2458,6 +2465,12 @@ fn spawn_segment_poll(
 
                 let poll_result = {
                     let mut audio = state.audio.lock().await;
+                    // Audio first, then voices: the stop takes them in the same
+                    // order, so the two cannot wait on each other.
+                    let mut voices_guard = match &voices {
+                        Some(voices) => Some(voices.lock().await),
+                        None => None,
+                    };
                     let mut ctx = MeetingRunContext {
                         engines: &state.engines,
                         bindings: &bindings,
@@ -2467,8 +2480,14 @@ fn spawn_segment_poll(
                         settings: &settings,
                         vocabulary: &vocabulary,
                     };
-                    run_meeting_poll_segment(&mut ctx, &meeting_id, &mut sequence, &mut elapsed_ms)
-                        .await
+                    run_meeting_poll_segment(
+                        &mut ctx,
+                        &meeting_id,
+                        &mut sequence,
+                        &mut elapsed_ms,
+                        voices_guard.as_deref_mut(),
+                    )
+                    .await
                 };
 
                 // Whether this tick actually produced a segment, read before
@@ -2528,6 +2547,38 @@ fn spawn_segment_poll(
     );
 }
 
+/// Loads the speaker embedder for a meeting that asked for voice separation.
+///
+/// The setting promises both diarization models, so both must be installed:
+/// the meeting path reads only the embedding model, but a user who turned the
+/// setting on has been asked to download the bundle, and a half-installed bundle
+/// should say so rather than quietly work. The error is the reason the user is
+/// shown, so it names the missing model.
+#[cfg(feature = "sherpa")]
+async fn open_meeting_voices(state: &AppState) -> Result<MeetingVoices, String> {
+    use kea_infer::{
+        DiarizationModels, SherpaOnnxSpeakerEmbedder, SpeakerEmbedder, DIARIZATION_EMBEDDING_ID,
+        DIARIZATION_SEGMENTATION_ID,
+    };
+
+    let storage = &state.diarization_storage;
+    let models = DiarizationModels::locate(
+        &storage.onnx_dir_for(DIARIZATION_SEGMENTATION_ID),
+        &storage.onnx_dir_for(DIARIZATION_EMBEDDING_ID),
+    )
+    .map_err(|e| e.to_string())?;
+    let embedder = SherpaOnnxSpeakerEmbedder::load(&models.embedding)
+        .await
+        .map_err(|e| e.to_string())?;
+    let embedder: Arc<dyn SpeakerEmbedder> = Arc::new(embedder);
+    Ok(MeetingVoices::new(embedder))
+}
+
+#[cfg(not(feature = "sherpa"))]
+async fn open_meeting_voices(_state: &AppState) -> Result<MeetingVoices, String> {
+    Err("this build has no diarization runtime (the `sherpa` feature is off)".into())
+}
+
 pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Result<String, String> {
     // Reject before the audio lock while a prior meeting is still finishing:
     // during synthesis active_meeting is None and audio is Idle, so without
@@ -2569,6 +2620,22 @@ pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Resu
     // One read, shared by the start context, the segment poll and the stop.
     let vocabulary = Arc::new(load_vocabulary(&state.config_pool).await);
 
+    // Decided once, here, from the models as they are at start. A meeting that
+    // cannot separate voices still records: it gets channel labels, and the
+    // user is told why, once.
+    let voices = if settings.voice_separation {
+        match open_meeting_voices(state).await {
+            Ok(voices) => Some(Arc::new(tokio::sync::Mutex::new(voices))),
+            Err(reason) => {
+                tracing::warn!(error = %reason, "meeting: voice separation unavailable");
+                emit_meeting_voice_separation_unavailable(app, &reason);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let session = {
         let mut audio = state.audio.lock().await;
         let mut ctx = MeetingRunContext {
@@ -2580,7 +2647,7 @@ pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Resu
             settings: &settings,
             vocabulary: &vocabulary,
         };
-        let session = run_meeting_start(&mut ctx).await?;
+        let session = run_meeting_start(&mut ctx, voices.is_some()).await?;
         report_device_fallback(app, audio.as_mut());
         session
     };
@@ -2597,6 +2664,7 @@ pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Resu
             // cadence from here rather than from a schedule that was never
             // created.
             interim: InterimSchedule::new(settings.interim_cadence()),
+            voices,
         });
     }
 
@@ -2667,6 +2735,13 @@ pub async fn stop_meeting_inner(
             MeetingSettings::default()
         });
 
+    // The poll may still be mid-tick with the voices; waiting for its guard
+    // here is the point, so the stop's re-cluster sees every segment the poll
+    // assigned. The guard is released before the session is dropped.
+    let mut voices_guard = match &session.voices {
+        Some(voices) => Some(voices.lock().await),
+        None => None,
+    };
     let detail = run_meeting_stop_with(
         &state.engines,
         &bindings,
@@ -2675,6 +2750,7 @@ pub async fn stop_meeting_inner(
         &session.session,
         drain_result,
         &vocabulary,
+        voices_guard.as_deref_mut(),
         MeetingStopOptions {
             calendar: state.calendar.clone(),
             calendar_titles: settings.calendar_titles,
@@ -2682,6 +2758,7 @@ pub async fn stop_meeting_inner(
         },
     )
     .await;
+    drop(voices_guard);
 
     match &detail {
         Ok(_) => emit_meeting_state(app, MeetingState::Idle),
