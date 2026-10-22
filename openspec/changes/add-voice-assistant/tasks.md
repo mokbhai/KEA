@@ -51,7 +51,7 @@
 
 ## 7. UI surface
 
-- [ ] 7.1 Add the assistant window in `src-tauri/src/overlay.rs` or a sibling module, keyed on its own label the way the dictation HUD is, and ensure it does not take keyboard focus; verify by running `make dev` that the frontmost app keeps focus when the window appears
+- [x] 7.1 Add the assistant window in `src-tauri/src/overlay.rs` or a sibling module, keyed on its own label the way the dictation HUD is, and ensure it does not take keyboard focus; verify by running `make dev` that the frontmost app keeps focus when the window appears
 - [x] 7.2 Add assistant events to `src-tauri/src/events.rs` (state, partial text, result, error) following the existing `DictationPartialPayload` shape; verify the payloads serialize in Rust unit tests
 - [x] 7.3 Add the listeners to `ui/src/api.ts` alongside `onDictationState`/`onDictationLevel`; verify `ui/src/api.test.ts` covers each new listener
 - [x] 7.4 Build `ui/src/components/AssistantHud.tsx` (named for the `DictationHud.tsx` it sits beside in the overlay, not the `AssistantPanel.tsx` this task first said) rendering the four states, live partial text, the answer with a copy control, a stop-speaking control while playback runs, and a cancel control; verify a colocated `.test.tsx` covers each state, matching the per-component test convention in `ui/src/`
@@ -66,7 +66,7 @@
 
 ## 9. Instrumentation and verification
 
-- [ ] 9.1 Add a timing span around the offline decode in the dictation and assistant paths (only insertion is timed today, at `crates/features/src/dictation.rs:487`); verify the elapsed value appears in the log for one real dictation, answering design.md's open question on re-decode cost
+- [x] 9.1 Add a timing span around the offline decode in the dictation and assistant paths (only insertion is timed today, at `crates/features/src/dictation.rs:487`); verify the elapsed value appears in the log for one real dictation, answering design.md's open question on re-decode cost
 - [x] 9.2 Add an end-to-end test driving activation through routing to a spoken answer with fake engines; verify it asserts the answer was both displayed and sent to the TTS engine, and that no action was invoked
 - [x] 9.3 Add an end-to-end test driving activation through routing to a completed action with fake engines; verify it asserts the `actions` ledger row and the presented result
 - [x] 9.4 Add an end-to-end test for the refusal path: a malformed routing response invokes no action, reports the failure, and leaves the session open
