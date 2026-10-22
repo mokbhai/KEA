@@ -4,6 +4,7 @@ pub mod interim;
 pub mod notion;
 pub mod settings;
 pub mod synthesis;
+pub mod voices;
 
 pub use attribution::{attribute_segment, SpeakerChannel};
 pub use export::{markdown_file_name, meeting_to_markdown};
@@ -23,4 +24,8 @@ pub use synthesis::{
     parse_meeting_notes_json, render_action_items_prose, sanitize_meeting_title,
     split_action_item_prose, strip_markdown_fence, ParsedActionItem, ParsedMeetingNotes,
     MEETING_INTERIM_PROMPT_VERSION, MEETING_NOTES_PROMPT_VERSION, MEETING_TITLE_PROMPT_VERSION,
+};
+pub use voices::{
+    embedding_windows, person_display_name, ReclusterResult, VoiceClusters, JOIN_SIM, MAX_CLUSTERS,
+    MERGE_SIM, MIN_WINDOWS,
 };
