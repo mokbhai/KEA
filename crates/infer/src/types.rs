@@ -228,6 +228,80 @@ impl SttResult {
     }
 }
 
+/// Words whisper.cpp writes, in brackets or parentheses, for audio that is not
+/// speech. Lower-case and with no surrounding punctuation.
+const NON_SPEECH_WORDS: &[&str] = &[
+    "applause",
+    "background noise",
+    "blank_audio",
+    "inaudible",
+    "laughing",
+    "laughs",
+    "laughter",
+    "music",
+    "music playing",
+    "noise",
+    "silence",
+    "sound",
+];
+
+/// Removes whisper's non-speech annotations from a piece of transcript.
+///
+/// whisper.cpp emits `[BLANK_AUDIO]`, `[MUSIC]`, `(silence)` and the like as
+/// ordinary segment text, and they went straight into whatever the user was
+/// dictating into, as well as meeting notes and subtitles. A bracketed tag is
+/// dropped when it is an all-caps annotation (`[BLANK_AUDIO]`,
+/// `[MUSIC PLAYING]`) or one of [`NON_SPEECH_WORDS`] in brackets or
+/// parentheses (`(silence)`, `[ Music ]`). Anything else in brackets is left
+/// alone: "(see page 4)" is speech.
+pub fn strip_non_speech(text: &str) -> String {
+    // A segment that is nothing but one wrapped phrase — "*Sounds of the
+    // wind*", "(wind blowing)", "[keyboard clicking]" — is whisper describing
+    // the room, not anyone speaking: real speech is practically never a whole
+    // segment in brackets. Seen live: the assistant answered "*Sounds of the
+    // wind*" as if it were a question.
+    let whole = text.trim();
+    for (open, close) in [('*', '*'), ('(', ')'), ('[', ']')] {
+        if whole.len() > 2
+            && whole.starts_with(open)
+            && whole.ends_with(close)
+            && !whole[1..whole.len() - 1].contains([open, close])
+        {
+            return String::new();
+        }
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find(['[', '(']) {
+        let close_char = if rest[open..].starts_with('[') {
+            ']'
+        } else {
+            ')'
+        };
+        let Some(len) = rest[open + 1..].find(close_char) else {
+            break;
+        };
+        let inner = &rest[open + 1..open + 1 + len];
+        let tag = inner.trim();
+        let annotation = !tag.is_empty()
+            && ((close_char == ']'
+                && tag.chars().any(|c| c.is_ascii_uppercase())
+                && tag
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '_' || c == ' ' || c == '-'))
+                || NON_SPEECH_WORDS.contains(&tag.to_ascii_lowercase().as_str()));
+        out.push_str(&rest[..open]);
+        if !annotation {
+            out.push_str(&rest[open..open + 1 + len + 1]);
+        }
+        rest = &rest[open + 1 + len + 1..];
+    }
+    out.push_str(rest);
+    // A dropped tag leaves its neighbours' spaces behind.
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Joins segment texts the way a transcript reads: single-spaced, with
 /// whatever leading space the model emitted trimmed off each piece.
 ///
@@ -427,5 +501,53 @@ mod stt_result_tests {
     fn no_timestamps_means_no_segments() {
         assert!(group_tokens_into_segments(&[], &[], None, 700, 7_000).is_empty());
         assert!(SttResult::text_only("hi").segments.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod non_speech_tests {
+    use super::strip_non_speech;
+
+    /// The case a user hit: dictation typed "[BLANK_AUDIO]" after the words.
+    #[test]
+    fn whisper_annotations_are_removed() {
+        assert_eq!(
+            strip_non_speech("I will grant you Confluence access today. [BLANK_AUDIO]"),
+            "I will grant you Confluence access today."
+        );
+        assert_eq!(strip_non_speech("[MUSIC PLAYING]"), "");
+        assert_eq!(
+            strip_non_speech(" (silence) Okay, let's start."),
+            "Okay, let's start."
+        );
+        assert_eq!(
+            strip_non_speech("Thanks [ Music ] everyone"),
+            "Thanks everyone"
+        );
+        assert_eq!(strip_non_speech("[ Applause ]"), "");
+        // A whole segment that only describes the room.
+        assert_eq!(strip_non_speech(" *Sounds of the wind*"), "");
+        assert_eq!(strip_non_speech("(wind blowing)"), "");
+        assert_eq!(strip_non_speech("[keyboard clicking]"), "");
+    }
+
+    /// Brackets that are speech stay: only annotations go.
+    #[test]
+    fn spoken_brackets_are_kept() {
+        assert_eq!(
+            strip_non_speech("See (page 4) for details"),
+            "See (page 4) for details"
+        );
+        assert_eq!(
+            strip_non_speech("the [draft] version"),
+            "the [draft] version"
+        );
+        assert_eq!(strip_non_speech("an unclosed [note"), "an unclosed [note");
+        assert_eq!(strip_non_speech("ship the API (v2)"), "ship the API (v2)");
+        // Emphasis inside speech is speech.
+        assert_eq!(
+            strip_non_speech("that was *really* good"),
+            "that was *really* good"
+        );
     }
 }

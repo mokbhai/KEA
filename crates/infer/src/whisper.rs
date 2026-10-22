@@ -244,10 +244,12 @@ impl WhisperInference for WhisperRsInference {
                     .full_get_segment_t1(i)
                     .map_err(|e| InferError::Other(format!("failed to read segment end: {e}")))?;
                 let start_ms = centiseconds_to_ms(t0);
+                // A segment that was only "[BLANK_AUDIO]" becomes empty, and
+                // `join_segment_text` and the subtitle writer skip empties.
                 segments.push(TimedSegment {
                     start_ms,
                     end_ms: centiseconds_to_ms(t1).max(start_ms),
-                    text,
+                    text: crate::types::strip_non_speech(&text),
                 });
             }
 
