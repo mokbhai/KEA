@@ -6,6 +6,21 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-23
+
+### Added
+
+- A new Meetings page. Your meetings are listed beside the selected one, grouped Today / Yesterday / This week / Earlier and searchable by title or notes. It opens on the meeting being recorded, or else the newest, with its summary on screen. Each meeting has Summary, Transcript and Ask AI tabs. A recording shows live in the same place, Record and Stop sit in the header, and every meeting setting moved into a ⚙ panel.
+- Ask AI about a meeting. Questions are answered from that meeting's notes and transcript, with `[mm:ss]` citations that jump to the line. Asking it to reshape the notes ("shorter", "email-ready", "only decisions", a translation) proposes a change you see side by side and Apply or Discard. Notes can also be edited by hand. Edited notes are marked, and Undo steps back to the notes as generated. The chat is saved with the meeting. Editing waits until a meeting has finished, because its notes are still being written until then.
+- Meetings can tell participants apart by voice. Turn on "Separate speakers by voice" in the meeting settings (it needs the two speaker models, which it offers to download). The other side of a call is then labelled "Person 1", "Person 2", … as they speak instead of all being "Others". A room on one microphone is split the same way. When the meeting stops, every voice is regrouped at once, so a person split in two while recording becomes one, and a name you typed stays on its voice. Names said in the conversation ("Thanks, Dan") are proposed only when a quoted line backs them, marked as inferred until you confirm them, and never replace a name you typed. Action-item owners use these names. Voice data is kept in memory only and discarded with the meeting. Nothing is written to disk.
+- An OpenAI-compatible local API for KEA's models. With the local API on, other apps and scripts can call `/v1/audio/transcriptions` (with optional `speakers=true`), `/v1/audio/speech`, `/v1/chat/completions` and `/v1/models`, so existing OpenAI SDKs and tools work by changing only their base URL. A separate "Allow localhost port" setting, off by default, serves it on `127.0.0.1:8765` for clients that cannot use the Unix socket. Requests from browser pages are refused, the token is required on every request, and the setting says plainly what the token allows. The port also brings the local API to Windows. The `kea` command gains `stt`, `tts`, `llm` and `models`, which work in pipelines (`git diff | kea llm "write a commit message"`).
+
+### Fixed
+
+- Transcripts no longer contain whisper's non-speech markers. `[BLANK_AUDIO]`, `[MUSIC]`, `(silence)` and descriptions such as `*Sounds of the wind*` were treated as text, so dictation typed `[BLANK_AUDIO]` into the document and the voice assistant could answer a gust of wind as if it were a question. Brackets and emphasis inside real speech are kept.
+- Meeting action items no longer repeat. Each interim notes pass restated every task in new words, and each wording was stored as another row, so a long meeting ended with the same items several times over. The latest pass now rewords its rows in place and drops the ones it no longer lists. Items you ticked off, dropped or added yourself are left alone.
+- Speaker labels in file transcription now work in installed builds. The app's diarization code sat behind a build feature that no build ever enabled, so every shipped version fell back to "no diarization runtime" even with the models downloaded. Speakers are also numbered in the order they are first heard, so a transcript no longer opens on "Speaker 2".
+
 ## [0.4.0] - 2026-09-28
 
 ### Added
