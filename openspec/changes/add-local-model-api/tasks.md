@@ -43,4 +43,4 @@
 ## 7. Verification
 
 - [x] 7.1 Run `cargo test --workspace`, `cargo clippy --workspace --all-targets`, `cargo fmt --check`, and the UI test and typecheck scripts; all pass
-- [ ] 7.2 End-to-end with the official OpenAI Python SDK (`base_url=http://127.0.0.1:8765/v1`, KEA token as the API key): transcribe a file (with and without `speakers`), synthesize speech to a WAV, run a chat completion with and without `stream=True`, and list models; confirm a browser `fetch` to the port from a web page is refused
+- [x] 7.2 End-to-end with the official OpenAI Python SDK (`base_url=http://127.0.0.1:8765/v1`, KEA token as the API key): transcribe a file (with and without `speakers`), synthesize speech to a WAV, run a chat completion with and without `stream=True`, and list models; confirm a browser `fetch` to the port from a web page is refused

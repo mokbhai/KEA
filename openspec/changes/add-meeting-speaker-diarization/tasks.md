@@ -37,7 +37,7 @@
 
 ## 6. App and UI
 
-- [ ] 6.1 Hold `VoiceClusters` and the embedder on `ActiveMeetingSession`, created at start only when the setting is on and both diarization models are installed; emit a one-time notice when unavailable; verify by `cargo build -p vox` (src-tauri) and a meeting started with models absent records with channel labels
+- [x] 6.1 Hold `VoiceClusters` and the embedder on `ActiveMeetingSession`, created at start only when the setting is on and both diarization models are installed; emit a one-time notice when unavailable; verify by `cargo build -p vox` (src-tauri) and a meeting started with models absent records with channel labels
 - [x] 6.2 Expose `voice_separation` through the meeting settings commands and `ui/src/api.ts`; verify `ui` type-check and the api test
 - [x] 6.3 Add the Meetings settings toggle with model install state and the existing download action; verify a `MeetingsPage` test that enabling without models offers the download
 - [x] 6.4 Show inferred names in `MeetingDetail` with an "inferred" badge and a confirm action (calls `set_meeting_speaker_name` with the same name); verify a `MeetingDetail` test for badge and confirm

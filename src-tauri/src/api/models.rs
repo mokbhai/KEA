@@ -505,7 +505,8 @@ fn speaker_runtime<'a>(
     Ok((diarizer, models))
 }
 
-/// One label per segment, `Person N` from the diarizer's zero-based index.
+/// One label per segment, `Person N` numbered in the order the voices are
+/// first heard. See [`number_by_first_appearance`].
 async fn label_speakers(
     diarizer: &dyn SpeakerDiarization,
     models: &DiarizationModels,
@@ -526,17 +527,32 @@ async fn label_speakers(
         )
         .await
         .map_err(|e| ApiError::internal(format!("speaker separation failed: {e}")))?;
-    Ok(assign_speakers(segments, &spans)
-        .iter()
-        .map(|key| key.as_deref().and_then(person_label))
-        .collect())
+    Ok(number_by_first_appearance(&assign_speakers(
+        segments, &spans,
+    )))
 }
 
-/// `spk3` → `Person 4`. The key is the one `assign_speakers` writes, and the
-/// number is shown one-based, as the meeting labels are.
-fn person_label(key: &str) -> Option<String> {
-    let index: u32 = key.strip_prefix("spk")?.parse().ok()?;
-    Some(format!("Person {}", index + 1))
+/// `Person 1`, `Person 2`, … in the order the segments first meet each voice.
+///
+/// Not the diarizer's own index: its clusters include ones no transcript
+/// segment lands in (a cough, a stretch of music), and numbering from those
+/// gave a two-voice upload "Person 2" and "Person 3" with no "Person 1",
+/// found running the OpenAI SDK against an installed build.
+fn number_by_first_appearance(keys: &[Option<String>]) -> Vec<Option<String>> {
+    let mut order: Vec<&str> = Vec::new();
+    keys.iter()
+        .map(|key| {
+            let key = key.as_deref()?;
+            let index = match order.iter().position(|seen| *seen == key) {
+                Some(index) => index,
+                None => {
+                    order.push(key);
+                    order.len() - 1
+                }
+            };
+            Some(format!("Person {}", index + 1))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1629,10 +1645,22 @@ mod tests {
     }
 
     #[test]
-    fn person_labels_are_one_based_and_ignore_other_keys() {
-        assert_eq!(person_label("spk0").as_deref(), Some("Person 1"));
-        assert_eq!(person_label("spk1").as_deref(), Some("Person 2"));
-        assert_eq!(person_label("nobody"), None);
+    fn people_are_numbered_by_first_appearance() {
+        let keys = [
+            Some("spk2".to_string()),
+            None,
+            Some("spk1".to_string()),
+            Some("spk2".to_string()),
+        ];
+        assert_eq!(
+            number_by_first_appearance(&keys),
+            vec![
+                Some("Person 1".to_string()),
+                None,
+                Some("Person 2".to_string()),
+                Some("Person 1".to_string()),
+            ]
+        );
     }
 
     #[test]
