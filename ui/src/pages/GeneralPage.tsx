@@ -67,7 +67,7 @@ const API_THREAT_MODEL =
 const TCP_WARNING =
   "Holding the token lets a program read your selection, type into the focused app, open " +
   "the microphone and spend LLM credits. Browsers are blocked from the localhost port, but " +
-  "any program on this Mac that has the token can call it.";
+  "any program on this computer that has the token can call it.";
 
 export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) {
   const { preference, setPreference } = useTheme();

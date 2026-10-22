@@ -184,6 +184,43 @@ pub fn redact(text: &str, secret: &str) -> String {
     text.replace(secret, "[redacted]")
 }
 
+/// Removes anything shaped like a credential from a provider's message.
+///
+/// [`redact`] handles the key we know was sent, but not every call knows it:
+/// a listed model id, or a binding that names no provider, makes the engine
+/// fall back to its own default provider, whose key this layer never sees.
+/// So every provider message also goes through this: a run of token
+/// characters is replaced when it carries a known key prefix, follows
+/// `Bearer`, or is long and mixes letters and digits the way keys do and
+/// words do not. A false positive costs a garbled request id in an error
+/// message; a false negative hands a caller someone's API key.
+pub fn scrub_secrets(text: &str) -> String {
+    const PREFIXES: [&str; 7] = ["sk-", "sk_", "gsk_", "xai-", "pk-", "AIza", "key-"];
+    let is_token_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+
+    let mut out = String::with_capacity(text.len());
+    let mut after_bearer = false;
+    let mut rest = text;
+    while let Some(start) = rest.find(is_token_char) {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let end = tail.find(|c: char| !is_token_char(c)).unwrap_or(tail.len());
+        let word = &tail[..end];
+
+        let has_letter = word.chars().any(|c| c.is_ascii_alphabetic());
+        let has_digit = word.chars().any(|c| c.is_ascii_digit());
+        let secret = (after_bearer && word.len() >= 8)
+            || (word.len() >= 12 && PREFIXES.iter().any(|p| word.starts_with(p)))
+            || (word.len() >= 24 && has_letter && has_digit);
+        out.push_str(if secret { "[redacted]" } else { word });
+
+        after_bearer = word.eq_ignore_ascii_case("bearer");
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Model names
 // ---------------------------------------------------------------------------
@@ -1410,5 +1447,23 @@ mod tests {
             let text_line = cue.lines().nth(2).unwrap_or("");
             assert!(text_line.starts_with("Person 1: "), "unlabelled cue: {cue}");
         }
+    }
+
+    #[test]
+    fn scrub_secrets_removes_key_shaped_tokens_and_keeps_words() {
+        let msg = "401: Incorrect API key provided: sk-proj-abcDEF1234567890xyz. Header was Bearer abc12345XYZ.";
+        let out = scrub_secrets(msg);
+        assert!(!out.contains("sk-proj"), "{out}");
+        assert!(!out.contains("abc12345XYZ"), "{out}");
+        assert!(
+            out.starts_with("401: Incorrect API key provided: [redacted]"),
+            "{out}"
+        );
+
+        let plain = "The model gpt-4o-mini does not exist or you do not have access to it.";
+        assert_eq!(scrub_secrets(plain), plain);
+
+        let long = "request id 9f8e7d6c5b4a39281706f5e4d3c2b1a0 failed";
+        assert_eq!(scrub_secrets(long), "request id [redacted] failed");
     }
 }

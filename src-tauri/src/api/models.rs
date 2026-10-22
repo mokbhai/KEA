@@ -42,9 +42,9 @@ use serde_json::Value;
 
 use super::openai::{
     chat_completion_body, chat_stream_body, flatten_messages, models_list_body, parse_chat,
-    parse_speech, redact, render_transcription, resolve_model, validate_speech, ApiError,
-    Capability, ListedModel, ModelChoice, SpeechFormat, TranscriptSegment, TranscriptionForm,
-    TranscriptionFormat, SSE_CONTENT_TYPE,
+    parse_speech, redact, render_transcription, resolve_model, scrub_secrets, validate_speech,
+    ApiError, Capability, ListedModel, ModelChoice, SpeechFormat, TranscriptSegment,
+    TranscriptionForm, TranscriptionFormat, SSE_CONTENT_TYPE,
 };
 use super::ratelimit::TokenBucket;
 use crate::commands::{try_acquire_busy, CHUNK_CUT_SEARCH_SECS};
@@ -264,8 +264,8 @@ async fn choose(
 /// message. That message is the only thing from the provider that reaches
 /// the body, and the key the binding names is removed from it first: a
 /// provider that echoes a rejected key back must not hand it to the caller.
-/// A binding with no provider named has no key to look up here, so its
-/// message goes through as the engine wrote it.
+/// A binding with no provider named has no key to look up here, which is why
+/// every message is also put through [`scrub_secrets`].
 async fn engine_failure(deps: &Deps<'_>, binding: &Binding, err: EngineError) -> ApiError {
     let message = match err {
         EngineError::Config(message) | EngineError::ModelNotInstalled(message) => {
@@ -281,7 +281,7 @@ async fn engine_failure(deps: &Deps<'_>, binding: &Binding, err: EngineError) ->
         Some(key) => redact(&message, &key),
         None => message,
     };
-    ApiError::provider(message)
+    ApiError::provider(scrub_secrets(&message))
 }
 
 fn busy(what: &str) -> ApiError {
@@ -1336,6 +1336,36 @@ mod tests {
         assert!(
             chat(&h.deps(None), CHAT).await.is_ok(),
             "the token was still there"
+        );
+    }
+
+    /// The reviewer's case: the binding names no provider, so the engine uses
+    /// its own default and this layer never learns the key. The key-shaped
+    /// token is still scrubbed from the 502.
+    #[tokio::test]
+    async fn a_key_echoed_for_an_unnamed_provider_is_scrubbed() {
+        let mut h = harness().await;
+        h.engines.register_llm(Arc::new(FakeLlm {
+            result: Err("invalid key sk-proj-AbCdEf0123456789".into()),
+        }));
+        h.bindings
+            .set(
+                API_FEATURE_ID,
+                "llm",
+                Binding {
+                    engine_id: "fake-llm".into(),
+                    model: None,
+                    provider_ref: None,
+                },
+            )
+            .await
+            .unwrap();
+        let err = expect_err(chat(&h.deps(None), CHAT).await);
+        assert_eq!(err.status, 502);
+        assert!(
+            !err.body().to_string().contains("sk-proj"),
+            "{}",
+            err.message
         );
     }
 
