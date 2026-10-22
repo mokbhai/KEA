@@ -683,6 +683,27 @@ async fn collect_body(body: Incoming, limit: usize) -> Result<Bytes, ()> {
         .map_err(|_| ())
 }
 
+/// The installed models of every download-based local engine, read from disk
+/// per request: a download that finishes while the API runs is callable on
+/// the next request, with no cache to invalidate.
+fn installed_models(state: &AppState) -> models::InstalledModels {
+    use crate::commands::{installed_onnx_model_ids, onnx_catalog_for_kind};
+    use kea_infer::ModelKind;
+
+    let onnx = |storage: &kea_infer::ModelStorage, kind: ModelKind| {
+        onnx_catalog_for_kind(kind)
+            .map(|catalog| installed_onnx_model_ids(storage, &catalog))
+            .unwrap_or_default()
+    };
+    models::InstalledModels::default()
+        .with("whisper", state.model_storage.installed_models())
+        .with(
+            "parakeet",
+            onnx(&state.parakeet_storage, ModelKind::Parakeet),
+        )
+        .with("sherpa-tts", onnx(&state.tts_storage, ModelKind::Tts))
+}
+
 /// Carries out one of the OpenAI-compatible routes.
 ///
 /// The dependencies are borrowed from the app for this request only. The
@@ -699,6 +720,7 @@ async fn serve_model_route(
     let bindings = BindingRepo::new(rt.state.config_pool.clone());
     let usage = UsageRepo::new(rt.state.data_pool.clone());
     let diarizer = models::production_diarizer();
+    let installed = installed_models(&rt.state);
     let deps = Deps {
         engines: &rt.state.engines,
         bindings: &bindings,
@@ -709,6 +731,7 @@ async fn serve_model_route(
         stt_busy: &rt.state.api_stt_busy,
         tts_busy: &rt.state.api_tts_busy,
         limiter: &rt.limiter,
+        installed: &installed,
     };
 
     let result = match kind {

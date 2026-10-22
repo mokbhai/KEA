@@ -73,6 +73,35 @@ pub struct Deps<'a> {
     pub tts_busy: &'a Arc<AtomicBool>,
     /// The per-minute LLM limit, shared with the verbs that spend credits.
     pub limiter: &'a Mutex<TokenBucket>,
+    /// Which models of the download-based engines are on disk.
+    pub installed: &'a InstalledModels,
+}
+
+/// The models of the download-based local engines that are actually installed.
+///
+/// An engine's `capabilities()` is its whole catalogue — every Whisper or
+/// Kokoro model it *could* load — which is right for a picker that offers
+/// downloads and wrong for `/v1/models`, whose readers take each id as one
+/// they can call. An engine with an entry here lists only those models; an
+/// engine with none (a hosted provider, the system voices) is listed whole,
+/// because nothing is downloaded for it.
+#[derive(Debug, Clone, Default)]
+pub struct InstalledModels {
+    by_engine: std::collections::HashMap<String, std::collections::HashSet<String>>,
+}
+
+impl InstalledModels {
+    pub fn with(mut self, engine_id: &str, models: impl IntoIterator<Item = String>) -> Self {
+        self.by_engine
+            .insert(engine_id.to_string(), models.into_iter().collect());
+        self
+    }
+
+    fn allows(&self, engine_id: &str, model: &str) -> bool {
+        self.by_engine
+            .get(engine_id)
+            .is_none_or(|installed| installed.contains(model))
+    }
 }
 
 /// A successful answer: what the server writes as the response body.
@@ -203,7 +232,11 @@ pub async fn listed_models(deps: &Deps<'_>) -> Result<Vec<ListedModel>, ApiError
                 });
                 continue;
             }
-            for (index, model) in models.iter().enumerate() {
+            let models: Vec<&String> = models
+                .iter()
+                .filter(|model| deps.installed.allows(&engine_id, model))
+                .collect();
+            for (index, model) in models.into_iter().enumerate() {
                 let is_default = match &default {
                     Some(b) if b.engine_id == engine_id => match &b.model {
                         Some(bound) => bound == model,
@@ -212,7 +245,7 @@ pub async fn listed_models(deps: &Deps<'_>) -> Result<Vec<ListedModel>, ApiError
                     _ => false,
                 };
                 listed.push(ListedModel {
-                    id: super::openai::model_id(&engine_id, Some(model)),
+                    id: super::openai::model_id(&engine_id, Some(model.as_str())),
                     engine_id: engine_id.clone(),
                     model: Some(model.clone()),
                     capability: cap,
@@ -840,6 +873,7 @@ mod tests {
         stt_busy: Arc<AtomicBool>,
         tts_busy: Arc<AtomicBool>,
         limiter: Mutex<TokenBucket>,
+        installed: InstalledModels,
         _dir: tempfile::TempDir,
     }
 
@@ -858,6 +892,7 @@ mod tests {
             stt_busy: Arc::new(AtomicBool::new(false)),
             tts_busy: Arc::new(AtomicBool::new(false)),
             limiter: Mutex::new(TokenBucket::per_minute(1_000, Instant::now())),
+            installed: InstalledModels::default(),
             _dir: dir,
         }
     }
@@ -874,6 +909,7 @@ mod tests {
                 stt_busy: &self.stt_busy,
                 tts_busy: &self.tts_busy,
                 limiter: &self.limiter,
+                installed: &self.installed,
             }
         }
 
@@ -1431,6 +1467,51 @@ mod tests {
     }
 
     // ---- /v1/models --------------------------------------------------------
+
+    /// Found running the OpenAI SDK against an installed build: the listing
+    /// was every engine's whole catalogue, 218 ids for a machine with a
+    /// handful installed. A download-based engine lists only what is on disk;
+    /// one with nothing installed is not listed at all.
+    #[tokio::test]
+    async fn models_lists_only_installed_models_of_download_based_engines() {
+        let mut h = harness().await;
+        h.engines.register_stt(Arc::new(FakeStt {
+            id: "whisper",
+            models: vec!["base".into(), "small".into(), "large".into()],
+            segments: Vec::new(),
+            text: String::new(),
+        }));
+        h.engines.register_stt(Arc::new(FakeStt {
+            id: "parakeet",
+            models: vec!["v3".into()],
+            segments: Vec::new(),
+            text: String::new(),
+        }));
+        h.engines.register_stt(Arc::new(FakeStt {
+            id: "openai-stt",
+            models: vec!["whisper-1".into()],
+            segments: Vec::new(),
+            text: String::new(),
+        }));
+        h.installed = InstalledModels::default()
+            .with("whisper", ["small".to_string()])
+            .with("parakeet", []);
+
+        let v = json_of(&list(&h.deps(None)).await.unwrap());
+        let mut ids: Vec<&str> = v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        ids.sort_unstable();
+        // A hosted engine has nothing to install, so it is listed whole.
+        assert_eq!(ids, vec!["openai-stt/whisper-1", "whisper/small"]);
+
+        // An uninstalled model is not callable by id either.
+        let err = expect_err(choose(&h.deps(None), Capability::Stt, Some("whisper/large")).await);
+        assert_eq!(err.status, 404);
+    }
 
     #[tokio::test]
     async fn models_lists_every_engines_models_and_marks_the_bound_one() {

@@ -7,7 +7,7 @@ edition = "2021"
 # The local engines ship by default: the picker offers Whisper/Parakeet/local
 # voices and downloads their models, so a build without them registered lets a
 # user fetch a gigabyte and then hit "unknown engine id" when it is selected.
-default = ["whisper", "parakeet", "streaming", "tts-local", "tts-system", "stt-apple"]
+default = ["whisper", "parakeet", "streaming", "tts-local", "tts-system", "stt-apple", "sherpa"]
 updater = ["tauri-plugin-updater"]
 whisper = ["kea-engines/whisper", "kea-infer/whisper"]
 # macOS-only; selected by host in the Makefile and per-runner in release.yml,
@@ -27,6 +27,12 @@ tts-system = ["kea-engines/tts-system"]
 # reports on-device recognition (see `register_apple_stt_engine`); the feature
 # builds everywhere so the workspace has one feature set.
 stt-apple = ["kea-engines/stt-apple"]
+# The app's own diarization and speaker-embedding code: file-transcription
+# speaker labels, meeting voice separation and the API's `speakers=true`. In
+# `default` because every default build already links sherpa-onnx through
+# `parakeet`/`streaming`/`tts-local`; without it here those three features
+# compiled to their "no runtime" fallback in every shipped build, and the
+# fakes in the tests could not notice.
 sherpa = ["kea-infer/sherpa"]
 # ScreenCaptureKit system audio for meetings. macOS-only, so selected by host
 # in the Makefile and per-runner in release.yml like `whisper-metal`. Without
