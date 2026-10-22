@@ -20,3 +20,4 @@ keyring.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+kea-infer = { path = "../infer", features = ["test-util"] }

@@ -2,6 +2,7 @@ pub mod download;
 pub mod error;
 pub mod registry;
 pub mod sherpa_diarize;
+pub mod sherpa_embed;
 pub mod sherpa_stream;
 pub mod sherpa_stt;
 pub mod sherpa_tts;
@@ -19,6 +20,7 @@ pub use registry::{
     MATCHA_VOCODER_FILE, MATCHA_VOCODER_ID,
 };
 pub use sherpa_diarize::{DiarizationModels, DiarizationOpts, SpeakerDiarization, SpeakerSpan};
+pub use sherpa_embed::{locate_embedding_model, SpeakerEmbedder, SPEAKER_EMBEDDING_SAMPLE_RATE_HZ};
 pub use sherpa_stream::{
     find_streaming_model_files, SherpaStreamSession, SherpaStreamingInference, StreamingModelFiles,
 };
@@ -43,6 +45,12 @@ pub use sherpa_stream::SherpaOnnxStreamingInference;
 
 #[cfg(feature = "sherpa")]
 pub use sherpa_diarize::SherpaOnnxDiarization;
+
+#[cfg(feature = "sherpa")]
+pub use sherpa_embed::SherpaOnnxSpeakerEmbedder;
+
+#[cfg(any(test, feature = "test-util"))]
+pub use sherpa_embed::ScriptedEmbedder;
 
 #[cfg(feature = "sherpa")]
 pub use sherpa_stt::SherpaOnnxSttInference;
