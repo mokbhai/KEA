@@ -29,10 +29,10 @@
 
 ## 5. CLI
 
-- [ ] 5.1 `kea stt FILE|-` with `--format/--language/--model/--speakers`; verify by running against a fake-backed debug build (or a `curl` mock) that text, srt and stdin inputs work
-- [ ] 5.2 `kea tts TEXT|-` with `--voice/--speed/--model/--out`, the terminal guard, and stdout when piped; verify the guard exits non-zero in a TTY and that `--out` writes a valid WAV
-- [ ] 5.3 `kea llm PROMPT|-` with `--system/--model`, appending piped stdin; and `kea models [--json]`; verify `echo ctx | kea llm "q"` sends both parts and `kea models` marks defaults
-- [ ] 5.4 `--api-url`/`KEA_API_URL` transport switch, bearer auth on both transports, error-message extraction and the existing exit codes; update `usage()`; verify `sh -n` and a manual run with the API off and on
+- [x] 5.1 `kea stt FILE|-` with `--format/--language/--model/--speakers`; verify by running against a fake-backed debug build (or a `curl` mock) that text, srt and stdin inputs work
+- [x] 5.2 `kea tts TEXT|-` with `--voice/--speed/--model/--out`, the terminal guard, and stdout when piped; verify the guard exits non-zero in a TTY and that `--out` writes a valid WAV
+- [x] 5.3 `kea llm PROMPT|-` with `--system/--model`, appending piped stdin; and `kea models [--json]`; verify `echo ctx | kea llm "q"` sends both parts and `kea models` marks defaults
+- [x] 5.4 `--api-url`/`KEA_API_URL` transport switch, bearer auth on both transports, error-message extraction and the existing exit codes; update `usage()`; verify `sh -n` and a manual run with the API off and on
 
 ## 6. UI
 
