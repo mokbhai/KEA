@@ -46,6 +46,17 @@ impl TtsEngine for SystemTtsEngine {
         }
     }
 
+    /// The installed voices, by the same identifiers `capabilities` lists.
+    fn voice_names(&self, _model: Option<&str>) -> Option<Vec<String>> {
+        Some(
+            self.inference
+                .voices()
+                .into_iter()
+                .map(|voice| voice.id)
+                .collect(),
+        )
+    }
+
     async fn synthesize(&self, text: &str, opts: TtsOpts) -> Result<AudioPcm, EngineError> {
         if text.trim().is_empty() {
             return Err(EngineError::Config("empty text".into()));

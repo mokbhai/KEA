@@ -13,10 +13,6 @@
 //! a secret to end up in, and [`redact`] is the one helper for the case where
 //! a provider echoes one back.
 
-// Nothing calls these until the model routes in `server.rs` and `exec.rs`
-// land (tasks 3 and 4). Remove this allow when the first route uses them.
-#![allow(dead_code)]
-
 use kea_core::transcript::{SubtitleFormat, SubtitleOpts};
 use kea_engines::traits::{SttSegment, TokenUsage};
 use serde::Deserialize;
@@ -146,6 +142,12 @@ impl ApiError {
         );
         err.retry_after = Some(retry_after);
         err
+    }
+
+    /// `500`: KEA itself failed (a join error, a DB error, an encoder). Not a
+    /// provider problem, so it is not a `502`, and the message is KEA's own.
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(500, "api_error", Some("internal_error"), message)
     }
 
     /// `502`: the bound hosted provider failed. Takes the message alone, so

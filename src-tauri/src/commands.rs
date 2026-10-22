@@ -1435,7 +1435,7 @@ pub const TRANSCRIBE_DIARIZE_SETTING: &str = "transcribe.diarization";
 ///
 /// Two seconds: far enough to clear a sentence, short enough that the chunks
 /// stay near the target length and the progress bar stays honest.
-const CHUNK_CUT_SEARCH_SECS: u32 = 2;
+pub(crate) const CHUNK_CUT_SEARCH_SECS: u32 = 2;
 
 /// The selected streaming model, or `None` when the feature is off.
 ///

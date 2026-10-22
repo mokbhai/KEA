@@ -89,6 +89,19 @@ impl TtsEngine for LocalTtsEngine {
         }
     }
 
+    /// The speakers in the bundle the request resolves to. A single-speaker
+    /// bundle lists none, so any name given for it is refused by the caller.
+    fn voice_names(&self, model: Option<&str>) -> Option<Vec<String>> {
+        let default_model = self.default_model();
+        let model_id = model.unwrap_or(&default_model);
+        Some(
+            ModelRegistry::voices(model_id)
+                .into_iter()
+                .map(|voice| voice.name)
+                .collect(),
+        )
+    }
+
     async fn synthesize(&self, text: &str, opts: TtsOpts) -> Result<AudioPcm, EngineError> {
         if text.trim().is_empty() {
             return Err(EngineError::Config("empty text".into()));

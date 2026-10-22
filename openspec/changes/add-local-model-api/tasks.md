@@ -15,14 +15,14 @@
 
 ## 3. Model execution
 
-- [ ] 3.1 Transcription: decode bytes, `plan_chunks`/`transcribe_chunks` with an event-free sink, optional whole-file diarization + `assign_speakers` rendered as `Person N`, the `api_stt_busy` flag; verify tests with a fake STT engine (segments, empty segments, `409` when busy, `409` when the diarization models are missing with `speakers=true`)
-- [ ] 3.2 Speech: resolve voice (unknown → `400`), speed range 0.25–4.0, 4,096-character input cap, synthesize, encode WAV/PCM with `x-kea-sample-rate`, the `api_tts_busy` flag, no playback; verify tests with a fake TTS engine that WAV headers and sample count are correct and that the playback path is never called
-- [ ] 3.3 Chat: resolve the LLM, take a rate-limit token (`429` + `Retry-After`), complete, record usage under feature `api`, map provider errors to `502`; verify tests with a fake LLM for success, stream, rate limit and provider failure, and that a usage row is written
-- [ ] 3.4 `GET /v1/models` from the registry plus bindings, marking per-capability defaults; verify a test with two STT engines and one bound
+- [x] 3.1 Transcription: decode bytes, `plan_chunks`/`transcribe_chunks` with an event-free sink, optional whole-file diarization + `assign_speakers` rendered as `Person N`, the `api_stt_busy` flag; verify tests with a fake STT engine (segments, empty segments, `409` when busy, `409` when the diarization models are missing with `speakers=true`)
+- [x] 3.2 Speech: resolve voice (unknown → `400`), speed range 0.25–4.0, 4,096-character input cap, synthesize, encode WAV/PCM with `x-kea-sample-rate`, the `api_tts_busy` flag, no playback; verify tests with a fake TTS engine that WAV headers and sample count are correct and that the playback path is never called
+- [x] 3.3 Chat: resolve the LLM, take a rate-limit token (`429` + `Retry-After`), complete, record usage under feature `api`, map provider errors to `502`; verify tests with a fake LLM for success, stream, rate limit and provider failure, and that a usage row is written
+- [x] 3.4 `GET /v1/models` from the registry plus bindings, marking per-capability defaults; verify a test with two STT engines and one bound
 
 ## 4. Server and transport
 
-- [ ] 4.1 Add the four routes to the route table, with a per-route body limit (25 MB for transcriptions, 1 MB otherwise) returning `413`; verify the route-table test and a socket test that an oversized body gets `413`
+- [x] 4.1 Add the four routes to the route table, with a per-route body limit (25 MB for transcriptions, 1 MB otherwise) returning `413`; verify the route-table test and a socket test that an oversized body gets `413`
 - [x] 4.2 Accept `Authorization: Bearer` alongside `x-kea-token` in `auth.rs` with the same constant-time compare, and rewrite the module doc's transport section for the opt-in port; verify auth unit tests for both headers, a wrong bearer, and `Origin` still refused
 - [ ] 4.3 TCP listener: optional `127.0.0.1:<port>` accept loop over the same service, a `watch`-based stop that lets in-flight requests finish, bind errors returned to the caller, and TCP-only operation on non-Unix; verify tests that bind an ephemeral port, authenticate via bearer, refuse `Host: attacker.example`, and stop accepting after disable
 - [ ] 4.4 Settings `api.tcp.enabled` (default off) and `api.tcp.port` (default 8765) in `api/settings.rs`, applied live; verify a settings test that the defaults read as off/8765 and a port conflict is reported without stopping the socket

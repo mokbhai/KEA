@@ -32,9 +32,14 @@ use tauri::AppHandle;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
+use kea_core::store::bindings::BindingRepo;
+use kea_core::store::usage::UsageRepo;
+
 use super::actions::{DictationVerb, KeaAction, RewriteRequest};
 use super::auth::{authorize, Denied};
 use super::exec::{execute, spends_llm_credits, ActionError, ActionOutcome};
+use super::models::{self, Deps, Reply};
+use super::openai::ApiError;
 use super::ratelimit::TokenBucket;
 use super::token;
 use crate::AppState;
@@ -43,6 +48,12 @@ use crate::AppState;
 /// hundred kilobytes; a megabyte is generous and stops a local process from
 /// making KEA buffer its way out of memory.
 const MAX_BODY: usize = 1024 * 1024;
+
+/// Biggest transcription upload. OpenAI's own limit for the same route, so a
+/// client that checks its file size before sending hits the same wall here.
+/// About an hour of compressed audio; the decoded PCM is the same footprint
+/// file transcription already accepts.
+const MAX_UPLOAD_BODY: usize = 25 * 1024 * 1024;
 
 /// One route: the method and path that name it, and the verb it produces.
 ///
@@ -62,6 +73,36 @@ enum RouteKind {
     Speak,
     Transcribe,
     Status,
+    // The OpenAI-compatible model routes. They do not produce a `KeaAction`:
+    // they are answered by `models`, with their own bodies and errors.
+    ModelTranscriptions,
+    ModelSpeech,
+    ModelChat,
+    ModelList,
+}
+
+impl RouteKind {
+    /// Whether this route is one of the OpenAI-compatible ones. Those answer
+    /// with OpenAI's error shape and a route-sized body limit; every other
+    /// route keeps its existing responses.
+    fn is_model_route(self) -> bool {
+        matches!(
+            self,
+            RouteKind::ModelTranscriptions
+                | RouteKind::ModelSpeech
+                | RouteKind::ModelChat
+                | RouteKind::ModelList
+        )
+    }
+
+    /// The most body this route will read. Only the upload route is larger
+    /// than the general limit.
+    fn body_limit(self) -> usize {
+        match self {
+            RouteKind::ModelTranscriptions => MAX_UPLOAD_BODY,
+            _ => MAX_BODY,
+        }
+    }
 }
 
 fn routes() -> Vec<Route> {
@@ -98,6 +139,26 @@ fn routes() -> Vec<Route> {
             method: Method::GET,
             path: "/v1/status",
             kind: RouteKind::Status,
+        },
+        Route {
+            method: Method::POST,
+            path: "/v1/audio/transcriptions",
+            kind: RouteKind::ModelTranscriptions,
+        },
+        Route {
+            method: Method::POST,
+            path: "/v1/audio/speech",
+            kind: RouteKind::ModelSpeech,
+        },
+        Route {
+            method: Method::POST,
+            path: "/v1/chat/completions",
+            kind: RouteKind::ModelChat,
+        },
+        Route {
+            method: Method::GET,
+            path: "/v1/models",
+            kind: RouteKind::ModelList,
         },
     ]
 }
@@ -198,6 +259,14 @@ fn action_for(kind: RouteKind, body: &[u8]) -> Result<KeaAction, ActionError> {
             })
         }
         RouteKind::Status => Ok(KeaAction::Status),
+        // Answered by `models`, never planned as an action. Reaching this
+        // arm would be a routing bug, so it is refused rather than guessed at.
+        RouteKind::ModelTranscriptions
+        | RouteKind::ModelSpeech
+        | RouteKind::ModelChat
+        | RouteKind::ModelList => Err(ActionError::Failed(
+            "a model route is not a KEA action".into(),
+        )),
     }
 }
 
@@ -517,16 +586,42 @@ async fn handle(rt: Runtime, req: Request<Incoming>) -> Response<Full<Bytes>> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let headers = req.headers().clone();
+    let kind = match_route(&method, &path);
+    // The model routes answer in OpenAI's shape, refusals included, so the
+    // shape is decided from the route before anything else is checked.
+    let openai = kind.is_some_and(RouteKind::is_model_route);
 
-    let body = match Limited::new(req.into_body(), MAX_BODY).collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => {
+    // Authorization comes before the body is read: a 25 MB upload from a
+    // process without the token should cost KEA nothing. `plan_request`
+    // repeats the check for the routes that take the action path, which is
+    // harmless: it can only refuse what this has already let through.
+    if let Err(denied) = authorize(&headers, rt.token.as_bytes()) {
+        tracing::warn!(%method, %path, reason = denied.reason(), "local API: request denied");
+        return if openai {
+            openai_error(ApiError::auth("invalid or missing API token"))
+        } else {
+            error_response(status_code(Denied::status(denied)), "unauthorized")
+        };
+    }
+    let Some(kind) = kind else {
+        return error_response(StatusCode::NOT_FOUND, "no such endpoint");
+    };
+
+    let limit = kind.body_limit();
+    let body = match collect_body(req.into_body(), limit).await {
+        Ok(bytes) => bytes,
+        Err(()) if openai => return openai_error(ApiError::too_large(limit)),
+        Err(()) => {
             return error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request body is too large or could not be read",
             )
         }
     };
+
+    if kind.is_model_route() {
+        return serve_model_route(&rt, &method, &path, kind, &headers, body).await;
+    }
 
     let action = match plan_request(&method, &path, &headers, rt.token.as_bytes(), &body) {
         Ok(action) => action,
@@ -576,6 +671,97 @@ async fn handle(rt: Runtime, req: Request<Incoming>) -> Response<Full<Bytes>> {
             error_response(status_code(e.status()), &e.to_string())
         }
     }
+}
+
+/// Reads a body up to `limit` bytes. Over the limit, or unreadable, is `Err`:
+/// the caller decides the response, because its shape depends on the route.
+async fn collect_body(body: Incoming, limit: usize) -> Result<Bytes, ()> {
+    Limited::new(body, limit)
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes())
+        .map_err(|_| ())
+}
+
+/// Carries out one of the OpenAI-compatible routes.
+///
+/// The dependencies are borrowed from the app for this request only. The
+/// repositories are cheap handles over the pools, so building them per
+/// request is what the action path does too.
+async fn serve_model_route(
+    rt: &Runtime,
+    method: &Method,
+    path: &str,
+    kind: RouteKind,
+    headers: &http::HeaderMap,
+    body: Bytes,
+) -> Response<Full<Bytes>> {
+    let bindings = BindingRepo::new(rt.state.config_pool.clone());
+    let usage = UsageRepo::new(rt.state.data_pool.clone());
+    let diarizer = models::production_diarizer();
+    let deps = Deps {
+        engines: &rt.state.engines,
+        bindings: &bindings,
+        usage: &usage,
+        credentials: rt.state.credentials.as_ref(),
+        diarization: &rt.state.diarization_storage,
+        diarizer: diarizer.as_deref(),
+        stt_busy: &rt.state.api_stt_busy,
+        tts_busy: &rt.state.api_tts_busy,
+        limiter: &rt.limiter,
+    };
+
+    let result = match kind {
+        RouteKind::ModelTranscriptions => {
+            let content_type = headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok());
+            models::transcriptions(&deps, content_type, body).await
+        }
+        RouteKind::ModelSpeech => models::speech(&deps, &body).await,
+        RouteKind::ModelChat => models::chat(&deps, &body).await,
+        _ => models::list(&deps).await,
+    };
+    match result {
+        Ok(reply) => {
+            tracing::info!(%method, %path, outcome = "ok", "local API");
+            model_reply(reply)
+        }
+        Err(error) => {
+            tracing::warn!(%method, %path, status = error.status, outcome = "error", "local API");
+            openai_error(error)
+        }
+    }
+}
+
+/// An [`ApiError`] in OpenAI's error shape, with `Retry-After` where the
+/// caller is expected to come back.
+fn openai_error(error: ApiError) -> Response<Full<Bytes>> {
+    let mut response = json(status_code(error.status), error.body());
+    if let Some(seconds) = error.retry_after {
+        if let Ok(value) = http::HeaderValue::from_str(&seconds.max(1).to_string()) {
+            response
+                .headers_mut()
+                .insert(http::header::RETRY_AFTER, value);
+        }
+    }
+    response
+}
+
+/// A model route's success, with its content type and any extra headers.
+fn model_reply(reply: Reply) -> Response<Full<Bytes>> {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, reply.content_type)
+        .header("x-content-type-options", "nosniff");
+    for (name, value) in reply.headers {
+        if let Ok(value) = http::HeaderValue::from_str(&value) {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+        .body(Full::new(Bytes::from(reply.body)))
+        .unwrap_or_else(|_| openai_error(ApiError::internal("could not build the response")))
 }
 
 /// Bind the unix socket and start its accept loop, returning its path.
@@ -971,6 +1157,177 @@ mod tests {
         assert_eq!(match_route(&Method::POST, "/v1/status"), None);
         assert_eq!(match_route(&Method::POST, "/rewrite"), None);
         assert_eq!(match_route(&Method::GET, "/"), None);
+    }
+
+    #[test]
+    fn the_model_routes_are_in_the_table_with_their_own_limits() {
+        assert_eq!(
+            match_route(&Method::POST, "/v1/audio/transcriptions"),
+            Some(RouteKind::ModelTranscriptions)
+        );
+        assert_eq!(
+            match_route(&Method::POST, "/v1/audio/speech"),
+            Some(RouteKind::ModelSpeech)
+        );
+        assert_eq!(
+            match_route(&Method::POST, "/v1/chat/completions"),
+            Some(RouteKind::ModelChat)
+        );
+        assert_eq!(
+            match_route(&Method::GET, "/v1/models"),
+            Some(RouteKind::ModelList)
+        );
+        // Method and path are both part of the match.
+        assert_eq!(match_route(&Method::GET, "/v1/audio/speech"), None);
+        assert_eq!(match_route(&Method::POST, "/v1/models"), None);
+
+        assert_eq!(
+            RouteKind::ModelTranscriptions.body_limit(),
+            25 * 1024 * 1024
+        );
+        assert_eq!(RouteKind::ModelChat.body_limit(), MAX_BODY);
+        assert_eq!(RouteKind::Rewrite.body_limit(), MAX_BODY);
+        assert!(RouteKind::ModelSpeech.is_model_route());
+        assert!(!RouteKind::Speak.is_model_route());
+        // A model route never becomes a KEA action, so the action path
+        // cannot be reached with one by mistake.
+        assert!(action_for(RouteKind::ModelChat, b"{}").is_err());
+    }
+
+    /// The stand-in service the body-limit socket test serves. It runs the
+    /// same authorization, routing and body collection that `handle` runs,
+    /// and answers with the same error shapes, so the limits are exercised
+    /// over a real socket without an `AppState` to carry the engines.
+    #[cfg(unix)]
+    async fn body_limit_service(req: Request<Incoming>) -> Response<Full<Bytes>> {
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+        let headers = req.headers().clone();
+        let kind = match_route(&method, &path);
+        let openai = kind.is_some_and(RouteKind::is_model_route);
+        if authorize(&headers, TEST_TOKEN.as_bytes()).is_err() {
+            return if openai {
+                openai_error(ApiError::auth("invalid or missing API token"))
+            } else {
+                error_response(StatusCode::UNAUTHORIZED, "unauthorized")
+            };
+        }
+        let Some(kind) = kind else {
+            return error_response(StatusCode::NOT_FOUND, "no such endpoint");
+        };
+        match collect_body(req.into_body(), kind.body_limit()).await {
+            Ok(_) => json(StatusCode::OK, serde_json::json!({ "route": path })),
+            Err(()) if openai => openai_error(ApiError::too_large(kind.body_limit())),
+            Err(()) => error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body is too large or could not be read",
+            ),
+        }
+    }
+
+    /// Sends a raw request with a body over the socket and reads the answer
+    /// to the close. The write runs beside the read: a server that answers
+    /// `413` stops reading early, and the rest of the upload fails to write.
+    /// That failure is expected, so it is not an error here.
+    ///
+    /// The write half stays open until the answer is read. Dropping it
+    /// would half-close the socket, and hyper then discards a response it
+    /// has not sent yet, which reads as an empty answer.
+    #[cfg(unix)]
+    async fn send_with_body(path: &std::path::Path, head: String, body: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let stream = tokio::net::UnixStream::connect(path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        let upload = tokio::spawn(async move {
+            let _ = writer.write_all(head.as_bytes()).await;
+            let _ = writer.write_all(&body).await;
+            std::future::pending::<()>().await;
+        });
+        let mut response = Vec::new();
+        reader.read_to_end(&mut response).await.unwrap();
+        upload.abort();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// The body limit, end to end over the socket: a 2 MB body to a chat
+    /// route (1 MB) is a `413` in OpenAI's error shape, and the same body to
+    /// the upload route (25 MB) is accepted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_oversized_model_body_is_a_413_in_openai_shape_over_the_socket() {
+        use hyper_util::rt::TokioIo;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = token::socket_path(dir.path());
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(|req: Request<Incoming>| async {
+                        Ok::<_, Infallible>(body_limit_service(req).await)
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        let payload = vec![b'a'; 2 * 1024 * 1024];
+        let head = |route: &str| {
+            format!(
+                "POST {route} HTTP/1.1\r\nHost: localhost\r\nx-kea-token: {TEST_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            )
+        };
+
+        let too_big = send_with_body(&socket, head("/v1/chat/completions"), payload.clone()).await;
+        assert!(too_big.starts_with("HTTP/1.1 413"), "{too_big}");
+        assert!(
+            too_big.contains("\"type\":\"invalid_request_error\""),
+            "{too_big}"
+        );
+        assert!(
+            too_big.contains("\"code\":\"request_too_large\""),
+            "{too_big}"
+        );
+
+        let upload = send_with_body(&socket, head("/v1/audio/transcriptions"), payload).await;
+        assert!(upload.starts_with("HTTP/1.1 200"), "{upload}");
+    }
+
+    /// An unauthenticated model route is refused in OpenAI's shape too, so an
+    /// SDK can read the reason it got.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_model_route_without_a_token_is_an_openai_401() {
+        use hyper_util::rt::TokioIo;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = token::socket_path(dir.path());
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(|req: Request<Incoming>| async {
+                        Ok::<_, Infallible>(body_limit_service(req).await)
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let anonymous = request(
+            &socket,
+            "GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(anonymous.starts_with("HTTP/1.1 401"), "{anonymous}");
+        assert!(
+            anonymous.contains("\"code\":\"invalid_api_key\""),
+            "{anonymous}"
+        );
     }
 
     #[test]
