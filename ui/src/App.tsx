@@ -6,7 +6,7 @@ import {
   type MutableRefObject,
 } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { getBinding, getSetting, setSetting, onApiOpenPage, onDictationError, onMeetingError, onRewriteError, onRewriteProgress, onTtsError, onTtsState } from "./api";
+import { getBinding, getSetting, setSetting, onApiOpenPage, onDictationError, onMeetingError, onMeetingVoiceSeparationUnavailable, onRewriteError, onRewriteProgress, onTtsError, onTtsState } from "./api";
 import Onboarding from "./components/Onboarding";
 import Spinner from "./components/Spinner";
 import StatusPill from "./components/StatusPill";
@@ -140,6 +140,9 @@ function AppShell() {
       }),
       onTtsError((message) => showStatus(message, "error")),
       onMeetingError((message) => showStatus(message, "error")),
+      onMeetingVoiceSeparationUnavailable((reason) =>
+        showStatus(`Voice separation is off for this meeting: ${reason}`, "progress"),
+      ),
     ]);
 
     return () => {

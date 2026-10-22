@@ -113,10 +113,14 @@ pub struct ReclusterResult {
     /// voice was merged into another maps to the survivor, so a user name on
     /// it can move with the voice. Old keys with no evidence are not listed.
     pub mapping: Vec<(String, String)>,
-    /// Keys the pass created, with their default display name. Renumbering
-    /// starts at the lowest free index, so a new label reads as the next
-    /// person to have spoken rather than a gap in the sequence.
-    pub fresh: Vec<(String, String)>,
+    /// Every key the pass leaves in use, with its default display name,
+    /// numbered "Person 1", "Person 2", … in the order a reader meets them.
+    ///
+    /// Keys are kept stable so a typed name stays on its voice; it is the
+    /// *names* that are renumbered. A key whose row holds a typed or inferred
+    /// name keeps that name, because the store only rewrites default rows.
+    /// A new key takes the lowest index no kept key holds.
+    pub names: Vec<(String, String)>,
 }
 
 /// Online participant clustering for one meeting.
@@ -126,6 +130,17 @@ pub struct VoiceClusters {
     /// Every window seen, tagged with its segment's sequence number. Kept so
     /// the stop-time pass can cluster the whole meeting, not just the centroids.
     evidence: Vec<(i32, Vec<f32>)>,
+    /// What the most recent [`VoiceClusters::assign`] did, so a segment that
+    /// is never stored can be taken back out. See [`VoiceClusters::forget`].
+    last: Option<LastAssign>,
+}
+
+#[derive(Debug, Clone)]
+struct LastAssign {
+    sequence: i32,
+    cluster: usize,
+    windows: usize,
+    opened: bool,
 }
 
 impl VoiceClusters {
@@ -184,11 +199,55 @@ impl VoiceClusters {
             }
         };
 
+        let opened = winner + 1 == self.clusters.len() && self.clusters[winner].count == 0;
+        let count = windows.len();
         for window in windows {
             self.clusters[winner].absorb(&window);
             self.evidence.push((sequence, window));
         }
+        self.last = Some(LastAssign {
+            sequence,
+            cluster: winner,
+            windows: count,
+            opened,
+        });
         Some(winner)
+    }
+
+    /// Takes back the most recent assignment, if it was for `sequence`.
+    ///
+    /// The label is decided before the segment is transcribed and stored, and
+    /// either step can fail. A segment that never reaches the table must not
+    /// stay in the evidence: the caller retries the next segment under the
+    /// same sequence number, and the phantom windows would then vote with it,
+    /// both live and in the stop-time pass.
+    pub fn forget(&mut self, sequence: i32) {
+        let Some(last) = self.last.take() else {
+            return;
+        };
+        if last.sequence != sequence {
+            self.last = Some(last);
+            return;
+        }
+        let start = self.evidence.len() - last.windows;
+        let removed: Vec<Vec<f32>> = self.evidence.drain(start..).map(|(_, w)| w).collect();
+        if last.opened {
+            self.clusters.pop();
+            return;
+        }
+        let cluster = &mut self.clusters[last.cluster];
+        let remaining = cluster.count - removed.len();
+        if remaining == 0 {
+            // Unreachable for a cluster this call did not open, but a running
+            // mean over nothing is not a centroid; keep the last one.
+            return;
+        }
+        let total = cluster.count as f32;
+        for (i, c) in cluster.centroid.iter_mut().enumerate() {
+            let sum: f32 = removed.iter().map(|w| w[i]).sum();
+            *c = (*c * total - sum) / remaining as f32;
+        }
+        cluster.count = remaining;
     }
 
     fn nearest(&self, embedding: &[f32]) -> Option<(usize, f32)> {
@@ -292,9 +351,7 @@ impl VoiceClusters {
             label_key.insert(label, key);
         }
 
-        // Leftover labels take the lowest numbers no kept key holds, in the
-        // order a reader meets them.
-        let mut fresh = Vec::new();
+        // Leftover labels take the lowest key indices no kept key holds.
         let mut next = 0u32;
         for &label in &segment_label {
             if label_key.contains_key(&label) {
@@ -307,9 +364,18 @@ impl VoiceClusters {
                     break candidate;
                 }
             };
-            let key = speaker_key(index);
-            fresh.push((key.clone(), person_display_name(index)));
-            label_key.insert(label, key);
+            label_key.insert(label, speaker_key(index));
+        }
+
+        // Display names follow first appearance, whatever the keys are: if
+        // "Person 1"'s voice is absorbed into "Person 2"'s, the transcript must
+        // not open on "Person 2".
+        let mut names: Vec<(String, String)> = Vec::new();
+        for &label in &segment_label {
+            let key = &label_key[&label];
+            if !names.iter().any(|(k, _)| k == key) {
+                names.push((key.clone(), person_display_name(names.len() as u32)));
+            }
         }
 
         // Each old key follows the label holding most of its windows. For a
@@ -335,7 +401,7 @@ impl VoiceClusters {
         ReclusterResult {
             segments,
             mapping,
-            fresh,
+            names,
         }
     }
 }
@@ -580,6 +646,7 @@ mod tests {
         VoiceClusters {
             clusters: Vec::new(),
             evidence: evidence.to_vec(),
+            last: None,
         }
     }
 
@@ -665,7 +732,10 @@ mod tests {
                 ("spk1".to_string(), "spk0".to_string()),
             ]
         );
-        assert!(result.fresh.is_empty());
+        assert_eq!(
+            result.names,
+            vec![("spk0".to_string(), "Person 1".to_string())]
+        );
     }
 
     #[test]
@@ -707,9 +777,13 @@ mod tests {
             result.segments,
             vec![(1, "spk1".to_string()), (2, "spk0".to_string())]
         );
+        // Keys stay put; names follow first appearance.
         assert_eq!(
-            result.fresh,
-            vec![("spk1".to_string(), "Person 2".to_string())]
+            result.names,
+            vec![
+                ("spk1".to_string(), "Person 1".to_string()),
+                ("spk0".to_string(), "Person 2".to_string()),
+            ]
         );
     }
 
@@ -722,9 +796,59 @@ mod tests {
             vec![(1, "spk0".to_string()), (2, "spk1".to_string())]
         );
         assert_eq!(
-            result.fresh,
-            vec![("spk0".to_string(), "Person 1".to_string())]
+            result.names,
+            vec![
+                ("spk0".to_string(), "Person 1".to_string()),
+                ("spk1".to_string(), "Person 2".to_string()),
+            ]
         );
+    }
+
+    /// The reviewer's case: Person 1's voice is absorbed into Person 2's, and
+    /// the transcript must still open on "Person 1".
+    #[test]
+    fn names_are_renumbered_by_first_appearance_after_a_merge() {
+        let near = jitter(&axis(1), &axis(0));
+        let state = state(&[
+            (1, axis(1)),
+            (1, axis(1)),
+            (2, near.clone()),
+            (2, near),
+            (3, axis(2)),
+            (3, axis(2)),
+        ]);
+        let result = state.recluster(&[key(1, "spk0"), key(2, "spk1"), key(3, "spk2")]);
+        let names: Vec<&str> = result.names.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(names, ["Person 1", "Person 2"]);
+        assert_eq!(result.segments[0].1, result.segments[1].1);
+    }
+
+    #[test]
+    fn forgetting_the_last_assignment_removes_its_evidence() {
+        let mut clusters = VoiceClusters::new();
+        assert_eq!(clusters.assign(1, vec![axis(0), axis(0)]), Some(0));
+        // A new voice that is never stored is taken back out entirely.
+        assert_eq!(clusters.assign(2, vec![axis(1), axis(1)]), Some(1));
+        clusters.forget(2);
+        assert_eq!(clusters.clusters.len(), 1);
+        assert_eq!(clusters.evidence.len(), 2);
+
+        // A known voice that is never stored leaves its centroid as it was.
+        let before = clusters.clusters[0].centroid.clone();
+        assert_eq!(
+            clusters.assign(2, vec![jitter(&axis(0), &axis(1)); 2]),
+            Some(0)
+        );
+        clusters.forget(2);
+        for (a, b) in before.iter().zip(&clusters.clusters[0].centroid) {
+            assert!((a - b).abs() < 1e-5);
+        }
+        assert_eq!(clusters.clusters[0].count, 2);
+
+        // Forgetting a sequence that was not the last one is a no-op.
+        clusters.assign(3, vec![axis(0), axis(0)]);
+        clusters.forget(2);
+        assert_eq!(clusters.evidence.len(), 4);
     }
 
     #[test]
@@ -732,7 +856,7 @@ mod tests {
         let result = VoiceClusters::new().recluster(&[]);
         assert!(result.segments.is_empty());
         assert!(result.mapping.is_empty());
-        assert!(result.fresh.is_empty());
+        assert!(result.names.is_empty());
     }
 
     #[test]

@@ -1093,6 +1093,18 @@ export const onMeetingNotesError = (
     handler(event.payload.message),
   );
 
+/**
+ * Voice separation is on but could not start for this meeting (a model is
+ * missing, or the runtime failed to load). The meeting still records, with
+ * "You"/"Others" labels, so this is a notice rather than `onMeetingError`.
+ */
+export const onMeetingVoiceSeparationUnavailable = (
+  handler: (reason: string) => void,
+): Promise<UnlistenFn> =>
+  listen<{ reason: string }>("meeting:voice_separation_unavailable", (event) =>
+    handler(event.payload.reason),
+  );
+
 /** Mirrors `kea_core::store::actions::ActionStatus`. */
 export type ActionStatus = "started" | "ok" | "error" | "cancelled";
 

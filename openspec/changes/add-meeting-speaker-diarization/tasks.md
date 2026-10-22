@@ -44,5 +44,5 @@
 
 ## 7. Verification
 
-- [ ] 7.1 Run `cargo test --workspace`, `cargo clippy --all-targets`, and `npm test` in `ui`; all pass
+- [x] 7.1 Run `cargo test --workspace`, `cargo clippy --all-targets`, and `npm test` in `ui`; all pass
 - [ ] 7.2 Record a real call with at least three remote participants (voice separation on), confirm distinct `Person N` labels live, a consistent set after stop, an inferred name where one was spoken, and action-item owners using those names; record the observed `JOIN_SIM`/`MERGE_SIM` choice in `voices.rs`

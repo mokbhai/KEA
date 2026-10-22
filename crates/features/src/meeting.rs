@@ -121,9 +121,10 @@ fn voice_audio(segment: &SpeechSegment, channel: SpeakerChannel) -> Option<&PcmF
 /// The key a segment is stored under: the channel key, or a participant key
 /// when voice separation names the segment's voice.
 ///
-/// Every failure returns the channel key. The voice is an improvement on the
-/// label, never a condition for the segment, so nothing here may fail the
-/// caller. An unassigned remote segment also brings the "Others" row into being
+/// Every failure returns the channel key — or, in a mic-only meeting, the
+/// unattributed key, since there the channel says nothing about who spoke. The
+/// voice is an improvement on the label, never a condition for the segment,
+/// so nothing here may fail the caller. An unassigned remote segment also brings the "Others" row into being
 /// here, since in a two-source meeting with voices the row is not seeded at
 /// start, and a segment labelled "Others" with no row would be a lie.
 async fn speaker_key_for_segment(
@@ -150,15 +151,22 @@ async fn speaker_key_for_segment(
         }
     };
     let Some(index) = assigned else {
-        if channel == SpeakerChannel::Remote {
+        // A mic-only segment the voices could not place is not "You": the mic
+        // is shared by the whole room. It is stored as unattributed instead.
+        let fallback = if segment.system.is_none() {
+            SpeakerChannel::Mixed
+        } else {
+            channel
+        };
+        if fallback != SpeakerChannel::Local {
             if let Err(e) = meetings
-                .ensure_speaker(meeting_id, channel, channel.display_name())
+                .ensure_speaker(meeting_id, fallback, fallback.display_name())
                 .await
             {
-                tracing::warn!(error = %e, meeting_id, "meeting: failed to seed the Others row");
+                tracing::warn!(error = %e, meeting_id, "meeting: failed to seed a fallback speaker row");
             }
         }
-        return channel_key;
+        return fallback.as_str().to_string();
     };
 
     let index_u32 = index as u32;
@@ -1084,10 +1092,11 @@ pub async fn run_meeting_poll_segment(
     // They are dropped with the segment either way — there is no recording on
     // disk to go back to — so attribution has to happen while the audio is
     // still in hand.
+    let mut voices = voices;
     let speaker_key = match segment_speaker(&segment) {
         Some(channel) => Some(
             speaker_key_for_segment(
-                voices,
+                voices.as_deref_mut(),
                 ctx.meetings,
                 meeting_id,
                 &segment,
@@ -1099,7 +1108,7 @@ pub async fn run_meeting_poll_segment(
         None => None,
     };
 
-    let event = append_transcribed_segment(
+    let event = match append_transcribed_segment(
         ctx.engines,
         ctx.bindings,
         ctx.meetings,
@@ -1110,7 +1119,18 @@ pub async fn run_meeting_poll_segment(
         *elapsed_ms,
         ctx.vocabulary,
     )
-    .await?;
+    .await
+    {
+        Ok(event) => event,
+        Err(e) => {
+            // The segment was given a voice but never stored, and the next one
+            // reuses its sequence number; its windows must not vote with it.
+            if let Some(voices) = voices {
+                voices.clusters.forget(*sequence);
+            }
+            return Err(e);
+        }
+    };
     *sequence += 1;
     *elapsed_ms = event.end_offset_ms;
     Ok(Some(event))
@@ -1433,12 +1453,14 @@ async fn recluster_speakers(
             speaker_key,
         })
         .collect();
-    if relabels.is_empty() {
+    // No early return when nothing moved: the names can still need
+    // renumbering, and the store leaves typed names alone either way.
+    if result.names.is_empty() {
         return;
     }
 
     if let Err(e) = meetings
-        .remap_segment_speakers(meeting_id, &relabels, &result.fresh)
+        .remap_segment_speakers(meeting_id, &relabels, &result.names)
         .await
     {
         tracing::warn!(
@@ -2945,6 +2967,102 @@ mod tests {
         let b = vec![0.5, 0.866_025_4, 0.0];
         let x = vec![0.9, 0.435_889_9, 0.0];
         (a, b, x)
+    }
+
+    /// A mic-only segment too short to place is unattributed, not "You".
+    #[tokio::test]
+    async fn a_mic_only_segment_too_short_to_place_is_unattributed() {
+        let (reg, bindings, actions, meetings) =
+            voice_world(&[], KindLlm::new("{\"names\":[]}", false)).await;
+        // About 1.25 s: one window at most, below MIN_WINDOWS, so nothing is
+        // embedded and an empty script is enough.
+        let mut audio = mic_only_audio(vec![mic_segment(20_000)]);
+        let settings = settings(false);
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        let mut voices = voices_with(Vec::new());
+
+        let session = run_meeting_start(&mut ctx, true).await.unwrap();
+        let (mut seq, mut elapsed) = (0, 0);
+        let ev = poll_with(
+            &mut ctx,
+            &session.meeting_id,
+            &mut seq,
+            &mut elapsed,
+            &mut voices,
+        )
+        .await;
+        assert_eq!(ev.speaker_key.as_deref(), Some("mixed"));
+
+        let detail = meetings.get(&session.meeting_id).await.unwrap().unwrap();
+        assert!(detail.speakers.iter().all(|s| s.display_name != "You"));
+    }
+
+    /// A name typed while recording stays on its voice through the stop pass.
+    #[tokio::test]
+    async fn a_name_typed_mid_meeting_survives_the_stop_pass() {
+        let llm = KindLlm::new("{\"names\":[]}", false);
+        let (reg, bindings, actions, meetings) = voice_world(&[], llm).await;
+        let mut audio = two_source_audio(vec![
+            remote_segment(TWO_WINDOWS, 16_000),
+            remote_segment(TWO_WINDOWS, 16_000),
+        ]);
+        let settings = settings(true);
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        let mut steps = windows_of(&voice(0), 2);
+        steps.extend(windows_of(&voice(1), 2));
+        let mut voices = voices_with(steps);
+
+        let session = run_meeting_start(&mut ctx, true).await.unwrap();
+        let (mut seq, mut elapsed) = (0, 0);
+        for _ in 0..2 {
+            poll_with(
+                &mut ctx,
+                &session.meeting_id,
+                &mut seq,
+                &mut elapsed,
+                &mut voices,
+            )
+            .await;
+        }
+        meetings
+            .set_speaker_name(&session.meeting_id, "spk1", "Dan")
+            .await
+            .unwrap();
+
+        let detail = run_meeting_stop(
+            &reg,
+            &bindings,
+            &actions,
+            &meetings,
+            &session,
+            empty_tail(),
+            &[],
+            Some(&mut voices),
+        )
+        .await
+        .unwrap();
+        let speakers = speaker_map(&detail);
+        let second_key = detail.segments[1].speaker_key.clone().unwrap();
+        assert_eq!(speakers[&second_key].display_name, "Dan");
+        assert_eq!(speakers[&second_key].source, SpeakerSource::User);
+        let first_key = detail.segments[0].speaker_key.clone().unwrap();
+        assert_eq!(speakers[&first_key].display_name, "Person 1");
     }
 
     #[tokio::test]

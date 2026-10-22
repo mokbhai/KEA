@@ -230,14 +230,26 @@ export default function MeetingsPage({ onNavigate }: Props) {
   });
   const voiceDownloading = DIARIZATION_MODEL_IDS.some((id) => voiceProgress.has(id));
 
-  const toggleVoiceSeparation = (next: boolean) => {
+  const toggleVoiceSeparation = async (next: boolean) => {
     setVoiceStatus(null);
     if (!next) {
       setVoiceEnablePending(false);
       void saveSettings({ voice_separation: false }, "voice_separation");
       return;
     }
-    if (voiceModelsReady) {
+    // The first read of the installed models may not have landed yet; "not
+    // known" must not be taken for "missing", or an installed pair would be
+    // offered for download again.
+    let installed = installedVoiceModels;
+    if (installed === null) {
+      try {
+        installed = await refreshVoiceModels();
+      } catch (e) {
+        setVoiceStatus(toMessage(e));
+        return;
+      }
+    }
+    if (DIARIZATION_MODEL_IDS.every((id) => installed.has(id))) {
       void saveSettings({ voice_separation: true }, "voice_separation");
       return;
     }
@@ -722,7 +734,7 @@ export default function MeetingsPage({ onNavigate }: Props) {
               label="Separate speakers by voice"
               checked={settings.voice_separation ?? false}
               disabled={meetingSettings.busy}
-              onChange={toggleVoiceSeparation}
+              onChange={(next) => void toggleVoiceSeparation(next)}
             />
           </Row>
           {voiceEnablePending && !voiceModelsReady && (
