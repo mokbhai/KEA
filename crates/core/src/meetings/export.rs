@@ -207,6 +207,7 @@ mod tests {
             notes,
             speakers: vec![],
             action_items: vec![],
+            can_undo: false,
         }
     }
 
@@ -233,6 +234,7 @@ mod tests {
             prompt_version: prompt_version.into(),
             engine_id: Some("openai".into()),
             model: Some("gpt-4o-mini".into()),
+            edited: false,
         }
     }
 

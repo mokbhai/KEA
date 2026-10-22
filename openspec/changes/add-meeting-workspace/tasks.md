@@ -2,11 +2,11 @@
 
 ## 1. Storage
 
-- [ ] 1.1 Add migration `crates/core/migrations/data/0009_meeting_workspace.sql` exactly as design.md decision 3; verify `cargo test -p kea-core` migration tests pass and a test that deleting a meeting cascades to its conversation and notes versions
-- [ ] 1.2 Exclude meeting chats from the rewrite History query (`meeting_id IS NULL`); verify a regression test that a meeting conversation does not appear in History
-- [ ] 1.3 `MeetingRepo::search(query, limit)` over title and notes sections with `%`/`_` escaping; verify tests for a title hit, a summary-only hit, a case-insensitive hit and a literal `%` query
-- [ ] 1.4 Notes versioning: `apply_user_notes(meeting_id, notes)` (push the current notes onto the versions table, write the new notes with `edited = 1`, cap at 50) and `undo_notes(meeting_id)` (pop and restore including `edited`); `MeetingDetail` gains `notes.edited` and `can_undo`; verify tests for apply→undo→generated clears edited, the 50-version cap, and undo with an empty stack
-- [ ] 1.5 Meeting conversations: lazily create a conversation per meeting, append messages with `meta`, list them, clear them, and set a proposal's state; verify store tests including clear and state transitions (pending→applied, pending→discarded, refuse applied→applied)
+- [x] 1.1 Add migration `crates/core/migrations/data/0009_meeting_workspace.sql` exactly as design.md decision 3; verify `cargo test -p kea-core` migration tests pass and a test that deleting a meeting cascades to its conversation and notes versions
+- [x] 1.2 Exclude meeting chats from the rewrite History query (`meeting_id IS NULL`); verify a regression test that a meeting conversation does not appear in History
+- [x] 1.3 `MeetingRepo::search(query, limit)` over title and notes sections with `%`/`_` escaping; verify tests for a title hit, a summary-only hit, a case-insensitive hit and a literal `%` query
+- [x] 1.4 Notes versioning: `apply_user_notes(meeting_id, notes)` (push the current notes onto the versions table, write the new notes with `edited = 1`, cap at 50) and `undo_notes(meeting_id)` (pop and restore including `edited`); `MeetingDetail` gains `notes.edited` and `can_undo`; verify tests for apply→undo→generated clears edited, the 50-version cap, and undo with an empty stack
+- [x] 1.5 Meeting conversations: lazily create a conversation per meeting, append messages with `meta`, list them, clear them, and set a proposal's state; verify store tests including clear and state transitions (pending→applied, pending→discarded, refuse applied→applied)
 
 ## 2. Chat core (pure)
 

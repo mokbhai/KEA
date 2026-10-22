@@ -514,6 +514,7 @@ async fn persist_notes(
         prompt_version: prompt_version.to_string(),
         engine_id: Some(binding.engine_id.clone()),
         model: binding.model.clone(),
+        edited: false,
     };
 
     meetings
@@ -600,6 +601,7 @@ pub async fn synthesize_meeting_notes(
         prompt_version: MEETING_NOTES_PROMPT_VERSION.to_string(),
         engine_id: Some(binding.engine_id.clone()),
         model: binding.model.clone(),
+        edited: false,
     })
 }
 

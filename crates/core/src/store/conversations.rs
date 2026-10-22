@@ -118,10 +118,14 @@ impl ConversationRepo {
         Ok(id)
     }
 
+    /// The rewrite History. Meeting chats are conversations too, but they
+    /// belong to their meeting's Ask AI tab, so the `meeting_id IS NULL` filter
+    /// keeps them off this list.
     pub async fn list_recent(&self, limit: i64) -> Result<Vec<ConversationSummary>, KeaError> {
         let rows = sqlx::query_as::<_, ConversationSummary>(
             "SELECT id, action_id, feature_id, engine_id, model, provider_ref, created_at
-             FROM conversations ORDER BY created_at DESC LIMIT ?",
+             FROM conversations WHERE meeting_id IS NULL
+             ORDER BY created_at DESC LIMIT ?",
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -273,6 +277,32 @@ mod tests {
 
         let messages = repo.list_messages(conv_id).await.unwrap();
         assert!(messages.is_empty());
+    }
+
+    /// A meeting's chat shares the conversations table, so the History query
+    /// has to filter it out or every Ask AI thread would show up as a rewrite.
+    #[tokio::test]
+    async fn list_recent_leaves_out_meeting_chats() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&pool).await.unwrap();
+        sqlx::query("INSERT INTO meetings (id,title,capture_mode,status,started_at) VALUES ('m1','t','mic_only','completed',datetime('now'))")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO conversations (feature_id, engine_id, meeting_id) VALUES ('meetings','openai','m1')")
+            .execute(&pool).await.unwrap();
+        let repo = ConversationRepo::new(pool.clone());
+        repo.start(&NewConversation {
+            action_id: None,
+            feature_id: "rewrite".into(),
+            engine_id: "openai".into(),
+            model: None,
+            provider_ref: None,
+        })
+        .await
+        .unwrap();
+
+        let recent = repo.list_recent(10).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].feature_id, "rewrite");
     }
 
     #[tokio::test]
