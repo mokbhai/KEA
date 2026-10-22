@@ -36,9 +36,9 @@
 
 ## 6. UI
 
-- [ ] 6.1 General page: "Allow localhost port" toggle and port field, with the token-capability warning, inline bind errors, and the "only transport on this platform" note on Windows; verify a `GeneralPage` test for warning visibility and the conflict message
-- [ ] 6.2 General page API blurb: base URL, the OpenAI SDK snippet, the supported formats, and that `temperature`/`max_tokens` are ignored; verify a snapshot/text test
-- [ ] 6.3 Models page: an "API" binding row for stt/tts/llm; verify a test that it shows "uses default" when unbound
+- [x] 6.1 General page: "Allow localhost port" toggle and port field, with the token-capability warning, inline bind errors, and the "only transport on this platform" note on Windows; verify a `GeneralPage` test for warning visibility and the conflict message
+- [x] 6.2 General page API blurb: base URL, the OpenAI SDK snippet, the supported formats, and that `temperature`/`max_tokens` are ignored; verify a snapshot/text test
+- [x] 6.3 Models page: an "API" binding row for stt/tts/llm; verify a test that it shows "uses default" when unbound
 
 ## 7. Verification
 

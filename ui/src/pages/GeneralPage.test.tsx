@@ -16,6 +16,11 @@ const API_OFF = {
   token_file: "/tmp/kea/api-token",
   max_rewrites_per_minute: 20,
   supported: true,
+  unix_socket_supported: true,
+  tcp_enabled: false,
+  tcp_running: false,
+  tcp_error: null,
+  tcp_port: 8765,
 };
 
 type Handlers = Record<string, (args?: Record<string, unknown>) => unknown>;
@@ -223,5 +228,124 @@ describe("GeneralPage", () => {
           .getAttribute("aria-checked"),
       ).toBe("false"),
     );
+  });
+
+  it("shows the localhost-port warning when the port is turned on", async () => {
+    let current = API_OFF;
+    mockGeneralWorld({
+      get_api_settings: () => current,
+      set_api_tcp_enabled: (args) => {
+        current = { ...current, tcp_enabled: args?.enabled as boolean, tcp_running: true };
+        return current;
+      },
+    });
+    renderPage();
+
+    const toggle = await screen.findByRole("switch", { name: "Allow localhost port" });
+    expect(screen.queryByText(/Holding the token lets a program/)).toBeNull();
+
+    await userEvent.click(toggle);
+
+    await waitFor(() => expect(invokeCalls("set_api_tcp_enabled")).toHaveLength(1));
+    expect(invokeCalls("set_api_tcp_enabled")[0]).toEqual({ enabled: true });
+    expect(await screen.findByText(/Holding the token lets a program/)).toBeTruthy();
+    expect(screen.getByText(/Listening on 127\.0\.0\.1:8765/)).toBeTruthy();
+  });
+
+  it("shows the bind conflict inline and leaves the port off", async () => {
+    mockGeneralWorld({
+      set_api_tcp_enabled: () => {
+        throw new Error("could not bind 127.0.0.1:8765: Address already in use");
+      },
+    });
+    renderPage();
+
+    const toggle = await screen.findByRole("switch", { name: "Allow localhost port" });
+    await userEvent.click(toggle);
+
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+    expect(await screen.findByText(/Address already in use/)).toBeTruthy();
+    expect(screen.queryByText(/Holding the token lets a program/)).toBeNull();
+  });
+
+  it("saves a new port on blur and refuses an out-of-range one", async () => {
+    mockGeneralWorld({
+      set_api_tcp_port: (args) => ({ ...API_OFF, tcp_port: args?.port as number }),
+    });
+    renderPage();
+
+    const input = await screen.findByRole("spinbutton", { name: "Localhost port" });
+    await userEvent.clear(input);
+    await userEvent.type(input, "9000");
+    await userEvent.tab();
+
+    await waitFor(() => expect(invokeCalls("set_api_tcp_port")).toHaveLength(1));
+    expect(invokeCalls("set_api_tcp_port")[0]).toEqual({ port: 9000 });
+
+    await userEvent.clear(input);
+    await userEvent.type(input, "70000");
+    await userEvent.tab();
+
+    expect(invokeCalls("set_api_tcp_port")).toHaveLength(1);
+    expect(await screen.findByText(/between 1 and 65535/)).toBeTruthy();
+  });
+
+  it("shows the port-in-use message when the new port cannot be bound", async () => {
+    mockGeneralWorld({
+      set_api_tcp_port: () => {
+        throw new Error("port 9000 is already in use");
+      },
+    });
+    renderPage();
+
+    const input = await screen.findByRole("spinbutton", { name: "Localhost port" });
+    await userEvent.clear(input);
+    await userEvent.type(input, "9000");
+    await userEvent.tab();
+
+    expect(await screen.findByText(/port 9000 is already in use/)).toBeTruthy();
+  });
+
+  it("gives the base URL for the port when it is on, with a placeholder key", async () => {
+    mockGeneralWorld({
+      get_api_settings: () => ({ ...API_OFF, tcp_enabled: true, tcp_running: true }),
+    });
+    renderPage();
+
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("Base URL: http://127.0.0.1:8765/v1"),
+    );
+    expect(document.body.textContent).toContain("<your KEA access token>");
+    expect(document.body.textContent).not.toContain("curl --unix-socket");
+  });
+
+  it("shows the socket curl example when the port is off", async () => {
+    mockGeneralWorld();
+    renderPage();
+
+    await waitFor(() =>
+      expect(document.body.textContent).toContain(
+        "curl --unix-socket /tmp/kea/kea-api.sock",
+      ),
+    );
+    expect(document.body.textContent).toContain("temperature");
+    expect(document.body.textContent).toContain("whole reply as a single chunk");
+  });
+
+  it("names the port as the only transport and hides the socket on Windows", async () => {
+    mockGeneralWorld({
+      get_api_settings: () => ({
+        ...API_OFF,
+        socket_path: "",
+        unix_socket_supported: false,
+      }),
+    });
+    renderPage();
+
+    expect(
+      await screen.findByText(/the localhost port is the only way to reach the API/),
+    ).toBeTruthy();
+    expect(document.body.textContent).not.toContain("curl --unix-socket");
+    expect(document.body.textContent).not.toContain("kea-api.sock");
   });
 });

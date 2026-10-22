@@ -13,8 +13,10 @@ import {
   type WhisperModel,
 } from "../api";
 import Banner from "../components/Banner";
+import FeatureAiCard from "../components/FeatureAiCard";
 import LoadingBlock from "../components/LoadingBlock";
 import { Row, RowGroup } from "../components/SettingsRow";
+import { useFeatureAi } from "../hooks/useFeatureAi";
 import { useModelDownloads } from "../hooks/useModelDownloads";
 import {
   catalogEngines,
@@ -23,6 +25,7 @@ import {
   type DownloadKind,
   type EngineCatalog,
 } from "../lib/engines";
+import type { SlotSpec } from "../lib/featureSlot";
 import { formatBytes, toMessage } from "../lib/format";
 
 /**
@@ -84,6 +87,18 @@ const CAPABILITIES = [
   ),
 ];
 
+/**
+ * The local API's bindable slots. Each one is what an OpenAI-compatible request
+ * uses for that kind of model; a slot with no override falls back to the
+ * shared default for its capability. Module-level so the hook's effect sees a
+ * stable array.
+ */
+const API_SLOTS: SlotSpec[] = [
+  { feature: "api", slot: "stt", capability: "stt", label: "Speech to text" },
+  { feature: "api", slot: "tts", capability: "tts", label: "Text to speech" },
+  { feature: "api", slot: "llm", capability: "llm", label: "Language model" },
+];
+
 type Section = {
   spec: CatalogSpec;
   models: (WhisperModel | OnnxModel)[];
@@ -94,6 +109,7 @@ export default function ModelsPage() {
   const [sections, setSections] = useState<Section[] | null>(null);
   const [bindings, setBindings] = useState<Map<Capability, Binding | null>>(new Map());
   const [error, setError] = useState<string | null>(null);
+  const apiAi = useFeatureAi(API_SLOTS);
 
   const refresh = useCallback(async () => {
     try {
@@ -280,6 +296,8 @@ export default function ModelsPage() {
           )}
         </section>
       ))}
+
+      <FeatureAiCard ai={apiAi} title="API" featureLabel="API" />
     </div>
   );
 }
