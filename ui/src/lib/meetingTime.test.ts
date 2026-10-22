@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatDuration, formatElapsed, meetingGroupFor } from "./meetingTime";
+import { formatDuration, formatElapsed, meetingGroupFor, parseStoredTime } from "./meetingTime";
 
 describe("meetingGroupFor", () => {
   // Friday 23 October 2026, mid-morning, local time.
@@ -38,5 +38,25 @@ describe("formatElapsed", () => {
     expect(formatElapsed(42_000)).toBe("00:42");
     expect(formatElapsed(3_723_000)).toBe("1:02:03");
     expect(formatElapsed(-5)).toBe("00:00");
+  });
+});
+
+// Found on an installed build: SQLite writes UTC with no zone, and reading it
+// as local time put every meeting off by the user's UTC offset.
+describe("parseStoredTime", () => {
+  it("reads a zoneless database timestamp as UTC", () => {
+    expect(parseStoredTime("2026-10-22 20:37:14")).toBe(Date.UTC(2026, 9, 22, 20, 37, 14));
+    expect(parseStoredTime("2026-10-22T20:37")).toBe(Date.UTC(2026, 9, 22, 20, 37));
+  });
+
+  it("keeps an explicit zone as given", () => {
+    expect(parseStoredTime("2026-10-22T20:37:14Z")).toBe(Date.UTC(2026, 9, 22, 20, 37, 14));
+    expect(parseStoredTime("2026-10-23T02:07:14+05:30")).toBe(Date.UTC(2026, 9, 22, 20, 37, 14));
+  });
+
+  it("is NaN for nothing or nonsense", () => {
+    expect(parseStoredTime(null)).toBeNaN();
+    expect(parseStoredTime("")).toBeNaN();
+    expect(parseStoredTime("not a date")).toBeNaN();
   });
 });

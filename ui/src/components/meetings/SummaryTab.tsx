@@ -91,6 +91,8 @@ function NotesSection({
         <textarea
           className="kea-input"
           aria-label={`${label} text`}
+          // Edit means "let me type": the box opens focused.
+          autoFocus
           value={edit.draft}
           rows={4}
           disabled={edit.busy}

@@ -7,6 +7,7 @@ import {
   formatElapsed,
   MEETING_GROUP_ORDER,
   meetingGroupFor,
+  parseStoredTime,
   type MeetingGroupLabel,
 } from "../../lib/meetingTime";
 
@@ -32,14 +33,14 @@ function RecordingElapsed({ startedAt }: { startedAt: string }) {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
-  const started = Date.parse(startedAt);
+  const started = parseStoredTime(startedAt);
   const elapsed = Number.isNaN(started) ? 0 : now - started;
   return <span style={{ fontVariantNumeric: "tabular-nums" }}>{formatElapsed(elapsed)}</span>;
 }
 
 /** The second line of a row: start time, then duration (or the live clock). */
 function RowMeta({ meeting }: { meeting: Meeting }) {
-  const started = new Date(meeting.started_at);
+  const started = new Date(parseStoredTime(meeting.started_at));
   const startLabel = Number.isNaN(started.getTime()) ? "" : formatClock(started);
   if (meeting.status === "recording") {
     return (
@@ -49,7 +50,7 @@ function RowMeta({ meeting }: { meeting: Meeting }) {
       </span>
     );
   }
-  const ended = meeting.ended_at ? Date.parse(meeting.ended_at) : NaN;
+  const ended = parseStoredTime(meeting.ended_at);
   const duration = Number.isNaN(started.getTime()) || Number.isNaN(ended)
     ? null
     : formatDuration(ended - started.getTime());
@@ -120,7 +121,10 @@ export default function MeetingList({ meetings, recording, selectedId, onSelect 
     return () => {
       cancelled = true;
     };
-  }, [debounced]);
+    // Re-run when the list changes as well: a meeting that stops during a
+    // search must appear in the results if it matches, not only after the
+    // query is retyped.
+  }, [debounced, meetings]);
 
   const searching = debounced !== "";
   // Results for a query still being typed would show the previous answer.
@@ -137,7 +141,7 @@ export default function MeetingList({ meetings, recording, selectedId, onSelect 
   );
   const byLabel = new Map<MeetingGroupLabel, Meeting[]>();
   for (const m of source) {
-    const started = new Date(m.started_at);
+    const started = new Date(parseStoredTime(m.started_at));
     if (Number.isNaN(started.getTime())) continue;
     const label = meetingGroupFor(started, now);
     const bucket = byLabel.get(label) ?? [];
@@ -147,7 +151,7 @@ export default function MeetingList({ meetings, recording, selectedId, onSelect 
   const groups = MEETING_GROUP_ORDER.flatMap((label) => {
     const items = byLabel.get(label);
     if (!items) return [];
-    items.sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at));
+    items.sort((a, b) => parseStoredTime(b.started_at) - parseStoredTime(a.started_at));
     return [{ label, items }];
   });
 
@@ -272,6 +276,12 @@ export default function MeetingList({ meetings, recording, selectedId, onSelect 
         className="kea-input"
         aria-label="Search meetings"
         placeholder="Search meetings"
+        // A query is not prose: macOS autocorrect turned "devops" into
+        // "Devops" on Escape, and its suggestion bubble covered the list.
+        spellCheck={false}
+        autoCorrect="off"
+        autoCapitalize="off"
+        autoComplete="off"
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onKeyDown={(e) => {

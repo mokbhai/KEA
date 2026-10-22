@@ -138,12 +138,14 @@ function ProposalCard({ proposal, current, recording, busy, onApply, onDiscard }
       {proposal.changed.map((section) => (
         <section key={section} style={{ marginBottom: 10 }}>
           <h4 style={{ margin: "0 0 4px", fontSize: 13 }}>{SECTION_LABELS[section]}</h4>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+          {/* minmax(0, …): a plain 1fr will not shrink below its longest word,
+              which pushed "Proposed" out of the card in a narrow pane. */}
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", gap: 8 }}>
             <div>
               <span className="kea-muted" style={{ fontSize: 11 }}>
                 Now
               </span>
-              <p style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 13 }}>
+              <p style={{ margin: 0, whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: 13 }}>
                 {current?.[section]?.trim() || "(empty)"}
               </p>
             </div>
@@ -151,7 +153,7 @@ function ProposalCard({ proposal, current, recording, busy, onApply, onDiscard }
               <span className="kea-muted" style={{ fontSize: 11 }}>
                 Proposed
               </span>
-              <p style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 13 }}>
+              <p style={{ margin: 0, whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: 13 }}>
                 {proposal.proposal[section].trim() || "(empty)"}
               </p>
             </div>

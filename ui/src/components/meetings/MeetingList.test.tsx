@@ -219,6 +219,27 @@ describe("MeetingList search", () => {
     expect(screen.queryByText(/No meeting matches/)).toBeNull();
   });
 
+  // Found on an installed build: a meeting that stopped during a search
+  // stayed out of the results until the query was retyped.
+  it("runs the search again when the list changes", async () => {
+    vi.useFakeTimers();
+    onInvoke({ search_meetings: () => [] });
+    const { rerender } = render(
+      <MeetingList meetings={recent} recording={null} selectedId={null} onSelect={noop} />,
+    );
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search meetings" }), {
+      target: { value: "devops" },
+    });
+    act(() => vi.advanceTimersByTime(200));
+    await act(async () => {});
+    expect(invokeCalls("search_meetings")).toHaveLength(1);
+
+    const added = [row("new", "DevOps sync", new Date()), ...recent];
+    rerender(<MeetingList meetings={added} recording={null} selectedId={null} onSelect={noop} />);
+    await act(async () => {});
+    expect(invokeCalls("search_meetings")).toHaveLength(2);
+  });
+
   // Found in review: a search hid the meeting being recorded unless it
   // matched the query.
   it("keeps the recording meeting pinned while searching", async () => {

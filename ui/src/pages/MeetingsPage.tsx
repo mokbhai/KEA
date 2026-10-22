@@ -1,3 +1,4 @@
+import { parseStoredTime } from "../lib/meetingTime";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   addMeetingActionItem,
@@ -125,7 +126,7 @@ function recordingPlaceholder(
 function newestMeetingId(list: Meeting[]): string | null {
   let best: Meeting | null = null;
   for (const m of list) {
-    if (!best || Date.parse(m.started_at) > Date.parse(best.started_at)) best = m;
+    if (!best || parseStoredTime(m.started_at) > parseStoredTime(best.started_at)) best = m;
   }
   return best?.id ?? null;
 }
@@ -814,7 +815,10 @@ export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMe
   return (
     <div>
       <header style={{ display: "flex", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
-        <div style={{ flex: 1, minWidth: 0 }}>
+        {/* A basis, not min-width 0: when the controls grow (the level meter
+            while recording) they wrap below instead of squeezing the title
+            to a sliver and painting over it. */}
+        <div style={{ flex: "1 1 280px", minWidth: 0 }}>
           <h1 style={{ marginTop: 0 }}>Meetings</h1>
           <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
             Record a meeting, watch the transcript appear live, and get notes when you

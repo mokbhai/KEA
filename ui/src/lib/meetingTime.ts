@@ -16,6 +16,36 @@ export const MEETING_GROUP_ORDER: readonly MeetingGroupLabel[] = [
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/** `YYYY-MM-DD HH:MM[:SS[.fff]]` with no zone: SQLite's `datetime('now')`. */
+const ZONELESS = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/;
+
+/**
+ * A stored meeting timestamp as epoch milliseconds, or NaN.
+ *
+ * The database writes UTC with no zone suffix (`2026-10-22 20:37:14`), and
+ * `Date.parse` reads a zoneless string as *local* time — which put every
+ * meeting off by the user's UTC offset: a meeting recorded at 02:07 in
+ * India showed as yesterday at 20:37, and a live recording's clock started
+ * at 5:30:00. A string with an explicit zone is parsed as given.
+ */
+export function parseStoredTime(value: string | null | undefined): number {
+  if (!value) return NaN;
+  const trimmed = value.trim();
+  return Date.parse(ZONELESS.test(trimmed) ? `${trimmed.replace(" ", "T")}Z` : trimmed);
+}
+
+/** A stored timestamp as a local date and time, e.g. "23 Oct, 02:07"; the raw text if unreadable. */
+export function formatStoredDateTime(value: string): string {
+  const ms = parseStoredTime(value);
+  if (Number.isNaN(ms)) return value;
+  return new Date(ms).toLocaleString([], {
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 /** Local midnight at the start of the day `d` falls on. */
 function startOfLocalDay(d: Date): Date {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate());

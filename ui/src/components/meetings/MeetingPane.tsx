@@ -1,3 +1,4 @@
+import { formatStoredDateTime, parseStoredTime } from "../../lib/meetingTime";
 import {
   forwardRef,
   useEffect,
@@ -79,7 +80,7 @@ export type MeetingPaneProps = {
 function meetingDurationMs(meeting: Meeting, segments: TranscriptSegment[]): number {
   const spoken = segments.reduce((max, seg) => Math.max(max, seg.end_offset_ms), 0);
   if (!meeting.ended_at) return spoken;
-  const wall = Date.parse(meeting.ended_at) - Date.parse(meeting.started_at);
+  const wall = parseStoredTime(meeting.ended_at) - parseStoredTime(meeting.started_at);
   return Number.isFinite(wall) ? Math.max(wall, spoken) : spoken;
 }
 
@@ -343,8 +344,8 @@ const MeetingPane = forwardRef<MeetingPaneHandle, MeetingPaneProps>(function Mee
           busy={busy}
         />
         <p className="kea-muted" style={{ margin: 0 }}>
-          {started}
-          {ended ? ` — ${ended}` : ""}
+          {formatStoredDateTime(started)}
+          {ended ? ` — ${formatStoredDateTime(ended)}` : ""}
           {" · "}
           {meeting.status}
           {" · "}
