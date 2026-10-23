@@ -40,8 +40,8 @@ that label in the live transcript as soon as the segment appears.
 - **THEN** segments are labelled "Person 1", "Person 2", … by voice, and none of them is labelled "You" by assumption
 
 #### Scenario: Ambiguous channel
-- **WHEN** a two-source segment is attributed to neither channel (both sources were active)
-- **THEN** it keeps the mixed label and is not assigned to a participant
+- **WHEN** a two-source segment is attributed to neither channel (both sources were active, as on laptop speakers where the mic also hears the call)
+- **THEN** it is assigned to a participant from the system audio alone, which carries only the call; if the system audio holds too little speech to identify a voice, it keeps the mixed label
 
 #### Scenario: Segment too short to identify
 - **WHEN** a segment carries too little speech to compute a reliable voice embedding

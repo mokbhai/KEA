@@ -53,7 +53,7 @@ Which segments are embedded:
 |---|---|---|---|
 | two-source | `remote` | system half | `spkN` |
 | two-source | `local` | none | `local` ("You") |
-| two-source | `mixed` | none | `mixed` |
+| two-source | `mixed` | system half (amended 2026-10-23: on speakers nearly every segment is mixed) | `spkN`, or `mixed` if too little speech |
 | mic-only | n/a | mixed signal | `spkN` |
 
 For two-source meetings, embedding the system half rather than the mixed signal keeps the local user's voice and echo out of the remote clusters.
