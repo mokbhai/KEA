@@ -111,13 +111,22 @@ impl MeetingVoices {
 /// The audio whose voice labels a segment, or `None` when the segment keeps its
 /// channel label and is not embedded at all.
 ///
-/// Two sources: only the remote half is embedded. The local half is the person
-/// sitting here, and embedding the mixed signal would let their voice and any
-/// echo into the remote clusters. One source (mic-only): the signal is all
+/// Two sources: the system half is embedded for remote *and* mixed segments,
+/// never the mic half or the mix. The system capture is the call alone — the
+/// local voice and any echo of it never reach it — so it is a clean remote
+/// signal even when the mic heard the call too. That is the normal case on
+/// laptop speakers: nearly every segment comes out mixed, and when mixed
+/// segments were skipped a real meeting labelled nobody at all. The cost,
+/// accepted by the user: when the person here talks over a remote speaker, the
+/// segment's text goes under that speaker's label. A mixed segment whose
+/// system half holds too little speech to embed keeps the mixed label. Local
+/// segments are never embedded. One source (mic-only): the signal is all
 /// there is, so it is embedded whatever the channel decision says.
 fn voice_audio(segment: &SpeechSegment, channel: SpeakerChannel) -> Option<&PcmFrame> {
     match (&segment.mic, &segment.system) {
-        (Some(_), Some(system)) => (channel == SpeakerChannel::Remote).then_some(system),
+        (Some(_), Some(system)) => {
+            matches!(channel, SpeakerChannel::Remote | SpeakerChannel::Mixed).then_some(system)
+        }
         _ => Some(&segment.pcm),
     }
 }
@@ -3191,6 +3200,63 @@ mod tests {
         let b = vec![0.5, 0.866_025_4, 0.0];
         let x = vec![0.9, 0.435_889_9, 0.0];
         (a, b, x)
+    }
+
+    /// A two-source segment both channels heard, the normal case on laptop
+    /// speakers, at the same level on mic and system.
+    fn mixed_segment(samples: usize) -> SpeechSegment {
+        let mic = tone(samples, 16_000, 0.5);
+        let system = tone(samples, 16_000, 0.5);
+        SpeechSegment {
+            pcm: kea_platform::audio::mix_frames(&mic, &system),
+            has_speech: true,
+            mic: Some(mic),
+            system: Some(system),
+        }
+    }
+
+    /// Found in a real meeting on speakers: every remote line came out mixed,
+    /// and with mixed lines skipped nobody was ever labelled. The system half
+    /// is the call alone, so a mixed line is placed from it; one too short to
+    /// place keeps the mixed label.
+    #[tokio::test]
+    async fn a_mixed_segment_is_placed_from_the_system_audio() {
+        let (reg, bindings, actions, meetings) =
+            voice_world(&[], KindLlm::new("{\"names\":[]}", false)).await;
+        let mut audio = two_source_audio(vec![mixed_segment(TWO_WINDOWS), mixed_segment(20_000)]);
+        let settings = settings(true);
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        // Two windows for the first segment; the short one embeds nothing.
+        let mut voices = voices_with(windows_of(&voice(0), 2));
+
+        let session = run_meeting_start(&mut ctx, true).await.unwrap();
+        let (mut seq, mut elapsed) = (0, 0);
+        let first = poll_with(
+            &mut ctx,
+            &session.meeting_id,
+            &mut seq,
+            &mut elapsed,
+            &mut voices,
+        )
+        .await;
+        let second = poll_with(
+            &mut ctx,
+            &session.meeting_id,
+            &mut seq,
+            &mut elapsed,
+            &mut voices,
+        )
+        .await;
+        assert_eq!(first.speaker_key.as_deref(), Some("spk0"));
+        assert_eq!(second.speaker_key.as_deref(), Some("mixed"));
     }
 
     /// A mic-only segment too short to place is unattributed, not "You".

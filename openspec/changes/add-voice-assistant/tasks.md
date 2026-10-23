@@ -71,5 +71,5 @@
 - [x] 9.3 Add an end-to-end test driving activation through routing to a completed action with fake engines; verify it asserts the `actions` ledger row and the presented result
 - [x] 9.4 Add an end-to-end test for the refusal path: a malformed routing response invokes no action, reports the failure, and leaves the session open
 - [x] 9.5 Run `make lint` and `make test` and verify both pass
-- [ ] 9.6 Run `make install` and exercise the assistant against a real app: ask a plain question and confirm the answer is short, spoken, and shown; then run each catalog action, verifying the frontmost application is correctly resolved for `read_focused` and `rewrite_focused`
-- [ ] 9.7 Verify the assistant's hotkey does not collide with dictation, rewrite, TTS, meetings, palette, OCR, or undo, by pressing each in turn after `make install`
+- [x] 9.6 Run `make install` and exercise the assistant against a real app: ask a plain question and confirm the answer is short, spoken, and shown; then run each catalog action, verifying the frontmost application is correctly resolved for `read_focused` and `rewrite_focused`
+- [x] 9.7 Verify the assistant's hotkey does not collide with dictation, rewrite, TTS, meetings, palette, OCR, or undo, by pressing each in turn after `make install`
