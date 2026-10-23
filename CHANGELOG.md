@@ -6,6 +6,14 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-24
+
+### Fixed
+
+- Floating HUD now appears over full-screen apps and other Spaces on macOS. The overlay window is converted to a non-activating `NSPanel` with `NSWindowStyleMaskNonactivatingPanel`, `NSStatusWindowLevel`, full-screen auxiliary collection behavior, and `orderFrontRegardless` presentation, so the dictation pill and assistant indicator float over background apps and full-screen windows across all displays without stealing focus.
+- Status popups now display in the floating HUD. Rewrite progress, Read-Aloud TTS state, dictation errors, and meeting notifications appear as auto-dismissing floating pills on the active display rather than remaining trapped inside the background settings window.
+- System audio mixed segments in meetings are placed accurately from ScreenCaptureKit stream timestamps (#24).
+
 ## [0.5.0] - 2026-10-23
 
 ### Added
