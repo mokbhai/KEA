@@ -6588,6 +6588,12 @@ pub async fn list_palette_history(state: State<'_, Arc<AppState>>) -> Result<Vec
 }
 
 #[tauri::command]
+pub fn set_status_overlay_visible(app: AppHandle, visible: bool) {
+    crate::overlay::sync_status_visibility(&app, visible);
+}
+
+
+#[tauri::command]
 pub async fn clear_palette_history(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     PaletteHistoryRepo::new(SettingsRepo::new(state.config_pool.clone()))
         .clear()

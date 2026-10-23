@@ -1218,6 +1218,40 @@ a:hover {
   white-space: nowrap;
 }
 
+/* ── Status HUD (Rewrite, TTS, Dictation/Meeting status floating pill) ── */
+.kea-hud--status {
+  position: static;
+  bottom: auto;
+  left: auto;
+  transform: none;
+  max-width: min(90vw, 540px);
+  text-align: left;
+  line-height: 1.4;
+  white-space: normal;
+  word-break: break-word;
+  animation: kea-hud-fade-in 140ms ease-out;
+}
+
+.kea-hud--status.kea-status-pill--error {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+}
+
+.kea-hud--status.kea-status-pill--progress {
+  border-color: var(--accent);
+}
+
+@keyframes kea-hud-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 /* ── Live waveform ─────────────────────────────────────────────────── */
 .kea-waveform {
   display: flex;

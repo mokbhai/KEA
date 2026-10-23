@@ -117,6 +117,11 @@ function AppShell() {
   }, []);
 
   useEffect(() => {
+    // In Tauri, the overlay window's StatusHud handles global status indicators
+    // across all Spaces and windows.
+    if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+      return;
+    }
     let clearTimer: ReturnType<typeof setTimeout> | undefined;
     const showStatus = (message: string, variant: "progress" | "error") => {
       setStatusMessage(message);

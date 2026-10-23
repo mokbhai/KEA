@@ -1643,3 +1643,10 @@ export const onPaletteOpen = (
 /** A dismissal the palette did not start: the toggle shortcut, or a delivery. */
 export const onPaletteClose = (handler: () => void): Promise<UnlistenFn> =>
   listen<null>("palette:close", () => handler());
+
+/**
+ * Signals to the backend whether a status pill is currently visible in the overlay window.
+ */
+export const setStatusOverlayVisible = (visible: boolean): Promise<void> =>
+  invoke<void>("set_status_overlay_visible", { visible }).catch(() => {});
+

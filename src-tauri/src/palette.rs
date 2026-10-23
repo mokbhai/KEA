@@ -348,12 +348,12 @@ pub fn create(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     Ok(window)
 }
 
-/// Pins the palette near the top centre of the primary monitor's work area.
+/// Pins the palette near the top centre of the target monitor's work area.
 ///
 /// Re-run on every open: the user may have changed displays, resolution or
-/// dock position since the window was built.
+/// dock position since the window was built, or moved the cursor to another monitor.
 pub fn reposition(window: &WebviewWindow) {
-    let Ok(Some(monitor)) = window.primary_monitor() else {
+    let Some(monitor) = crate::nswindow::target_monitor(window) else {
         return;
     };
     let scale = monitor.scale_factor();

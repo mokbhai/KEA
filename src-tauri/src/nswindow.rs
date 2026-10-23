@@ -36,6 +36,66 @@ mod collection_behavior {
     /// only, which is exactly the reported symptom: the HUD showed on the
     /// desktop and nowhere else.
     pub const FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+    /// Allows the window to join Spaces associated with all other applications,
+    /// including another application's fullscreen Space.
+    pub const CAN_JOIN_ALL_APPLICATIONS: usize = 1 << 18;
+}
+
+/// AppKit `NSWindowStyleMask` bits.
+#[cfg(target_os = "macos")]
+pub mod style_mask {
+    /// Identifies the window as a secondary utility panel.
+    pub const UTILITY_WINDOW: usize = 1 << 4;
+    /// **The bit that allows floating over other applications' fullscreen Spaces.**
+    ///
+    /// macOS requires that a panel displayed over another application's Space
+    /// is nonactivating so that showing it does not pull focus away from the
+    /// active application or trigger a Space switch.
+    pub const NONACTIVATING_PANEL: usize = 1 << 7;
+    /// Allows the content view to span the full window dimensions.
+    pub const FULLSIZE_CONTENT_VIEW: usize = 1 << 15;
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct CGPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl objc2::encode::Encode for CGPoint {
+    const ENCODING: objc2::encode::Encoding =
+        objc2::encode::Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct CGSize {
+    pub width: f64,
+    pub height: f64,
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl objc2::encode::Encode for CGSize {
+    const ENCODING: objc2::encode::Encoding =
+        objc2::encode::Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct CGRect {
+    pub origin: CGPoint,
+    pub size: CGSize,
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl objc2::encode::Encode for CGRect {
+    const ENCODING: objc2::encode::Encoding =
+        objc2::encode::Encoding::Struct("CGRect", &[CGPoint::ENCODING, CGSize::ENCODING]);
 }
 
 /// `NSStatusWindowLevel`. `always_on_top` gives a window
@@ -50,7 +110,47 @@ pub const STATUS_WINDOW_LEVEL: isize = 25;
 #[cfg(target_os = "macos")]
 pub const fn floating_collection_behavior() -> usize {
     use collection_behavior::*;
-    CAN_JOIN_ALL_SPACES | STATIONARY | IGNORES_CYCLE | FULL_SCREEN_AUXILIARY
+    CAN_JOIN_ALL_SPACES
+        | STATIONARY
+        | IGNORES_CYCLE
+        | FULL_SCREEN_AUXILIARY
+        | CAN_JOIN_ALL_APPLICATIONS
+}
+
+/// Converts a Tao `NSWindow` to an AppKit `NSPanel` with the necessary
+/// collection behaviour, style mask, and level to float over fullscreen apps
+/// and across all desktop spaces.
+///
+/// An ordinary `NSWindow` rejects `NSWindowStyleMaskNonactivatingPanel` and
+/// cannot join another application's fullscreen Space when KEA is running in the
+/// background. Converting it to `NSPanel` and applying `NONACTIVATING_PANEL`
+/// allows the macOS Window Server to treat the window as an auxiliary panel.
+#[cfg(target_os = "macos")]
+unsafe fn convert_to_panel(ns_window: *mut objc2::runtime::AnyObject, nonactivating: bool) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyClass;
+
+    if let Some(panel_class) =
+        AnyClass::get(core::ffi::CStr::from_bytes_with_nul(b"NSPanel\0").unwrap())
+    {
+        let _: *const AnyClass = objc2::ffi::object_setClass(ns_window, panel_class);
+    }
+
+    let current_mask: usize = msg_send![ns_window, styleMask];
+    let mut new_mask =
+        current_mask | style_mask::UTILITY_WINDOW | style_mask::FULLSIZE_CONTENT_VIEW;
+    if nonactivating {
+        new_mask |= style_mask::NONACTIVATING_PANEL;
+    }
+    let _: () = msg_send![ns_window, setStyleMask: new_mask];
+    let _: () = msg_send![ns_window, setCollectionBehavior: floating_collection_behavior()];
+    // `setFloatingPanel: true` resets window level to NSFloatingWindowLevel (3),
+    // so `setLevel: STATUS_WINDOW_LEVEL` (25) MUST be called after it.
+    let _: () = msg_send![ns_window, setFloatingPanel: true];
+    let _: () = msg_send![ns_window, setLevel: STATUS_WINDOW_LEVEL];
+    let _: () = msg_send![ns_window, setHidesOnDeactivate: false];
+    let _: () = msg_send![ns_window, setCanHide: false];
+    let _: () = msg_send![ns_window, setWorksWhenModal: true];
 }
 
 /// Raises `window` so it floats over full-screen apps.
@@ -77,7 +177,6 @@ pub const fn floating_collection_behavior() -> usize {
 /// the call.
 #[cfg(target_os = "macos")]
 pub fn float_over_fullscreen(window: &WebviewWindow) {
-    use objc2::msg_send;
     use objc2::runtime::AnyObject;
 
     let label = window.label().to_string();
@@ -93,12 +192,10 @@ pub fn float_over_fullscreen(window: &WebviewWindow) {
         }
     };
 
-    // SAFETY: `ns_window` is a live NSWindow owned by tao for as long as the
-    // window exists, and both selectors are plain setters on it. Called on the
-    // main thread; see the doc comment.
+    // The overlay is click-through and non-activating; the prompt palette is focusable.
+    let is_overlay = label == crate::overlay::LABEL;
     unsafe {
-        let _: () = msg_send![ns_window, setCollectionBehavior: floating_collection_behavior()];
-        let _: () = msg_send![ns_window, setLevel: STATUS_WINDOW_LEVEL];
+        convert_to_panel(ns_window, is_overlay);
     }
 }
 
@@ -146,12 +243,17 @@ pub fn order_front_without_activating(window: &WebviewWindow) {
             _ => return,
         };
 
-        // SAFETY: a live NSWindow owned by tao, three plain selectors on it,
-        // and we are on the main thread — which is the whole point of the
-        // closure this runs inside.
+        let is_overlay = window.label() == crate::overlay::LABEL;
         unsafe {
-            let _: () = msg_send![ns_window, setCollectionBehavior: floating_collection_behavior()];
-            let _: () = msg_send![ns_window, setLevel: STATUS_WINDOW_LEVEL];
+            convert_to_panel(ns_window, is_overlay);
+            if is_overlay {
+                reposition_ns_window_on_active_screen(
+                    ns_window,
+                    crate::overlay::WIDTH,
+                    crate::overlay::HEIGHT,
+                    crate::overlay::BOTTOM_MARGIN,
+                );
+            }
             let _: () = msg_send![ns_window, orderFrontRegardless];
         }
     });
@@ -162,6 +264,113 @@ pub fn order_front_without_activating(_window: &WebviewWindow) {}
 
 #[cfg(not(target_os = "macos"))]
 pub fn float_over_fullscreen(_window: &WebviewWindow) {}
+
+/// Positions an AppKit `NSWindow` bottom-centred on the screen containing the mouse cursor
+/// (or the main screen if the cursor is outside all displays).
+///
+/// # Safety
+/// Must be called on the AppKit main thread with a valid `ns_window` pointer.
+#[cfg(target_os = "macos")]
+pub unsafe fn reposition_ns_window_on_active_screen(
+    ns_window: *mut objc2::runtime::AnyObject,
+    width: f64,
+    _height: f64,
+    bottom_margin: f64,
+) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyClass;
+
+    let event_cls = match AnyClass::get(core::ffi::CStr::from_bytes_with_nul(b"NSEvent\0").unwrap())
+    {
+        Some(cls) => cls,
+        None => return,
+    };
+    let screen_cls = match AnyClass::get(core::ffi::CStr::from_bytes_with_nul(b"NSScreen\0").unwrap())
+    {
+        Some(cls) => cls,
+        None => return,
+    };
+
+    let pointer: CGPoint = msg_send![event_cls, mouseLocation];
+    let screens: *mut objc2::runtime::AnyObject = msg_send![screen_cls, screens];
+    let count: usize = msg_send![screens, count];
+
+    let mut matched_screen: *mut objc2::runtime::AnyObject = std::ptr::null_mut();
+    for i in 0..count {
+        let s: *mut objc2::runtime::AnyObject = msg_send![screens, objectAtIndex: i];
+        let f: CGRect = msg_send![s, frame];
+        if pointer.x >= f.origin.x
+            && pointer.x < f.origin.x + f.size.width
+            && pointer.y >= f.origin.y
+            && pointer.y < f.origin.y + f.size.height
+        {
+            matched_screen = s;
+            break;
+        }
+    }
+    if matched_screen.is_null() {
+        matched_screen = msg_send![screen_cls, mainScreen];
+    }
+    if matched_screen.is_null() {
+        return;
+    }
+
+    let visible: CGRect = msg_send![matched_screen, visibleFrame];
+    let x = visible.origin.x + (visible.size.width - width) / 2.0;
+    let y = visible.origin.y + bottom_margin;
+    let origin = CGPoint { x, y };
+
+    let _: () = msg_send![ns_window, setFrameOrigin: origin];
+}
+
+/// Positions `window` bottom-centred on the screen containing the mouse cursor
+/// (or the main screen if the cursor is outside all displays).
+#[cfg(target_os = "macos")]
+pub fn reposition_on_active_screen(
+    window: &WebviewWindow,
+    width: f64,
+    height: f64,
+    bottom_margin: f64,
+) {
+    use objc2::runtime::AnyObject;
+
+    let Ok(ptr) = window.ns_window() else {
+        return;
+    };
+    if ptr.is_null() {
+        return;
+    }
+    let ns_window = ptr as *mut AnyObject;
+
+    unsafe {
+        reposition_ns_window_on_active_screen(ns_window, width, height, bottom_margin);
+    }
+}
+
+/// Finds the monitor that contains the user's mouse cursor, falling back to
+/// the window's current monitor or the primary monitor.
+pub fn target_monitor(window: &WebviewWindow) -> Option<tauri::Monitor> {
+    if let Ok(cursor) = window.cursor_position() {
+        if let Ok(monitors) = window.available_monitors() {
+            for m in monitors {
+                let pos = m.position();
+                let size = m.size();
+                if cursor.x >= pos.x as f64
+                    && cursor.x < (pos.x + size.width as i32) as f64
+                    && cursor.y >= pos.y as f64
+                    && cursor.y < (pos.y + size.height as i32) as f64
+                {
+                    return Some(m);
+                }
+            }
+        }
+    }
+    window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten())
+}
 
 /// Top-left physical position that centres a `w x h` window horizontally in a
 /// work area and puts its top edge `top` down from the area's top.
@@ -205,7 +414,16 @@ mod tests {
         assert_eq!(mask & (1 << 8), 1 << 8, "FULL_SCREEN_AUXILIARY must be set");
         assert_eq!(mask & (1 << 0), 1 << 0, "CAN_JOIN_ALL_SPACES must be set");
         assert_eq!(mask & (1 << 4), 1 << 4, "STATIONARY must be set");
-        assert_eq!(mask, 0b1_0101_0001);
+        assert_eq!(mask & (1 << 6), 1 << 6, "IGNORES_CYCLE must be set");
+        assert_eq!(
+            mask & (1 << 18),
+            1 << 18,
+            "CAN_JOIN_ALL_APPLICATIONS must be set"
+        );
+        assert_eq!(
+            mask,
+            (1 << 0) | (1 << 4) | (1 << 6) | (1 << 8) | (1 << 18)
+        );
     }
 
     /// The level has to clear NSFloatingWindowLevel (3), which `always_on_top`

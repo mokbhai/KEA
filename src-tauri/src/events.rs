@@ -11,6 +11,7 @@ pub struct RewriteEventPayload {
 }
 
 pub fn emit_rewrite_progress(app: &AppHandle, message: &str) {
+    crate::overlay::sync_status_visibility(app, true);
     let _ = app.emit(
         "rewrite:progress",
         RewriteEventPayload {
@@ -20,6 +21,7 @@ pub fn emit_rewrite_progress(app: &AppHandle, message: &str) {
 }
 
 pub fn emit_rewrite_error(app: &AppHandle, message: &str) {
+    crate::overlay::sync_status_visibility(app, true);
     let _ = app.emit(
         "rewrite:error",
         RewriteEventPayload {
@@ -251,6 +253,7 @@ pub fn emit_device_fallback(app: &AppHandle, fallback: &DeviceFallback) {
 }
 
 pub fn emit_dictation_error(app: &AppHandle, message: &str) {
+    crate::overlay::sync_status_visibility(app, true);
     let _ = app.emit(
         "dictation:error",
         RewriteEventPayload {
@@ -344,6 +347,7 @@ pub fn emit_meeting_level(app: &AppHandle, level: f32) {
 }
 
 pub fn emit_meeting_error(app: &AppHandle, message: &str) {
+    crate::overlay::sync_status_visibility(app, true);
     let _ = app.emit(
         "meeting:error",
         RewriteEventPayload {
@@ -388,6 +392,7 @@ pub struct VoiceSeparationUnavailablePayload {
 /// labels, so nothing is in trouble. The reason is what the user needs in order
 /// to fix it, which for a missing model is the download the Models page offers.
 pub fn emit_meeting_voice_separation_unavailable(app: &AppHandle, reason: &str) {
+    crate::overlay::sync_status_visibility(app, true);
     let _ = app.emit(
         "meeting:voice_separation_unavailable",
         VoiceSeparationUnavailablePayload {
@@ -479,6 +484,9 @@ pub struct TtsStatePayload {
 }
 
 pub fn emit_tts_state(app: &AppHandle, state: TtsState) {
+    if state == TtsState::Reading {
+        crate::overlay::sync_status_visibility(app, true);
+    }
     let _ = app.emit(
         "tts:state",
         TtsStatePayload {
@@ -488,6 +496,7 @@ pub fn emit_tts_state(app: &AppHandle, state: TtsState) {
 }
 
 pub fn emit_tts_error(app: &AppHandle, message: &str) {
+    crate::overlay::sync_status_visibility(app, true);
     let _ = app.emit(
         "tts:error",
         RewriteEventPayload {

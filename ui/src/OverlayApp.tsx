@@ -1,5 +1,6 @@
 import AssistantHud from "./components/AssistantHud";
 import DictationHud from "./components/DictationHud";
+import StatusHud from "./components/StatusHud";
 import { ThemeProvider } from "./theme";
 
 /**
@@ -12,6 +13,7 @@ export default function OverlayApp() {
       <div className="kea-overlay-root">
         <DictationHud />
         <AssistantHud />
+        <StatusHud />
       </div>
     </ThemeProvider>
   );
