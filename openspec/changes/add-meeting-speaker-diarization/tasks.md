@@ -29,6 +29,8 @@
 - [x] 4.4 Make every embedder error degrade to the channel label without failing the poll; verify a feature test with a failing embedder keeps recording and labels `remote`
 - [x] 4.5 Run the stop-time re-cluster in `finalize_meeting` before notes, keeping live labels when it fails; verify a feature test where a split voice ends as one participant and the notes prompt shows one label
 
+- [x] 4.6 Split each chunk at its speaker turns (pyannote segmentation over the mixed signal, planned by `kea_core::meetings::turns::plan_turns`), transcribe and store each turn as its own line, and end chunks on a 1.5 s pause while voices are separated; verify feature tests for two remote voices in one chunk, you-then-the-call in one chunk, and a failed turn search keeping the chunk whole (added after a real meeting labelled whole 30 s chunks as one person)
+
 ## 5. Feature: name inference and speaker-aware notes
 
 - [x] 5.1 Add `build_speaker_names_request` and `parse_speaker_names` in `synthesis.rs` with validation (verbatim evidence, name in evidence, 1–40 chars, known label, unique names); verify unit tests for each rejection
