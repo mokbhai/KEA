@@ -1643,6 +1643,47 @@ impl MeetingRepo {
         Ok(())
     }
 
+    /// Meetings still marked as recording.
+    ///
+    /// Read at launch, when nothing can be recording yet: every one of them is
+    /// a meeting KEA was closed or crashed during, before its stop finished.
+    pub async fn interrupted_ids(&self) -> Result<Vec<String>, KeaError> {
+        let ids =
+            sqlx::query_scalar("SELECT id FROM meetings WHERE status = ? ORDER BY started_at")
+                .bind(MeetingStatus::Recording.as_str())
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(ids)
+    }
+
+    /// Closes a meeting [`MeetingRepo::interrupted_ids`] returned.
+    ///
+    /// It ends where its last line does rather than now: the app may have been
+    /// closed for hours, and that time was never part of the meeting.
+    pub async fn complete_interrupted(
+        &self,
+        id: &str,
+        status: MeetingStatus,
+        error: Option<&str>,
+    ) -> Result<(), KeaError> {
+        let result = sqlx::query(
+            "UPDATE meetings SET status = ?, error = ?,
+                 ended_at = datetime(started_at, printf('+%d seconds',
+                     COALESCE((SELECT MAX(end_offset_ms) FROM meeting_segments
+                               WHERE meeting_id = meetings.id), 0) / 1000))
+             WHERE id = ?",
+        )
+        .bind(status.as_str())
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(KeaError::NotFound(format!("meeting {id}")));
+        }
+        Ok(())
+    }
+
     pub async fn delete(&self, id: &str) -> Result<(), KeaError> {
         let result = sqlx::query("DELETE FROM meetings WHERE id = ?")
             .bind(id)
@@ -1679,6 +1720,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_meeting_is_found_and_ends_at_its_last_line() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&pool).await.unwrap();
+        let repo = MeetingRepo::new(pool);
+        for id in ["done", "cut-off"] {
+            repo.create(&NewMeeting {
+                id: id.into(),
+                title: "Untitled Meeting".into(),
+                capture_mode: CaptureMode::MicOnly,
+                stt_engine_id: None,
+                llm_engine_id: None,
+            })
+            .await
+            .unwrap();
+        }
+        repo.complete("done", MeetingStatus::Completed, None)
+            .await
+            .unwrap();
+        repo.append_segment(
+            "cut-off",
+            &NewSegment {
+                sequence: 0,
+                start_offset_ms: 0,
+                end_offset_ms: 90_500,
+                text: "Last thing said".into(),
+                speaker_key: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(repo.interrupted_ids().await.unwrap(), vec!["cut-off"]);
+
+        repo.complete_interrupted("cut-off", MeetingStatus::Completed, None)
+            .await
+            .unwrap();
+        assert!(repo.interrupted_ids().await.unwrap().is_empty());
+        let meeting = repo.get("cut-off").await.unwrap().unwrap().meeting;
+        assert_eq!(meeting.status, MeetingStatus::Completed);
+        let lasted: i64 = sqlx::query_scalar(
+            "SELECT strftime('%s', ended_at) - strftime('%s', started_at) FROM meetings WHERE id = 'cut-off'",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(lasted, 90);
     }
 
     #[tokio::test]

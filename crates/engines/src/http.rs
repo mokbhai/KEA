@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 
 use crate::traits::EngineError;
@@ -180,11 +182,29 @@ pub struct ReqwestHttpClient {
     client: reqwest::Client,
 }
 
+/// Longest a provider may take to accept the connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest a provider may go without sending a byte.
+///
+/// Without one a request that the server never answers waits forever, and a
+/// meeting stop that is waiting on it stays "Processing" for hours. It is an
+/// idle limit, not a total one, so a stream that keeps sending runs as long as
+/// it needs; it is generous because a non-streamed reply sends nothing until
+/// it is done, and a local model writing notes for a long meeting is slow.
+const READ_TIMEOUT: Duration = Duration::from_secs(300);
+
 impl ReqwestHttpClient {
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+        let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
+            .build()
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "http: could not build a client with timeouts");
+                reqwest::Client::new()
+            });
+        Self { client }
     }
 
     /// The single place a credential is attached to a request.

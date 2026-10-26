@@ -1052,6 +1052,8 @@ fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
 
     hotkeys::spawn_dispatch_loop(state.clone(), app_handle.clone(), action_rx);
 
+    commands::spawn_interrupted_meeting_recovery(&state);
+
     // Deliberately after the dispatcher is up: the hold-to-talk listener drives
     // the same dictation handlers.
     hotkeys::spawn_saved_dictation_settings(&state, &app_handle, config_pool.clone());
