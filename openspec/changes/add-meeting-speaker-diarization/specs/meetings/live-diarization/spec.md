@@ -39,6 +39,10 @@ that label in the live transcript as soon as the segment appears.
 - **WHEN** a meeting captures only the microphone and several people in the room speak
 - **THEN** segments are labelled "Person 1", "Person 2", … by voice, and none of them is labelled "You" by assumption
 
+#### Scenario: Speaker changes inside a chunk
+- **WHEN** two or more people speak within one captured chunk (a hand-over shorter than the pause that ends a chunk)
+- **THEN** the chunk is split at the speaker turns and each turn is transcribed and stored as its own line with its own label and time range; turns under about a second are folded into the neighbouring turn, and if no turn can be found the chunk is stored whole as before
+
 #### Scenario: Ambiguous channel
 - **WHEN** a two-source segment is attributed to neither channel (both sources were active, as on laptop speakers where the mic also hears the call)
 - **THEN** it is assigned to a participant from the system audio alone, which carries only the call; if the system audio holds too little speech to identify a voice, it keeps the mixed label

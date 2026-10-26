@@ -2498,7 +2498,12 @@ fn spawn_segment_poll(
                 // the match below consumes the result: the interim cadence
                 // counts segments, not ticks, and this loop runs once a second
                 // whether anybody spoke or not.
-                let transcribed = matches!(poll_result, Ok(Some(_)));
+                // A chunk split at its speaker turns stores several lines, and
+                // each one counts towards the cadence like any segment.
+                let transcribed = match &poll_result {
+                    Ok(events) => events.len(),
+                    Err(_) => 0,
+                };
 
                 // The poll cursor and the interim schedule advance under one
                 // lock, held for arithmetic only — the pass itself is spawned
@@ -2510,7 +2515,7 @@ fn spawn_segment_poll(
                         if active.session.meeting_id == meeting_id {
                             active.sequence = sequence;
                             active.elapsed_ms = elapsed_ms;
-                            if transcribed {
+                            for _ in 0..transcribed {
                                 active.interim.note_segment();
                             }
                             // The setting is read every tick rather than
@@ -2525,20 +2530,21 @@ fn spawn_segment_poll(
                 }
 
                 match poll_result {
-                    Ok(Some(ev)) => {
-                        emit_meeting_segment(
-                            &app,
-                            &MeetingSegmentPayload {
-                                meeting_id: ev.meeting_id,
-                                sequence: ev.sequence,
-                                text: ev.text,
-                                start_offset_ms: ev.start_offset_ms,
-                                end_offset_ms: ev.end_offset_ms,
-                                speaker_key: ev.speaker_key,
-                            },
-                        );
+                    Ok(events) => {
+                        for ev in events {
+                            emit_meeting_segment(
+                                &app,
+                                &MeetingSegmentPayload {
+                                    meeting_id: ev.meeting_id,
+                                    sequence: ev.sequence,
+                                    text: ev.text,
+                                    start_offset_ms: ev.start_offset_ms,
+                                    end_offset_ms: ev.end_offset_ms,
+                                    speaker_key: ev.speaker_key,
+                                },
+                            );
+                        }
                     }
-                    Ok(None) => {}
                     Err(e) => emit_meeting_error(&app, &e),
                 }
 
@@ -2561,8 +2567,8 @@ fn spawn_segment_poll(
 #[cfg(feature = "sherpa")]
 async fn open_meeting_voices(state: &AppState) -> Result<MeetingVoices, String> {
     use kea_infer::{
-        DiarizationModels, SherpaOnnxSpeakerEmbedder, SpeakerEmbedder, DIARIZATION_EMBEDDING_ID,
-        DIARIZATION_SEGMENTATION_ID,
+        DiarizationModels, SherpaOnnxDiarization, SherpaOnnxSpeakerEmbedder, SpeakerDiarization,
+        SpeakerEmbedder, DIARIZATION_EMBEDDING_ID, DIARIZATION_SEGMENTATION_ID,
     };
 
     let storage = &state.diarization_storage;
@@ -2575,7 +2581,10 @@ async fn open_meeting_voices(state: &AppState) -> Result<MeetingVoices, String> 
         .await
         .map_err(|e| e.to_string())?;
     let embedder: Arc<dyn SpeakerEmbedder> = Arc::new(embedder);
-    Ok(MeetingVoices::new(embedder))
+    // The segmentation model finds where the speaker changes inside a chunk;
+    // without it a chunk two people spoke in went under one name.
+    let diarizer: Arc<dyn SpeakerDiarization> = Arc::new(SherpaOnnxDiarization::new());
+    Ok(MeetingVoices::new(embedder).with_turns(diarizer, models))
 }
 
 #[cfg(not(feature = "sherpa"))]
@@ -6591,7 +6600,6 @@ pub async fn list_palette_history(state: State<'_, Arc<AppState>>) -> Result<Vec
 pub fn set_status_overlay_visible(app: AppHandle, visible: bool) {
     crate::overlay::sync_status_visibility(&app, visible);
 }
-
 
 #[tauri::command]
 pub async fn clear_palette_history(state: State<'_, Arc<AppState>>) -> Result<(), String> {

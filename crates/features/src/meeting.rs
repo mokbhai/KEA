@@ -28,7 +28,10 @@ use kea_core::store::vocabulary::VocabularyEntry;
 use kea_core::transcript::speakers::speaker_key;
 use kea_engines::traits::{AudioPcm, LlmEngine, SttOpts, Transcript};
 use kea_engines::EngineRegistry;
-use kea_infer::{SpeakerEmbedder, SPEAKER_EMBEDDING_SAMPLE_RATE_HZ};
+use kea_infer::{
+    DiarizationModels, DiarizationOpts, SpeakerDiarization, SpeakerEmbedder,
+    SPEAKER_EMBEDDING_SAMPLE_RATE_HZ,
+};
 use kea_platform::audio::util::resample_linear;
 use kea_platform::audio::SpeechSegment;
 use kea_platform::{AudioIo, PcmFrame, SystemAudioCapability};
@@ -54,7 +57,27 @@ pub struct MeetingVoices {
     /// Whether an embedder failure has been logged yet. A runtime that fails
     /// once tends to fail on every window, so one warning per meeting says it.
     warned: bool,
+    /// Finds the speaker turns inside a chunk, so a chunk two people spoke in
+    /// is stored as two lines. `None` labels each chunk as a whole.
+    turns: Option<TurnFinder>,
 }
+
+/// The diarizer and its models, held for the meeting.
+struct TurnFinder {
+    diarizer: Arc<dyn SpeakerDiarization>,
+    models: DiarizationModels,
+}
+
+/// The rate the diarizer's segmentation model was trained at; it refuses
+/// anything else rather than resampling.
+const DIARIZATION_SAMPLE_RATE_HZ: u32 = 16_000;
+
+/// The pause that ends a chunk while voices are separated, in seconds.
+///
+/// The default of three seconds is for one person dictating. Between two
+/// people the hand-over is a fraction of a second, so with turns being split
+/// anyway a shorter pause mostly makes lines arrive sooner after they are said.
+const VOICE_CHUNK_PAUSE_SECS: f32 = 1.5;
 
 impl MeetingVoices {
     pub fn new(embedder: Arc<dyn SpeakerEmbedder>) -> Self {
@@ -63,7 +86,18 @@ impl MeetingVoices {
             embedder,
             announced: BTreeSet::new(),
             warned: false,
+            turns: None,
         }
+    }
+
+    /// Also split each chunk at its speaker turns.
+    pub fn with_turns(
+        mut self,
+        diarizer: Arc<dyn SpeakerDiarization>,
+        models: DiarizationModels,
+    ) -> Self {
+        self.turns = Some(TurnFinder { diarizer, models });
+        self
     }
 
     /// Embeds a segment's audio and assigns it a participant. `None` means the
@@ -198,6 +232,162 @@ async fn speaker_key_for_segment(
         voices.announced.insert(index);
     }
     speaker_key(index_u32)
+}
+
+/// One chunk cut into its speaker turns: one piece per turn, or the chunk
+/// itself when the diarizer finds one speaker, is not configured, or fails.
+///
+/// The diarizer hears the *mixed* signal, so the person at the mic and the
+/// call are both in it; each piece keeps its own slice of the mic and system
+/// halves, so it is then attributed and given a voice like any chunk.
+async fn split_into_turns(
+    voices: Option<&mut MeetingVoices>,
+    segment: SpeechSegment,
+) -> Vec<SpeechSegment> {
+    let Some(voices) = voices else {
+        return vec![segment];
+    };
+    let Some(finder) = &voices.turns else {
+        return vec![segment];
+    };
+    let rate = segment.pcm.sample_rate_hz;
+    if rate == 0 {
+        return vec![segment];
+    }
+    let total_ms = segment.pcm.samples.len() as u64 * 1000 / u64::from(rate);
+    let audio = resample_linear(&segment.pcm, DIARIZATION_SAMPLE_RATE_HZ);
+    let started = std::time::Instant::now();
+    let spans = match finder
+        .diarizer
+        .diarize(
+            kea_infer::AudioPcm {
+                samples: audio.samples,
+                sample_rate_hz: audio.sample_rate_hz,
+            },
+            &finder.models,
+            DiarizationOpts::default(),
+        )
+        .await
+    {
+        Ok(spans) => spans,
+        Err(e) => {
+            voices.log_failure_once(&e.to_string());
+            return vec![segment];
+        }
+    };
+    let plan = kea_core::meetings::turns::plan_turns(&spans, total_ms);
+    // Timed because the diarizer loads its models per call: if this grows
+    // past a fraction of the chunk, holding them loaded is the next step.
+    tracing::info!(
+        chunk_ms = total_ms,
+        turns = plan.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "meeting: speaker turns found"
+    );
+    if plan.len() < 2 {
+        return vec![segment];
+    }
+
+    let cut = |frame: &PcmFrame, start_ms: u64, end_ms: u64| {
+        let at = |ms: u64| {
+            ((ms * u64::from(frame.sample_rate_hz) / 1000) as usize).min(frame.samples.len())
+        };
+        PcmFrame {
+            samples: frame.samples[at(start_ms)..at(end_ms)].to_vec(),
+            sample_rate_hz: frame.sample_rate_hz,
+        }
+    };
+    plan.iter()
+        .map(|turn| SpeechSegment {
+            pcm: cut(&segment.pcm, turn.start_ms, turn.end_ms),
+            has_speech: true,
+            mic: segment
+                .mic
+                .as_ref()
+                .map(|m| cut(m, turn.start_ms, turn.end_ms)),
+            system: segment
+                .system
+                .as_ref()
+                .map(|s| cut(s, turn.start_ms, turn.end_ms)),
+        })
+        .collect()
+}
+
+/// Transcribes and stores one chunk, as one line per speaker turn.
+///
+/// Each piece takes the next sequence number and starts where the one before
+/// it ended. A piece that fails after earlier ones were stored ends the chunk
+/// there with what was stored; only a failure on the first piece is an error,
+/// so a caller's retry never duplicates lines already written.
+#[allow(clippy::too_many_arguments)]
+async fn store_speech_segment(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    meetings: &MeetingRepo,
+    meeting_id: &str,
+    segment: SpeechSegment,
+    mut voices: Option<&mut MeetingVoices>,
+    sequence: &mut i32,
+    elapsed_ms: &mut i64,
+    vocabulary: &[VocabularyEntry],
+) -> Result<Vec<MeetingSegmentEvent>, String> {
+    let pieces = split_into_turns(voices.as_deref_mut(), segment).await;
+    let mut events = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        if !has_min_audio(&piece.pcm) {
+            continue;
+        }
+        // Decided before the STT call, off the two halves this piece carries.
+        // They are dropped with it either way — there is no recording on disk
+        // to go back to — so attribution has to happen while the audio is
+        // still in hand.
+        let speaker_key = match segment_speaker(&piece) {
+            Some(channel) => Some(
+                speaker_key_for_segment(
+                    voices.as_deref_mut(),
+                    meetings,
+                    meeting_id,
+                    &piece,
+                    channel,
+                    *sequence,
+                )
+                .await,
+            ),
+            None => None,
+        };
+        match append_transcribed_segment(
+            engines,
+            bindings,
+            meetings,
+            meeting_id,
+            piece.pcm,
+            speaker_key,
+            *sequence,
+            *elapsed_ms,
+            vocabulary,
+        )
+        .await
+        {
+            Ok(event) => {
+                *sequence += 1;
+                *elapsed_ms = event.end_offset_ms;
+                events.push(event);
+            }
+            Err(e) => {
+                // Given a voice but never stored, and the next piece reuses
+                // its sequence number: its windows must not vote with it.
+                if let Some(voices) = voices.as_deref_mut() {
+                    voices.clusters.forget(*sequence);
+                }
+                if events.is_empty() {
+                    return Err(e);
+                }
+                tracing::warn!(error = %e, meeting_id, "meeting: a speaker turn could not be transcribed; keeping the turns before it");
+                break;
+            }
+        }
+    }
+    Ok(events)
 }
 
 pub struct MeetingFeature;
@@ -1294,13 +1484,19 @@ pub async fn run_meeting_poll_segment(
     sequence: &mut i32,
     elapsed_ms: &mut i64,
     voices: Option<&mut MeetingVoices>,
-) -> Result<Option<MeetingSegmentEvent>, String> {
+) -> Result<Vec<MeetingSegmentEvent>, String> {
     // Ends the segment at a pause in speech when there is one, and at the
     // user's configured length when the speaker never pauses — a boundary on
     // the clock alone lands mid-word.
+    let defaults = kea_platform::audio::segment::SegmentCutConfig::default();
     let cut_cfg = kea_platform::audio::segment::SegmentCutConfig {
         max_secs: ctx.settings.segment_duration_secs as f32,
-        ..Default::default()
+        pause_secs: if voices.is_some() {
+            VOICE_CHUNK_PAUSE_SECS
+        } else {
+            defaults.pause_secs
+        },
+        ..defaults
     };
     let Some(segment) = ctx
         .audio
@@ -1308,65 +1504,31 @@ pub async fn run_meeting_poll_segment(
         .await
         .map_err(|e| e.to_string())?
     else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
 
     // Silence is dropped rather than transcribed: a model handed a silent
     // clip tends to emit plausible-looking text that was never spoken.
     if !segment.has_speech {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     if !has_min_audio(&segment.pcm) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
-    // Decided before the STT call, off the two halves this segment carries.
-    // They are dropped with the segment either way — there is no recording on
-    // disk to go back to — so attribution has to happen while the audio is
-    // still in hand.
-    let mut voices = voices;
-    let speaker_key = match segment_speaker(&segment) {
-        Some(channel) => Some(
-            speaker_key_for_segment(
-                voices.as_deref_mut(),
-                ctx.meetings,
-                meeting_id,
-                &segment,
-                channel,
-                *sequence,
-            )
-            .await,
-        ),
-        None => None,
-    };
-
-    let event = match append_transcribed_segment(
+    store_speech_segment(
         ctx.engines,
         ctx.bindings,
         ctx.meetings,
         meeting_id,
-        segment.pcm,
-        speaker_key,
-        *sequence,
-        *elapsed_ms,
+        segment,
+        voices,
+        sequence,
+        elapsed_ms,
         ctx.vocabulary,
     )
     .await
-    {
-        Ok(event) => event,
-        Err(e) => {
-            // The segment was given a voice but never stored, and the next one
-            // reuses its sequence number; its windows must not vote with it.
-            if let Some(voices) = voices {
-                voices.clusters.forget(*sequence);
-            }
-            return Err(e);
-        }
-    };
-    *sequence += 1;
-    *elapsed_ms = event.end_offset_ms;
-    Ok(Some(event))
 }
 
 /// Audio phase of stopping a meeting: drain the tail buffer and release the
@@ -1536,31 +1698,19 @@ async fn finalize_meeting(
     let tail = drain_result?;
 
     if has_min_audio(&tail.pcm) {
-        // The tail is attributed like every other segment: the last thing said
-        // in a meeting is as worth labelling as the first.
-        let speaker_key = match segment_speaker(&tail) {
-            Some(channel) => Some(
-                speaker_key_for_segment(
-                    voices.as_deref_mut(),
-                    meetings,
-                    meeting_id,
-                    &tail,
-                    channel,
-                    sequence,
-                )
-                .await,
-            ),
-            None => None,
-        };
-        append_transcribed_segment(
+        // The tail is attributed, and split at its turns, like every other
+        // segment: the last thing said in a meeting is as worth labelling as
+        // the first.
+        let (mut sequence, mut elapsed_ms) = (sequence, elapsed_ms);
+        store_speech_segment(
             engines,
             bindings,
             meetings,
             meeting_id,
-            tail.pcm,
-            speaker_key,
-            sequence,
-            elapsed_ms,
+            tail,
+            voices.as_deref_mut(),
+            &mut sequence,
+            &mut elapsed_ms,
             vocabulary,
         )
         .await?;
@@ -2283,14 +2433,18 @@ mod tests {
         let ev1 =
             run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed, None)
                 .await
-                .unwrap();
+                .unwrap()
+                .into_iter()
+                .next();
         assert!(ev1.is_some());
         assert_eq!(ev1.unwrap().text, "hello");
 
         let ev2 =
             run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed, None)
                 .await
-                .unwrap();
+                .unwrap()
+                .into_iter()
+                .next();
         assert!(ev2.is_some());
         assert_eq!(ev2.unwrap().text, "world");
 
@@ -2396,7 +2550,9 @@ mod tests {
         let ev =
             run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed, None)
                 .await
-                .unwrap();
+                .unwrap()
+                .into_iter()
+                .next();
         assert!(ev.is_some());
         assert_eq!(ev.unwrap().text, "polled");
 
@@ -2604,6 +2760,8 @@ mod tests {
             )
             .await
             .unwrap()
+            .into_iter()
+            .next()
             .expect("a segment was queued");
             keys.push(ev.speaker_key);
         }
@@ -2668,6 +2826,8 @@ mod tests {
             run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed, None)
                 .await
                 .unwrap()
+                .into_iter()
+                .next()
                 .unwrap();
         assert_eq!(ev.speaker_key.as_deref(), Some("local"));
 
@@ -2709,7 +2869,9 @@ mod tests {
         for _ in 0..2 {
             run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed, None)
                 .await
-                .unwrap();
+                .unwrap()
+                .into_iter()
+                .next();
         }
 
         meetings
@@ -2933,6 +3095,8 @@ mod tests {
         run_meeting_poll_segment(ctx, meeting_id, seq, elapsed, Some(voices))
             .await
             .unwrap()
+            .into_iter()
+            .next()
             .expect("a segment was queued")
     }
 
@@ -3213,6 +3377,193 @@ mod tests {
             mic: Some(mic),
             system: Some(system),
         }
+    }
+
+    /// Answers every diarization with the same spans, or fails.
+    struct ScriptedDiarizer {
+        spans: Result<Vec<kea_infer::SpeakerSpan>, String>,
+    }
+
+    #[async_trait::async_trait]
+    impl SpeakerDiarization for ScriptedDiarizer {
+        async fn diarize(
+            &self,
+            _pcm: kea_infer::AudioPcm,
+            _models: &DiarizationModels,
+            _opts: DiarizationOpts,
+        ) -> Result<Vec<kea_infer::SpeakerSpan>, kea_infer::InferError> {
+            self.spans.clone().map_err(kea_infer::InferError::Other)
+        }
+    }
+
+    fn span(start_ms: u64, end_ms: u64, speaker: u32) -> kea_infer::SpeakerSpan {
+        kea_infer::SpeakerSpan {
+            start_ms,
+            end_ms,
+            speaker,
+        }
+    }
+
+    fn voices_with_turns(
+        steps: Vec<Result<Vec<f32>, String>>,
+        spans: Result<Vec<kea_infer::SpeakerSpan>, String>,
+    ) -> MeetingVoices {
+        voices_with(steps).with_turns(
+            Arc::new(ScriptedDiarizer { spans }),
+            DiarizationModels {
+                segmentation: "seg/model.onnx".into(),
+                embedding: "emb/model.onnx".into(),
+            },
+        )
+    }
+
+    /// Two halves of one chunk, each loud on the given side: `(mic, system)`
+    /// amplitude per half, three seconds each.
+    fn two_halves(first: (f32, f32), second: (f32, f32)) -> SpeechSegment {
+        let half = |amp: f32| tone(48_000, 16_000, amp).samples;
+        let join = |a: f32, b: f32| PcmFrame {
+            samples: [half(a), half(b)].concat(),
+            sample_rate_hz: 16_000,
+        };
+        let mic = join(first.0, second.0);
+        let system = join(first.1, second.1);
+        SpeechSegment {
+            pcm: kea_platform::audio::mix_frames(&mic, &system),
+            has_speech: true,
+            mic: Some(mic),
+            system: Some(system),
+        }
+    }
+
+    /// The reported bug: a chunk two people spoke in went under one name.
+    /// With the turns found, it is two lines, each with its own speaker and
+    /// its own place in time.
+    #[tokio::test]
+    async fn a_chunk_with_two_remote_voices_becomes_two_lines() {
+        let (reg, bindings, actions, meetings) =
+            voice_world(&["first", "second"], KindLlm::new("{\"names\":[]}", false)).await;
+        let mut audio = two_source_audio(vec![two_halves((0.01, 0.5), (0.01, 0.5))]);
+        let settings = settings(true);
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        let mut steps = windows_of(&voice(0), 3);
+        steps.extend(windows_of(&voice(1), 3));
+        let mut voices =
+            voices_with_turns(steps, Ok(vec![span(0, 3_000, 0), span(3_000, 6_000, 1)]));
+
+        let session = run_meeting_start(&mut ctx, true).await.unwrap();
+        let (mut seq, mut elapsed) = (0, 0);
+        let events = run_meeting_poll_segment(
+            &mut ctx,
+            &session.meeting_id,
+            &mut seq,
+            &mut elapsed,
+            Some(&mut voices),
+        )
+        .await
+        .unwrap();
+
+        let lines: Vec<(i32, i64, i64, Option<&str>, &str)> = events
+            .iter()
+            .map(|e| {
+                (
+                    e.sequence,
+                    e.start_offset_ms,
+                    e.end_offset_ms,
+                    e.speaker_key.as_deref(),
+                    e.text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                (0, 0, 3_000, Some("spk0"), "first"),
+                (1, 3_000, 6_000, Some("spk1"), "second"),
+            ]
+        );
+        assert_eq!((seq, elapsed), (2, 6_000));
+    }
+
+    /// You speak, then the call answers, inside one chunk: the first turn is
+    /// yours by its channel and is never embedded; the second is placed by voice.
+    #[tokio::test]
+    async fn a_chunk_with_you_then_the_call_labels_each_side() {
+        let (reg, bindings, actions, meetings) =
+            voice_world(&["mine", "theirs"], KindLlm::new("{\"names\":[]}", false)).await;
+        let mut audio = two_source_audio(vec![two_halves((0.5, 0.01), (0.01, 0.5))]);
+        let settings = settings(true);
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        // Only the remote turn is embedded: any call past these would fail.
+        let mut voices = voices_with_turns(
+            windows_of(&voice(0), 3),
+            Ok(vec![span(0, 3_000, 0), span(3_000, 6_000, 1)]),
+        );
+
+        let session = run_meeting_start(&mut ctx, true).await.unwrap();
+        let (mut seq, mut elapsed) = (0, 0);
+        let keys: Vec<Option<String>> = run_meeting_poll_segment(
+            &mut ctx,
+            &session.meeting_id,
+            &mut seq,
+            &mut elapsed,
+            Some(&mut voices),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.speaker_key)
+        .collect();
+        assert_eq!(keys, vec![Some("local".into()), Some("spk0".into())]);
+    }
+
+    /// A diarizer that fails leaves the chunk whole, labelled as before.
+    #[tokio::test]
+    async fn a_failed_turn_search_keeps_the_chunk_whole() {
+        let (reg, bindings, actions, meetings) =
+            voice_world(&["all of it"], KindLlm::new("{\"names\":[]}", false)).await;
+        let mut audio = two_source_audio(vec![two_halves((0.01, 0.5), (0.01, 0.5))]);
+        let settings = settings(true);
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        let mut voices = voices_with_turns(windows_of(&voice(0), 7), Err("model missing".into()));
+
+        let session = run_meeting_start(&mut ctx, true).await.unwrap();
+        let (mut seq, mut elapsed) = (0, 0);
+        let events = run_meeting_poll_segment(
+            &mut ctx,
+            &session.meeting_id,
+            &mut seq,
+            &mut elapsed,
+            Some(&mut voices),
+        )
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].text, "all of it");
+        assert_eq!(events[0].speaker_key.as_deref(), Some("spk0"));
     }
 
     /// Found in a real meeting on speakers: every remote line came out mixed,
@@ -3546,7 +3897,9 @@ mod tests {
         for _ in 0..2 {
             run_meeting_poll_segment(&mut ctx, &session.meeting_id, &mut seq, &mut elapsed, None)
                 .await
-                .unwrap();
+                .unwrap()
+                .into_iter()
+                .next();
         }
         run_meeting_stop(
             &reg,
