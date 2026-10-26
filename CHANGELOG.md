@@ -6,6 +6,8 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-26
+
 ### Added
 
 - Meeting lines are now split where the speaker changes. A chunk with several people in it becomes one line per person, labelled "You" or "Person N", instead of being labelled as a whole by its loudest voice (#25).
