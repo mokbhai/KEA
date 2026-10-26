@@ -111,11 +111,17 @@ pub fn find_segment_cut(
     let mask = speech_mask(samples, sample_rate_hz);
     let has_speech = mask.iter().any(|s| *s);
 
-    // Hard cap: cut regardless of what the speaker is doing.
+    // Hard cap: cut regardless of what the speaker is doing, and never take
+    // more than the cap. A buffer past it is a backlog — the transcriber fell
+    // behind — and handing all of it over at once makes the next pass slower
+    // still, so the chunks grew without bound. The rest stays buffered and is
+    // cut on the next poll.
     if total_secs >= cfg.max_secs {
+        let take = ((cfg.max_secs * rate as f32) as usize).clamp(1, samples.len());
+        let frames = take.div_ceil(flen).min(mask.len());
         return Some(SegmentCut {
-            take: samples.len(),
-            has_speech,
+            take,
+            has_speech: mask[..frames].iter().any(|s| *s),
         });
     }
 
@@ -196,6 +202,27 @@ mod tests {
         let cut = find_segment_cut(&audio, RATE, cfg).expect("cap must force a cut");
         assert_eq!(cut.take, audio.len());
         assert!(cut.has_speech);
+    }
+
+    /// A transcriber that fell behind leaves minutes buffered; the cut still
+    /// takes one cap's worth, so each pass stays as cheap as the last.
+    #[test]
+    fn a_backlog_is_cut_one_cap_at_a_time() {
+        let cfg = SegmentCutConfig::default();
+        let audio = tone(95.0, RATE);
+        let cut = find_segment_cut(&audio, RATE, cfg).expect("cap must force a cut");
+        assert_eq!(cut.take, 30 * RATE as usize);
+        assert!(cut.has_speech);
+    }
+
+    #[test]
+    fn a_backlog_reports_speech_for_the_part_it_takes() {
+        let cfg = SegmentCutConfig::default();
+        let mut audio = quiet(30.0, RATE);
+        audio.extend(tone(30.0, RATE));
+        let cut = find_segment_cut(&audio, RATE, cfg).expect("cap must force a cut");
+        assert_eq!(cut.take, 30 * RATE as usize);
+        assert!(!cut.has_speech, "the speech is in the part left buffered");
     }
 
     #[test]

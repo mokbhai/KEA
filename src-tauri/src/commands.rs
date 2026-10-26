@@ -46,8 +46,8 @@ use kea_engines::{EngineRegistry, TtsOpts};
 use kea_features::demo::{run_ping, DemoFeature};
 use kea_features::dictation::{run_dictation_with_commands, spawn_partials, DictationRunOpts};
 use kea_features::meeting::{
-    run_interim_notes_pass, run_meeting_stop_with, InterimSchedule, MeetingStopOptions,
-    MeetingVoices,
+    finish_interrupted_meeting, run_interim_notes_pass, run_meeting_stop_with, InterimSchedule,
+    MeetingStopOptions, MeetingVoices,
 };
 use kea_features::rewrite::{complete_rewrite, OCR_COMMAND, PALETTE_COMMAND, UNDO_COMMAND};
 use kea_features::run_rewrite_with_storage;
@@ -2691,6 +2691,62 @@ pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Resu
     );
 
     Ok(meeting_id)
+}
+
+/// Writes the notes for every meeting KEA was closed or crashed during.
+///
+/// Run once at launch. Such a meeting's lines are all stored but its stop
+/// never ran, so it sat as "recording" with no notes for good. Each one is
+/// closed — with notes, or as an error that says why — so none is picked up
+/// again at the next launch.
+pub fn spawn_interrupted_meeting_recovery(state: &Arc<AppState>) {
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        let ids = match state.meeting_repo.interrupted_ids().await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(error = %e, "meeting recovery: could not list interrupted meetings");
+                return;
+            }
+        };
+        let bindings = BindingRepo::new(state.config_pool.clone());
+        let settings = MeetingSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
+            .get()
+            .await
+            .unwrap_or_default();
+        for meeting_id in ids {
+            // A meeting started since launch is recording for real.
+            let active = state
+                .active_meeting
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|a| a.session.meeting_id.clone()));
+            if active.as_deref() == Some(meeting_id.as_str()) {
+                continue;
+            }
+            tracing::info!(meeting_id = %meeting_id, "meeting recovery: writing notes for an interrupted meeting");
+            let result = finish_interrupted_meeting(
+                &state.engines,
+                &bindings,
+                &state.meeting_repo,
+                &meeting_id,
+                MeetingStopOptions {
+                    calendar: state.calendar.clone(),
+                    calendar_titles: settings.calendar_titles,
+                    usage: Some(UsageRepo::new(state.data_pool.clone())),
+                },
+            )
+            .await;
+            match result {
+                Ok(()) => {
+                    tracing::info!(meeting_id = %meeting_id, "meeting recovery: notes written")
+                }
+                Err(e) => {
+                    tracing::warn!(meeting_id = %meeting_id, error = %e, "meeting recovery: closed without notes")
+                }
+            }
+        }
+    });
 }
 
 pub async fn stop_meeting_inner(

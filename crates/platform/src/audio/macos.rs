@@ -1420,9 +1420,14 @@ mod tests {
         assert_eq!(mic.sample_rate_hz, system.sample_rate_hz);
         // Mixed is the average of the two halves, sample for sample.
         assert!((segment.pcm.samples[0] - (mic.samples[0] + system.samples[0]) / 2.0).abs() < 1e-6);
-        // The whole buffer was taken at the cap, so nothing is left over.
-        assert!(io.meeting_drain_frames.lock().unwrap().is_empty());
-        assert!(io.meeting_system_frames.lock().unwrap().is_empty());
+        // One cap's worth was taken; the second past it stays buffered on both
+        // sides, cut at the same index, for the next poll.
+        assert_eq!(segment.pcm.samples.len(), 5 * 16_000);
+        let left = |frames: &Mutex<Vec<PcmFrame>>| -> usize {
+            frames.lock().unwrap().iter().map(|b| b.samples.len()).sum()
+        };
+        assert_eq!(left(&io.meeting_drain_frames), 16_000);
+        assert_eq!(left(&io.meeting_system_frames), 16_000);
     }
 
     /// Mic-only: there is no second channel, and inventing a silent one would
@@ -1442,7 +1447,7 @@ mod tests {
         let segment = io.try_drain_meeting_segment(cfg).await.unwrap().unwrap();
         assert!(segment.mic.is_none());
         assert!(segment.system.is_none());
-        assert_eq!(segment.pcm.samples.len(), 6 * 16_000);
+        assert_eq!(segment.pcm.samples.len(), 5 * 16_000);
     }
 
     /// Before a cut point both buffers stay exactly as they were: the padding

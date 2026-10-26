@@ -60,6 +60,10 @@ pub struct MeetingVoices {
     /// Finds the speaker turns inside a chunk, so a chunk two people spoke in
     /// is stored as two lines. `None` labels each chunk as a whole.
     turns: Option<TurnFinder>,
+    /// Whether the last chunk took longer to process than it lasted. The turn
+    /// search is skipped while this holds, so a meeting that fell behind real
+    /// time catches up instead of falling further behind with every chunk.
+    behind: bool,
 }
 
 /// The diarizer and its models, held for the meeting.
@@ -87,6 +91,7 @@ impl MeetingVoices {
             announced: BTreeSet::new(),
             warned: false,
             turns: None,
+            behind: false,
         }
     }
 
@@ -250,6 +255,13 @@ async fn split_into_turns(
     let Some(finder) = &voices.turns else {
         return vec![segment];
     };
+    if voices.behind {
+        // Labelled whole, as before turns were split: a line with two voices
+        // in it is a better outcome than a transcript that arrives later and
+        // later until the stop has a backlog of minutes to work through.
+        tracing::info!("meeting: behind real time; this chunk is labelled whole");
+        return vec![segment];
+    }
     let rate = segment.pcm.sample_rate_hz;
     if rate == 0 {
         return vec![segment];
@@ -288,7 +300,23 @@ async fn split_into_turns(
         return vec![segment];
     }
 
-    let cut = |frame: &PcmFrame, start_ms: u64, end_ms: u64| {
+    plan.iter()
+        .map(|turn| cut_segment(&segment, turn.start_ms, turn.end_ms))
+        .collect()
+}
+
+/// Length of `frame` in milliseconds.
+fn duration_ms(frame: &PcmFrame) -> u64 {
+    match frame.sample_rate_hz {
+        0 => 0,
+        rate => frame.samples.len() as u64 * 1000 / u64::from(rate),
+    }
+}
+
+/// The stretch of `segment` from `start_ms` to `end_ms`, on every half it
+/// carries, so the mic and system halves stay aligned with the mix.
+fn cut_segment(segment: &SpeechSegment, start_ms: u64, end_ms: u64) -> SpeechSegment {
+    let cut = |frame: &PcmFrame| {
         let at = |ms: u64| {
             ((ms * u64::from(frame.sample_rate_hz) / 1000) as usize).min(frame.samples.len())
         };
@@ -297,19 +325,30 @@ async fn split_into_turns(
             sample_rate_hz: frame.sample_rate_hz,
         }
     };
-    plan.iter()
-        .map(|turn| SpeechSegment {
-            pcm: cut(&segment.pcm, turn.start_ms, turn.end_ms),
-            has_speech: true,
-            mic: segment
-                .mic
-                .as_ref()
-                .map(|m| cut(m, turn.start_ms, turn.end_ms)),
-            system: segment
-                .system
-                .as_ref()
-                .map(|s| cut(s, turn.start_ms, turn.end_ms)),
-        })
+    SpeechSegment {
+        pcm: cut(&segment.pcm),
+        has_speech: segment.has_speech,
+        mic: segment.mic.as_ref().map(cut),
+        system: segment.system.as_ref().map(cut),
+    }
+}
+
+/// Longest piece the stop's tail is handled in, in milliseconds.
+///
+/// The tail is everything still buffered, which after a meeting that fell
+/// behind can be minutes. The turn search slows faster than the audio grows,
+/// so the tail goes through in pieces the length of an ordinary chunk.
+const TAIL_PIECE_MS: u64 = 30_000;
+
+/// `segment` in consecutive pieces of at most `max_ms`.
+fn split_evenly(segment: SpeechSegment, max_ms: u64) -> Vec<SpeechSegment> {
+    let total_ms = duration_ms(&segment.pcm);
+    if total_ms <= max_ms || max_ms == 0 {
+        return vec![segment];
+    }
+    (0..total_ms)
+        .step_by(max_ms as usize)
+        .map(|start| cut_segment(&segment, start, (start + max_ms).min(total_ms)))
         .collect()
 }
 
@@ -331,6 +370,8 @@ async fn store_speech_segment(
     elapsed_ms: &mut i64,
     vocabulary: &[VocabularyEntry],
 ) -> Result<Vec<MeetingSegmentEvent>, String> {
+    let chunk_ms = duration_ms(&segment.pcm);
+    let started = std::time::Instant::now();
     let pieces = split_into_turns(voices.as_deref_mut(), segment).await;
     let mut events = Vec::with_capacity(pieces.len());
     for piece in pieces {
@@ -386,6 +427,16 @@ async fn store_speech_segment(
                 break;
             }
         }
+    }
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    tracing::info!(
+        chunk_ms,
+        lines = events.len(),
+        elapsed_ms,
+        "meeting: chunk stored"
+    );
+    if let Some(voices) = voices {
+        voices.behind = elapsed_ms > chunk_ms;
     }
     Ok(events)
 }
@@ -1649,9 +1700,9 @@ pub async fn run_meeting_stop_with(
         engines,
         bindings,
         meetings,
-        session,
+        meeting_id,
         &existing,
-        drain_result,
+        drain_result.map(Some),
         vocabulary,
         voices,
         &opts,
@@ -1670,6 +1721,51 @@ pub async fn run_meeting_stop_with(
         .ok_or_else(|| format!("meeting {meeting_id} not found"))
 }
 
+/// Writes the notes for a meeting KEA was closed or crashed during.
+///
+/// Its lines were stored as they were transcribed, so only the stop is
+/// missing: there is no tail to add — that audio went with the process — and
+/// no voices to recluster, so the live labels stand. A meeting with no lines
+/// has nothing to write notes from and is closed as an error that says so.
+pub async fn finish_interrupted_meeting(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    meetings: &MeetingRepo,
+    meeting_id: &str,
+    opts: MeetingStopOptions,
+) -> Result<(), String> {
+    let existing = meetings
+        .get(meeting_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("meeting {meeting_id} not found"))?;
+    let outcome = if existing.segments.is_empty() {
+        Err("KEA closed before anything in this meeting was transcribed".to_string())
+    } else {
+        finalize_meeting(
+            engines,
+            bindings,
+            meetings,
+            meeting_id,
+            &existing,
+            Ok(None),
+            &[],
+            None,
+            &opts,
+        )
+        .await
+    };
+    let (status, error) = match &outcome {
+        Ok(()) => (MeetingStatus::Completed, None),
+        Err(e) => (MeetingStatus::Error, Some(e.as_str())),
+    };
+    meetings
+        .complete_interrupted(meeting_id, status, error)
+        .await
+        .map_err(|e| e.to_string())?;
+    outcome
+}
+
 /// Everything between the drain and the final status write: transcribe the tail
 /// segment, synthesize notes and a title, and persist both. Every step here
 /// closes the meeting and the action rows as an error via the one epilogue in
@@ -1679,15 +1775,13 @@ async fn finalize_meeting(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
     meetings: &MeetingRepo,
-    session: &ActiveMeeting,
+    meeting_id: &str,
     existing: &MeetingDetail,
-    drain_result: Result<SpeechSegment, String>,
+    drain_result: Result<Option<SpeechSegment>, String>,
     vocabulary: &[VocabularyEntry],
     mut voices: Option<&mut MeetingVoices>,
     opts: &MeetingStopOptions,
 ) -> Result<(), String> {
-    let meeting_id = &session.meeting_id;
-
     let sequence = existing.segments.len() as i32;
     let elapsed_ms = existing
         .segments
@@ -1697,23 +1791,28 @@ async fn finalize_meeting(
 
     let tail = drain_result?;
 
-    if has_min_audio(&tail.pcm) {
+    if let Some(tail) = tail.filter(|t| has_min_audio(&t.pcm)) {
         // The tail is attributed, and split at its turns, like every other
         // segment: the last thing said in a meeting is as worth labelling as
         // the first.
         let (mut sequence, mut elapsed_ms) = (sequence, elapsed_ms);
-        store_speech_segment(
-            engines,
-            bindings,
-            meetings,
-            meeting_id,
-            tail,
-            voices.as_deref_mut(),
-            &mut sequence,
-            &mut elapsed_ms,
-            vocabulary,
-        )
-        .await?;
+        for piece in split_evenly(tail, TAIL_PIECE_MS) {
+            if !has_min_audio(&piece.pcm) {
+                continue;
+            }
+            store_speech_segment(
+                engines,
+                bindings,
+                meetings,
+                meeting_id,
+                piece,
+                voices.as_deref_mut(),
+                &mut sequence,
+                &mut elapsed_ms,
+                vocabulary,
+            )
+            .await?;
+        }
     }
 
     let mut partial = reload_meeting(meetings, meeting_id).await?;
@@ -3566,6 +3665,82 @@ mod tests {
         assert_eq!(events[0].speaker_key.as_deref(), Some("spk0"));
     }
 
+    /// A meeting that fell behind real time labels its next chunk whole, so it
+    /// catches up rather than falling further behind.
+    #[tokio::test]
+    async fn a_meeting_behind_real_time_skips_the_turn_search() {
+        let (reg, bindings, actions, meetings) =
+            voice_world(&["all of it"], KindLlm::new("{\"names\":[]}", false)).await;
+        let mut audio = two_source_audio(vec![two_halves((0.01, 0.5), (0.01, 0.5))]);
+        let settings = settings(true);
+        let mut ctx = MeetingRunContext {
+            engines: &reg,
+            bindings: &bindings,
+            actions: &actions,
+            meetings: &meetings,
+            audio: &mut audio,
+            settings: &settings,
+            vocabulary: &[],
+        };
+        let mut voices = voices_with_turns(
+            windows_of(&voice(0), 7),
+            Ok(vec![span(0, 3_000, 0), span(3_000, 6_000, 1)]),
+        );
+        voices.behind = true;
+
+        let session = run_meeting_start(&mut ctx, true).await.unwrap();
+        let (mut seq, mut elapsed) = (0, 0);
+        let events = run_meeting_poll_segment(
+            &mut ctx,
+            &session.meeting_id,
+            &mut seq,
+            &mut elapsed,
+            Some(&mut voices),
+        )
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].text, "all of it");
+        // Processing a six-second chunk with fakes takes nowhere near six
+        // seconds, so the next chunk is searched again.
+        assert!(!voices.behind);
+    }
+
+    /// A tail of minutes goes through in chunk-sized pieces, each half cut
+    /// at the same place as the mix.
+    #[test]
+    fn a_long_tail_is_cut_into_chunk_sized_pieces() {
+        let frame = |secs: usize| PcmFrame {
+            samples: vec![0.1; secs * 16_000],
+            sample_rate_hz: 16_000,
+        };
+        let tail = SpeechSegment {
+            pcm: frame(65),
+            has_speech: true,
+            mic: Some(frame(65)),
+            system: Some(frame(65)),
+        };
+        let pieces = split_evenly(tail, TAIL_PIECE_MS);
+        let lengths: Vec<(u64, u64, u64)> = pieces
+            .iter()
+            .map(|p| {
+                (
+                    duration_ms(&p.pcm),
+                    duration_ms(p.mic.as_ref().unwrap()),
+                    duration_ms(p.system.as_ref().unwrap()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            lengths,
+            vec![
+                (30_000, 30_000, 30_000),
+                (30_000, 30_000, 30_000),
+                (5_000, 5_000, 5_000)
+            ]
+        );
+    }
+
     /// Found in a real meeting on speakers: every remote line came out mixed,
     /// and with mixed lines skipped nobody was ever labelled. The system half
     /// is the call alone, so a mixed line is placed from it; one too short to
@@ -4627,6 +4802,76 @@ mod item_16_17_tests {
         schedule.record_success(1);
         schedule.record_failure();
         assert!(!schedule.is_disabled());
+    }
+
+    // --- a meeting KEA was closed during ---
+
+    #[tokio::test]
+    async fn an_interrupted_meeting_gets_its_notes_from_the_stored_lines() {
+        let llm = RecordingLlm::new(&[]);
+        let (reg, bindings, _actions, meetings) = world(llm.clone()).await;
+        recording_meeting(&meetings, "m1", &["hello", "world"]).await;
+
+        finish_interrupted_meeting(
+            &reg,
+            &bindings,
+            &meetings,
+            "m1",
+            MeetingStopOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let detail = meetings.get("m1").await.unwrap().unwrap();
+        assert_eq!(detail.meeting.status, MeetingStatus::Completed);
+        assert!(detail.notes.is_some(), "notes were written");
+        assert_eq!(detail.segments.len(), 2, "the transcript is untouched");
+        assert!(llm.prompts()[0].contains("hello"));
+        assert!(meetings.interrupted_ids().await.unwrap().is_empty());
+    }
+
+    /// A provider that fails still closes the meeting, so it is not picked up
+    /// again at every launch, and the transcript stays.
+    #[tokio::test]
+    async fn an_interrupted_meeting_whose_notes_fail_is_closed_as_an_error() {
+        let (reg, bindings, _actions, meetings) = world(RecordingLlm::failing()).await;
+        recording_meeting(&meetings, "m1", &["hello"]).await;
+
+        let result = finish_interrupted_meeting(
+            &reg,
+            &bindings,
+            &meetings,
+            "m1",
+            MeetingStopOptions::default(),
+        )
+        .await;
+        assert!(result.is_err());
+
+        let detail = meetings.get("m1").await.unwrap().unwrap();
+        assert_eq!(detail.meeting.status, MeetingStatus::Error);
+        assert_eq!(detail.segments.len(), 1);
+        assert!(meetings.interrupted_ids().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_meeting_with_no_lines_says_so() {
+        let llm = RecordingLlm::new(&[]);
+        let (reg, bindings, _actions, meetings) = world(llm.clone()).await;
+        recording_meeting(&meetings, "m1", &[]).await;
+
+        let err = finish_interrupted_meeting(
+            &reg,
+            &bindings,
+            &meetings,
+            "m1",
+            MeetingStopOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("before anything"), "{err}");
+        assert!(llm.prompts().is_empty(), "nothing to send");
+        let meeting = meetings.get("m1").await.unwrap().unwrap().meeting;
+        assert_eq!(meeting.status, MeetingStatus::Error);
     }
 
     // --- 17: calendar titles ---

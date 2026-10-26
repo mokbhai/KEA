@@ -6,6 +6,16 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+### Added
+
+- Meeting lines are now split where the speaker changes. A chunk with several people in it becomes one line per person, labelled "You" or "Person N", instead of being labelled as a whole by its loudest voice (#25).
+
+### Fixed
+
+- A meeting no longer stays "Processing" for good. Requests to an AI provider now time out after 5 minutes without a reply, so a provider that never answers ends the stop with an error instead of waiting forever.
+- A meeting that was recording or being written up when KEA closed is finished at the next launch. Its notes and title are written from the transcript already saved, and it no longer stays "recording" in the list.
+- Long meetings with voice separation no longer fall further and further behind. Audio is handed to the transcriber at most one segment length at a time, and when a chunk takes longer to process than it lasted, the next chunk skips the speaker-change search so the meeting catches up. Before, the chunks grew to several minutes each, and stopping took as long again.
+
 ## [0.5.1] - 2026-10-24
 
 ### Fixed
