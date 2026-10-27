@@ -6,6 +6,10 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+### Fixed
+
+- Voice separation no longer turns a few people into many. When a meeting stops, a "person" heard for only a few seconds is folded into the voice they sound most like. Before, one call with three people listed eight. On recorded test meetings with four people, it now finds three to six instead of seven to fifteen.
+
 ## [0.5.2] - 2026-10-26
 
 ### Added
