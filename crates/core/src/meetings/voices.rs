@@ -56,6 +56,19 @@ pub const MAX_CLUSTERS: usize = 16;
 /// label instead.
 pub const MIN_WINDOWS: usize = 2;
 
+/// Below this many windows a stop-time cluster is a fragment, not a person.
+///
+/// Forty windows is about thirty seconds of speech. Measured on AMI meetings,
+/// four real speakers came out as seven to fifteen clusters, and every extra
+/// one was under this: the embedding model cannot place a few seconds of call
+/// audio reliably, so they scatter into labels of their own. Paired with
+/// [`FRAGMENT_SHARE`], so a short meeting where everyone spoke briefly keeps
+/// its people.
+const FRAGMENT_WINDOWS: usize = 40;
+
+/// A fragment must also be under this share of the largest cluster.
+const FRAGMENT_SHARE: f32 = 0.25;
+
 /// Above this many windows the stop-time pass clusters per-segment means.
 ///
 /// The pairwise similarity table is quadratic: at this size it is about 144 MB
@@ -313,6 +326,8 @@ impl VoiceClusters {
                     .unwrap_or(0)
             })
             .collect();
+        let mut segment_label = segment_label;
+        absorb_fragments(&self.evidence, &segments, &mut segment_label);
 
         let mut old_key: BTreeMap<i32, Option<&str>> = BTreeMap::new();
         for (sequence, key) in existing_keys {
@@ -441,6 +456,67 @@ pub fn embedding_windows(samples: &[f32], rate_hz: u32) -> Vec<Range<usize>> {
         start += hop;
     }
     ranges
+}
+
+/// Folds clusters too small to be a person into the voice they sound most like.
+///
+/// Decided on segment labels, after each segment has taken its majority: that
+/// is what a reader sees as a person, and a cluster can be large over windows
+/// yet own almost no segments. Smallest first, one at a time, so a fragment is
+/// compared with clusters as they stand after earlier ones were folded in. A
+/// fragment goes to the most similar cluster that is not itself a fragment.
+fn absorb_fragments(
+    evidence: &[(i32, Vec<f32>)],
+    segments: &[(i32, Vec<usize>)],
+    segment_label: &mut [usize],
+) {
+    let dim = evidence.first().map_or(0, |(_, e)| e.len());
+    loop {
+        let mut size: BTreeMap<usize, usize> = BTreeMap::new();
+        for (segment, (_, windows)) in segments.iter().enumerate() {
+            *size.entry(segment_label[segment]).or_default() += windows.len();
+        }
+        let largest = size.values().copied().max().unwrap_or(0);
+        let is_fragment =
+            |n: usize| n < FRAGMENT_WINDOWS && (n as f32) < FRAGMENT_SHARE * largest as f32;
+        let Some((&fragment, _)) = size
+            .iter()
+            .filter(|(_, &n)| is_fragment(n))
+            .min_by_key(|(&label, &n)| (n, label))
+        else {
+            return;
+        };
+
+        let centroid = |label: usize| {
+            let mut sum = vec![0.0f32; dim];
+            for (segment, (_, windows)) in segments.iter().enumerate() {
+                if segment_label[segment] != label {
+                    continue;
+                }
+                for &window in windows {
+                    for (s, x) in sum.iter_mut().zip(normalized(&evidence[window].1)) {
+                        *s += x;
+                    }
+                }
+            }
+            normalized(&sum)
+        };
+        let from = centroid(fragment);
+        let Some(into) = size
+            .iter()
+            .filter(|(&label, &n)| label != fragment && !is_fragment(n))
+            .map(|(&label, _)| (label, dot(&from, &centroid(label))))
+            .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)))
+            .map(|(label, _)| label)
+        else {
+            return;
+        };
+        for label in segment_label.iter_mut() {
+            if *label == fragment {
+                *label = into;
+            }
+        }
+    }
 }
 
 /// The cluster label of every window.
@@ -692,6 +768,47 @@ mod tests {
         let index = clusters.assign(2, vec![axis(0), axis(1), axis(0)]);
         assert_eq!(index, Some(0));
         assert_eq!(clusters.clusters.len(), 1);
+    }
+
+    /// Found in a real meeting: three people came out as eight, all but one of
+    /// the extras a few seconds long.
+    ///
+    /// Two long voices and a few seconds of a third, closer to the second:
+    /// the stop folds the few seconds into the second rather than keeping a
+    /// person nobody can place.
+    #[test]
+    fn a_fragment_is_folded_into_the_voice_it_sounds_most_like() {
+        let mut evidence = Vec::new();
+        for seq in 0..10 {
+            evidence.extend((0..6).map(|_| (seq, axis(seq as usize % 2))));
+        }
+        let fragment = jitter(&axis(2), &axis(1));
+        let fragment: Vec<f32> = fragment
+            .iter()
+            .zip(axis(1))
+            .map(|(f, b)| f * 0.6 + b * 0.4)
+            .collect();
+        evidence.extend((0..4).map(|_| (10, fragment.clone())));
+        let keys: Vec<_> = (0..10)
+            .map(|seq| key(seq, if seq % 2 == 0 { "spk0" } else { "spk1" }))
+            .chain([key(10, "spk2")])
+            .collect();
+
+        let result = state(&evidence).recluster(&keys);
+        assert_eq!(result.segments.last(), Some(&(10, "spk1".to_string())));
+        assert_eq!(result.names.len(), 2, "{:?}", result.names);
+    }
+
+    /// A short meeting where everyone spoke briefly keeps everyone: a cluster
+    /// is only a fragment next to someone who spoke far longer.
+    #[test]
+    fn brief_voices_of_similar_length_are_all_kept() {
+        let evidence: Vec<_> = (0..3)
+            .flat_map(|seq| (0..5).map(move |_| (seq, axis(seq as usize))))
+            .collect();
+        let keys: Vec<_> = (0..3).map(|seq| key(seq, &format!("spk{seq}"))).collect();
+        let result = state(&evidence).recluster(&keys);
+        assert_eq!(result.names.len(), 3);
     }
 
     #[test]

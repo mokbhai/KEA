@@ -70,6 +70,8 @@ In `finalize_meeting`, after the tail segment and before name inference and note
 
 All of this happens in one repo transaction, `remap_segment_speakers`.
 
+**Fragments (amended 2026-10-27).** A real call with two remote people came out as seven participants, all but one of them under 40 s. On AMI meetings (4 speakers, clean and through a 16 kbit/s Opus call path), the pass labelled 7, 13, 13 and 15 people. Even sherpa's own whole-meeting diarizer, with the same two models, found 19 speakers at threshold 0.7 and 6 at 1.0. CAM++ cannot reliably place a few seconds of meeting audio, and no merge threshold separated the same-speaker and different-speaker distributions. So after each segment takes its majority label, any cluster under about 30 s of speech (40 windows) that is also under a quarter of the largest cluster is folded into the most similar cluster that isn't itself a fragment. On the same four AMI runs that gives 5, 4, 3 and 6 people. A participant who says a single sentence is the price: they are labelled as whoever they sound most like.
+
 The cost is O(n²) over windows. A one-hour meeting with about half its time remote speech is around 2,400 windows, which takes well under a second on the CPU. Above 6,000 windows the pass clusters the per-segment means instead of individual windows.
 
 Alternative considered: keep live labels as final. That was rejected because online clustering decides early, with little evidence, and the spec requires stable labels.
