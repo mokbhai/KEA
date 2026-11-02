@@ -6,9 +6,15 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-02
+
+### Added
+
+- Hold the middle mouse button (the scroll-wheel click) to dictate. It works like holding ⌥⇧: hold it for a moment to start recording, and let go to transcribe. A normal middle-click still does what it did before, and double middle-clicks never lock the microphone on. A middle press also ends a locked recording. Needs hold-to-talk turned on.
+
 ### Fixed
 
-- Voice separation no longer turns a few people into many. When a meeting stops, a "person" heard for only a few seconds is folded into the voice they sound most like. Before, one call with three people listed eight. On recorded test meetings with four people, it now finds three to six instead of seven to fifteen.
+- Voice separation no longer turns a few people into many. When a meeting stops, a "person" heard for only a few seconds is folded into the voice they sound most like. Before, one call with three people listed eight. On recorded test meetings with four people, it now finds three to six instead of seven to fifteen (#27).
 
 ## [0.5.2] - 2026-10-26
 
