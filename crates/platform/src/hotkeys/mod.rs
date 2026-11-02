@@ -64,10 +64,12 @@ impl HoldControl {
 /// the OS registers and reports as presses, and a modifier-only press-and-hold
 /// chord is neither — see [`hold`] for why.
 ///
-/// `enabled` is polled by the listener rather than passed by value so the
-/// settings toggle can silence it without a restart.
+/// `enabled` (the ⌥⇧ chord) and `mouse` (the middle mouse button) are polled
+/// by the listener rather than passed by value so each settings toggle can
+/// silence its trigger without a restart.
 pub fn spawn_hold_to_talk(
     enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mouse: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<
     (
         HoldControl,
@@ -77,11 +79,11 @@ pub fn spawn_hold_to_talk(
 > {
     #[cfg(target_os = "macos")]
     {
-        macos_hold::spawn(enabled)
+        macos_hold::spawn(enabled, mouse)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = enabled;
+        let _ = (enabled, mouse);
         Err(HotkeyError::Other(
             "hold-to-talk is not yet implemented on this platform".into(),
         ))

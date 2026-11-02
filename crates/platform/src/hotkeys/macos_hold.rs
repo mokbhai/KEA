@@ -15,7 +15,7 @@
 //! # Manual verification
 //! 1. Grant Accessibility (without it `CGEventTapCreate` returns NULL and this
 //!    refuses to start, with the same message the paste path uses).
-//! 2. Hold ⌥⇧ (or the middle mouse button) for half a second: the dictation HUD appears and the mic opens.
+//! 2. Hold ⌥⇧ (or the middle mouse button, if its switch is on) for half a second: the dictation HUD appears and the mic opens.
 //! 3. Release either key: the HUD switches to transcribing and the text lands.
 //! 4. Tap ⌥⇧ quickly, and separately hold ⌥⇧ and press ← a few times: neither
 //!    may start a recording.
@@ -63,13 +63,14 @@ extern "C" {
 
 /// Installs the hold-to-talk listener.
 ///
-/// `enabled` is read on every event so the settings toggle takes effect without
-/// tearing anything down. The listener is deliberately *not* stoppable: ending
+/// `enabled` (the ⌥⇧ chord) and `mouse` (the middle button) are read on every
+/// event so each settings toggle takes effect without tearing anything down. The listener is deliberately *not* stoppable: ending
 /// a `CFRunLoop` from another thread needs a source or timer installed purely to
 /// carry the request, and the tap is inert while disabled (it resets the state
 /// machine and returns before reading anything). It goes away when KEA quits.
 pub fn spawn(
     enabled: Arc<AtomicBool>,
+    mouse: Arc<AtomicBool>,
 ) -> Result<(HoldControl, mpsc::UnboundedReceiver<HoldAction>), HotkeyError> {
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
@@ -82,6 +83,7 @@ pub fn spawn(
     spawn_tap_thread(
         machine.clone(),
         enabled,
+        mouse,
         events_tx.clone(),
         wake_tx,
         started_tx,
@@ -104,13 +106,14 @@ pub fn spawn(
 /// Said in one place because it is said from two: the pre-flight trust check
 /// and the `CGEventTapCreate` failure path mean the same thing to a user.
 const ACCESSIBILITY_REQUIRED: &str =
-    "KEA needs Accessibility permission to watch for the hold-to-talk chord (⌥⇧). \
+    "KEA needs Accessibility permission to watch for hold-to-talk (⌥⇧ or the middle mouse button). \
 Grant it in System Settings → Privacy & Security → Accessibility, then quit and \
 reopen KEA. Cmd+Shift+D keeps working without it.";
 
 fn spawn_tap_thread(
     machine: Arc<Mutex<HoldToTalk>>,
     enabled: Arc<AtomicBool>,
+    mouse: Arc<AtomicBool>,
     events: mpsc::UnboundedSender<HoldAction>,
     wake: std::sync::mpsc::Sender<()>,
     started: std::sync::mpsc::SyncSender<Result<(), String>>,
@@ -131,7 +134,9 @@ fn spawn_tap_thread(
                     CGEventType::OtherMouseUp,
                 ],
                 move |_proxy, event_type, event| {
-                    on_event(&machine, &enabled, &events, &wake, event_type, event);
+                    on_event(
+                        &machine, &enabled, &mouse, &events, &wake, event_type, event,
+                    );
                     CallbackResult::Keep
                 },
             );
@@ -198,6 +203,7 @@ fn disable_reason(event_type: CGEventType) -> Option<&'static str> {
 fn on_event(
     machine: &Mutex<HoldToTalk>,
     enabled: &AtomicBool,
+    mouse: &AtomicBool,
     events: &mpsc::UnboundedSender<HoldAction>,
     wake: &std::sync::mpsc::Sender<()>,
     event_type: CGEventType,
@@ -251,7 +257,9 @@ fn on_event(
 
     let mut machine = machine.lock().unwrap_or_else(|p| p.into_inner());
 
-    if !enabled.load(Ordering::Relaxed) {
+    let keyboard_on = enabled.load(Ordering::Relaxed);
+    let mouse_on = mouse.load(Ordering::Relaxed);
+    if !keyboard_on && !mouse_on {
         // Turning the mode off mid-hold must end that hold, not strand the
         // dictation run it started — nor an armed stream, which `reset` cannot
         // report alongside the abandoned recording.
@@ -264,6 +272,12 @@ fn on_event(
     }
 
     let action = match event_type {
+        // The chord switched off while the mouse stays on: read every flags
+        // change as "nothing held", which ends a chord hold that was running
+        // when the switch flipped and never starts a new one.
+        CGEventType::FlagsChanged if !keyboard_on => {
+            machine.on_modifiers(Instant::now(), HoldModifiers::NONE)
+        }
         CGEventType::FlagsChanged => {
             let flags = event.get_flags();
             let mods = HoldModifiers {
@@ -285,6 +299,13 @@ fn on_event(
         CGEventType::KeyDown => machine.on_other_key(),
         // The scroll wheel's click is button 2; back/forward are 3 and 4 and
         // belong to the user's own shortcuts.
+        // The button switched off mid-hold: a later press, or the release,
+        // ends that hold instead of starting another.
+        CGEventType::OtherMouseDown | CGEventType::OtherMouseUp
+            if !mouse_on && is_middle_button(event) =>
+        {
+            machine.on_pointer_up()
+        }
         CGEventType::OtherMouseDown if is_middle_button(event) => {
             machine.on_pointer_down(Instant::now())
         }

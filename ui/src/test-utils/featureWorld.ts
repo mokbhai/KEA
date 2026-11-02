@@ -82,6 +82,7 @@ export function featureHandlers({
       post_process: false,
       active_model: null,
       hold_to_talk: false,
+      hold_mouse: false,
       input_device: null,
       preroll: true,
       language: null,

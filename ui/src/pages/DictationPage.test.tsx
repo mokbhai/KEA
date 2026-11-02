@@ -198,6 +198,7 @@ describe("DictationPage", () => {
           post_process: false,
           active_model: "whisper-base",
           hold_to_talk: false,
+          hold_mouse: false,
           input_device: null,
           preroll: true,
           language: null,
@@ -221,6 +222,7 @@ describe("DictationPage", () => {
           post_process: true,
           active_model: null,
           hold_to_talk: false,
+          hold_mouse: false,
           input_device: null,
           preroll: true,
           language: null,
@@ -299,6 +301,7 @@ describe("DictationPage", () => {
         post_process: true,
         active_model: null,
         hold_to_talk: false,
+        hold_mouse: false,
         input_device: null,
         preroll: true,
         language: null,
@@ -320,6 +323,31 @@ describe("DictationPage", () => {
         post_process: false,
         active_model: null,
         hold_to_talk: true,
+        hold_mouse: false,
+        input_device: null,
+        preroll: true,
+        language: null,
+      },
+    });
+  });
+
+  it("saves the scroll-button switch on its own, leaving the chord alone", async () => {
+    mockWorld({ bindings: { "default/stt": whisperBinding } });
+    render(<DictationPage />);
+
+    const toggle = await screen.findByRole("switch", {
+      name: "Hold the scroll button to talk",
+    });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    await userEvent.click(toggle);
+
+    await waitFor(() => expect(invokeCalls("set_dictation_settings")).toHaveLength(1));
+    expect(invokeCalls("set_dictation_settings")[0]).toEqual({
+      settings: {
+        post_process: false,
+        active_model: null,
+        hold_to_talk: false,
+        hold_mouse: true,
         input_device: null,
         preroll: true,
         language: null,
@@ -348,6 +376,7 @@ describe("DictationPage", () => {
         post_process: false,
         active_model: null,
         hold_to_talk: false,
+        hold_mouse: false,
         input_device: "Yeti",
         preroll: true,
         language: null,
@@ -365,6 +394,7 @@ describe("DictationPage", () => {
           post_process: false,
           active_model: null,
           hold_to_talk: false,
+          hold_mouse: false,
           input_device: "Road Caster",
           preroll: true,
           language: null,
@@ -429,6 +459,7 @@ describe("DictationPage", () => {
         post_process: false,
         active_model: null,
         hold_to_talk: false,
+        hold_mouse: false,
         input_device: null,
         preroll: false,
         language: null,
@@ -457,6 +488,7 @@ describe("DictationPage", () => {
           post_process: false,
           active_model: null,
           hold_to_talk: true,
+          hold_mouse: false,
           input_device: null,
           preroll: true,
           language: null,
@@ -489,6 +521,7 @@ describe("DictationPage", () => {
         post_process: false,
         active_model: null,
         hold_to_talk: false,
+        hold_mouse: false,
         input_device: null,
         preroll: true,
         language: "de",
@@ -505,6 +538,7 @@ describe("DictationPage", () => {
           post_process: false,
           active_model: null,
           hold_to_talk: false,
+          hold_mouse: false,
           input_device: null,
           preroll: true,
           language: "de",
@@ -560,6 +594,7 @@ describe("DictationPage", () => {
           post_process: false,
           active_model: TURBO.id,
           hold_to_talk: false,
+          hold_mouse: false,
           input_device: null,
           preroll: true,
           language: null,
@@ -583,6 +618,7 @@ describe("DictationPage", () => {
           post_process: false,
           active_model: null,
           hold_to_talk: false,
+          hold_mouse: false,
           input_device: null,
           preroll: true,
           language: "cy",
@@ -800,6 +836,7 @@ describe("DictationPage", () => {
             post_process: false,
             active_model: null,
             hold_to_talk: false,
+            hold_mouse: false,
             input_device: null,
             preroll: true,
             language,

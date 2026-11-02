@@ -1763,7 +1763,9 @@ pub async fn run_dictation_action(
     }
 }
 
-/// Brings the ⌥⇧ hold-to-talk listener in line with the setting.
+/// Brings the hold-to-talk listener in line with its two switches: the ⌥⇧
+/// chord and the middle mouse button. One listener serves both, installed
+/// when either is on.
 ///
 /// Installing is one-way (the platform listener outlives any disable), so this
 /// is safe to call on every settings write and at startup; turning the mode off
@@ -1774,9 +1776,10 @@ pub async fn run_dictation_action(
 /// that silently does nothing is the exact failure this release set out to
 /// remove. `installed` stays false in that case so granting the permission and
 /// toggling the setting again retries.
-pub fn sync_hold_to_talk(state: &Arc<AppState>, app: &AppHandle, enabled: bool) {
-    state.hold_to_talk_enabled.store(enabled, Ordering::SeqCst);
-    if !enabled {
+pub fn sync_hold_to_talk(state: &Arc<AppState>, app: &AppHandle, keyboard: bool, mouse: bool) {
+    state.hold_to_talk_enabled.store(keyboard, Ordering::SeqCst);
+    state.hold_mouse_enabled.store(mouse, Ordering::SeqCst);
+    if !keyboard && !mouse {
         return;
     }
 
@@ -1789,29 +1792,31 @@ pub fn sync_hold_to_talk(state: &Arc<AppState>, app: &AppHandle, enabled: bool) 
             return;
         }
 
-        let (control, events) =
-            match kea_platform::spawn_hold_to_talk(state.hold_to_talk_enabled.clone()) {
-                Ok(listener) => listener,
-                Err(error) => {
-                    tracing::warn!(%error, "hold-to-talk listener could not start");
-                    emit_dictation_error(app, &error.to_string());
-                    // Put the system's own dialog in front of the user rather
-                    // than only a message in the app. The grant is revoked by
-                    // anything that changes the binary — every rebuild and
-                    // install — so this is a routine state, not an exotic one,
-                    // and "go and find the Accessibility pane" is a poor answer
-                    // to a chord that silently stopped working.
-                    //
-                    // No-op when already trusted, so it cannot nag: macOS only
-                    // shows the dialog for an untrusted process, and reaching
-                    // here means untrusted.
-                    #[cfg(target_os = "macos")]
-                    {
-                        let _ = kea_platform::textio::macos_ax::prompt_ax_trust();
-                    }
-                    return;
+        let (control, events) = match kea_platform::spawn_hold_to_talk(
+            state.hold_to_talk_enabled.clone(),
+            state.hold_mouse_enabled.clone(),
+        ) {
+            Ok(listener) => listener,
+            Err(error) => {
+                tracing::warn!(%error, "hold-to-talk listener could not start");
+                emit_dictation_error(app, &error.to_string());
+                // Put the system's own dialog in front of the user rather
+                // than only a message in the app. The grant is revoked by
+                // anything that changes the binary — every rebuild and
+                // install — so this is a routine state, not an exotic one,
+                // and "go and find the Accessibility pane" is a poor answer
+                // to a chord that silently stopped working.
+                //
+                // No-op when already trusted, so it cannot nag: macOS only
+                // shows the dialog for an untrusted process, and reaching
+                // here means untrusted.
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = kea_platform::textio::macos_ax::prompt_ax_trust();
                 }
-            };
+                return;
+            }
+        };
         *installed = true;
         // Kept so a lock can be ended by something other than the keyboard
         // tap — Escape, or a run that finished by another route.
@@ -4370,7 +4375,7 @@ pub async fn apply_dictation_settings(
         .lock()
         .await
         .set_input_device(settings.input_device.clone());
-    sync_hold_to_talk(state, app, settings.hold_to_talk);
+    sync_hold_to_talk(state, app, settings.hold_to_talk, settings.hold_mouse);
 }
 
 #[tauri::command]
@@ -7661,6 +7666,7 @@ mod tests {
                 post_process: true,
                 active_model: Some("ggml-base.en".into()),
                 hold_to_talk: false,
+                hold_mouse: false,
                 input_device: None,
                 preroll: true,
                 language: None,

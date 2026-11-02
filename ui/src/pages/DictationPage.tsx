@@ -294,6 +294,7 @@ export default function DictationPage({ onNavigate }: Props) {
       post_process: false,
       active_model: null,
       hold_to_talk: false,
+      hold_mouse: false,
       input_device: null,
       preroll: true,
       language: null,
@@ -304,6 +305,7 @@ export default function DictationPage({ onNavigate }: Props) {
   const {
     post_process: postProcess,
     hold_to_talk: holdToTalk,
+    hold_mouse: holdMouse,
     input_device: inputDevice,
     preroll,
     language,
@@ -724,6 +726,22 @@ export default function DictationPage({ onNavigate }: Props) {
                   disabled={anyBusy}
                   onChange={(next) =>
                     void settings.save({ hold_to_talk: next }, "hold_to_talk")
+                  }
+                />
+              </Row>
+              <Row
+                label="Hold the scroll button to talk"
+                hint="Hold the middle mouse button (press the scroll wheel down) to record, then let go and KEA types what you said. A normal middle-click still works as before."
+              >
+                {settings.savedKey === "hold_mouse" && (
+                  <span className="kea-saved">Saved ✓</span>
+                )}
+                <Toggle
+                  label="Hold the scroll button to talk"
+                  checked={holdMouse}
+                  disabled={anyBusy}
+                  onChange={(next) =>
+                    void settings.save({ hold_mouse: next }, "hold_mouse")
                   }
                 />
               </Row>

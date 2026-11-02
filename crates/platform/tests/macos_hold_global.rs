@@ -24,7 +24,8 @@ async fn test_hold_to_talk_background() {
 
     // Spawn the hold to talk listener
     let enabled = Arc::new(AtomicBool::new(true));
-    let (_control, mut rx) = spawn_hold_to_talk(enabled).expect("Failed to spawn hold to talk");
+    let (_control, mut rx) = spawn_hold_to_talk(enabled, Arc::new(AtomicBool::new(false)))
+        .expect("Failed to spawn hold to talk");
 
     // Launch the child process (chord-probe) to post the exact synthetic event sequence.
     // Notice that running chord-probe does not make the test executable frontmost,

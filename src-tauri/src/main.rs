@@ -149,6 +149,9 @@ pub struct AppState {
     /// Whether ⌥⇧ hold-to-talk is armed. Read by the platform listener on every
     /// event, so the settings toggle takes effect immediately.
     pub hold_to_talk_enabled: Arc<AtomicBool>,
+    /// Whether holding the middle mouse button records. Read by the same
+    /// listener; either switch being on is enough to install it.
+    pub hold_mouse_enabled: Arc<AtomicBool>,
     /// Whether the hold-to-talk listener has been installed. It cannot be taken
     /// back down (see `kea_platform::hotkeys::macos_hold`), so this guards
     /// against installing a second one — while still allowing a retry after the
@@ -830,6 +833,7 @@ fn build_state(
         ))),
         dictation_busy: Arc::new(AtomicBool::new(false)),
         hold_to_talk_enabled: Arc::new(AtomicBool::new(false)),
+        hold_mouse_enabled: Arc::new(AtomicBool::new(false)),
         hold_to_talk_installed: Mutex::new(false),
         hold_control: Mutex::new(None),
         preroll_enabled: Arc::new(AtomicBool::new(true)),

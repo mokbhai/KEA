@@ -517,6 +517,8 @@ export type DictationSettings = {
   active_model: string | null;
   /** Hold ⌥⇧ to record, release to transcribe and insert. */
   hold_to_talk: boolean;
+  /** Hold the middle mouse button to record, release to transcribe and insert. */
+  hold_mouse: boolean;
   /** Which microphone to record from, by name, or null for the system default. */
   input_device: string | null;
   /** Open the mic as ⌥⇧ is pressed so the first word is not clipped. */

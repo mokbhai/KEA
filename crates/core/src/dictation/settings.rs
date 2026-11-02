@@ -8,6 +8,7 @@ const KEY_ACTIVE_MODEL: &str = "dictation.active_model";
 const KEY_HOLD_TO_TALK: &str = "dictation.hold_to_talk";
 const KEY_INPUT_DEVICE: &str = "dictation.input_device";
 const KEY_PREROLL: &str = "dictation.preroll";
+const KEY_HOLD_MOUSE: &str = "dictation.hold_mouse";
 const KEY_POST_PROCESS_MIN_CHARS: &str = "dictation.post_process_min_chars";
 const KEY_LANGUAGE: &str = "dictation.language";
 const KEY_VOICE_COMMANDS_ENABLED: &str = "dictation.voice_commands_enabled";
@@ -25,6 +26,16 @@ pub struct DictationSettings {
     /// added field cannot fail to deserialize an older config.
     #[serde(default)]
     pub hold_to_talk: bool,
+    /// Hold the middle mouse button (the scroll-wheel click) to record,
+    /// release to transcribe and insert. Its own switch, independent of the
+    /// ⌥⇧ chord, so someone who middle-clicks a lot can keep one and not the
+    /// other.
+    ///
+    /// With no saved row it follows `hold_to_talk`: 0.5.3 shipped the button
+    /// riding on that switch, so whoever had it on keeps it, and nobody who
+    /// had it off is suddenly asked for Accessibility.
+    #[serde(default)]
+    pub hold_mouse: bool,
     /// Which microphone to record from, by device name, or `None` for the
     /// system default.
     ///
@@ -174,10 +185,16 @@ impl DictationSettingsRepo {
     }
 
     pub async fn get(&self) -> Result<DictationSettings, KeaError> {
+        let hold_to_talk = self.settings.get(KEY_HOLD_TO_TALK).await?.unwrap_or(false);
         Ok(DictationSettings {
             post_process: self.settings.get(KEY_POST_PROCESS).await?.unwrap_or(false),
             active_model: self.settings.get_optional(KEY_ACTIVE_MODEL).await?,
-            hold_to_talk: self.settings.get(KEY_HOLD_TO_TALK).await?.unwrap_or(false),
+            hold_to_talk,
+            hold_mouse: self
+                .settings
+                .get(KEY_HOLD_MOUSE)
+                .await?
+                .unwrap_or(hold_to_talk),
             input_device: self.settings.get_optional(KEY_INPUT_DEVICE).await?,
             preroll: self.settings.get(KEY_PREROLL).await?.unwrap_or(true),
             post_process_min_chars: self
@@ -199,6 +216,7 @@ impl DictationSettingsRepo {
         self.settings
             .set(KEY_HOLD_TO_TALK, &cfg.hold_to_talk)
             .await?;
+        self.settings.set(KEY_HOLD_MOUSE, &cfg.hold_mouse).await?;
         self.settings
             .set(KEY_INPUT_DEVICE, &cfg.input_device)
             .await?;
@@ -259,6 +277,7 @@ mod tests {
             post_process: true,
             active_model: Some("ggml-base.en".into()),
             hold_to_talk: true,
+            hold_mouse: false,
             input_device: Some("Yeti".into()),
             preroll: false,
             language: None,
@@ -279,6 +298,7 @@ mod tests {
             post_process: true,
             active_model: Some("ggml-base.en".into()),
             hold_to_talk: false,
+            hold_mouse: false,
             input_device: None,
             preroll: true,
             language: None,
@@ -290,6 +310,7 @@ mod tests {
             post_process: true,
             active_model: None,
             hold_to_talk: false,
+            hold_mouse: false,
             input_device: None,
             preroll: true,
             language: None,
@@ -306,6 +327,28 @@ mod tests {
     /// A config stored before `hold_to_talk` existed has no row for it, which
     /// must read back as "off" rather than failing the whole settings read and
     /// taking dictation's model and clean-up toggle down with it.
+    /// 0.5.3 shipped the middle mouse button riding on the hold-to-talk switch.
+    /// With no row of its own it must follow that switch both ways: on keeps
+    /// the button for whoever was using it, off must not start asking for
+    /// Accessibility. Once saved, the two are independent.
+    #[tokio::test]
+    async fn hold_mouse_follows_hold_to_talk_until_saved() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let settings = SettingsRepo::new(pool.clone());
+        let repo = DictationSettingsRepo::new(SettingsRepo::new(pool));
+
+        assert!(!repo.get().await.unwrap().hold_mouse);
+        settings.set("dictation.hold_to_talk", &true).await.unwrap();
+        assert!(repo.get().await.unwrap().hold_mouse);
+
+        let mut cfg = repo.get().await.unwrap();
+        cfg.hold_mouse = false;
+        repo.set(&cfg).await.unwrap();
+        let got = repo.get().await.unwrap();
+        assert!(got.hold_to_talk && !got.hold_mouse);
+    }
+
     #[tokio::test]
     async fn a_config_written_before_hold_to_talk_existed_still_reads() {
         let pool = open_pool("sqlite::memory:").await.unwrap();
@@ -340,6 +383,7 @@ mod tests {
             post_process: false,
             active_model: None,
             hold_to_talk: false,
+            hold_mouse: false,
             input_device: Some("Yeti".into()),
             preroll: true,
             language: None,
@@ -368,6 +412,7 @@ mod tests {
             post_process: false,
             active_model: None,
             hold_to_talk: false,
+            hold_mouse: false,
             input_device: None,
             preroll: false,
             language: None,
