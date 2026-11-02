@@ -6,6 +6,20 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-11-02
+
+0.5.3 was never published (its Linux build failed), so this release also carries everything listed under it.
+
+### Added
+
+- Hold the middle mouse button (the scroll-wheel click) to dictate. Hold it for a moment to start recording, and let go to transcribe. A normal middle-click still does what it did before, and double middle-clicks never lock the microphone on. A middle press also ends a locked recording.
+- The scroll button has its own switch, "Hold the scroll button to talk", in Settings → Dictation, separate from "Hold to talk" (⌥⇧). Turn on either one or both. Until you change it, it follows "Hold to talk".
+
+### Fixed
+
+- Voice separation no longer turns a few people into many. When a meeting stops, a "person" heard for only a few seconds is folded into the voice they sound most like. Before, one call with three people listed eight. On recorded test meetings with four people, it now finds three to six instead of seven to fifteen (#27).
+- The Linux build works again on GitHub's new Ubuntu 26.04 runners.
+
 ## [0.5.3] - 2026-11-02
 
 ### Added
