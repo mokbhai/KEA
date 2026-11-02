@@ -109,6 +109,13 @@ jobs:
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
             libasound2-dev libfuse2
+          # ubuntu-latest moved to 26.04 (Nov 2026), whose libclang makes the
+          # bindgen in whisper-rs-sys 0.11 emit an empty whisper_full_params,
+          # and the build fails with "no field `greedy`". Use the bindings the
+          # crate ships instead; they match its whisper.cpp field-for-field.
+          # Linux only: they were generated for an LP64 target, and Windows
+          # lays C `long` out differently.
+          echo "WHISPER_DONT_GENERATE_BINDINGS=1" >> "$GITHUB_ENV"
 
       # `cargo install tauri-cli` compiles the CLI from source and costs several
       # minutes on every run; cache the resulting binary keyed on the pinned
