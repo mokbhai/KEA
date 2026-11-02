@@ -15,7 +15,7 @@
 //! # Manual verification
 //! 1. Grant Accessibility (without it `CGEventTapCreate` returns NULL and this
 //!    refuses to start, with the same message the paste path uses).
-//! 2. Hold ⌥⇧ for half a second: the dictation HUD appears and the mic opens.
+//! 2. Hold ⌥⇧ (or the middle mouse button) for half a second: the dictation HUD appears and the mic opens.
 //! 3. Release either key: the HUD switches to transcribing and the text lands.
 //! 4. Tap ⌥⇧ quickly, and separately hold ⌥⇧ and press ← a few times: neither
 //!    may start a recording.
@@ -124,7 +124,12 @@ fn spawn_tap_thread(
                 // Never Default: an active tap can drop events, and dropping
                 // the user's ⌥⇧ would break every shortcut built on it.
                 CGEventTapOptions::ListenOnly,
-                vec![CGEventType::KeyDown, CGEventType::FlagsChanged],
+                vec![
+                    CGEventType::KeyDown,
+                    CGEventType::FlagsChanged,
+                    CGEventType::OtherMouseDown,
+                    CGEventType::OtherMouseUp,
+                ],
                 move |_proxy, event_type, event| {
                     on_event(&machine, &enabled, &events, &wake, event_type, event);
                     CallbackResult::Keep
@@ -278,6 +283,12 @@ fn on_event(
         }
         // Nothing is read off the event: only that a key went down at all.
         CGEventType::KeyDown => machine.on_other_key(),
+        // The scroll wheel's click is button 2; back/forward are 3 and 4 and
+        // belong to the user's own shortcuts.
+        CGEventType::OtherMouseDown if is_middle_button(event) => {
+            machine.on_pointer_down(Instant::now())
+        }
+        CGEventType::OtherMouseUp if is_middle_button(event) => machine.on_pointer_up(),
         _ => HoldAction::Nothing,
     };
     drop(machine);
@@ -285,6 +296,10 @@ fn on_event(
     send(events, action);
     // A deadline may have moved either way; let the timer recompute.
     let _ = wake.send(());
+}
+
+fn is_middle_button(event: &core_graphics::event::CGEvent) -> bool {
+    event.get_integer_value_field(core_graphics::event::EventField::MOUSE_EVENT_BUTTON_NUMBER) == 2
 }
 
 /// Forward a decision, dropping the one that means "no decision".

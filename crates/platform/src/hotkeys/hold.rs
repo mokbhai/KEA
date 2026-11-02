@@ -153,6 +153,10 @@ pub struct HoldToTalk {
     /// When the chord was last released before reaching the hold threshold.
     /// A second chord within [`DOUBLE_TAP_WINDOW`] of it locks.
     last_tap: Option<Instant>,
+    /// Whether the middle mouse button is the thing being held. While it is,
+    /// modifier changes are ignored: they describe the keyboard, and acting
+    /// on an unrelated Shift press would end a hold the mouse owns.
+    pointer: bool,
 }
 
 impl HoldToTalk {
@@ -170,6 +174,7 @@ impl HoldToTalk {
             min_hold,
             lock_max,
             last_tap: None,
+            pointer: false,
         }
     }
 
@@ -191,6 +196,9 @@ impl HoldToTalk {
 
     /// Feed a modifier-flags change.
     pub fn on_modifiers(&mut self, now: Instant, modifiers: HoldModifiers) -> HoldAction {
+        if self.pointer {
+            return HoldAction::Nothing;
+        }
         if modifiers.is_chord() {
             return self.on_chord_complete(now);
         }
@@ -286,6 +294,53 @@ impl HoldToTalk {
             }
             State::Recording => {
                 // A hold that ran its course is not half of a double tap.
+                self.last_tap = None;
+                HoldAction::Stop
+            }
+            _ => HoldAction::Nothing,
+        }
+    }
+
+    /// The middle mouse button went down.
+    ///
+    /// The button is a one-key chord: held past the hold threshold it records,
+    /// released it stops. It never joins the double-tap lock — a quick
+    /// middle-click is an everyday gesture (closing tabs, pasting in a
+    /// terminal) and two of them must not open the microphone. It can still
+    /// *end* a lock, since that is a press aimed at the recording.
+    pub fn on_pointer_down(&mut self, now: Instant) -> HoldAction {
+        if self.pointer {
+            return HoldAction::Nothing;
+        }
+        match self.state {
+            State::Idle => {
+                self.pointer = true;
+                self.state = State::Chord {
+                    since: now,
+                    armed: false,
+                };
+                HoldAction::Nothing
+            }
+            State::Locked { .. } => {
+                self.pointer = true;
+                self.state = State::PassedThrough;
+                self.last_tap = None;
+                HoldAction::StopLocked
+            }
+            _ => HoldAction::Nothing,
+        }
+    }
+
+    /// The middle mouse button came up.
+    pub fn on_pointer_up(&mut self) -> HoldAction {
+        if !self.pointer {
+            return HoldAction::Nothing;
+        }
+        self.pointer = false;
+        match std::mem::replace(&mut self.state, State::Idle) {
+            // Released before the threshold: a plain click, not a tap.
+            State::Chord { armed, .. } => disarm_if(armed),
+            State::Recording => {
                 self.last_tap = None;
                 HoldAction::Stop
             }
@@ -398,6 +453,7 @@ impl HoldToTalk {
     pub fn reset(&mut self) -> HoldAction {
         let previous = std::mem::replace(&mut self.state, State::Idle);
         self.last_tap = None;
+        self.pointer = false;
         match previous {
             State::Recording => HoldAction::Stop,
             State::Locked { .. } => HoldAction::StopLocked,
@@ -890,5 +946,39 @@ mod tests {
         assert_eq!(hold.reset(), HoldAction::StopLocked);
         assert!(!hold.is_locked());
         assert_eq!(hold.reset(), HoldAction::Nothing);
+    }
+
+    #[test]
+    fn holding_the_middle_button_records_until_release() {
+        let (mut hold, t0) = machine();
+        assert_eq!(hold.on_pointer_down(at(t0, 0)), HoldAction::Nothing);
+        assert_eq!(hold.poll(at(t0, 100)), HoldAction::Arm);
+        assert_eq!(hold.poll(at(t0, 400)), HoldAction::Start);
+        // An unrelated modifier press must not end the hold.
+        assert_eq!(
+            hold.on_modifiers(at(t0, 500), HoldModifiers::NONE),
+            HoldAction::Nothing
+        );
+        assert_eq!(hold.on_pointer_up(), HoldAction::Stop);
+    }
+
+    #[test]
+    fn a_middle_click_and_a_double_click_start_nothing() {
+        let (mut hold, t0) = machine();
+        assert_eq!(hold.on_pointer_down(at(t0, 0)), HoldAction::Nothing);
+        assert_eq!(hold.on_pointer_up(), HoldAction::Nothing);
+        assert_eq!(hold.on_pointer_down(at(t0, 100)), HoldAction::Nothing);
+        assert_eq!(hold.poll(at(t0, 150)), HoldAction::Nothing);
+        assert_eq!(hold.on_pointer_up(), HoldAction::Nothing);
+        assert!(!hold.is_locked());
+    }
+
+    #[test]
+    fn a_key_during_a_middle_hold_cancels_it() {
+        let (mut hold, t0) = machine();
+        hold.on_pointer_down(at(t0, 0));
+        assert_eq!(hold.on_other_key(), HoldAction::Nothing);
+        assert_eq!(hold.poll(at(t0, 500)), HoldAction::Nothing);
+        assert_eq!(hold.on_pointer_up(), HoldAction::Nothing);
     }
 }

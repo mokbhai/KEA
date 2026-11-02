@@ -285,11 +285,11 @@ pub unsafe fn reposition_ns_window_on_active_screen(
         Some(cls) => cls,
         None => return,
     };
-    let screen_cls = match AnyClass::get(core::ffi::CStr::from_bytes_with_nul(b"NSScreen\0").unwrap())
-    {
-        Some(cls) => cls,
-        None => return,
-    };
+    let screen_cls =
+        match AnyClass::get(core::ffi::CStr::from_bytes_with_nul(b"NSScreen\0").unwrap()) {
+            Some(cls) => cls,
+            None => return,
+        };
 
     let pointer: CGPoint = msg_send![event_cls, mouseLocation];
     let screens: *mut objc2::runtime::AnyObject = msg_send![screen_cls, screens];
@@ -420,10 +420,7 @@ mod tests {
             1 << 18,
             "CAN_JOIN_ALL_APPLICATIONS must be set"
         );
-        assert_eq!(
-            mask,
-            (1 << 0) | (1 << 4) | (1 << 6) | (1 << 8) | (1 << 18)
-        );
+        assert_eq!(mask, (1 << 0) | (1 << 4) | (1 << 6) | (1 << 8) | (1 << 18));
     }
 
     /// The level has to clear NSFloatingWindowLevel (3), which `always_on_top`

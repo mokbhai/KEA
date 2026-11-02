@@ -16,11 +16,9 @@
 //!    Space behind it. Repeat on a second Space and with Mission Control open.
 
 use kea_platform::DictationState;
-use tauri::{
-    AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
-};
 #[cfg(not(target_os = "macos"))]
 use tauri::PhysicalPosition;
+use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use crate::nswindow::float_over_fullscreen;
 
@@ -194,7 +192,10 @@ pub fn refresh_visibility(app: &AppHandle) {
 /// Shows or hides the overlay for a dictation state. No-op when the overlay
 /// failed to build, so dictation still works without it.
 pub fn sync_visibility(app: &AppHandle, state: DictationState) {
-    DICTATION_OVERLAY.store(visible_for_state(state), std::sync::atomic::Ordering::Relaxed);
+    DICTATION_OVERLAY.store(
+        visible_for_state(state),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     refresh_visibility(app);
 }
 
