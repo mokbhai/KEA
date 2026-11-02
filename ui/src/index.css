@@ -5,16 +5,9 @@
   --surface-2: #eef0f3;
   --text: #1a1d21;
   --text-muted: #5c6370;
-  /* 1.38:1 light / 1.29:1 dark against --surface. Decorative where it draws a
-     container edge (.kea-card, .kea-topbar, .kea-sidebar, .kea-panel), but NOT
-     decorative everywhere: it is also the sole boundary of .kea-icon-btn
-     (background: transparent — the outline is the entire affordance),
-     .kea-segment, .kea-choice and the unselected meeting button in
-     MeetingsPage. Those remain real 1.4.11 shortfalls, tracked in issue #15;
-     .kea-btn no longer shares them because --btn-border was split off and
-     recalibrated below (issue #11).
-     Do not read the floor in palette.contrast.test.ts as a claim that this
-     value is sufficient — it only stops it fading further. */
+  /* Container edges only (.kea-card, .kea-topbar, .kea-sidebar, .kea-panel):
+     decorative, so 1.38:1 light / 1.29:1 dark is by design. Never the sole
+     boundary of a control — those use --control-border (issue #15). */
   --border: #d8dce2;
   /* The .kea-table row rules only. Row grouping is conveyed by the table
      markup and row state by a background fill, so this is not a 1.4.11 3:1
@@ -23,6 +16,13 @@
      card edge in the app. Clears 2:1 against all three row fills (--surface,
      --btn-hover-bg, --surface-2); see palette.contrast.test.ts. */
   --border-strong: #a1a9b4;
+  /* The sole boundary of .kea-icon-btn (transparent fill, so the outline is
+     the entire affordance), .kea-segment, .kea-choice and an unselected
+     meeting row. A 1.4.11 control boundary, split from --border so it can
+     clear 3:1 without hardening every card edge (issue #15). Same value as
+     --btn-border, so every outlined control reads at one weight: 3.31 / 3.58
+     / 3.14:1 against --bg / --surface / --surface-2 (= --btn-hover-bg). */
+  --control-border: #818891;
   --accent: #2563eb;
   --accent-text: #ffffff;
   --btn-bg: #ffffff;
@@ -42,12 +42,18 @@
   --input-bg: #ffffff;
   --input-text: #1a1d21;
   /* The 1px box is the *only* boundary of every .kea-input / .kea-select, so
-     it is a 1.4.11 non-text control boundary and must clear 3:1 against
-     --surface. The old #c5cad2 measured 1.65:1. */
-  --input-border: #888f99;
+     it is a 1.4.11 non-text control boundary. It has to clear 3:1 against
+     --surface-2 as well as --surface: .kea-provider-detail fills with
+     --surface-2, and the old #888f99 measured 2.86:1 there (issue #15). Now
+     the same value as --btn-border, which sits beside it in
+     .kea-provider-detail__control. */
+  --input-border: #818891;
   --underline: #2563eb;
   --danger: #b91c1c;
-  --ok: #15803d;
+  /* .kea-status--ok renders in table cells, so it sits on the hovered and
+     aria-current row fills (--btn-hover-bg / --surface-2) as well as
+     --surface. #15803d measured 4.39:1 there; this is 4.74:1 (issue #15). */
+  --ok: #157a3a;
   --ok-bg: rgba(22, 163, 74, 0.1);
   --warn: #b45309;
   --warn-bg: rgba(217, 119, 6, 0.1);
@@ -68,6 +74,11 @@
   --text-muted: #9aa0ab;
   --border: #30343c;
   --border-strong: #5c6371;
+  /* See the light-theme note. A shade lighter than --btn-border (#6e7682)
+     because .kea-segment fills with --btn-hover-bg on hover, the lightest
+     backdrop here, where #6e7682 measured 2.72:1. Measures 4.44 / 4.02 / 3.59
+     / 3.12:1 against --bg / --surface / --surface-2 / --btn-hover-bg. */
+  --control-border: #77808b;
   /* Lifted from #4c8dff, which as a foreground on --surface-2 measured 4.49:1
      — one hundredth short of 4.5 for the active nav item and the current
      picker option. Contrast is luminance-only and --surface-2 cannot be
@@ -96,8 +107,9 @@
   --btn-hover-bg: #30343c;
   --input-bg: #1e2128;
   --input-text: #e6e8eb;
-  /* See the light-theme note: 1.4.11 boundary, was #404650 at 1.70:1. */
-  --input-border: #6a717d;
+  /* See the light-theme note: 1.4.11 boundary, was #404650 at 1.70:1 and then
+     #6a717d, which fell short against --surface-2. Matches --btn-border. */
+  --input-border: #6e7682;
   --underline: #5090ff;
   --danger: #f87171;
   --ok: #4ade80;
@@ -371,7 +383,7 @@ a:hover {
   font-size: 1.125rem;
   color: var(--text);
   background: transparent;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: 6px;
   cursor: pointer;
   transition: background 0.15s ease;
@@ -858,7 +870,7 @@ a:hover {
   font-family: inherit;
   color: var(--text);
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: 6px;
   cursor: pointer;
 }
@@ -1039,7 +1051,7 @@ a:hover {
   gap: 10px;
   align-items: flex-start;
   padding: 12px 14px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: 10px;
   background: var(--surface);
   cursor: pointer;

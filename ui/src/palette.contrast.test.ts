@@ -38,22 +38,6 @@ const NON_TEXT = 3.0;
  * row can take, which is what this floor pins.
  */
 const SEPARATOR_FLOOR = 2.0;
-/**
- * Not a WCAG threshold, and NOT a statement that this value passes.
- *
- * --border is a known 1.4.11 shortfall at 1.38:1 light / 1.29:1 dark —
- * decorative on card, topbar and sidebar edges, but also the sole boundary of
- * .kea-icon-btn (transparent fill, so the outline is the entire affordance),
- * .kea-segment, .kea-choice and the unselected meeting button in MeetingsPage.
- * This floor exists only so the value cannot fade further while that is open;
- * raising it to NON_TEXT is issue #15's job, after which this constant and its
- * one remaining entry go away.
- *
- * --btn-border was the other half of this and is no longer here: issue #11
- * split it off and recalibrated it, so it is measured at NON_TEXT below.
- */
-const PENDING_FLOOR = 1.25;
-
 interface Pair {
   /** Foreground token. */
   fg: string;
@@ -91,23 +75,28 @@ const PAIRS: Pair[] = [
   { fg: "--accent-text", bg: "--accent", min: TEXT, why: ".kea-btn--primary label" },
   { fg: "--accent", bg: "--surface-2", min: TEXT, why: ".kea-nav-item--active, current picker option" },
   { fg: "--accent", bg: "--surface", min: TEXT, why: ".kea-table__select at rest, inside .kea-table-wrap" },
-  // Known gap, tracked in issue #15: .kea-status--* also render inside table
-  // cells (HistoryPanel.tsx:66) and so take the hovered and aria-current row
-  // fills, which are not measured here. Light --ok on either is 4.39:1 —
-  // below the floor. Pre-existing, so adding the pair would fail the suite
-  // for a fault no branch that touched this file introduced.
+  // .kea-status--* render in table cells too (HistoryPanel.tsx), so they take
+  // the hovered and aria-current row fills as well as --surface. --warn has no
+  // status class and never sits in a row.
   { fg: "--ok", bg: "--surface", min: TEXT, why: ".kea-status--ok" },
   { fg: "--warn", bg: "--surface", min: TEXT, why: "warning status text" },
   { fg: "--danger", bg: "--surface", min: TEXT, why: ".kea-status--error" },
+  { fg: "--ok", bg: "--btn-hover-bg", min: TEXT, why: ".kea-status--ok on a hovered row" },
+  { fg: "--ok", bg: "--surface-2", min: TEXT, why: ".kea-status--ok on the aria-current row" },
+  { fg: "--danger", bg: "--btn-hover-bg", min: TEXT, why: ".kea-status--error on a hovered row" },
+  { fg: "--danger", bg: "--surface-2", min: TEXT, why: ".kea-status--error on the aria-current row" },
+  { fg: "--text-muted", bg: "--btn-hover-bg", min: TEXT, why: ".kea-status--muted on a hovered row" },
 
   // ── Non-text: 1.4.11 ───────────────────────────────────────────────
   { fg: "--input-border", bg: "--surface", min: NON_TEXT, why: "the only boundary of .kea-input / .kea-select" },
+  { fg: "--input-border", bg: "--surface-2", min: NON_TEXT, why: ".kea-input / .kea-select inside .kea-provider-detail" },
+  { fg: "--input-border", bg: "--bg", min: NON_TEXT, why: ".kea-input / .kea-select at page level" },
   // Three backdrops, not one: a .kea-btn is the only control here that renders
   // on all of them, and --surface-2 (.kea-provider-detail) is the binding case
   // in both themes — the darkest backdrop in light, the lightest in dark. A
   // value measured against --surface alone passes at 3.26:1 and still fails
-  // where the button actually sits, which is how #11 outlived #10 — and is
-  // still true of --input-border above, tracked in #15.
+  // where the button actually sits, which is how #11 outlived #10, and how
+  // --input-border above failed until #15.
   { fg: "--btn-border", bg: "--surface", min: NON_TEXT, why: "the only boundary of .kea-btn, whose fill matches --surface in light theme" },
   { fg: "--btn-border", bg: "--bg", min: NON_TEXT, why: ".kea-btn at page level, outside any card" },
   { fg: "--btn-border", bg: "--surface-2", min: NON_TEXT, why: ".kea-btn inside .kea-provider-detail" },
@@ -126,8 +115,14 @@ const PAIRS: Pair[] = [
   { fg: "--border-strong", bg: "--btn-hover-bg", min: SEPARATOR_FLOOR, why: ".kea-table separator, hovered row" },
   { fg: "--border-strong", bg: "--surface-2", min: SEPARATOR_FLOOR, why: ".kea-table separator, aria-current row" },
 
-  // ── Known shortfalls, pinned not blessed (issue #15) ───────────────
-  { fg: "--border", bg: "--surface", min: PENDING_FLOOR, why: "card edges, but also the .kea-icon-btn / .kea-segment / .kea-choice boundary" },
+  // The sole boundary of .kea-icon-btn (transparent, so it sits on whatever is
+  // behind it, and fills with --surface-2 on hover), .kea-segment (--surface,
+  // --btn-hover-bg on hover), .kea-choice and an unselected meeting row
+  // (--surface). Issue #15.
+  { fg: "--control-border", bg: "--surface", min: NON_TEXT, why: ".kea-segment / .kea-choice / meeting row, and .kea-icon-btn in a card" },
+  { fg: "--control-border", bg: "--bg", min: NON_TEXT, why: ".kea-icon-btn at page level" },
+  { fg: "--control-border", bg: "--surface-2", min: NON_TEXT, why: ".kea-icon-btn on hover, or on a raised panel" },
+  { fg: "--control-border", bg: "--btn-hover-bg", min: NON_TEXT, why: ".kea-segment on hover" },
 ];
 
 /**
@@ -135,6 +130,8 @@ const PAIRS: Pair[] = [
  * neither measured nor listed here fails `covers every token in :root`.
  */
 const EXEMPT: Record<string, string> = {
+  "--border":
+    "container edges only (.kea-card, .kea-topbar, .kea-sidebar, .kea-panel), which are decorative; every control boundary uses --control-border, --btn-border or --input-border instead (issue #15)",
   "--underline": "declared but referenced by no rule; kept equal to --accent so it cannot drift",
   "--toggle-thumb-border":
     "softens the thumb edge rather than carrying it. background-clip defaults to border-box, so this ring composites over the thumb's own fill and never meets the track — the --toggle-thumb pairs above carry 1.4.11 for that control",
@@ -270,7 +267,8 @@ describe("palette contrast (index.css tokens)", () => {
   // Note the limit of this guard, so it is not mistaken for more than it is:
   // token completeness is not pairing completeness. A token counts as covered
   // once it is measured against ONE background, even where the UI puts it on
-  // three — see the .kea-status--* note in PAIRS. Tracked in issue #11.
+  // three. Pairs for a token on each backdrop it renders on have to be added
+  // by hand, as the .kea-status--* and boundary pairs in PAIRS were.
   it("covers every token in :root", () => {
     const measured = new Set(PAIRS.flatMap((p) => [p.fg, p.bg, p.fgOver, p.bgOver]));
     const uncovered = Object.keys(LIGHT).filter((t) => !measured.has(t) && !(t in EXEMPT));

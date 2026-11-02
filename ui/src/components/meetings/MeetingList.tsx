@@ -66,7 +66,7 @@ const rowStyle = (selected: boolean): CSSProperties => ({
   width: "100%",
   textAlign: "left",
   padding: "8px 10px",
-  border: selected ? "2px solid var(--accent)" : "1px solid var(--border)",
+  border: selected ? "2px solid var(--accent)" : "1px solid var(--control-border)",
   borderRadius: 6,
   background: selected ? "var(--surface-2)" : "var(--surface)",
   color: "var(--text)",
