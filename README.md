@@ -4,6 +4,17 @@ Cross-platform AI rewrite, dictation, meeting-notes, and text-to-speech utility 
 
 [Documentation](docs/README.md) | [Changelog](CHANGELOG.md) | [License](LICENSE)
 
+<table>
+  <tr>
+    <td align="center"><a href="docs/media/kea-talk.mp4"><img src="docs/media/kea-talk.jpg" width="180" alt="Dictate: stop typing, start talking"></a><br><b>Dictate</b></td>
+    <td align="center"><a href="docs/media/kea-rewrite.mp4"><img src="docs/media/kea-rewrite.jpg" width="180" alt="Rewrite selected text in place"></a><br><b>Rewrite</b></td>
+    <td align="center"><a href="docs/media/kea-meetings.mp4"><img src="docs/media/kea-meetings.jpg" width="180" alt="Meeting notes"></a><br><b>Meeting notes</b></td>
+    <td align="center"><a href="docs/media/kea-all-in-one.mp4"><img src="docs/media/kea-all-in-one.jpg" width="180" alt="One Mac app, four jobs"></a><br><b>All in one</b></td>
+  </tr>
+</table>
+
+Click a card to watch the 20-second video. The app windows in the videos are drawn mock-ups.
+
 ## Platforms
 
 **macOS** is the supported platform. Windows and Linux builds compile and are CI-tested, but runtime support (hotkeys, text I/O, audio capture, permissions) is not yet functional. Cross-platform support is planned.
@@ -16,6 +27,18 @@ Cross-platform AI rewrite, dictation, meeting-notes, and text-to-speech utility 
 - Meeting capture, transcription, diarization, and synthesis workflows
 - Text-to-speech and activity/history surfaces
 - Cross-platform Tauri 2.x shell (macOS supported; Windows/Linux build-only until runtime stubs are replaced)
+
+## Install
+
+On an Apple Silicon Mac, with [Homebrew](https://brew.sh):
+
+```sh
+brew install --cask mokbhai/tap/kea
+```
+
+Update with `brew upgrade --cask kea`. The cask lives in [mokbhai/homebrew-tap](https://github.com/mokbhai/homebrew-tap) and moves to each new release on its own. Installers for every platform are also on the [Releases](https://github.com/mokbhai/KEA/releases) page.
+
+To build from source instead, read on.
 
 ## Prerequisites
 
