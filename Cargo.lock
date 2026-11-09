@@ -2556,7 +2556,7 @@ dependencies = [
 
 [[package]]
 name = "kea-app"
-version = "0.5.5"
+version = "0.5.6-beta.1"
 dependencies = [
  "arboard",
  "async-trait",
