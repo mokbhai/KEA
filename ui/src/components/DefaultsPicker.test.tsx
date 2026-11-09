@@ -2,12 +2,7 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  emitTauriEvent,
-  invokeCalls,
-  onInvoke,
-  resetTauriMocks,
-} from "../test-utils/tauri";
+import { emitTauriEvent, invokeCalls, onInvoke, resetTauriMocks } from "../test-utils/tauri";
 import { usePendingActivation } from "../hooks/usePendingActivation";
 import DefaultsPicker, { type Capability } from "./DefaultsPicker";
 import type { BindingTarget } from "../lib/capabilityDefaults";
@@ -96,8 +91,8 @@ describe("DefaultsPicker", () => {
 
     expect(await screen.findByText("148.0 MB ⬇")).toBeTruthy();
     expect(screen.getByText("Key missing")).toBeTruthy();
-    const cloud = screen.getByRole("button", { name: /OpenAI whisper-1/ });
-    expect(cloud.hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("region", { name: "Not set up" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: /Set up OpenAI/ })).toBeTruthy();
   });
 
   it("downloads a missing local model, then activates it on completion", async () => {
@@ -108,7 +103,9 @@ describe("DefaultsPicker", () => {
     await userEvent.click(await screen.findByRole("button", { name: /Whisper Base/ }));
 
     await waitFor(() => expect(invokeCalls("download_whisper_model")).toHaveLength(1));
-    expect(invokeCalls("download_whisper_model")[0]).toEqual({ modelId: "whisper-base" });
+    expect(invokeCalls("download_whisper_model")[0]).toEqual({
+      modelId: "whisper-base",
+    });
     expect(invokeCalls("set_binding")).toHaveLength(0);
 
     act(() => {
@@ -184,9 +181,9 @@ describe("DefaultsPicker", () => {
     // No binding is written, and the option is selectable again.
     expect(invokeCalls("set_binding")).toHaveLength(0);
     await waitFor(() =>
-      expect(
-        screen.getByRole("button", { name: /Whisper Base/ }).hasAttribute("disabled"),
-      ).toBe(false),
+      expect(screen.getByRole("button", { name: /Whisper Base/ }).hasAttribute("disabled")).toBe(
+        false,
+      ),
     );
   });
 
@@ -257,6 +254,7 @@ describe("DefaultsPicker", () => {
       ],
       get_binding: () => null,
       has_credential: (args) => (args as { providerRef: string }).providerRef === "openai",
+      list_provider_models: () => ["whisper-1", "gpt-4o-mini-tts", "qwen3:8b"],
       set_binding: () => undefined,
     });
     render(<Harness capability="llm" />);
@@ -264,17 +262,18 @@ describe("DefaultsPicker", () => {
     // Local servers need no key; a keyless cloud provider can't be picked.
     expect(await screen.findByRole("button", { name: /OpenAI/ })).toBeTruthy();
     expect(screen.getByText("No key needed")).toBeTruthy();
-    expect(screen.getByRole("button", { name: /Groq/ }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("link", { name: /Set up Groq/ })).toBeTruthy();
     expect(screen.getByRole("button", { name: /OpenAI/ }).hasAttribute("disabled")).toBe(false);
 
     await userEvent.click(screen.getByRole("button", { name: /Local server/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "qwen3:8b" }));
 
     await waitFor(() => expect(invokeCalls("set_binding")).toHaveLength(1));
     expect(invokeCalls("set_binding")[0]).toEqual({
       feature: "default",
       slot: "llm",
       engine: "openai-compatible",
-      model: null,
+      model: "qwen3:8b",
       providerRef: "local-llm",
     });
     // Text has no per-feature model setting to keep in step.
@@ -332,9 +331,13 @@ describe("DefaultsPicker", () => {
         },
       ],
       list_installed_onnx_models: () => ["parakeet-v2"],
+      list_provider_models: () => ["whisper-1", "gpt-4o-mini-tts", "qwen3:8b"],
       set_binding: () => undefined,
       // A whisper model left over from an earlier pick.
-      get_dictation_settings: () => ({ post_process: true, active_model: "whisper-base" }),
+      get_dictation_settings: () => ({
+        post_process: true,
+        active_model: "whisper-base",
+      }),
       set_dictation_settings: () => undefined,
     });
     render(<Harness capability="stt" />);
@@ -365,14 +368,19 @@ describe("DefaultsPicker", () => {
       list_installed_whisper_models: () => ["whisper-base"],
       list_onnx_models: () => [],
       list_installed_onnx_models: () => [],
+      list_provider_models: () => ["whisper-1", "gpt-4o-mini-tts", "qwen3:8b"],
       set_binding: () => undefined,
       // Left over from an earlier local pick.
-      get_dictation_settings: () => ({ post_process: false, active_model: "whisper-base" }),
+      get_dictation_settings: () => ({
+        post_process: false,
+        active_model: "whisper-base",
+      }),
       set_dictation_settings: () => undefined,
     });
     render(<Harness capability="stt" target={{ feature: "dictation", slot: "stt" }} />);
 
     await userEvent.click(await screen.findByRole("button", { name: /OpenAI whisper-1/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "whisper-1" }));
 
     await waitFor(() => expect(invokeCalls("set_binding")).toHaveLength(1));
     // The binding carries the cloud model; the local fallback is not touched,
@@ -391,7 +399,10 @@ describe("DefaultsPicker", () => {
     // to a cloud engine; (4) "use default again" drops the override and
     // resolve lands back on whisper/null — which transcribes only because
     // step 3 left the fallback in place.
-    let dictation = { post_process: false, active_model: null as string | null };
+    let dictation = {
+      post_process: false,
+      active_model: null as string | null,
+    };
     onInvoke({
       list_providers: () => [{ provider_ref: "openai", name: "OpenAI", built_in: true }],
       get_binding: () => null,
@@ -400,6 +411,7 @@ describe("DefaultsPicker", () => {
       list_installed_whisper_models: () => ["whisper-base"],
       list_onnx_models: () => [],
       list_installed_onnx_models: () => [],
+      list_provider_models: () => ["whisper-1", "gpt-4o-mini-tts", "qwen3:8b"],
       set_binding: () => undefined,
       get_dictation_settings: () => dictation,
       set_dictation_settings: (args) => {
@@ -414,8 +426,11 @@ describe("DefaultsPicker", () => {
 
     // Step 3: switching to the cloud engine must not disturb it.
     await userEvent.click(screen.getByRole("button", { name: /OpenAI whisper-1/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "whisper-1" }));
     await waitFor(() => expect(invokeCalls("set_binding")).toHaveLength(2));
-    expect(invokeCalls("set_binding")[1]).toMatchObject({ engine: "openai-stt" });
+    expect(invokeCalls("set_binding")[1]).toMatchObject({
+      engine: "openai-stt",
+    });
 
     // Step 4 works because this still names an installed whisper model.
     expect(dictation.active_model).toBe("whisper-base");
@@ -429,22 +444,30 @@ describe("DefaultsPicker", () => {
       has_credential: () => true,
       list_onnx_models: () => [],
       list_installed_onnx_models: () => [],
+      list_provider_models: () => ["whisper-1", "gpt-4o-mini-tts", "qwen3:8b"],
       set_binding: () => undefined,
       // A sherpa voice left over from an earlier pick.
-      get_tts_settings: () => ({ active_voice: null, active_model: "vits-piper-en-us-amy-low" }),
+      get_tts_settings: () => ({
+        active_voice: null,
+        active_model: "vits-piper-en-us-amy-low",
+      }),
       set_tts_settings: () => undefined,
     });
     render(<Harness capability="tts" />);
 
     // The play button next to the row is also named after the option.
     await userEvent.click(await screen.findByRole("button", { name: /^OpenAI voices/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "gpt-4o-mini-tts" }));
 
     await waitFor(() => expect(invokeCalls("set_tts_settings")).toHaveLength(1));
     // The voice is the cloud engine's; the model stays as the fallback for a
     // model-less sherpa binding, which would otherwise fall back to the
     // first catalog voice and may not have it installed.
     expect(invokeCalls("set_tts_settings")[0]).toEqual({
-      settings: { active_voice: "alloy", active_model: "vits-piper-en-us-amy-low" },
+      settings: {
+        active_voice: "alloy",
+        active_model: "vits-piper-en-us-amy-low",
+      },
     });
   });
 
@@ -466,6 +489,7 @@ describe("DefaultsPicker", () => {
         },
       ],
       list_installed_onnx_models: () => ["vits-piper-en-us-amy-low"],
+      list_provider_models: () => ["whisper-1", "gpt-4o-mini-tts", "qwen3:8b"],
       set_binding: () => undefined,
       get_tts_settings: () => ({ active_voice: "nova", active_model: null }),
       set_tts_settings: () => undefined,
@@ -476,7 +500,10 @@ describe("DefaultsPicker", () => {
 
     await waitFor(() => expect(invokeCalls("set_tts_settings")).toHaveLength(1));
     expect(invokeCalls("set_tts_settings")[0]).toEqual({
-      settings: { active_voice: "nova", active_model: "vits-piper-en-us-amy-low" },
+      settings: {
+        active_voice: "nova",
+        active_model: "vits-piper-en-us-amy-low",
+      },
     });
   });
   it("offers the system synthesizer, which has nothing to download", async () => {
@@ -492,6 +519,7 @@ describe("DefaultsPicker", () => {
       has_credential: () => true,
       list_onnx_models: () => [],
       list_installed_onnx_models: () => [],
+      list_provider_models: () => ["whisper-1", "gpt-4o-mini-tts", "qwen3:8b"],
       set_binding: () => undefined,
       get_tts_settings: () => ({ active_voice: "nova", active_model: null }),
       set_tts_settings: () => undefined,
@@ -517,5 +545,78 @@ describe("DefaultsPicker", () => {
     // And nothing was written to the voice settings, since the pick carried
     // no voice of its own.
     expect(invokeCalls("set_tts_settings")).toHaveLength(0);
+  });
+});
+
+describe("provider model catalogs", () => {
+  beforeEach(() => resetTauriMocks());
+  function world(list: () => unknown) {
+    onInvoke({
+      list_providers: () => [{ provider_ref: "custom", name: "OpenWebUI", built_in: false }],
+      get_binding: () => ({
+        engine_id: "openai-compatible",
+        provider_ref: "custom",
+        model: "old",
+      }),
+      has_credential: () => true,
+      list_provider_models: list,
+      set_binding: () => undefined,
+    });
+  }
+  it("loads, searches and selects provider and model together; Escape closes", async () => {
+    let resolve!: (models: string[]) => void;
+    world(
+      () =>
+        new Promise<string[]>((done) => {
+          resolve = done;
+        }),
+    );
+    render(<Harness capability="llm" target={{ feature: "dictation", slot: "llm" }} />);
+    await userEvent.click(await screen.findByRole("button", { name: /^OpenWebUI/ }));
+    expect(screen.getByRole("status").textContent).toContain("Loading models");
+    await act(async () => resolve(["old", "new-chat", "other"]));
+    expect(screen.getByRole("button", { name: "old" }).getAttribute("aria-pressed")).toBe("true");
+    await userEvent.type(screen.getByRole("textbox", { name: "Search models" }), "new");
+    expect(screen.queryByRole("button", { name: "other" })).toBeNull();
+    const model = screen.getByRole("button", { name: "new-chat" });
+    model.focus();
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() =>
+      expect(invokeCalls("set_binding")[0]).toEqual({
+        feature: "dictation",
+        slot: "llm",
+        engine: "openai-compatible",
+        providerRef: "custom",
+        model: "new-chat",
+      }),
+    );
+    expect(screen.getByRole("button", { name: "new-chat" }).getAttribute("aria-pressed")).toBe(
+      "true",
+    );
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+  it("retries errors and empty catalogs and offers manual ids", async () => {
+    const list = vi
+      .fn()
+      .mockRejectedValueOnce("OpenWebUI: key rejected")
+      .mockResolvedValueOnce([])
+      .mockResolvedValue(["chat"]);
+    world(list);
+    render(<Harness capability="llm" />);
+    await userEvent.click(await screen.findByRole("button", { name: /^OpenWebUI/ }));
+    expect((await screen.findByRole("alert")).textContent).toContain("key rejected");
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("No models returned for this capability.")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByRole("button", { name: "chat" })).toBeTruthy();
+    await userEvent.type(screen.getByRole("textbox", { name: "Type a model id" }), "private-model");
+    await userEvent.click(screen.getByRole("button", { name: "Use model" }));
+    await waitFor(() =>
+      expect(invokeCalls("set_binding")[0]).toMatchObject({
+        providerRef: "custom",
+        model: "private-model",
+      }),
+    );
   });
 });

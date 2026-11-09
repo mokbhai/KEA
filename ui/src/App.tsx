@@ -215,6 +215,17 @@ function AppShell() {
     [isMobile, closeDrawer],
   );
 
+  useEffect(() => {
+    const onHash = () => {
+      if (window.location.hash === "#ai-providers") {
+        navigate("ai-providers");
+        window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      }
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, [navigate]);
+
   // `kea://open/<page>` shows the window and emits the page name; routing
   // belongs to the frontend, so this is where that URL finally lands somewhere.
   useEffect(() => {

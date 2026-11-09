@@ -1,11 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  getBinding,
-  listProviders,
-  previewVoice,
-  type Binding,
-  type Provider,
-} from "../api";
+import { getBinding, listProviders, previewVoice, type Binding, type Provider } from "../api";
 import { useModelDownloads } from "../hooks/useModelDownloads";
 import type { PendingActivation } from "../hooks/usePendingActivation";
 import {
@@ -20,6 +14,7 @@ import {
 } from "../lib/capabilityDefaults";
 import { cloudEngineFor } from "../lib/engines";
 import { toMessage } from "../lib/format";
+import ProviderModels from "./ProviderModels";
 import LoadingBlock from "./LoadingBlock";
 
 export { CAPABILITY_LABELS };
@@ -52,8 +47,16 @@ type Props = {
 function findMatch(options: PickerOption[], binding: Binding): string | null {
   const match =
     options.find(
-      (o) => o.engine === binding.engine_id && (o.model ?? null) === (binding.model ?? null),
-    ) ?? options.find((o) => o.engine === binding.engine_id);
+      (o) =>
+        o.engine === binding.engine_id &&
+        (!binding.provider_ref || o.providerRef === binding.provider_ref) &&
+        (o.model ?? null) === (binding.model ?? null),
+    ) ??
+    options.find(
+      (o) =>
+        o.engine === binding.engine_id &&
+        (!binding.provider_ref || o.providerRef === binding.provider_ref),
+    );
   return match?.id ?? null;
 }
 
@@ -71,12 +74,15 @@ export default function DefaultsPicker({
   const [loading, setLoading] = useState(true);
   const [options, setOptions] = useState<PickerOption[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [binding, setBinding] = useState<Binding | null>(null);
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [voice, setVoice] = useState(OPENAI_TTS_VOICES[0]);
   const [advProvider, setAdvProvider] = useState("openai");
   const [advModel, setAdvModel] = useState("");
   const [advEngine, setAdvEngine] = useState("");
 
+  const choices = useRef(new Map<string, PickerOption>());
   const voiceRef = useRef(voice);
   voiceRef.current = voice;
 
@@ -103,13 +109,20 @@ export default function DefaultsPicker({
       try {
         const [providerList, binding] = await Promise.all([
           listProviders(),
-          getBinding(targetFeature, targetSlot).catch(() => null),
+          getBinding(targetFeature, targetSlot)
+            .then(
+              (binding) =>
+                binding ?? (targetFeature !== "default" ? getBinding("default", capability) : null),
+            )
+            .catch(() => null),
         ]);
         const keyByRef = await loadKeyStates(providerList);
         const opts = await buildCapabilityOptions(capability, providerList, keyByRef);
 
         if (!cancelled) {
           setProviders(providerList);
+          setBinding(binding);
+          setExpandedId(null);
           setAdvProvider(providerList[0]?.provider_ref ?? "openai");
           setOptions(opts);
           setCurrentId(binding ? findMatch(opts, binding) : null);
@@ -153,10 +166,18 @@ export default function DefaultsPicker({
       prev.map((o) => (o.id === savedId ? { ...o, installed: true, status: "installed ✓" } : o)),
     );
     setCurrentId(savedId);
+    const choice = choices.current.get(savedId);
+    if (choice)
+      setBinding({
+        engine_id: choice.engine,
+        provider_ref: choice.providerRef,
+        model: choice.model,
+      });
   }, [savedId]);
 
-  const pick = (option: PickerOption) =>
-    activation.start({
+  const pick = async (option: PickerOption) => {
+    choices.current.set(option.id, option);
+    await activation.start({
       capability,
       option,
       // Only the options that expose the voice dropdown carry a voice; the
@@ -166,6 +187,7 @@ export default function DefaultsPicker({
       voice: option.cloudVoices ? voiceRef.current : null,
       target: { feature: targetFeature, slot: targetSlot },
     });
+  };
 
   const preview = async (option: PickerOption) => {
     setError(null);
@@ -201,10 +223,20 @@ export default function DefaultsPicker({
     <div
       className="kea-picker"
       role="dialog"
+      onKeyDown={(e) => {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          onClose();
+        }
+      }}
       aria-label={title ?? `Choose ${CAPABILITY_LABELS[capability]}`}
     >
       <div className="kea-picker__header">
-        <strong>{title ?? `Choose ${CAPABILITY_LABELS[capability].toLowerCase()}`}</strong>
+        <strong>
+          {title ?? `Choose ${CAPABILITY_LABELS[capability].toLowerCase()}`}
+          {binding?.model &&
+            ` — ${providers.find((p) => p.provider_ref === binding.provider_ref)?.name ?? binding.engine_id} · ${binding.model}`}
+        </strong>
         <button type="button" className="kea-icon-btn" aria-label="Close" onClick={onClose}>
           ✕
         </button>
@@ -214,78 +246,130 @@ export default function DefaultsPicker({
       ) : (
         <>
           <ul className="kea-picker__options">
-            {options.map((option) => {
-              const progress = option.model ? progressById.get(option.model) : undefined;
-              const isPending = pending?.id === option.id;
-              const percent =
-                progress && progress.bytes_total > 0
-                  ? Math.round((progress.bytes_received / progress.bytes_total) * 100)
-                  : null;
-              const statusText = isPending
-                ? percent !== null
-                  ? `downloading ${percent}%`
-                  : "starting download…"
-                : savedId === option.id
-                  ? "Saved ✓"
-                  : option.status;
-              return (
-                <li key={option.id}>
-                  <div className="kea-picker__row">
-                    <button
-                      type="button"
-                      className={`kea-picker__option${
-                        currentId === option.id ? " kea-picker__option--current" : ""
-                      }`}
-                      onClick={() => void pick(option)}
-                      disabled={!option.ready || busy}
-                      aria-current={currentId === option.id ? "true" : undefined}
-                    >
-                      <span className="kea-picker__name">
-                        {option.label}
-                        <span className="kea-picker__detail">{option.detail}</span>
-                      </span>
-                      <span className="kea-picker__status">{statusText}</span>
-                    </button>
-                    {isPending && (
+            {options
+              .filter((o) => o.ready)
+              .map((option) => {
+                const progress = option.model ? progressById.get(option.model) : undefined;
+                const isPending = pending?.id === option.id;
+                const isCurrent = option.providerRef
+                  ? binding?.provider_ref === option.providerRef &&
+                    binding.engine_id === option.engine
+                  : currentId === option.id;
+                const percent =
+                  progress && progress.bytes_total > 0
+                    ? Math.round((progress.bytes_received / progress.bytes_total) * 100)
+                    : null;
+                const statusText = isPending
+                  ? percent !== null
+                    ? `downloading ${percent}%`
+                    : "starting download…"
+                  : savedId === option.id
+                    ? "Saved ✓"
+                    : option.status;
+                return (
+                  <li key={option.id}>
+                    <div className="kea-picker__row">
                       <button
                         type="button"
-                        className="kea-btn"
-                        aria-label={`Cancel download of ${option.label}`}
-                        onClick={() => void activation.cancel()}
+                        className={`kea-picker__option${
+                          isCurrent ? " kea-picker__option--current" : ""
+                        }`}
+                        onClick={() =>
+                          option.providerRef
+                            ? setExpandedId((id) => (id === option.id ? null : option.id))
+                            : void pick(option)
+                        }
+                        aria-expanded={option.providerRef ? expandedId === option.id : undefined}
+                        disabled={!option.ready || busy}
+                        aria-current={isCurrent ? "true" : undefined}
                       >
-                        Cancel
+                        <span className="kea-picker__name">
+                          {option.label}
+                          {option.providerRef &&
+                            binding?.provider_ref === option.providerRef &&
+                            binding?.model &&
+                            ` · ${binding.model}`}
+                          <span className="kea-picker__detail">{option.detail}</span>
+                        </span>
+                        <span className="kea-picker__status">{statusText}</span>
                       </button>
-                    )}
-                    {capability === "tts" && option.cloudVoices && (
-                      <select
-                        className="kea-select"
-                        aria-label="Voice"
-                        value={voice}
-                        onChange={(e) => setVoice(e.target.value)}
-                      >
-                        {OPENAI_TTS_VOICES.map((v) => (
-                          <option key={v} value={v}>
-                            {v}
-                          </option>
-                        ))}
-                      </select>
-                    )}
-                    {capability === "tts" &&
-                      (option.installed || (option.cloudVoices && option.ready)) && (
+                      {isPending && (
                         <button
                           type="button"
                           className="kea-btn"
-                          aria-label={`Preview ${option.label}`}
-                          onClick={() => void preview(option)}
+                          aria-label={`Cancel download of ${option.label}`}
+                          onClick={() => void activation.cancel()}
                         >
-                          ▶
+                          Cancel
                         </button>
                       )}
-                  </div>
-                </li>
-              );
-            })}
+                      {capability === "tts" && option.cloudVoices && (
+                        <select
+                          className="kea-select"
+                          aria-label="Voice"
+                          value={voice}
+                          onChange={(e) => setVoice(e.target.value)}
+                        >
+                          {OPENAI_TTS_VOICES.map((v) => (
+                            <option key={v} value={v}>
+                              {v}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                      {capability === "tts" &&
+                        (option.installed || (option.cloudVoices && option.ready)) && (
+                          <button
+                            type="button"
+                            className="kea-btn"
+                            aria-label={`Preview ${option.label}`}
+                            onClick={() => void preview(option)}
+                          >
+                            ▶
+                          </button>
+                        )}
+                    </div>
+                    {option.providerRef && expandedId === option.id && (
+                      <ProviderModels
+                        key={option.id}
+                        option={option}
+                        capability={capability}
+                        selected={
+                          binding?.provider_ref === option.providerRef ? binding.model : null
+                        }
+                        busy={busy}
+                        onPick={pick}
+                      />
+                    )}
+                  </li>
+                );
+              })}
           </ul>
+          {options.some((o) => !o.ready) && (
+            <section aria-label="Not set up">
+              <h3>Not set up</h3>
+              <ul className="kea-picker__options">
+                {options
+                  .filter((o) => !o.ready)
+                  .map((o) => (
+                    <li key={o.id} className="kea-picker__row">
+                      <span className="kea-picker__option">
+                        {o.label}
+                        <span className="kea-picker__status">{o.status}</span>
+                      </span>
+                      <a
+                        className="kea-btn"
+                        href="#ai-providers"
+                        onClick={onClose}
+                        aria-label={`Set up ${o.label} in AI Providers`}
+                      >
+                        Set up
+                      </a>
+                    </li>
+                  ))}
+              </ul>
+            </section>
+          )}
           <details className="kea-advanced">
             <summary>Advanced</summary>
             <div className="kea-advanced__body">

@@ -1689,3 +1689,7 @@ export const setFeatureEnabled = (feature: string, enabled: boolean) =>
 export const onFeatureSwitchChanged = (fn: (feature: string) => void) =>
   listen<string>("feature-switch-changed", event => fn(event.payload));
 export const getCliShimStatus = () => invoke<string>("get_cli_shim_status");
+
+/** Live catalog, cached briefly by the backend; credentials stay in Rust. */
+export const listProviderModels = (providerRef: string, capability: "llm" | "stt" | "tts") =>
+  invoke<string[]>("list_provider_models", { providerRef, capability });

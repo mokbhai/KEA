@@ -99,13 +99,15 @@ describe("ReadAloudPage", () => {
 
     await userEvent.click(await screen.findByRole("button", { name: "Change…" }));
     await userEvent.click(await screen.findByRole("button", { name: /^OpenAI voices/ }));
+    await userEvent.type(screen.getByRole("textbox", { name: "Type a model id" }), "tts-1");
+    await userEvent.click(screen.getByRole("button", { name: "Use model" }));
 
     await waitFor(() => expect(invokeCalls("set_binding")).toHaveLength(1));
     expect(invokeCalls("set_binding")[0]).toEqual({
       feature: "tts",
       slot: "tts",
       engine: "openai-tts",
-      model: null,
+      model: "tts-1",
       providerRef: "openai",
     });
   });

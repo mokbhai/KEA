@@ -5,6 +5,7 @@ import { getAssistantSettings, setAssistantSettings, type AssistantSettings } fr
 import FeatureBanner from "../components/FeatureBanner";
 import HotkeyRow from "../components/HotkeyRow";
 import { Row, RowGroup } from "../components/SettingsRow";
+import FeatureAiCard from "../components/FeatureAiCard";
 import Toggle from "../components/Toggle";
 import { useFeatureAi } from "../hooks/useFeatureAi";
 import { useOptimisticSetting } from "../hooks/useOptimisticSetting";
@@ -162,6 +163,8 @@ function AssistantPageContent({ onNavigate }: Props) {
           </p>
         )}
       </section>
+
+      <FeatureAiCard ai={ai} featureLabel="Assistant" />
 
       <section style={{ marginBottom: 24 }}>
         <h2 style={{ margin: "0 0 4px" }}>What it can do</h2>

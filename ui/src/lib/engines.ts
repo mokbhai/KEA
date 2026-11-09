@@ -144,7 +144,8 @@ const withModel = (text: string, binding: Binding) =>
   `${text}${binding.model ? ` · ${binding.model}` : ""}`;
 
 /** "OpenAI · gpt-4o-mini" — a vendor-branded engine. */
-const vendorSummary = (vendor: string) => (binding: Binding) => withModel(vendor, binding);
+const vendorSummary = (vendor: string) => (binding: Binding, ctx: BindingContext) =>
+  withModel(ctx.providers.find((p) => p.provider_ref === binding.provider_ref)?.name ?? vendor, binding);
 
 /** "Groq · llama-3" — an engine that is whatever server the provider names. */
 const providerSummary = (binding: Binding, ctx: BindingContext) =>

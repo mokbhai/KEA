@@ -213,13 +213,15 @@ describe("MeetingsPage", () => {
     // [0] speech to text, [1] notes writing.
     await userEvent.click(changeButtons[1]);
     await userEvent.click(await screen.findByRole("button", { name: /Local server/ }));
+    await userEvent.type(screen.getByRole("textbox", { name: "Type a model id" }), "qwen3:8b");
+    await userEvent.click(screen.getByRole("button", { name: "Use model" }));
 
     await waitFor(() => expect(invokeCalls("set_binding")).toHaveLength(1));
     expect(invokeCalls("set_binding")[0]).toEqual({
       feature: "meetings",
       slot: "llm",
       engine: "openai-compatible",
-      model: null,
+      model: "qwen3:8b",
       providerRef: "local-llm",
     });
   });
