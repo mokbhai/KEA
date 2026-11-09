@@ -556,11 +556,7 @@ mod tests {
         let start = nav.find("export const PAGES").expect("PAGES in nav.ts");
         let body = &nav[start..];
         let body = &body[..body.find("];").expect("end of PAGES")];
-        let mut ui: Vec<&str> = body
-            .split('"')
-            .skip(1)
-            .step_by(2)
-            .collect();
+        let mut ui: Vec<&str> = body.split('"').skip(1).step_by(2).collect();
         let mut here: Vec<&str> = SETTINGS_PAGES.to_vec();
         ui.sort_unstable();
         here.sort_unstable();

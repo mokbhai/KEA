@@ -28,10 +28,13 @@ fn is_rotated_log_name(name: &str) -> bool {
         return false;
     };
     date.len() == 10
-        && date
-            .chars()
-            .enumerate()
-            .all(|(i, c)| if i == 4 || i == 7 { c == '-' } else { c.is_ascii_digit() })
+        && date.chars().enumerate().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                c == '-'
+            } else {
+                c.is_ascii_digit()
+            }
+        })
 }
 
 /// Deletes rotated log files older than `days` days. The rolling appender
@@ -155,7 +158,10 @@ mod tests {
         roller.flush().unwrap();
         let path = current_log_path(dir.path());
         let tail = tail_log_file(&path, 4096).unwrap();
-        assert!(tail.contains("hello-from-the-roller"), "read {path:?}: {tail:?}");
+        assert!(
+            tail.contains("hello-from-the-roller"),
+            "read {path:?}: {tail:?}"
+        );
     }
 
     #[test]
