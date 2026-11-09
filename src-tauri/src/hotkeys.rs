@@ -16,6 +16,7 @@ use kea_core::rewrite::language::describe;
 use kea_core::rewrite::RewriteMode;
 use kea_core::store::hotkeys::HotkeyBindingRepo;
 use kea_core::store::settings::SettingsRepo;
+use kea_features::{read_aloud_press, ReadAloudPress};
 use kea_platform::ActionId;
 use sqlx::SqlitePool;
 use tauri::AppHandle;
@@ -31,7 +32,7 @@ use crate::commands::{
     undo_last_rewrite, BusyGuard, HotkeyAction, MeetingHotkeyAction, RewriteOverride,
     ASSISTANT_ACTION_ID, ASSISTANT_CANCEL_ACTION_ID, ASSISTANT_COPY_ACTION_ID, DICTATION_ACTION_ID,
     HOTKEY_ACTIONS, LOCK_CANCEL_ACTION_ID, MEETINGS_ACTION_ID, OCR_ACTION_ID, PALETTE_ACTION_ID,
-    REWRITE_ACTION_ID, TTS_ACTION_ID, UNDO_ACTION_ID,
+    REWRITE_ACTION_ID, TTS_ACTION_ID, TTS_CANCEL_ACTION_ID, UNDO_ACTION_ID,
 };
 use crate::events::{
     emit_meeting_error, emit_rewrite_error, emit_rewrite_progress, emit_tts_error,
@@ -351,6 +352,28 @@ pub fn spawn_dispatch_loop(state: Arc<AppState>, app: AppHandle, mut rx: mpsc::R
                 continue;
             }
 
+            // Escape while read-aloud audio is playing. Registered only for
+            // that window (`ReadAloudEscape`), matched here because it has no
+            // [`HOTKEY_ACTIONS`] row. No busy gate: stopping is the one thing
+            // that must work while the run it stops still holds `tts_busy`.
+            if action_id == TTS_CANCEL_ACTION_ID {
+                let state = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::commands::handle_read_aloud_escape(&state).await;
+                });
+                continue;
+            }
+
+            // The read-aloud shortcut is a toggle, decided before the busy gate
+            // for the reason the palette's is below: the flag that would
+            // swallow this press is held for the whole run it belongs to.
+            if action_id == TTS_ACTION_ID
+                && read_aloud_press(state.read_aloud.phase()) == ReadAloudPress::Stop
+            {
+                state.read_aloud.request_stop();
+                continue;
+            }
+
             if action_id == LOCK_CANCEL_ACTION_ID {
                 // The same busy flag as every other dictation trigger: an
                 // Escape landing alongside the tap that stops the same lock
@@ -629,6 +652,20 @@ fn handle_ocr_capture<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_aloud_escape_is_not_a_permanent_hotkey() {
+        // Registered by `ReadAloudEscape` for the length of the playback only.
+        assert!(
+            HOTKEY_ACTIONS
+                .iter()
+                .all(|a| a.action_id() != TTS_CANCEL_ACTION_ID),
+            "read-aloud's Escape must not be a fixed hotkey row"
+        );
+        assert!(handler_for(TTS_CANCEL_ACTION_ID).is_none());
+        assert_ne!(TTS_CANCEL_ACTION_ID, ASSISTANT_CANCEL_ACTION_ID);
+        assert_ne!(TTS_CANCEL_ACTION_ID, LOCK_CANCEL_ACTION_ID);
+    }
 
     #[test]
     fn escape_is_not_a_permanent_hotkey() {

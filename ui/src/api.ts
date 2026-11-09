@@ -1263,6 +1263,8 @@ export type TtsSettings = {
   active_model: string | null;
   /** Rate multiplier; 1 is the voice's natural pace. */
   speed: number;
+  /** Whether Escape stops a read while it is playing. */
+  stop_with_esc: boolean;
 };
 
 /** Slowest and fastest the read-aloud rate may be set to. */
@@ -1326,6 +1328,9 @@ export const setTtsSettings = (settings: TtsSettings) =>
 export const runReadAloud = () => invoke<void>("run_read_aloud");
 
 export const triggerTts = () => invoke<void>("trigger_tts");
+
+/** Stops the read in progress, whether it is still synthesizing or already playing. */
+export const stopReadAloud = () => invoke<boolean>("stop_read_aloud");
 
 export const listOnnxModels = (kind: OnnxModelKindParam) =>
   invoke<OnnxModel[]>("list_onnx_models", { kind });

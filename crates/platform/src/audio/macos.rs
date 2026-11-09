@@ -1219,6 +1219,18 @@ impl AudioIo for MacAudioIo {
             .await
             .map_err(|e| AudioIoError::Other(e.to_string()))?
     }
+
+    async fn play_until(
+        &self,
+        pcm: PcmFrame,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), AudioIoError> {
+        tokio::task::spawn_blocking(move || {
+            crate::audio::playback::play_pcm_cancellable(&pcm, &cancel)
+        })
+        .await
+        .map_err(|e| AudioIoError::Other(e.to_string()))?
+    }
 }
 
 #[cfg(test)]

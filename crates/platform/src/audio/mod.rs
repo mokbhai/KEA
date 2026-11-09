@@ -270,6 +270,22 @@ pub trait AudioIo: Send + Sync {
         let _ = pcm;
         Ok(())
     }
+
+    /// Like [`play`](Self::play), but returns early — silencing the output at
+    /// the next poll, not after the buffer — once `cancel` is set. Returning
+    /// `Ok(())` for a stop is deliberate: the caller set the flag and knows.
+    ///
+    /// The default ignores `cancel` and plays to the end, which is right for
+    /// fakes and stubs that finish instantly; a backend with real output must
+    /// override it.
+    async fn play_until(
+        &self,
+        pcm: PcmFrame,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), AudioIoError> {
+        let _ = cancel;
+        self.play(pcm).await
+    }
 }
 
 /// Construct the active platform [`AudioIo`] implementation for this OS.

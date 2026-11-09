@@ -1,7 +1,7 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { invokeCalls, onInvoke, resetTauriMocks } from "../test-utils/tauri";
+import { emitTauriEvent, invokeCalls, onInvoke, resetTauriMocks } from "../test-utils/tauri";
 import { featureHandlers, openAiBinding } from "../test-utils/featureWorld";
 import ReadAloudPage from "./ReadAloudPage";
 
@@ -222,6 +222,57 @@ describe("ReadAloudPage", () => {
       // The sample must go to the provider the binding names, or it would
       // read a different key than the real read-aloud run does.
       providerRef: "openai",
+    });
+  });
+
+  describe("stopping a read", () => {
+    it("offers Stop with Esc, on by default, and saves it on its own", async () => {
+      mockWorld({ bindings: { "default/tts": openAiBinding("openai-tts") } });
+      render(<ReadAloudPage />);
+
+      const toggle = await screen.findByRole("switch", { name: "Stop with Esc" });
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+      await userEvent.click(toggle);
+
+      await waitFor(() => expect(invokeCalls("set_tts_settings")).toHaveLength(1));
+      expect(invokeCalls("set_tts_settings")[0]?.settings).toEqual({
+        active_voice: null,
+        active_model: null,
+        speed: 1,
+        stop_with_esc: false,
+      });
+      expect(
+        (await screen.findByRole("switch", { name: "Stop with Esc" })).getAttribute(
+          "aria-checked",
+        ),
+      ).toBe("false");
+    });
+
+    it("shows a Stop button only while a read is in progress", async () => {
+      mockWorld({ bindings: { "default/tts": openAiBinding("openai-tts") } });
+      render(<ReadAloudPage />);
+      await screen.findByRole("switch", { name: "Stop with Esc" });
+      expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+
+      act(() => emitTauriEvent("tts:state", { state: "reading" }));
+      expect(await screen.findByRole("button", { name: "Stop" })).toBeTruthy();
+
+      act(() => emitTauriEvent("tts:state", { state: "idle" }));
+      await waitFor(() => expect(screen.queryByRole("button", { name: "Stop" })).toBeNull());
+    });
+
+    it("stops the read when Stop is pressed", async () => {
+      mockWorld({
+        bindings: { "default/tts": openAiBinding("openai-tts") },
+        extra: { stop_read_aloud: () => true },
+      });
+      render(<ReadAloudPage />);
+      await screen.findByRole("switch", { name: "Stop with Esc" });
+
+      act(() => emitTauriEvent("tts:state", { state: "reading" }));
+      await userEvent.click(await screen.findByRole("button", { name: "Stop" }));
+
+      await waitFor(() => expect(invokeCalls("stop_read_aloud")).toHaveLength(1));
     });
   });
 });

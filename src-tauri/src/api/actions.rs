@@ -110,8 +110,15 @@ pub enum KeaAction {
     Rewrite(RewriteRequest),
     Dictation(DictationVerb),
     ReadAloud,
-    Transcribe { path: PathBuf },
-    Open { page: String },
+    /// Stop the read-aloud run in progress. The URL scheme spells it
+    /// `kea://read-aloud/stop`, the HTTP API `POST /v1/speak/stop`.
+    StopReadAloud,
+    Transcribe {
+        path: PathBuf,
+    },
+    Open {
+        page: String,
+    },
     Status,
 }
 
@@ -123,6 +130,7 @@ impl KeaAction {
             KeaAction::Rewrite(_) => "rewrite",
             KeaAction::Dictation(_) => "dictation",
             KeaAction::ReadAloud => "read-aloud",
+            KeaAction::StopReadAloud => "read-aloud/stop",
             KeaAction::Transcribe { .. } => "transcribe",
             KeaAction::Open { .. } => "open",
             KeaAction::Status => "status",
@@ -277,12 +285,11 @@ pub fn parse_kea_url(raw: &str) -> Result<KeaAction, ParseError> {
                     got: (*first).to_string(),
                 })
         }
-        "read-aloud" => {
-            if !subject.is_empty() {
-                return Err(ParseError::UnexpectedSubject("read-aloud"));
-            }
-            Ok(KeaAction::ReadAloud)
-        }
+        "read-aloud" => match subject.as_slice() {
+            [] => Ok(KeaAction::ReadAloud),
+            [first] if first.eq_ignore_ascii_case("stop") => Ok(KeaAction::StopReadAloud),
+            _ => Err(ParseError::UnexpectedSubject("read-aloud")),
+        },
         "transcribe" => {
             if !subject.is_empty() {
                 return Err(ParseError::UnexpectedSubject("transcribe"));
@@ -440,6 +447,17 @@ mod tests {
     #[test]
     fn read_aloud_and_open_and_transcribe_parse() {
         assert_eq!(parse_kea_url("kea://read-aloud"), Ok(KeaAction::ReadAloud));
+        assert_eq!(
+            parse_kea_url("kea://read-aloud/stop"),
+            Ok(KeaAction::StopReadAloud)
+        );
+        assert_eq!(
+            parse_kea_url("kea://read-aloud/pause").unwrap_err(),
+            ParseError::UnexpectedSubject("read-aloud")
+        );
+        // Stopping touches nothing in the user's app, so it must work while
+        // KEA itself is frontmost (the Stop button lives there).
+        assert!(!KeaAction::StopReadAloud.needs_the_users_app());
         assert_eq!(
             parse_kea_url("kea://open/general"),
             Ok(KeaAction::Open {

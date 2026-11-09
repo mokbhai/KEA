@@ -203,6 +203,11 @@ pub struct AppState {
     /// that starts a read, and two reads at once is two voices over each
     /// other. See `hotkeys::busy_flag`.
     pub tts_busy: Arc<AtomicBool>,
+    /// The stop switch for the read-aloud run in progress, and where that run
+    /// is (synthesizing or playing). Shared by the shortcut's toggle, Escape,
+    /// the Stop button and the local API, none of which can reach the run
+    /// itself: it is parked inside a blocking playback call.
+    pub read_aloud: Arc<kea_features::ReadAloudControl>,
     /// True while an API transcription is running. Its own flag, not
     /// `file_transcribe_busy`: a script's upload must not make the Transcribe
     /// page report busy, and a running file job must not refuse an upload.
@@ -483,6 +488,7 @@ fn main() {
             commands::get_assistant_settings,
             commands::set_assistant_settings,
             commands::run_read_aloud,
+            commands::stop_read_aloud,
             commands::trigger_tts,
             commands::read_selection,
             commands::list_onnx_models,
@@ -873,6 +879,7 @@ fn build_state(
         assistant_speaking: Arc::new(AtomicBool::new(false)),
         assistant_speech_stop: Arc::new(AtomicBool::new(false)),
         tts_busy: Arc::new(AtomicBool::new(false)),
+        read_aloud: Arc::new(kea_features::ReadAloudControl::default()),
         api_stt_busy: Arc::new(AtomicBool::new(false)),
         api_tts_busy: Arc::new(AtomicBool::new(false)),
         api_server: Mutex::new(None),

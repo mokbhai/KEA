@@ -16,7 +16,9 @@ import FeatureBanner from "../components/FeatureBanner";
 import HotkeyRow from "../components/HotkeyRow";
 import LoadingBlock from "../components/LoadingBlock";
 import { Row, RowGroup } from "../components/SettingsRow";
+import ReadAloudStop from "../components/ReadAloudStop";
 import Spinner from "../components/Spinner";
+import Toggle from "../components/Toggle";
 import { useFeatureAi } from "../hooks/useFeatureAi";
 import { useOptimisticSetting } from "../hooks/useOptimisticSetting";
 import { OPENAI_TTS_VOICES } from "../lib/capabilityDefaults";
@@ -95,7 +97,7 @@ type Props = {
 export default function ReadAloudPage({ onNavigate }: Props) {
   const ai = useFeatureAi(SLOTS);
   const tts = useOptimisticSetting<TtsSettings>({
-    initial: { active_voice: null, active_model: null, speed: 1 },
+    initial: { active_voice: null, active_model: null, speed: 1, stop_with_esc: true },
     persist: setTtsSettings,
   });
   const settings = tts.value;
@@ -202,6 +204,8 @@ export default function ReadAloudPage({ onNavigate }: Props) {
         </p>
       </header>
 
+      <ReadAloudStop />
+
       <FeatureBanner ai={ai} onNavigate={onNavigate} />
 
       <section style={{ marginBottom: 24 }}>
@@ -263,6 +267,18 @@ export default function ReadAloudPage({ onNavigate }: Props) {
                 <span className="kea-muted" style={{ minWidth: "3.5ch" }}>
                   {speed.toFixed(2)}×
                 </span>
+              </Row>
+              <Row
+                label="Stop with Esc"
+                hint="Press Esc to stop a read while it is playing. Esc is only taken for as long as the audio plays, so it keeps working everywhere else."
+              >
+                {tts.savedKey === "stop_with_esc" && <span className="kea-saved">Saved ✓</span>}
+                <Toggle
+                  label="Stop with Esc"
+                  checked={settings.stop_with_esc ?? true}
+                  disabled={tts.busy}
+                  onChange={(next) => void tts.save({ stop_with_esc: next }, "stop_with_esc")}
+                />
               </Row>
             </RowGroup>
 

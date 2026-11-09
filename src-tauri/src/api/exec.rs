@@ -136,6 +136,7 @@ pub async fn execute(
         KeaAction::Rewrite(request) => rewrite(state, request).await,
         KeaAction::Dictation(verb) => dictation(state, app, verb).await,
         KeaAction::ReadAloud => read_aloud(state, app).await,
+        KeaAction::StopReadAloud => stop_read_aloud(state),
         KeaAction::Transcribe { path } => {
             let home = home_dir().ok_or_else(|| {
                 ActionError::Failed("could not determine the home directory".into())
@@ -329,6 +330,21 @@ async fn read_aloud(
         .await
         .map(|()| ActionOutcome::Done)
         .map_err(classify)
+}
+
+/// Stops the read in progress. Takes no busy flag: the run being stopped
+/// holds `tts_busy` for its whole length, so claiming it would refuse every
+/// stop.
+///
+/// Refused with 409 when nothing is being read, as `dictation/stop` is when
+/// nothing is being dictated: a script that stops a read it believes is
+/// running should hear that it is not.
+fn stop_read_aloud(state: &Arc<crate::AppState>) -> Result<ActionOutcome, ActionError> {
+    if state.read_aloud.request_stop() {
+        Ok(ActionOutcome::Done)
+    } else {
+        Err(busy_refusal("nothing is being read aloud"))
+    }
 }
 
 /// The only verb that shows a window.
