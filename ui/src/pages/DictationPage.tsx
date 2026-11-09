@@ -266,11 +266,12 @@ const STT_SLOT: SlotSpec = {
 };
 
 /**
- * With clean-up on, dictation.rs resolves ("rewrite", "llm") and fails the
- * *whole* run when it can't — the transcript is discarded, not merely left
- * un-cleaned. So the clean-up AI is a real dependency exactly while the toggle
- * is on, and the page must say so. Both arrays are module-level constants to
- * keep useFeatureAi's stable-identity contract.
+ * With clean-up on, dictation.rs resolves ("rewrite", "llm"). When it can't, the
+ * run no longer fails: the raw transcript is typed and the user is told clean-up
+ * was skipped. The clean-up AI is still a dependency exactly while the toggle is
+ * on — without it the text is not cleaned — so the page still says so. Both
+ * arrays are module-level constants to keep useFeatureAi's stable-identity
+ * contract.
  */
 const SLOTS_PLAIN: SlotSpec[] = [STT_SLOT];
 
@@ -765,7 +766,7 @@ function DictationPageContent({ onNavigate }: Props) {
               </Row>
               <Row
                 label="Clean up text with AI"
-                hint="Removes filler words and fixes punctuation before typing. Needs the Rewrite AI — dictation fails outright without it."
+                hint="Removes filler words and fixes punctuation before typing. Uses the Rewrite AI; if that's unavailable, your raw transcript is typed instead."
               >
                 {settings.savedKey === "post_process" && (
                   <span className="kea-saved">Saved ✓</span>

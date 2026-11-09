@@ -287,6 +287,16 @@ describe("DictationPage", () => {
     expect(screen.queryByText(/Nothing is set up for this yet/)).toBeNull();
   });
 
+  it("says plainly that clean-up falls back to the raw transcript", async () => {
+    mockWorld({ bindings: { "default/stt": whisperBinding } });
+    render(<DictationPage />);
+
+    expect(
+      await screen.findByText(/if that's unavailable, your raw transcript is typed instead/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/fails outright/)).toBeNull();
+  });
+
   it("saves the AI clean-up toggle", async () => {
     mockWorld({ bindings: { "default/stt": whisperBinding } });
     render(<DictationPage />);
