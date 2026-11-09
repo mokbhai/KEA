@@ -3,8 +3,35 @@ use std::path::{Path, PathBuf};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+/// The file the logger is writing to right now.
+///
+/// `tracing_appender::rolling::daily` never writes a bare `kea.log`: it
+/// appends the date, so today's file is `kea.log.YYYY-MM-DD`. The newest of
+/// those is the live one. ISO dates sort lexically, so the greatest name is
+/// the newest. A bare `kea.log` is only the fallback for a directory the
+/// roller has not written to yet.
 pub fn current_log_path(log_dir: &Path) -> PathBuf {
-    log_dir.join("kea.log")
+    let newest = std::fs::read_dir(log_dir).ok().and_then(|dir| {
+        dir.flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| is_rotated_log_name(name))
+            .max()
+    });
+    match newest {
+        Some(name) => log_dir.join(name),
+        None => log_dir.join("kea.log"),
+    }
+}
+
+fn is_rotated_log_name(name: &str) -> bool {
+    let Some(date) = name.strip_prefix("kea.log.") else {
+        return false;
+    };
+    date.len() == 10
+        && date
+            .chars()
+            .enumerate()
+            .all(|(i, c)| if i == 4 || i == 7 { c == '-' } else { c.is_ascii_digit() })
 }
 
 /// Deletes rotated log files older than `days` days. The rolling appender
@@ -91,9 +118,44 @@ mod tests {
     }
 
     #[test]
-    fn current_log_path_joins_kea_log() {
+    fn current_log_path_falls_back_to_kea_log_in_an_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(current_log_path(dir.path()), dir.path().join("kea.log"));
+    }
+
+    /// The Logs page showed "(Log file is empty or not created yet.)" while
+    /// the folder held weeks of `kea.log.YYYY-MM-DD` files: the reader looked
+    /// for a bare `kea.log` the daily roller never creates.
+    #[test]
+    fn current_log_path_picks_the_newest_rotated_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "kea.log.2026-09-30",
+            "kea.log.2026-11-09",
+            "kea.log.2026-10-31",
+            "kea.log.bak",
+            "other.log.2026-12-31",
+        ] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        assert_eq!(
+            current_log_path(dir.path()),
+            dir.path().join("kea.log.2026-11-09")
+        );
+    }
+
+    #[test]
+    fn current_log_path_finds_what_the_daily_roller_writes() {
+        use std::io::Write;
+        // The roller directly, not `init_logging`: the global subscriber is
+        // process-wide and another test may already have installed it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut roller = tracing_appender::rolling::daily(dir.path(), "kea.log");
+        roller.write_all(b"hello-from-the-roller\n").unwrap();
+        roller.flush().unwrap();
+        let path = current_log_path(dir.path());
+        let tail = tail_log_file(&path, 4096).unwrap();
+        assert!(tail.contains("hello-from-the-roller"), "read {path:?}: {tail:?}");
     }
 
     #[test]
