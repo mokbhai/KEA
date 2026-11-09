@@ -21,7 +21,8 @@ pub const SCHEME: &str = "kea";
 /// A table rather than a match: `open` has no behaviour per page — it shows
 /// one window and hands the name to the frontend — so the only thing worth
 /// encoding is which names exist.
-pub const SETTINGS_PAGES: [&str; 12] = [
+pub const SETTINGS_PAGES: [&str; 14] = [
+    "assistant",
     "rewrite",
     "dictation",
     "meetings",
@@ -33,6 +34,7 @@ pub const SETTINGS_PAGES: [&str; 12] = [
     "profiles",
     "general",
     "history",
+    "usage",
     "logs",
 ];
 
@@ -543,5 +545,25 @@ mod tests {
             &abs("Users/kea-backup/a.m4a"),
             home
         ));
+    }
+
+    /// `kea://open/assistant` and `kea://open/usage` were refused because
+    /// this table fell behind `ui/src/lib/nav.ts`. Read the union from the UI
+    /// source so the next page added there fails here instead of in a link.
+    #[test]
+    fn settings_pages_match_the_ui_page_list() {
+        let nav = include_str!("../../../ui/src/lib/nav.ts");
+        let start = nav.find("export const PAGES").expect("PAGES in nav.ts");
+        let body = &nav[start..];
+        let body = &body[..body.find("];").expect("end of PAGES")];
+        let mut ui: Vec<&str> = body
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .collect();
+        let mut here: Vec<&str> = SETTINGS_PAGES.to_vec();
+        ui.sort_unstable();
+        here.sort_unstable();
+        assert_eq!(here, ui, "SETTINGS_PAGES drifted from ui/src/lib/nav.ts");
     }
 }
