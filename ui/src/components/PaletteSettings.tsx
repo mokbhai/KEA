@@ -51,7 +51,7 @@ const DEFAULTS: Flags = {
  * The palette's and the screen-capture shortcut's settings.
  *
  * Both live on the Rewrite page because both are rewrite commands — same
- * feature, same `llm` slot binding, same presets. Giving them a page of their
+ * feature, same `llm` slot binding, same prompt overrides. Giving them a page of their
  * own would imply a second AI configuration that does not exist.
  */
 export default function PaletteSettings() {

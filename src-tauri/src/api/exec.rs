@@ -18,7 +18,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use kea_core::rewrite::RewriteMode;
+use kea_core::rewrite::{RewriteMode, StyleRef, StyleRepo};
 use tauri::{AppHandle, Manager};
 
 use crate::commands::{
@@ -204,16 +204,37 @@ async fn rewrite(
         .map_err(|e| ActionError::Refused(e.to_string()))?;
 
     let over = RewriteOverride {
-        mode: request.mode,
-        preset_id: request.preset_id.clone(),
+        style: request.style.clone(),
         instruction: request.instruction.clone(),
     };
+
+    // A caller that names a custom style that does not exist hears about it.
+    // The saved-selection and app-profile paths fall back quietly because the
+    // user did not just type that id; this caller did, and a silent fallback
+    // would rewrite in a voice they did not ask for.
+    if let Some(style) = &over.style {
+        let known = StyleRepo::new(state.config_pool.clone())
+            .exists(style)
+            .await
+            .unwrap_or(false);
+        if !known {
+            return Err(ActionError::Refused(format!(
+                "unknown style '{}'; expected a built-in style ({}) or the id of a custom style",
+                style.as_str(),
+                RewriteMode::ALL
+                    .iter()
+                    .map(|m| m.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
 
     // Supplied text: no capture, no insertion, no history row — the same deal
     // the settings window's "try it" box gets.
     if let Some(text) = request.text {
-        let (mode, instruction) = resolve_preview_mode(state, &over).await;
-        return preview_rewrite_inner(state, text, mode, over.preset_id, instruction)
+        let (style, instruction) = resolve_preview_style(state, &over).await;
+        return preview_rewrite_inner(state, text, style, instruction)
             .await
             .map(ActionOutcome::Text)
             .map_err(classify);
@@ -239,26 +260,26 @@ async fn rewrite(
     let text = capture_selection_text()
         .await
         .map_err(ActionError::Refused)?;
-    let (mode, instruction) = resolve_preview_mode(state, &over).await;
-    preview_rewrite_inner(state, text, mode, over.preset_id, instruction)
+    let (style, instruction) = resolve_preview_style(state, &over).await;
+    preview_rewrite_inner(state, text, style, instruction)
         .await
         .map(ActionOutcome::Text)
         .map_err(classify)
 }
 
-/// The mode and parameter a non-inserting rewrite runs with.
+/// The style and parameter a non-inserting rewrite runs with.
 ///
 /// It has no app profile to consult (nothing is being written back into an
 /// app), so it falls back to the saved defaults — and the parameter is
 /// re-derived from whichever mode wins, because a mode's parameter comes from
 /// a key chosen by that mode.
-async fn resolve_preview_mode(
+async fn resolve_preview_style(
     state: &Arc<crate::AppState>,
     over: &RewriteOverride,
-) -> (RewriteMode, Option<String>) {
+) -> (StyleRef, Option<String>) {
     let mut input = crate::commands::default_rewrite_input(&state.config_pool).await;
     over.apply(&mut input, &state.config_pool).await;
-    (input.mode, input.custom_instruction)
+    (input.style(), input.custom_instruction)
 }
 
 async fn dictation(

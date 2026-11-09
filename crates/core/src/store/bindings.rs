@@ -14,10 +14,9 @@ impl Binding {
     ///
     /// The rule is the engine id: a model or a provider ref with no engine
     /// names no engine to send the request to, so the override inherits
-    /// instead of half-applying. Two tables carry exactly these three columns
-    /// for exactly this purpose — `app_profiles` and `rewrite_presets` — and
-    /// this is the one place that says what a half-filled row means, so the
-    /// two cannot come to disagree about it.
+    /// instead of half-applying. `app_profiles` carries exactly these three columns for exactly this
+    /// purpose, and this is the one place that says what a half-filled row
+    /// means.
     pub fn from_parts(
         engine_id: Option<String>,
         model: Option<String>,

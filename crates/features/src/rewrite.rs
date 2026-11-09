@@ -1,6 +1,6 @@
 use kea_core::resolve::SlotResolver;
 use kea_core::rewrite::{build_llm_request, RewriteInput};
-use kea_core::rewrite::{PresetRepo, PromptOverrideRepo};
+use kea_core::rewrite::{PromptOverrideRepo, StyleRepo};
 use kea_core::store::actions::{ActionRepo, NewAction};
 use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_core::store::conversations::{ConversationRepo, MessageRole, NewConversation, NewMessage};
@@ -192,7 +192,7 @@ impl Feature for RewriteFeature {
     /// `Feature` of their own would give them a *second* `llm` slot binding
     /// for the user to configure, and picking a writer for "Rewrite" while the
     /// palette silently used another is not a distinction anyone asked for.
-    /// [`crate::feature::ProfileOverrides`], the preset list and the prompt
+    /// [`crate::feature::ProfileOverrides`], the style list and the prompt
     /// overrides all follow the same seam for the same reason.
     fn commands(&self) -> Vec<Command> {
         vec![
@@ -287,7 +287,7 @@ pub async fn run_rewrite(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
     actions: &ActionRepo,
-    presets: &PresetRepo,
+    styles: &StyleRepo,
     overrides: &PromptOverrideRepo,
     textio: &dyn TextIo,
     input: RewriteInput,
@@ -297,7 +297,7 @@ pub async fn run_rewrite(
         engines,
         bindings,
         actions,
-        presets,
+        styles,
         overrides,
         textio,
         input,
@@ -313,7 +313,7 @@ pub async fn run_rewrite_with_storage(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
     actions: &ActionRepo,
-    presets: &PresetRepo,
+    styles: &StyleRepo,
     overrides: &PromptOverrideRepo,
     textio: &dyn TextIo,
     mut input: RewriteInput,
@@ -331,7 +331,7 @@ pub async fn run_rewrite_with_storage(
         engines,
         bindings,
         actions,
-        presets,
+        styles,
         overrides,
         "rewrite_selection",
         &input,
@@ -386,20 +386,19 @@ pub async fn complete_rewrite(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
     actions: &ActionRepo,
-    presets: &PresetRepo,
+    styles: &StyleRepo,
     overrides: &PromptOverrideRepo,
     command: &str,
     input: &RewriteInput,
     profile: &ProfileOverrides,
     storage: ContentStorageOpts<'_>,
 ) -> Result<(String, i64), String> {
-    // Three places may name the LLM, and `llm_binding_over` is the one that
-    // says in which order. A profile or a preset substitutes for the resolver
+    // A matched app profile may name the LLM. It substitutes for the resolver
     // rather than patching its result: `llm_binding()` is None unless an
     // engine id is set, so a half-filled override inherits the global binding
-    // instead of half-applying one.
-    let preset_binding = preset_llm_binding(presets, input.preset_id.as_deref()).await;
-    let binding = match profile.llm_binding_over(preset_binding) {
+    // instead of half-applying one. Styles — built-in or custom — never pick
+    // an AI of their own; they all run on the Rewrite AI.
+    let binding = match profile.llm_binding.clone() {
         Some(binding) => binding,
         None => SlotResolver::new(engines, bindings)
             .require_llm("rewrite")
@@ -408,7 +407,7 @@ pub async fn complete_rewrite(
     };
     let engine_id = binding.engine_id.clone();
 
-    let mut llm_req = build_llm_request(input, presets, overrides)
+    let mut llm_req = build_llm_request(input, styles, overrides)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -437,21 +436,6 @@ pub async fn complete_rewrite(
         Ok(text) => Ok((text, guard.release())),
         Err(e) => Err(guard.fail(e).await),
     }
-}
-
-/// The LLM a preset asks for, if this run is using one that asks.
-///
-/// A preset that cannot be read is treated as a preset with no override: the
-/// rewrite itself is about to fail on the same missing row inside
-/// `build_llm_request`, with a message that names it, and failing here first
-/// would replace that message with a vaguer one.
-async fn preset_llm_binding(presets: &PresetRepo, preset_id: Option<&str>) -> Option<Binding> {
-    presets
-        .get(preset_id?)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|preset| preset.llm_binding())
 }
 
 /// The LLM call and the optional conversation record — everything that is the
@@ -541,7 +525,7 @@ mod tests {
         engines: EngineRegistry,
         bindings: BindingRepo,
         actions: ActionRepo,
-        presets: PresetRepo,
+        styles: StyleRepo,
         overrides: PromptOverrideRepo,
         conversations: ConversationRepo,
     }
@@ -558,7 +542,7 @@ mod tests {
                 engines,
                 bindings: BindingRepo::new(config_pool.clone()),
                 actions: ActionRepo::new(data_pool.clone()),
-                presets: PresetRepo::new(config_pool.clone()),
+                styles: StyleRepo::new(config_pool.clone()),
                 overrides: PromptOverrideRepo::new(config_pool),
                 conversations: ConversationRepo::new(data_pool),
             }
@@ -593,20 +577,20 @@ mod tests {
 
         let bindings = BindingRepo::new(config_pool.clone());
         let actions = ActionRepo::new(data_pool);
-        let presets = PresetRepo::new(config_pool.clone());
+        let styles = StyleRepo::new(config_pool.clone());
         let overrides = PromptOverrideRepo::new(config_pool);
 
         let out = run_rewrite(
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             textio.as_ref(),
             RewriteInput {
                 source_text: String::new(),
                 mode: RewriteMode::Improve,
-                preset_id: None,
+                custom_style_id: None,
                 custom_instruction: None,
             },
             &ProfileOverrides::default(),
@@ -646,20 +630,20 @@ mod tests {
 
         let bindings = BindingRepo::new(config_pool.clone());
         let actions = ActionRepo::new(data_pool);
-        let presets = PresetRepo::new(config_pool.clone());
+        let styles = StyleRepo::new(config_pool.clone());
         let overrides = PromptOverrideRepo::new(config_pool);
 
         let out = run_rewrite(
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             textio.as_ref(),
             RewriteInput {
                 source_text: String::new(),
                 mode: RewriteMode::Translate,
-                preset_id: None,
+                custom_style_id: None,
                 custom_instruction: Some("de".into()),
             },
             &ProfileOverrides::default(),
@@ -690,20 +674,20 @@ mod tests {
         let bindings = BindingRepo::new(config_pool.clone());
         let actions = ActionRepo::new(data_pool.clone());
         let conversations = ConversationRepo::new(data_pool);
-        let presets = PresetRepo::new(config_pool.clone());
+        let styles = StyleRepo::new(config_pool.clone());
         let overrides = PromptOverrideRepo::new(config_pool);
 
         run_rewrite_with_storage(
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             textio.as_ref(),
             RewriteInput {
                 source_text: String::new(),
                 mode: RewriteMode::Improve,
-                preset_id: None,
+                custom_style_id: None,
                 custom_instruction: None,
             },
             &ProfileOverrides::default(),
@@ -740,20 +724,20 @@ mod tests {
         let bindings = BindingRepo::new(config_pool.clone());
         let actions = ActionRepo::new(data_pool.clone());
         let conversations = ConversationRepo::new(data_pool);
-        let presets = PresetRepo::new(config_pool.clone());
+        let styles = StyleRepo::new(config_pool.clone());
         let overrides = PromptOverrideRepo::new(config_pool);
 
         run_rewrite_with_storage(
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             textio.as_ref(),
             RewriteInput {
                 source_text: String::new(),
                 mode: RewriteMode::Improve,
-                preset_id: None,
+                custom_style_id: None,
                 custom_instruction: None,
             },
             &ProfileOverrides::default(),
@@ -777,13 +761,13 @@ mod tests {
             &h.engines,
             &h.bindings,
             &h.actions,
-            &h.presets,
+            &h.styles,
             &h.overrides,
             PALETTE_COMMAND,
             &RewriteInput {
                 source_text: "the selection the palette already had".into(),
                 mode: RewriteMode::AskKea,
-                preset_id: None,
+                custom_style_id: None,
                 custom_instruction: Some("make it shorter".into()),
             },
             &ProfileOverrides::default(),
@@ -814,13 +798,13 @@ mod tests {
             &h.engines,
             &h.bindings,
             &h.actions,
-            &h.presets,
+            &h.styles,
             &h.overrides,
             PALETTE_COMMAND,
             &RewriteInput {
                 source_text: String::new(),
                 mode: RewriteMode::AskKea,
-                preset_id: None,
+                custom_style_id: None,
                 custom_instruction: Some("what is 9 factorial".into()),
             },
             &ProfileOverrides::default(),
@@ -843,14 +827,14 @@ mod tests {
             &h.engines,
             &h.bindings,
             &h.actions,
-            &h.presets,
+            &h.styles,
             &h.overrides,
             PALETTE_COMMAND,
             &RewriteInput {
                 source_text: "hi".into(),
                 // Ask KEA with no instruction cannot render its template.
                 mode: RewriteMode::AskKea,
-                preset_id: None,
+                custom_style_id: None,
                 custom_instruction: None,
             },
             &ProfileOverrides::default(),
@@ -872,13 +856,13 @@ mod tests {
             &h.engines,
             &h.bindings,
             &h.actions,
-            &h.presets,
+            &h.styles,
             &h.overrides,
             PALETTE_COMMAND,
             &RewriteInput {
                 source_text: "some selected prose".into(),
                 mode: RewriteMode::AskKea,
-                preset_id: None,
+                custom_style_id: None,
                 custom_instruction: Some("shorten".into()),
             },
             &ProfileOverrides::default(),
@@ -936,20 +920,20 @@ mod tests {
         let bindings = BindingRepo::new(config_pool.clone());
         let actions = ActionRepo::new(data_pool);
         let conversations = ConversationRepo::new(no_migrations_pool);
-        let presets = PresetRepo::new(config_pool.clone());
+        let styles = StyleRepo::new(config_pool.clone());
         let overrides = PromptOverrideRepo::new(config_pool);
 
         let err = run_rewrite_with_storage(
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             textio.as_ref(),
             RewriteInput {
                 source_text: String::new(),
                 mode: RewriteMode::Improve,
-                preset_id: None,
+                custom_style_id: None,
                 custom_instruction: None,
             },
             &ProfileOverrides::default(),
@@ -1140,7 +1124,7 @@ mod custom_provider_tests {
             .unwrap();
 
         let actions = ActionRepo::new(data_pool);
-        let presets = PresetRepo::new(config_pool.clone());
+        let styles = StyleRepo::new(config_pool.clone());
         let overrides = PromptOverrideRepo::new(config_pool);
         let textio = Arc::new(FakeTextIo {
             selection: "bad text".into(),
@@ -1151,13 +1135,13 @@ mod custom_provider_tests {
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             textio.as_ref(),
             RewriteInput {
                 source_text: String::new(),
                 mode: RewriteMode::Improve,
-                preset_id: None,
+                custom_style_id: None,
                 custom_instruction: None,
             },
             &ProfileOverrides::default(),

@@ -15,7 +15,7 @@ export type LlmChoices = {
 /**
  * The two lists an "override the AI for this one thing" picker needs.
  *
- * Both app rules and rewrite presets can name their own engine, model and
+ * App rules can name their own engine, model and
  * provider, and both have to filter the backend's engine list through
  * `enginesFor("llm")` for the same reason: an engine registered but not in the
  * UI catalog has no label, and an unlabelled option in a dropdown is one the

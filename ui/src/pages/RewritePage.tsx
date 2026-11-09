@@ -48,12 +48,7 @@ function RewritePageContent({ onRunSetup, onNavigate }: Props) {
     setRunStatus(null);
     setResult(null);
     try {
-      const text = await previewRewrite(
-        sample,
-        settings.mode,
-        settings.preset_id,
-        rewrite.parameter,
-      );
+      const text = await previewRewrite(sample, settings.style, rewrite.parameter);
       setResult(text);
     } catch (e) {
       setRunStatus(toMessage(e));
@@ -91,11 +86,7 @@ function RewritePageContent({ onRunSetup, onNavigate }: Props) {
     setRunStatus(null);
     setResult(null);
     try {
-      const text = await triggerRewrite(
-        settings.mode,
-        settings.preset_id,
-        rewrite.parameter,
-      );
+      const text = await triggerRewrite(settings.style, rewrite.parameter);
       setRunStatus(
         text ? "Rewritten and replaced in the app you were last in." : "Rewrite completed.",
       );

@@ -18,8 +18,8 @@ use kea_core::resolve::Resolution;
 use kea_core::resolve::SlotResolver;
 use kea_core::rewrite::language::is_well_formed_tag;
 use kea_core::rewrite::{
-    build_llm_request, PaletteHistoryRepo, PresetRepo, PromptOverrideRepo, ProviderConfig,
-    ProviderConfigRepo, RewriteInput, RewriteMode, RewritePreset, STORE_HISTORY_SETTING,
+    build_llm_request, CustomStyle, PaletteHistoryRepo, PromptOverrideRepo, ProviderConfig,
+    ProviderConfigRepo, RewriteInput, RewriteMode, StyleRef, StyleRepo, STORE_HISTORY_SETTING,
 };
 use kea_core::secrets::NOTION_TOKEN_REF;
 use kea_core::store::actions::{ActionDetail, ActionRepo, ActionRow, NewAction};
@@ -1050,7 +1050,7 @@ pub async fn capture_app_context_now(state: &AppState) -> Option<kea_platform::A
     ctx.bundle_id.is_some().then_some(ctx)
 }
 
-/// Force `input` onto `mode`, re-deriving the parameter that mode reads.
+/// Force `input` onto `style`, re-deriving the parameter that style reads.
 ///
 /// The re-derive is the part worth being careful about: a mode's parameter
 /// comes from a key chosen BY that mode, so anything that forces Translate
@@ -1058,27 +1058,50 @@ pub async fn capture_app_context_now(state: &AppState) -> Option<kea_platform::A
 /// re-reading the parameter would hand Translate the Ask instruction, or
 /// nothing at all.
 ///
+/// A custom style replaces the prompt template outright (`build_llm_request`),
+/// so forcing a built-in mode also drops a custom style that was selected;
+/// leaving it in place would quietly run it instead — which for a translate
+/// shortcut means the key does not translate at all.
+///
+/// Returns `false`, leaving `input` untouched, for a custom style that no
+/// longer exists: the caller decides whether that is "no override" (a profile,
+/// the saved selection) or an error (an explicit API request).
+///
 /// Shared by the app-profile path and the `kea://`/HTTP override so the two
 /// cannot answer that differently.
-pub async fn set_rewrite_mode(
+pub async fn set_rewrite_style(
     input: &mut RewriteInput,
-    mode: RewriteMode,
+    style: &StyleRef,
     config_pool: &SqlitePool,
-) {
-    // Naming a mode means asking for that mode's template, and a preset
-    // replaces the template outright (`build_llm_request`). Leaving the saved
-    // preset in place would quietly run it instead — which for a translate
-    // shortcut means the key does not translate at all.
-    input.preset_id = None;
-    if mode == input.mode {
-        return;
+) -> bool {
+    match style {
+        StyleRef::Builtin(mode) => {
+            let was_custom = input.custom_style_id.take().is_some();
+            if *mode == input.mode && !was_custom {
+                return true;
+            }
+            input.mode = *mode;
+            input.custom_instruction =
+                mode_parameter_value(&SettingsRepo::new(config_pool.clone()), *mode).await;
+            true
+        }
+        StyleRef::Custom(id) => {
+            let exists = StyleRepo::new(config_pool.clone())
+                .exists(style)
+                .await
+                .unwrap_or(false);
+            if !exists {
+                return false;
+            }
+            input.custom_style_id = Some(id.clone());
+            input.mode = RewriteMode::Improve;
+            input.custom_instruction = None;
+            true
+        }
     }
-    input.mode = mode;
-    input.custom_instruction =
-        mode_parameter_value(&SettingsRepo::new(config_pool.clone()), mode).await;
 }
 
-/// The default rewrite input with `profile`'s mode and preset applied.
+/// The default rewrite input with `profile`'s style applied.
 pub async fn rewrite_input_for_profile(
     config_pool: &SqlitePool,
     profile: Option<&AppProfile>,
@@ -1087,11 +1110,10 @@ pub async fn rewrite_input_for_profile(
     let Some(profile) = profile else {
         return input;
     };
-    if let Some(mode) = profile.mode() {
-        set_rewrite_mode(&mut input, mode, config_pool).await;
-    }
-    if profile.preset_id.is_some() {
-        input.preset_id = profile.preset_id.clone();
+    if let Some(style) = profile.style() {
+        // A style that no longer exists is no override: the profile inherits
+        // the saved style, as for any other value it cannot act on.
+        set_rewrite_style(&mut input, &style, config_pool).await;
     }
     input
 }
@@ -1104,23 +1126,19 @@ pub async fn rewrite_input_for_profile(
 /// function instead of the shortcut keeping its own copy of it.
 #[derive(Debug, Clone, Default)]
 pub struct RewriteOverride {
-    pub mode: Option<RewriteMode>,
-    pub preset_id: Option<String>,
+    pub style: Option<StyleRef>,
     pub instruction: Option<String>,
 }
 
 impl RewriteOverride {
     pub async fn apply(&self, input: &mut RewriteInput, config_pool: &SqlitePool) {
-        if let Some(mode) = self.mode {
-            set_rewrite_mode(input, mode, config_pool).await;
+        if let Some(style) = &self.style {
+            set_rewrite_style(input, style, config_pool).await;
         }
-        if self.preset_id.is_some() {
-            input.preset_id = self.preset_id.clone();
-        }
-        // After the mode, not before: `set_rewrite_mode` re-derives the
+        // After the style, not before: `set_rewrite_style` re-derives the
         // parameter from settings, and an instruction the caller spelled out
-        // has to survive that.
-        if self.instruction.is_some() {
+        // has to survive that. A custom style has no parameter to receive it.
+        if self.instruction.is_some() && input.custom_style_id.is_none() {
             input.custom_instruction = self.instruction.clone();
         }
     }
@@ -1339,18 +1357,19 @@ pub async fn capture_selection_text() -> Result<String, String> {
 
 pub async fn default_rewrite_input(config_pool: &SqlitePool) -> RewriteInput {
     let settings = SettingsRepo::new(config_pool.clone());
-    let mode = settings
-        .get::<String>("rewrite.active_mode")
+    // One value names the active style, built-in or custom; a custom style
+    // that was deleted reads as Improve (`StyleRepo::active`).
+    let active = StyleRepo::new(config_pool.clone())
+        .active()
         .await
-        .ok()
-        .flatten()
-        .and_then(|s| RewriteMode::from_str(&s))
-        .unwrap_or(RewriteMode::Improve);
-    let preset_id = PresetRepo::new(config_pool.clone())
-        .active_id()
-        .await
-        .ok()
-        .flatten();
+        .unwrap_or(StyleRef::Builtin(RewriteMode::Improve));
+    if let StyleRef::Custom(id) = active {
+        return RewriteInput::for_style(StyleRef::Custom(id), String::new(), None);
+    }
+    let mode = match active {
+        StyleRef::Builtin(mode) => mode,
+        StyleRef::Custom(_) => RewriteMode::Improve,
+    };
     let custom_instruction = mode_parameter_value(&settings, mode).await;
     // Translate is the one mode whose parameter is not optional — without a
     // target the prompt cannot be rendered at all — so it falls back rather
@@ -1369,7 +1388,7 @@ pub async fn default_rewrite_input(config_pool: &SqlitePool) -> RewriteInput {
     RewriteInput {
         source_text: String::new(),
         mode,
-        preset_id,
+        custom_style_id: None,
         custom_instruction,
     }
 }
@@ -1542,7 +1561,7 @@ pub async fn execute_rewrite(
 ) -> Result<kea_features::RewriteOutcome, String> {
     let bindings = BindingRepo::new(state.config_pool.clone());
     let actions = ActionRepo::new(state.data_pool.clone());
-    let presets = PresetRepo::new(state.config_pool.clone());
+    let styles = StyleRepo::new(state.config_pool.clone());
     let overrides = PromptOverrideRepo::new(state.config_pool.clone());
     let textio = new_text_io();
     let conversations = ConversationRepo::new(state.data_pool.clone());
@@ -1559,7 +1578,7 @@ pub async fn execute_rewrite(
         &state.engines,
         &bindings,
         &actions,
-        &presets,
+        &styles,
         &overrides,
         textio.as_ref(),
         input,
@@ -3506,7 +3525,7 @@ async fn finish_run(
 
     let bindings = BindingRepo::new(state.config_pool.clone());
     let actions = ActionRepo::new(state.data_pool.clone());
-    let presets = PresetRepo::new(state.config_pool.clone());
+    let styles = StyleRepo::new(state.config_pool.clone());
     let overrides = PromptOverrideRepo::new(state.config_pool.clone());
     let textio = new_text_io();
     let mut replay = ReplayAudioIo::new(pcm);
@@ -3537,7 +3556,7 @@ async fn finish_run(
         &state.engines,
         &bindings,
         &actions,
-        &presets,
+        &styles,
         &overrides,
         &mut replay,
         textio.as_ref(),
@@ -4065,27 +4084,34 @@ pub async fn preview_vocabulary(
 }
 
 #[tauri::command]
-pub async fn list_presets(state: State<'_, Arc<AppState>>) -> Result<Vec<RewritePreset>, String> {
-    PresetRepo::new(state.config_pool.clone())
+pub async fn list_custom_styles(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<CustomStyle>, String> {
+    StyleRepo::new(state.config_pool.clone())
         .list()
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn upsert_preset(
+pub async fn upsert_custom_style(
     state: State<'_, Arc<AppState>>,
-    preset: RewritePreset,
+    style: CustomStyle,
 ) -> Result<(), String> {
-    PresetRepo::new(state.config_pool.clone())
-        .upsert(&preset)
+    StyleRepo::new(state.config_pool.clone())
+        .upsert(&style)
         .await
         .map_err(|e| e.to_string())
 }
 
+/// Deletes a custom style. The active style falls back to Improve and app
+/// profiles that forced it go back to inheriting — see `StyleRepo::delete`.
 #[tauri::command]
-pub async fn delete_preset(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
-    PresetRepo::new(state.config_pool.clone())
+pub async fn delete_custom_style(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<(), String> {
+    StyleRepo::new(state.config_pool.clone())
         .delete(&id)
         .await
         .map_err(|e| e.to_string())
@@ -4453,8 +4479,7 @@ pub async fn clear_hotkey(
 #[tauri::command]
 pub async fn trigger_rewrite(
     state: State<'_, Arc<AppState>>,
-    mode: RewriteMode,
-    preset_id: Option<String>,
+    style: String,
     custom_instruction: Option<String>,
 ) -> Result<String, String> {
     crate::feature_switches::require(&state.config_pool, "rewrite").await?;
@@ -4471,12 +4496,7 @@ pub async fn trigger_rewrite(
     // record one.
     execute_rewrite(
         &state,
-        RewriteInput {
-            source_text: String::new(),
-            mode,
-            preset_id,
-            custom_instruction,
-        },
+        RewriteInput::for_style(StyleRef::parse(&style), String::new(), custom_instruction),
         &ProfileOverrides::default(),
     )
     .await
@@ -4500,11 +4520,16 @@ pub async fn trigger_rewrite(
 pub async fn preview_rewrite(
     state: State<'_, Arc<AppState>>,
     text: String,
-    mode: RewriteMode,
-    preset_id: Option<String>,
+    style: String,
     custom_instruction: Option<String>,
 ) -> Result<String, String> {
-    preview_rewrite_inner(state.inner(), text, mode, preset_id, custom_instruction).await
+    preview_rewrite_inner(
+        state.inner(),
+        text,
+        StyleRef::parse(&style),
+        custom_instruction,
+    )
+    .await
 }
 
 /// [`preview_rewrite`] without the Tauri boundary.
@@ -4515,8 +4540,7 @@ pub async fn preview_rewrite(
 pub async fn preview_rewrite_inner(
     state: &Arc<AppState>,
     text: String,
-    mode: RewriteMode,
-    preset_id: Option<String>,
+    style: StyleRef,
     custom_instruction: Option<String>,
 ) -> Result<String, String> {
     crate::feature_switches::require(&state.config_pool, "rewrite").await?;
@@ -4525,7 +4549,7 @@ pub async fn preview_rewrite_inner(
     }
 
     let bindings = BindingRepo::new(state.config_pool.clone());
-    let presets = PresetRepo::new(state.config_pool.clone());
+    let styles = StyleRepo::new(state.config_pool.clone());
     let overrides = PromptOverrideRepo::new(state.config_pool.clone());
 
     let resolver = SlotResolver::new(&state.engines, &bindings);
@@ -4539,13 +4563,8 @@ pub async fn preview_rewrite_inner(
     };
 
     let mut req = build_llm_request(
-        &RewriteInput {
-            source_text: text,
-            mode,
-            preset_id,
-            custom_instruction,
-        },
-        &presets,
+        &RewriteInput::for_style(style, text, custom_instruction),
+        &styles,
         &overrides,
     )
     .await
@@ -7117,7 +7136,7 @@ async fn run_palette_inner(
 
     // A per-app profile applies to a palette ask exactly as it does to a
     // hotkey rewrite — same binding, same insertion mode, same post-process
-    // choice. Its `mode` and `preset_id` deliberately do not: the user typed
+    // choice. Its style deliberately does not: the user typed
     // an instruction, and that IS the mode. Forcing them into Professional
     // because they are in Slack would answer a question they did not ask.
     let profile = profile_for(&state.config_pool, context.as_ref()).await;
@@ -7126,13 +7145,13 @@ async fn run_palette_inner(
     let input = RewriteInput {
         source_text: source_text.clone(),
         mode: RewriteMode::AskKea,
-        preset_id: None,
+        custom_style_id: None,
         custom_instruction: Some(instruction.to_string()),
     };
 
     let bindings = BindingRepo::new(state.config_pool.clone());
     let actions = ActionRepo::new(state.data_pool.clone());
-    let presets = PresetRepo::new(state.config_pool.clone());
+    let styles = StyleRepo::new(state.config_pool.clone());
     let prompt_overrides = PromptOverrideRepo::new(state.config_pool.clone());
     let conversations = ConversationRepo::new(state.data_pool.clone());
     let usage = UsageRepo::new(state.data_pool.clone());
@@ -7149,7 +7168,7 @@ async fn run_palette_inner(
         &state.engines,
         &bindings,
         &actions,
-        &presets,
+        &styles,
         &prompt_overrides,
         PALETTE_COMMAND,
         &input,
@@ -8346,11 +8365,12 @@ mod tests {
         );
     }
 
-    /// A preset replaces the prompt template outright, so a caller that names
-    /// a mode and gets the saved preset anyway did not get the mode. For a
-    /// translate shortcut that is the difference between translating and not.
+    /// A custom style replaces the prompt template outright, so a caller that
+    /// names a built-in mode and gets the saved custom style anyway did not get
+    /// the mode. For a translate shortcut that is the difference between
+    /// translating and not.
     #[tokio::test]
-    async fn forcing_a_mode_drops_the_saved_preset() {
+    async fn forcing_a_mode_drops_the_selected_custom_style() {
         let pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&pool).await.unwrap();
         SettingsRepo::new(pool.clone())
@@ -8361,43 +8381,154 @@ mod tests {
         let mut input = RewriteInput {
             source_text: "hello".into(),
             mode: RewriteMode::Improve,
-            preset_id: Some("preset-1".into()),
+            custom_style_id: Some("style-1".into()),
             custom_instruction: None,
         };
-        set_rewrite_mode(&mut input, RewriteMode::Translate, &pool).await;
+        let applied = set_rewrite_style(
+            &mut input,
+            &StyleRef::Builtin(RewriteMode::Translate),
+            &pool,
+        )
+        .await;
+        assert!(applied);
         assert_eq!(input.mode, RewriteMode::Translate);
-        assert_eq!(input.preset_id, None);
+        assert_eq!(input.custom_style_id, None);
         // And the parameter comes from the key the new mode reads, not the
         // one the old mode did.
         assert_eq!(input.custom_instruction.as_deref(), Some("de"));
     }
 
     /// The whole path a translate shortcut takes: the override names the mode
-    /// and carries the tag, and neither the saved preset nor the saved style
-    /// survives it.
+    /// and carries the tag, and the saved style — built-in or custom — does
+    /// not survive it.
     #[tokio::test]
-    async fn a_translate_override_wins_over_the_saved_style_and_preset() {
+    async fn a_translate_override_wins_over_the_saved_style() {
         let pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&pool).await.unwrap();
-        let settings = SettingsRepo::new(pool.clone());
-        settings
-            .set("rewrite.active_mode", &"friendly".to_string())
+        let styles = StyleRepo::new(pool.clone());
+        styles
+            .upsert(&CustomStyle::new(
+                "style-1",
+                "Pirate",
+                "Rewrite as a pirate",
+            ))
+            .await
+            .unwrap();
+        styles
+            .set_active(&StyleRef::Custom("style-1".into()))
             .await
             .unwrap();
 
         let mut input = default_rewrite_input(&pool).await;
-        input.preset_id = Some("preset-1".into());
+        assert_eq!(input.custom_style_id.as_deref(), Some("style-1"));
         RewriteOverride {
-            mode: Some(RewriteMode::Translate),
+            style: Some(StyleRef::Builtin(RewriteMode::Translate)),
             instruction: Some("pt-BR".into()),
-            ..RewriteOverride::default()
         }
         .apply(&mut input, &pool)
         .await;
 
         assert_eq!(input.mode, RewriteMode::Translate);
-        assert_eq!(input.preset_id, None);
+        assert_eq!(input.custom_style_id, None);
         assert_eq!(input.custom_instruction.as_deref(), Some("pt-BR"));
+    }
+
+    /// The saved selection is one value: a custom style id there is what the
+    /// rewrite hotkey runs, and it reaches the prompt as that style's
+    /// instruction.
+    #[tokio::test]
+    async fn the_active_custom_style_is_what_the_hotkey_rewrites_with() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let styles = StyleRepo::new(pool.clone());
+        styles
+            .upsert(&CustomStyle::new(
+                "style-1",
+                "Standup",
+                "Rewrite as a three-bullet standup update.",
+            ))
+            .await
+            .unwrap();
+        SettingsRepo::new(pool.clone())
+            .set("rewrite.active_mode", &"style-1".to_string())
+            .await
+            .unwrap();
+
+        let mut input = default_rewrite_input(&pool).await;
+        input.source_text = "did the thing".into();
+        let req = build_llm_request(&input, &styles, &PromptOverrideRepo::new(pool.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            req.prompt,
+            "Rewrite as a three-bullet standup update.\n\nSource text:\ndid the thing"
+        );
+    }
+
+    /// Deleting the style the user had selected must not leave the hotkey
+    /// failing with "style not found": it runs Improve.
+    #[tokio::test]
+    async fn a_deleted_active_style_rewrites_with_improve() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let styles = StyleRepo::new(pool.clone());
+        styles
+            .upsert(&CustomStyle::new(
+                "style-1",
+                "Pirate",
+                "Rewrite as a pirate",
+            ))
+            .await
+            .unwrap();
+        styles
+            .set_active(&StyleRef::Custom("style-1".into()))
+            .await
+            .unwrap();
+        styles.delete("style-1").await.unwrap();
+
+        let input = default_rewrite_input(&pool).await;
+        assert_eq!(input.mode, RewriteMode::Improve);
+        assert_eq!(input.custom_style_id, None);
+
+        // Even if the stored value were stale (written by hand, say).
+        SettingsRepo::new(pool.clone())
+            .set("rewrite.active_mode", &"style-1".to_string())
+            .await
+            .unwrap();
+        let input = default_rewrite_input(&pool).await;
+        assert_eq!(input.mode, RewriteMode::Improve);
+        assert_eq!(input.custom_style_id, None);
+    }
+
+    /// An app profile forces a style by the same single value: a custom id,
+    /// a built-in name, and — for a style that no longer exists — nothing.
+    #[tokio::test]
+    async fn an_app_profile_can_force_a_custom_style() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        StyleRepo::new(pool.clone())
+            .upsert(&CustomStyle::new(
+                "style-1",
+                "Pirate",
+                "Rewrite as a pirate",
+            ))
+            .await
+            .unwrap();
+
+        let mut profile = AppProfile::new("slack", "Slack");
+        profile.rewrite_style = Some("style-1".into());
+        let input = rewrite_input_for_profile(&pool, Some(&profile)).await;
+        assert_eq!(input.custom_style_id.as_deref(), Some("style-1"));
+
+        profile.rewrite_style = Some("concise".into());
+        let input = rewrite_input_for_profile(&pool, Some(&profile)).await;
+        assert_eq!(input.mode, RewriteMode::Concise);
+        assert_eq!(input.custom_style_id, None);
+
+        profile.rewrite_style = Some("deleted".into());
+        let input = rewrite_input_for_profile(&pool, Some(&profile)).await;
+        assert_eq!(input.mode, RewriteMode::Improve);
+        assert_eq!(input.custom_style_id, None);
     }
 
     #[tokio::test]

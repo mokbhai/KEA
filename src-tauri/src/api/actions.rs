@@ -8,7 +8,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use kea_core::rewrite::RewriteMode;
+use kea_core::rewrite::{RewriteMode, StyleRef};
 use url::Url;
 
 /// The URL scheme KEA registers. Also the `CFBundleURLSchemes` entry in
@@ -79,8 +79,9 @@ impl DictationVerb {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RewriteRequest {
     pub text: Option<String>,
-    pub mode: Option<RewriteMode>,
-    pub preset_id: Option<String>,
+    /// A built-in style name or a custom style id, as one value. Whether a
+    /// custom id exists is checked when the request runs, not when it parses.
+    pub style: Option<StyleRef>,
     pub instruction: Option<String>,
     pub insert: bool,
 }
@@ -155,8 +156,15 @@ pub enum ParseError {
     UnknownVerb(String),
     MissingSubject(&'static str),
     UnexpectedSubject(&'static str),
-    UnknownSubject { verb: &'static str, got: String },
+    UnknownSubject {
+        verb: &'static str,
+        got: String,
+    },
     UnknownMode(String),
+    /// `preset` / `preset_id`: removed with the Preset feature. Refused rather
+    /// than ignored, because a caller that still sends one would otherwise
+    /// get the default style and never learn why.
+    PresetRemoved(&'static str),
     MissingParam(&'static str),
     EmptyParam(&'static str),
     Contradiction(&'static str),
@@ -190,6 +198,11 @@ impl std::fmt::Display for ParseError {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            ParseError::PresetRemoved(p) => write!(
+                f,
+                "`{p}` is no longer supported: presets were replaced by styles; \
+                 send `style` instead (a built-in style name or a custom style id)"
+            ),
             ParseError::MissingParam(p) => write!(f, "missing required parameter '{p}'"),
             ParseError::EmptyParam(p) => write!(f, "parameter '{p}' is empty"),
             ParseError::Contradiction(why) => write!(f, "{why}"),
@@ -214,23 +227,45 @@ fn required(url: &Url, key: &'static str) -> Result<String, ParseError> {
     }
 }
 
-/// `Some` only for a present, non-empty value: `?preset=` is a script that
-/// interpolated an unset shell variable, not a request for the empty preset.
+/// `Some` only for a present, non-empty value: `?style=` is a script that
+/// interpolated an unset shell variable, not a request for the empty style.
 fn optional(url: &Url, key: &str) -> Option<String> {
     param(url, key).filter(|v| !v.is_empty())
 }
 
-/// The mode named by `?mode=`, if any.
+/// The style a request names, from `?style=` or its older spelling `?mode=`.
 ///
-/// [`RewriteMode::from_str`] is the parser — it already has the explicit
-/// `_ => None` arm that rejects an unknown value — so a `None` from it becomes
-/// an error here rather than being swallowed by an `unwrap_or(Improve)`.
-fn mode_param(url: &Url) -> Result<Option<RewriteMode>, ParseError> {
-    match optional(url, "mode") {
-        None => Ok(None),
-        Some(raw) => RewriteMode::from_str(&raw)
-            .map(Some)
+/// `mode` stays as an alias for scripts written before custom styles existed;
+/// it takes built-in names only, through [`RewriteMode::from_str`] — which
+/// already has the explicit `_ => None` arm that rejects an unknown value — so
+/// a typo becomes an error here rather than being swallowed by an
+/// `unwrap_or(Improve)`. `style` takes either kind, and is the spelling to use.
+///
+/// `preset` / `preset_id` are refused with a message naming `style`.
+fn style_param(url: &Url) -> Result<Option<StyleRef>, ParseError> {
+    for removed in ["preset", "preset_id"] {
+        if param(url, removed).is_some() {
+            return Err(ParseError::PresetRemoved(removed));
+        }
+    }
+    resolve_style_params(optional(url, "style"), optional(url, "mode"))
+}
+
+/// The one rule for `style` + its `mode` alias, shared by the URL scheme and
+/// the HTTP body so the two cannot answer differently.
+pub(crate) fn resolve_style_params(
+    style: Option<String>,
+    mode: Option<String>,
+) -> Result<Option<StyleRef>, ParseError> {
+    match (style, mode) {
+        (Some(_), Some(_)) => Err(ParseError::Contradiction(
+            "`style` and `mode` name the same thing; send only `style`",
+        )),
+        (Some(style), None) => Ok(Some(StyleRef::parse(&style))),
+        (None, Some(raw)) => RewriteMode::from_str(&raw)
+            .map(|m| Some(StyleRef::Builtin(m)))
             .ok_or(ParseError::UnknownMode(raw)),
+        (None, None) => Ok(None),
     }
 }
 
@@ -267,8 +302,7 @@ pub fn parse_kea_url(raw: &str) -> Result<KeaAction, ParseError> {
             let request = RewriteRequest {
                 insert: text.is_none(),
                 text,
-                mode: mode_param(&url)?,
-                preset_id: optional(&url, "preset"),
+                style: style_param(&url)?,
                 instruction: optional(&url, "instruction"),
             };
             request.validate()?;
@@ -349,7 +383,7 @@ mod tests {
     fn every_mode_string_round_trips_through_the_url() {
         for mode in RewriteMode::ALL {
             let url = format!("kea://rewrite?mode={}", mode.as_str());
-            assert_eq!(rewrite(&url).mode, Some(mode), "{url}");
+            assert_eq!(rewrite(&url).style, Some(StyleRef::Builtin(mode)), "{url}");
         }
     }
 
@@ -379,7 +413,7 @@ mod tests {
         let req = rewrite(
             "kea://rewrite?mode=ask_kea&instruction=R%26D%20plan%2Bnotes%20for%20Espa%C3%B1a",
         );
-        assert_eq!(req.mode, Some(RewriteMode::AskKea));
+        assert_eq!(req.style, Some(StyleRef::Builtin(RewriteMode::AskKea)));
         // `+` inside a query is a space under form decoding; the caller that
         // wanted a literal plus percent-encoded it, and got one.
         assert_eq!(
@@ -389,11 +423,36 @@ mod tests {
     }
 
     #[test]
-    fn a_preset_can_be_asked_for_by_id() {
+    fn a_style_can_be_asked_for_by_builtin_name_or_custom_id() {
         assert_eq!(
-            rewrite("kea://rewrite?preset=standup").preset_id.as_deref(),
-            Some("standup")
+            rewrite("kea://rewrite?style=concise").style,
+            Some(StyleRef::Builtin(RewriteMode::Concise))
         );
+        assert_eq!(
+            rewrite("kea://rewrite?style=style-1699").style,
+            Some(StyleRef::Custom("style-1699".into()))
+        );
+    }
+
+    #[test]
+    fn style_and_its_mode_alias_together_are_a_contradiction() {
+        let err = parse_kea_url("kea://rewrite?style=concise&mode=friendly").unwrap_err();
+        assert!(matches!(err, ParseError::Contradiction(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_removed_preset_parameter_is_refused_naming_style() {
+        for url in [
+            "kea://rewrite?preset=standup",
+            "kea://rewrite?preset_id=standup",
+        ] {
+            let err = parse_kea_url(url).unwrap_err();
+            assert!(
+                matches!(err, ParseError::PresetRemoved(_)),
+                "{url}: {err:?}"
+            );
+            assert!(err.to_string().contains("`style`"), "{err}");
+        }
     }
 
     #[test]
@@ -406,8 +465,8 @@ mod tests {
 
     #[test]
     fn an_empty_optional_parameter_reads_as_absent() {
-        let req = rewrite("kea://rewrite?preset=&instruction=");
-        assert_eq!(req.preset_id, None);
+        let req = rewrite("kea://rewrite?style=&instruction=");
+        assert_eq!(req.style, None);
         assert_eq!(req.instruction, None);
     }
 

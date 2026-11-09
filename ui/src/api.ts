@@ -21,20 +21,23 @@ export type RewriteMode =
   | "ask_kea"
   | "translate";
 
-export type RewritePreset = {
+/**
+ * A style the user wrote: a name for the picker and an instruction used as the
+ * rewrite prompt. It runs on the Rewrite AI like every built-in style.
+ */
+export type CustomStyle = {
   id: string;
   name: string;
   instruction: string;
-  /**
-   * The AI this preset asks for, or nulls to use whatever the Rewrite slot is
-   * bound to. Same three columns an app rule carries, at a different scope —
-   * and the app rule wins when both name one (see `llm_binding_over` in
-   * crates/features/src/feature.rs), which the editor says out loud.
-   */
-  llm_engine_id: string | null;
-  llm_model: string | null;
-  llm_provider_ref: string | null;
 };
+
+/**
+ * What names a style in `rewrite.active_mode`, an app rule's `rewrite_style`
+ * and the API's `style`: a {@link RewriteMode} tag or a {@link CustomStyle} id.
+ * A plain `string` because the second kind is open-ended; {@link isBuiltinStyle}
+ * tells them apart.
+ */
+export type StyleValue = string;
 
 export type VocabularyEntry = {
   id: string;
@@ -47,16 +50,33 @@ export type VocabularyEntry = {
 
 export type RewriteEventPayload = { message: string };
 
+/**
+ * The built-in styles the picker offers, in order. `audio_refinement` is
+ * deliberately absent: it is dictation's internal clean-up pass, never a style
+ * a person chooses to rewrite with.
+ */
 export const REWRITE_MODES: { value: RewriteMode; label: string }[] = [
   { value: "improve", label: "Improve" },
   { value: "fix_grammar", label: "Fix grammar" },
   { value: "professional", label: "Professional" },
   { value: "concise", label: "Concise" },
   { value: "friendly", label: "Friendly" },
-  { value: "audio_refinement", label: "Audio refinement" },
   { value: "ask_kea", label: "Ask KEA" },
   { value: "translate", label: "Translate" },
 ];
+
+/** Whether `value` names one of the built-in styles the picker offers. */
+export const isBuiltinStyle = (value: string): value is RewriteMode =>
+  REWRITE_MODES.some((m) => m.value === value);
+
+/** The label for any style value; an id nothing knows is shown as itself. */
+export function styleLabel(value: string, styles: CustomStyle[]): string {
+  return (
+    REWRITE_MODES.find((m) => m.value === value)?.label ??
+    styles.find((s) => s.id === value)?.name ??
+    value
+  );
+}
 
 /**
  * The extra value a mode's prompt template needs, mirroring
@@ -238,22 +258,13 @@ export const updateCustomProvider = (provider_ref: string, name: string) =>
 export const removeCustomProvider = (provider_ref: string) =>
   invoke<void>("remove_custom_provider", { providerRef: provider_ref });
 
-export const listPresets = () => invoke<RewritePreset[]>("list_presets");
+export const listCustomStyles = () => invoke<CustomStyle[]>("list_custom_styles");
 
-export const upsertPreset = (preset: RewritePreset) =>
-  invoke<void>("upsert_preset", { preset });
+export const upsertCustomStyle = (style: CustomStyle) =>
+  invoke<void>("upsert_custom_style", { style });
 
-export const deletePreset = (id: string) => invoke<void>("delete_preset", { id });
-
-/** A preset with no AI of its own — the shape the "add a preset" row writes. */
-export const newPreset = (id: string, name: string, instruction: string): RewritePreset => ({
-  id,
-  name,
-  instruction,
-  llm_engine_id: null,
-  llm_model: null,
-  llm_provider_ref: null,
-});
+/** Also resets the active style to Improve when it was the one deleted. */
+export const deleteCustomStyle = (id: string) => invoke<void>("delete_custom_style", { id });
 
 // ---------------------------------------------------------------------------
 // Undo the last rewrite
@@ -363,9 +374,8 @@ export type AppProfile = {
   match_bundle_id: string | null;
   /** `*` glob over host[/path], e.g. "*.slack.com/*"; null matches any page. */
   match_url_glob: string | null;
-  /** A {@link RewriteMode} tag, or null to inherit. */
-  rewrite_mode: string | null;
-  preset_id: string | null;
+  /** A {@link StyleValue} (built-in tag or custom style id), or null to inherit. */
+  rewrite_style: string | null;
   llm_engine_id: string | null;
   llm_model: string | null;
   llm_provider_ref: string | null;
@@ -458,17 +468,14 @@ export const clearHotkey = (feature: string, command: string) =>
 /**
  * Rewrites the current selection in the frontmost app and replaces it there.
  *
- * `parameter` is whatever the mode needs (see {@link MODE_PARAMETER}): Ask
- * KEA's instruction, Translate's BCP-47 target tag, null for the rest.
+ * `style` is a built-in tag or a custom style id. `parameter` is whatever a
+ * built-in mode needs (see {@link MODE_PARAMETER}): Ask KEA's instruction,
+ * Translate's BCP-47 target tag, null for the rest — and for a custom style,
+ * which carries its whole prompt.
  */
-export const triggerRewrite = (
-  mode: RewriteMode,
-  preset_id?: string | null,
-  parameter?: string | null,
-) =>
+export const triggerRewrite = (style: StyleValue, parameter?: string | null) =>
   invoke<string>("trigger_rewrite", {
-    mode,
-    presetId: preset_id ?? null,
+    style,
     customInstruction: parameter ?? null,
   });
 
@@ -480,14 +487,12 @@ export const triggerRewrite = (
  */
 export const previewRewrite = (
   text: string,
-  mode: RewriteMode,
-  preset_id?: string | null,
+  style: StyleValue,
   parameter?: string | null,
 ) =>
   invoke<string>("preview_rewrite", {
     text,
-    mode,
-    presetId: preset_id ?? null,
+    style,
     customInstruction: parameter ?? null,
   });
 

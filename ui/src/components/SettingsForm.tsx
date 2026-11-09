@@ -1,23 +1,16 @@
 import { useState, type ReactNode } from "react";
-import {
-  REWRITE_MODES,
-  TRANSLATION_TARGETS,
-  type RewriteMode,
-  type RewritePreset,
-} from "../api";
-import { useLlmChoices } from "../hooks/useLlmChoices";
+import { TRANSLATION_TARGETS, isBuiltinStyle } from "../api";
 import type { RewriteSettingsController } from "../hooks/useRewriteSettings";
+import CustomStyles from "./CustomStyles";
 import LoadingBlock from "./LoadingBlock";
 import { Row, RowGroup } from "./SettingsRow";
+import StyleOptions from "./StyleOptions";
 
 /**
- * The `<select>` value standing for "use the Rewrite AI", stored as null.
- * The empty string, because no engine or provider id can be empty — the same
- * spelling the app-rule editor uses for the same idea.
+ * The Style menu entry that opens the "add a style" form instead of choosing
+ * anything. Not a style id: those are `style-<time>` or a built-in tag.
  */
-const INHERIT = "";
-
-const orNull = (value: string) => (value.trim() === "" ? null : value.trim());
+const NEW_STYLE = "__new_style__";
 
 type Props = {
   /** The rewrite state, owned by whoever also runs the rewrites with it. */
@@ -29,27 +22,21 @@ type Props = {
 /**
  * The rewrite behaviour form. Presentational: every value it shows and every
  * write it makes goes through `rewrite`, so the only state left here is the
- * two half-typed fields of the "add a preset" row, which nothing else wants.
+ * counter that asks "Your styles" to open its add form, which nothing else wants.
  */
 export default function SettingsForm({ rewrite, leadingRows }: Props) {
-  const [newPresetName, setNewPresetName] = useState("");
-  const [newPresetInstruction, setNewPresetInstruction] = useState("");
-  const { presets, promptOverride, loading, busy, status, removePreset } = rewrite;
+  const [newStyleRequest, setNewStyleRequest] = useState(0);
+  const { styles, promptOverride, loading, busy, status } = rewrite;
   const {
-    mode,
+    style,
     custom_instruction: customInstruction,
     translate_target: translateTarget,
   } = rewrite.settings;
-  const presetId = rewrite.settings.preset_id ?? "";
+  // The two rows below belong to a built-in style's parameter; a custom style
+  // carries its whole prompt and has none.
+  const mode = isBuiltinStyle(style) ? style : null;
 
   const savePromptOverride = () => void rewrite.savePromptOverride();
-
-  const addPreset = async () => {
-    if (await rewrite.addPreset(newPresetName, newPresetInstruction)) {
-      setNewPresetName("");
-      setNewPresetInstruction("");
-    }
-  };
 
   return (
     <>
@@ -63,29 +50,18 @@ export default function SettingsForm({ rewrite, leadingRows }: Props) {
               <select
                 className="kea-select"
                 aria-label="Rewrite style"
-                value={mode}
-                onChange={(e) => rewrite.chooseMode(e.target.value as RewriteMode)}
+                value={style}
+                onChange={(e) => {
+                  if (e.target.value === NEW_STYLE) {
+                    // Opens the form; the selection itself does not change.
+                    setNewStyleRequest((n) => n + 1);
+                    return;
+                  }
+                  rewrite.chooseStyle(e.target.value);
+                }}
               >
-                {REWRITE_MODES.map((m) => (
-                  <option key={m.value} value={m.value}>
-                    {m.label}
-                  </option>
-                ))}
-              </select>
-            </Row>
-            <Row label="Preset" hint="A saved instruction, used instead of the style.">
-              <select
-                className="kea-select"
-                aria-label="Rewrite preset"
-                value={presetId}
-                onChange={(e) => rewrite.choosePreset(e.target.value)}
-              >
-                <option value="">None (use style)</option>
-                {presets.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
+                <StyleOptions styles={styles} />
+                <option value={NEW_STYLE}>+ New style…</option>
               </select>
             </Row>
             {mode === "translate" && (
@@ -128,97 +104,48 @@ export default function SettingsForm({ rewrite, leadingRows }: Props) {
             )}
           </RowGroup>
 
+          <CustomStyles rewrite={rewrite} newStyleRequest={newStyleRequest} />
+
           <details className="kea-advanced">
             <summary>Advanced</summary>
             <div className="kea-advanced__body">
-              <label>
-                <span className="kea-label">Prompt override (optional)</span>
-                <textarea
-                  className="kea-input"
-                  value={promptOverride}
-                  onChange={(e) => rewrite.editPromptOverride(e.target.value)}
-                  rows={3}
-                  style={{ resize: "vertical" }}
-                  placeholder="Override the built-in prompt for the selected style"
-                />
-              </label>
-              {mode === "translate" && (
+              {mode ? (
+                <>
+                  <label>
+                    <span className="kea-label">Prompt override (optional)</span>
+                    <textarea
+                      className="kea-input"
+                      value={promptOverride}
+                      onChange={(e) => rewrite.editPromptOverride(e.target.value)}
+                      rows={3}
+                      style={{ resize: "vertical" }}
+                      placeholder="Override the built-in prompt for the selected style"
+                    />
+                  </label>
+                  {mode === "translate" && (
+                    <p className="kea-muted" style={{ margin: 0, fontSize: "0.8125rem" }}>
+                      One prompt covers every language: keep{" "}
+                      <code>{"{{target_language}}"}</code> in it, which is replaced with
+                      the language you picked.
+                    </p>
+                  )}
+                  <div>
+                    <button
+                      type="button"
+                      className="kea-btn"
+                      onClick={savePromptOverride}
+                      disabled={busy}
+                    >
+                      Save prompt override
+                    </button>
+                  </div>
+                </>
+              ) : (
                 <p className="kea-muted" style={{ margin: 0, fontSize: "0.8125rem" }}>
-                  One prompt covers every language: keep{" "}
-                  <code>{"{{target_language}}"}</code> in it, which is replaced with
-                  the language you picked.
+                  The selected style is one of yours, so its instruction is the whole
+                  prompt. Edit it under Your styles.
                 </p>
               )}
-              <div>
-                <button
-                  type="button"
-                  className="kea-btn"
-                  onClick={savePromptOverride}
-                  disabled={busy}
-                >
-                  Save prompt override
-                </button>
-              </div>
-              <fieldset
-                style={{
-                  border: "1px solid var(--border)",
-                  borderRadius: 6,
-                  padding: 12,
-                  margin: 0,
-                }}
-              >
-                <legend style={{ fontWeight: 600 }}>Manage presets</legend>
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
-                  <input
-                    className="kea-input"
-                    value={newPresetName}
-                    onChange={(e) => setNewPresetName(e.target.value)}
-                    placeholder="Preset name"
-                    aria-label="Preset name"
-                    style={{ minWidth: 140, maxWidth: 200 }}
-                  />
-                  <input
-                    className="kea-input"
-                    value={newPresetInstruction}
-                    onChange={(e) => setNewPresetInstruction(e.target.value)}
-                    placeholder="Instruction"
-                    aria-label="Preset instruction"
-                    style={{ flex: 1, minWidth: 200, maxWidth: "none" }}
-                  />
-                  <button
-                    type="button"
-                    className="kea-btn"
-                    onClick={addPreset}
-                    disabled={busy || !newPresetName.trim() || !newPresetInstruction.trim()}
-                  >
-                    Add preset
-                  </button>
-                </div>
-                {presets.length > 0 && (
-                  <ul style={{ margin: 0, paddingLeft: 20 }}>
-                    {presets.map((p) => (
-                      <li key={p.id} style={{ marginBottom: 12 }}>
-                        <strong>{p.name}</strong> — {p.instruction.slice(0, 60)}
-                        {p.instruction.length > 60 ? "…" : ""}{" "}
-                        <button
-                          type="button"
-                          className="kea-btn"
-                          onClick={() => removePreset(p.id)}
-                          disabled={busy}
-                          style={{ marginLeft: 8 }}
-                        >
-                          Delete
-                        </button>
-                        <PresetAi
-                          preset={p}
-                          busy={busy}
-                          onSave={(next) => void rewrite.savePreset(next)}
-                        />
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </fieldset>
             </div>
           </details>
 
@@ -230,93 +157,5 @@ export default function SettingsForm({ rewrite, leadingRows }: Props) {
         </>
       )}
     </>
-  );
-}
-
-type PresetAiProps = {
-  preset: RewritePreset;
-  busy: boolean;
-  onSave: (preset: RewritePreset) => void;
-};
-
-/**
- * The AI one preset asks for.
- *
- * Bindings are per capability slot, so without this every preset shares one
- * model — you cannot spend a cheap model on grammar and an expensive one on a
- * hard rewrite. Leaving the engine on "the Rewrite AI" ignores the other two
- * fields, exactly as an app rule does: a model with no engine names nothing
- * KEA can resolve.
- */
-function PresetAi({ preset, busy, onSave }: PresetAiProps) {
-  const { engines, providers } = useLlmChoices();
-  const overridden = preset.llm_engine_id !== null;
-
-  return (
-    <details style={{ marginTop: 4 }}>
-      <summary style={{ cursor: "pointer", fontSize: "0.8125rem" }}>
-        AI: {overridden ? (preset.llm_model ?? preset.llm_engine_id) : "the Rewrite AI"}
-      </summary>
-      <div style={{ display: "grid", gap: 8, padding: "8px 0 0 4px" }}>
-        <p className="kea-muted" style={{ margin: 0, fontSize: "0.8125rem" }}>
-          An app rule that names its own AI wins over this one — a rule about where
-          the text is going is a constraint, and this is a preference about the job.
-        </p>
-        <label>
-          <span className="kea-label">AI engine</span>
-          <select
-            className="kea-select"
-            aria-label={`AI engine for ${preset.name}`}
-            value={preset.llm_engine_id ?? INHERIT}
-            disabled={busy}
-            onChange={(e) =>
-              onSave({ ...preset, llm_engine_id: orNull(e.target.value) })
-            }
-          >
-            <option value={INHERIT}>The Rewrite AI</option>
-            {engines.map((id) => (
-              <option key={id} value={id}>
-                {id}
-              </option>
-            ))}
-            {/* An engine saved by a newer build still has to show as the
-                selection, or this dropdown would silently re-target it. */}
-            {preset.llm_engine_id && !engines.includes(preset.llm_engine_id) && (
-              <option value={preset.llm_engine_id}>{preset.llm_engine_id}</option>
-            )}
-          </select>
-        </label>
-        <label>
-          <span className="kea-label">Model</span>
-          <input
-            className="kea-input"
-            aria-label={`Model for ${preset.name}`}
-            value={preset.llm_model ?? ""}
-            disabled={busy || !overridden}
-            onChange={(e) => onSave({ ...preset, llm_model: orNull(e.target.value) })}
-            placeholder="gpt-4o-mini"
-          />
-        </label>
-        <label>
-          <span className="kea-label">Provider</span>
-          <select
-            className="kea-select"
-            aria-label={`Provider for ${preset.name}`}
-            value={preset.llm_provider_ref ?? INHERIT}
-            disabled={busy || !overridden}
-            onChange={(e) =>
-              onSave({ ...preset, llm_provider_ref: orNull(e.target.value) })
-            }
-          >
-            <option value={INHERIT}>The engine's own</option>
-            {providers.map((p) => (
-              <option key={p.provider_ref} value={p.provider_ref}>
-                {p.name}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
-    </details>
   );
 }

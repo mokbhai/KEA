@@ -19,8 +19,7 @@ const profile = (over: Partial<AppProfile> = {}): AppProfile => ({
   priority: 0,
   match_bundle_id: "com.tinyspeck.slackmacgap",
   match_url_glob: null,
-  rewrite_mode: "friendly",
-  preset_id: null,
+  rewrite_style: "friendly",
   llm_engine_id: null,
   llm_model: null,
   llm_provider_ref: null,
@@ -53,7 +52,7 @@ function mockWorld({
     capture_app_context: () => null,
     get_setting: (args) => settings[(args as { key: string }).key] ?? null,
     set_setting: () => undefined,
-    list_presets: () => [{ id: "preset-1", name: "Standup", instruction: "be brief" }],
+    list_custom_styles: () => [{ id: "style-1", name: "Standup", instruction: "be brief" }],
     list_providers: () => [{ provider_ref: "openai", name: "OpenAI", built_in: true }],
     ...extra,
   });
@@ -120,14 +119,30 @@ describe("ProfilesPage", () => {
       enabled: true,
       match_bundle_id: "com.apple.Terminal",
       match_url_glob: null,
-      rewrite_mode: null,
-      preset_id: null,
+      rewrite_style: null,
       post_process: null,
       insertion_mode: null,
       llm_engine_id: null,
     });
     // The editor closes and the saved rule is listed.
     expect(await screen.findByRole("cell", { name: "Terminal" })).toBeTruthy();
+  });
+
+  it("lets a rule force one of the user's own styles, and lists it by name", async () => {
+    mockWorld({ profiles: [profile({ rewrite_style: "style-1" })] });
+    render(<ProfilesPage />);
+
+    const row = (await screen.findByRole("cell", { name: "Slack" })).closest("tr")!;
+    expect(within(row).getByText(/Standup/)).toBeTruthy();
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit Slack" }));
+    const select = screen.getByRole("combobox", { name: "Rewrite style" }) as HTMLSelectElement;
+    expect(select.value).toBe("style-1");
+
+    await userEvent.selectOptions(select, "concise");
+    await userEvent.click(screen.getByRole("button", { name: "Save rule" }));
+    await waitFor(() => expect(invokeCalls("upsert_app_profile")).toHaveLength(1));
+    expect(savedProfile().rewrite_style).toBe("concise");
   });
 
   describe("AI clean-up is a tri-state", () => {

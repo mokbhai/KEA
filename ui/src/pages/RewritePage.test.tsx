@@ -11,7 +11,7 @@ vi.mock("@tauri-apps/api/event", async () => (await import("../test-utils/tauri"
 const settingsHandlers = {
   get_setting: () => null,
   set_setting: () => undefined,
-  list_presets: () => [],
+  list_custom_styles: () => [],
   get_prompt_override: () => null,
 };
 
@@ -138,7 +138,7 @@ describe("RewritePage", () => {
     await userEvent.click(screen.getByRole("button", { name: "Rewrite this" }));
 
     await waitFor(() => expect(invokeCalls("preview_rewrite")).toHaveLength(1));
-    expect(invokeCalls("preview_rewrite")[0]).toMatchObject({ mode: "concise" });
+    expect(invokeCalls("preview_rewrite")[0]).toMatchObject({ style: "concise" });
   });
 
   it("sends the target language as the run's parameter when translating", async () => {
@@ -162,7 +162,7 @@ describe("RewritePage", () => {
     // One argument carries whatever the mode needs, so translate's tag rides
     // in the slot Ask KEA's instruction uses.
     expect(invokeCalls("preview_rewrite")[0]).toMatchObject({
-      mode: "translate",
+      style: "translate",
       customInstruction: "de",
     });
   });
@@ -253,10 +253,11 @@ describe("RewritePage", () => {
     ).toBeTruthy();
     expect(invokeCalls("trigger_rewrite")).toHaveLength(0);
     expect(invokeCalls("preview_rewrite")[0]).toMatchObject({
-      mode: "improve",
-      presetId: null,
+      style: "improve",
       customInstruction: null,
     });
+    // One style value now, not a mode plus a second selector.
+    expect(invokeCalls("preview_rewrite")[0]).not.toHaveProperty("mode");
   });
 
   it("offers to put the user's words back, and shows the refusal verbatim", async () => {

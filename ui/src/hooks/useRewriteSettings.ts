@@ -1,38 +1,39 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   MODE_PARAMETER,
-  REWRITE_MODES,
   clearHotkey,
-  deletePreset,
+  deleteCustomStyle,
   getPromptOverride,
   getSetting,
-  listPresets,
-  newPreset,
+  isBuiltinStyle,
+  listCustomStyles,
   setPromptOverride,
   setSetting,
   systemTranslationTarget,
   translateCommand,
-  upsertPreset,
-  type RewriteMode,
-  type RewritePreset,
+  upsertCustomStyle,
+  type CustomStyle,
+  type StyleValue,
 } from "../api";
 import { toMessage } from "../lib/format";
 
-/** What a rewrite run is parameterised by: the style, the preset, the free text. */
+/** What a rewrite run is parameterised by: the style and the free text. */
 export type RewriteSettings = {
-  mode: RewriteMode;
-  preset_id: string | null;
+  /** A built-in tag or a custom style id — one value, see {@link StyleValue}. */
+  style: StyleValue;
   custom_instruction: string;
   /** Translate's target, as a BCP-47 tag. */
   translate_target: string;
 };
 
 /**
- * The one extra value the chosen mode's prompt needs, or null when it needs
- * none — the shape both rewrite entry points take as their last argument.
+ * The one extra value the chosen style's prompt needs, or null when it needs
+ * none — the shape both rewrite entry points take as their last argument. A
+ * custom style carries its whole prompt, so it never needs one.
  */
 export function modeParameter(settings: RewriteSettings): string | null {
-  switch (MODE_PARAMETER[settings.mode]) {
+  if (!isBuiltinStyle(settings.style)) return null;
+  switch (MODE_PARAMETER[settings.style]) {
     case "instruction":
       return settings.custom_instruction || null;
     case "target_language":
@@ -55,18 +56,18 @@ export type RewriteSettingsController = {
   settings: RewriteSettings;
   /** {@link modeParameter} of the current settings, for whoever runs them. */
   parameter: string | null;
-  presets: RewritePreset[];
+  /** The user's own styles, in the order the picker lists them. */
+  styles: CustomStyle[];
   /** Tags with a translate shortcut of their own, in the order shown. */
   translateTargets: string[];
-  /** The prompt override for the currently selected style, "" when none. */
+  /** The prompt override for the selected built-in style, "" when none. */
   promptOverride: string;
   /** True until the mount fetch settles; the form shows a spinner instead. */
   loading: boolean;
   /** A write is in flight: the form disables its buttons. */
   busy: boolean;
   status: string | null;
-  chooseMode: (mode: RewriteMode) => void;
-  choosePreset: (presetId: string) => void;
+  chooseStyle: (style: StyleValue) => void;
   chooseTranslateTarget: (tag: string) => void;
   /** No-op when `tag` is already listed, so the list stays a set. */
   addTranslateTarget: (tag: string) => Promise<void>;
@@ -76,19 +77,18 @@ export type RewriteSettingsController = {
   commitCustomInstruction: (text: string) => void;
   editPromptOverride: (text: string) => void;
   savePromptOverride: () => Promise<void>;
-  /** Resolves true once the preset is stored, so the form can clear its inputs. */
-  addPreset: (name: string, instruction: string) => Promise<boolean>;
+  /** Resolves true once the style is stored, so the form can clear its inputs. */
+  addStyle: (name: string, instruction: string) => Promise<boolean>;
+  /** Resolves true once the edit is stored, so the form can close its editor. */
+  saveStyle: (style: CustomStyle) => Promise<boolean>;
   /**
-   * Writes a whole preset back — the editor's per-preset AI override goes
-   * through this rather than a third "save the llm columns" command, because
-   * `upsert_preset` already takes the whole row and a partial writer would be
-   * a second place that decides what a cleared override means.
+   * Deletes a style. The backend falls the active style back to Improve when
+   * it was the one deleted, and this mirrors that so the picker agrees.
    */
-  savePreset: (preset: RewritePreset) => Promise<void>;
-  removePreset: (id: string) => Promise<void>;
+  removeStyle: (id: string) => Promise<void>;
 };
 
-const DEFAULT_MODE: RewriteMode = "improve";
+const DEFAULT_STYLE: StyleValue = "improve";
 const TARGETS_KEY = "rewrite.translate.targets";
 
 /** The stored list, tolerant of a key never written or written as junk. */
@@ -104,8 +104,7 @@ function parseTargets(raw: string | null): string[] {
 }
 
 export function useRewriteSettings(): RewriteSettingsController {
-  const [mode, setMode] = useState<RewriteMode>(DEFAULT_MODE);
-  const [presetId, setPresetId] = useState("");
+  const [style, setStyle] = useState<StyleValue>(DEFAULT_STYLE);
   const [customInstruction, setCustomInstruction] = useState("");
   // Seeded from the system language: translating into your own is what an
   // unconfigured shortcut is for, and it beats showing a target the user never
@@ -113,25 +112,30 @@ export function useRewriteSettings(): RewriteSettingsController {
   const [translateTarget, setTranslateTarget] = useState(systemTranslationTarget);
   const [translateTargets, setTranslateTargets] = useState<string[]>([]);
   const [promptOverride, setPromptOverrideText] = useState("");
-  const [presets, setPresets] = useState<RewritePreset[]>([]);
+  const [styles, setStyles] = useState<CustomStyle[]>([]);
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   /** Set by the first edit: the mount fetch must not clobber what it replaced. */
   const editedRef = useRef(false);
 
-  const loadPresets = () =>
-    listPresets()
-      .then(setPresets)
-      .catch((e) => setStatus(toMessage(e)));
+  const loadStyles = () =>
+    listCustomStyles()
+      .then((list) => {
+        setStyles(list);
+        return list;
+      })
+      .catch((e) => {
+        setStatus(toMessage(e));
+        return [] as CustomStyle[];
+      });
 
   const persist = useCallback((next: RewriteSettings) => {
     editedRef.current = true;
     setBusy(true);
     setStatus(null);
     Promise.all([
-      setSetting("rewrite.active_mode", next.mode),
-      setSetting("rewrite.active_preset_id", next.preset_id ?? ""),
+      setSetting("rewrite.active_mode", next.style),
       setSetting("rewrite.custom_instruction", next.custom_instruction),
       setSetting("rewrite.translate.target", next.translate_target),
     ])
@@ -143,20 +147,20 @@ export function useRewriteSettings(): RewriteSettingsController {
   useEffect(() => {
     Promise.all([
       getSetting("rewrite.active_mode"),
-      getSetting("rewrite.active_preset_id"),
       getSetting("rewrite.custom_instruction"),
       getSetting("rewrite.translate.target"),
       getSetting(TARGETS_KEY),
-      loadPresets(),
+      loadStyles(),
     ])
-      .then(([activeMode, activePreset, customInst, target, targets]) => {
+      .then(([activeStyle, customInst, target, targets, list]) => {
         // An edit made while this was in flight already went to the store;
         // applying what the store held before it would undo the user.
         if (editedRef.current) return;
-        if (activeMode && REWRITE_MODES.some((m) => m.value === activeMode)) {
-          setMode(activeMode as RewriteMode);
+        // One stored value names either kind. A custom id that no longer
+        // exists reads as Improve, the same fallback the backend applies.
+        if (activeStyle && (isBuiltinStyle(activeStyle) || list.some((s) => s.id === activeStyle))) {
+          setStyle(activeStyle);
         }
-        setPresetId(activePreset ?? "");
         setCustomInstruction(customInst ?? "");
         // Absent or blank keeps the system-language seed rather than blanking
         // the picker.
@@ -169,26 +173,25 @@ export function useRewriteSettings(): RewriteSettingsController {
   }, []);
 
   useEffect(() => {
-    getPromptOverride(mode)
+    // Only a built-in style has a template to override.
+    if (!isBuiltinStyle(style)) {
+      setPromptOverrideText("");
+      return;
+    }
+    getPromptOverride(style)
       .then((value) => setPromptOverrideText(value ?? ""))
       .catch((e) => setStatus(toMessage(e)));
-  }, [mode]);
+  }, [style]);
 
   const settings: RewriteSettings = {
-    mode,
-    preset_id: presetId || null,
+    style,
     custom_instruction: customInstruction,
     translate_target: translateTarget,
   };
 
-  const chooseMode = (m: RewriteMode) => {
-    setMode(m);
-    persist({ ...settings, mode: m });
-  };
-
-  const choosePreset = (pid: string) => {
-    setPresetId(pid);
-    persist({ ...settings, preset_id: pid || null });
+  const chooseStyle = (value: StyleValue) => {
+    setStyle(value);
+    persist({ ...settings, style: value });
   };
 
   const chooseTranslateTarget = (tag: string) => {
@@ -249,10 +252,11 @@ export function useRewriteSettings(): RewriteSettingsController {
   };
 
   const savePromptOverride = async () => {
+    if (!isBuiltinStyle(style)) return;
     setBusy(true);
     setStatus(null);
     try {
-      await setPromptOverride(mode, promptOverride);
+      await setPromptOverride(style, promptOverride);
       setStatus("Prompt override saved.");
     } catch (e) {
       setStatus(toMessage(e));
@@ -261,17 +265,19 @@ export function useRewriteSettings(): RewriteSettingsController {
     }
   };
 
-  const addPreset = async (name: string, instruction: string) => {
+  const addStyle = async (name: string, instruction: string) => {
     if (!name.trim() || !instruction.trim()) return false;
+    editedRef.current = true;
     setBusy(true);
     setStatus(null);
     try {
-      const id = `preset-${Date.now()}`;
-      await upsertPreset(newPreset(id, name.trim(), instruction.trim()));
-      await loadPresets();
-      setPresetId(id);
-      persist({ ...settings, preset_id: id });
-      setStatus("Preset added.");
+      await upsertCustomStyle({
+        id: `style-${Date.now()}`,
+        name: name.trim(),
+        instruction: instruction.trim(),
+      });
+      await loadStyles();
+      setStatus("Style added. Choose it from the Style menu to use it.");
       return true;
     } catch (e) {
       setStatus(toMessage(e));
@@ -281,37 +287,39 @@ export function useRewriteSettings(): RewriteSettingsController {
     }
   };
 
-  const savePreset = async (preset: RewritePreset) => {
+  const saveStyle = async (edited: CustomStyle) => {
+    if (!edited.name.trim() || !edited.instruction.trim()) return false;
+    editedRef.current = true;
     setBusy(true);
     setStatus(null);
-    // Shown before the write lands: the pickers are `<select>`s bound to the
-    // stored list, so waiting would leave the one just changed showing its old
-    // value for the length of a round trip.
-    setPresets((current) => current.map((p) => (p.id === preset.id ? preset : p)));
     try {
-      await upsertPreset(preset);
-      setStatus("Preset saved.");
+      await upsertCustomStyle({
+        ...edited,
+        name: edited.name.trim(),
+        instruction: edited.instruction.trim(),
+      });
+      await loadStyles();
+      setStatus("Style saved.");
+      return true;
     } catch (e) {
       setStatus(toMessage(e));
-      // Put back whatever is actually stored, rather than leaving the form
-      // showing an override the backend refused.
-      await loadPresets();
+      return false;
     } finally {
       setBusy(false);
     }
   };
 
-  const removePreset = async (id: string) => {
+  const removeStyle = async (id: string) => {
+    editedRef.current = true;
     setBusy(true);
     setStatus(null);
     try {
-      await deletePreset(id);
-      if (presetId === id) {
-        setPresetId("");
-        persist({ ...settings, preset_id: null });
-      }
-      await loadPresets();
-      setStatus("Preset deleted.");
+      await deleteCustomStyle(id);
+      // The backend has already reset the stored selection; mirror it rather
+      // than writing it again, so the picker cannot disagree with the store.
+      if (style === id) setStyle(DEFAULT_STYLE);
+      await loadStyles();
+      setStatus("Style deleted.");
     } catch (e) {
       setStatus(toMessage(e));
     } finally {
@@ -322,14 +330,13 @@ export function useRewriteSettings(): RewriteSettingsController {
   return {
     settings,
     parameter: modeParameter(settings),
-    presets,
+    styles,
     translateTargets,
     promptOverride,
     loading,
     busy,
     status,
-    chooseMode,
-    choosePreset,
+    chooseStyle,
     chooseTranslateTarget,
     addTranslateTarget,
     removeTranslateTarget,
@@ -337,8 +344,8 @@ export function useRewriteSettings(): RewriteSettingsController {
     commitCustomInstruction: (text) => persist({ ...settings, custom_instruction: text }),
     editPromptOverride: setPromptOverrideText,
     savePromptOverride,
-    addPreset,
-    savePreset,
-    removePreset,
+    addStyle,
+    saveStyle,
+    removeStyle,
   };
 }

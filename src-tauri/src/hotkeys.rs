@@ -491,9 +491,9 @@ fn handle_rewrite<'a>(
 /// Translate the selection into this shortcut's language.
 ///
 /// The rewrite shortcut's body with the mode and its parameter forced: a
-/// translate key does not ask what the saved style is, and clearing the active
-/// preset is part of forcing the mode (see `set_rewrite_mode`) — a preset
-/// replaces the prompt template outright.
+/// translate key does not ask what the saved style is, and dropping a selected
+/// custom style is part of forcing the mode (see `set_rewrite_style`) — a
+/// custom style replaces the prompt template outright.
 fn handle_translate<'a>(
     state: &'a Arc<AppState>,
     app: &'a AppHandle,
@@ -513,9 +513,8 @@ fn handle_translate<'a>(
         let language = describe(tag).unwrap_or_else(|_| tag.to_string());
         emit_rewrite_progress(app, &format!("Translating to {language}..."));
         let over = RewriteOverride {
-            mode: Some(RewriteMode::Translate),
+            style: Some(RewriteMode::Translate.into()),
             instruction: Some(tag.to_string()),
-            ..RewriteOverride::default()
         };
         match run_selection_rewrite(state, &over).await {
             Ok(_) => emit_rewrite_progress(app, "Done"),

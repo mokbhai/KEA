@@ -197,8 +197,15 @@ fn match_route(method: &Method, path: &str) -> Option<RouteKind> {
 #[serde(deny_unknown_fields)]
 struct RewriteBody {
     text: Option<String>,
+    /// A built-in style name or a custom style id.
+    style: Option<String>,
+    /// The older spelling of `style`, built-in names only.
     mode: Option<String>,
-    preset_id: Option<String>,
+    /// Removed with presets. Accepted only to be refused by name in
+    /// [`action_for`]: with `deny_unknown_fields` alone the caller would get
+    /// a generic "unknown field" error that does not say what replaced it.
+    preset_id: Option<serde_json::Value>,
+    preset: Option<serde_json::Value>,
     instruction: Option<String>,
     #[serde(default)]
     insert: bool,
@@ -230,23 +237,24 @@ fn action_for(kind: RouteKind, body: &[u8]) -> Result<KeaAction, ActionError> {
     match kind {
         RouteKind::Rewrite => {
             let body: RewriteBody = parse_body(body)?;
-            // The mode parser is `RewriteMode::from_str`, here as everywhere:
-            // it already rejects an unknown value, and a second one would
-            // eventually disagree with it.
-            let mode = match body.mode.filter(|m| !m.is_empty()) {
-                None => None,
-                Some(raw) => Some(kea_core::rewrite::RewriteMode::from_str(&raw).ok_or_else(
-                    || {
-                        ActionError::Refused(
-                            super::actions::ParseError::UnknownMode(raw).to_string(),
-                        )
-                    },
-                )?),
-            };
+            for (field, value) in [("preset_id", &body.preset_id), ("preset", &body.preset)] {
+                if value.is_some() {
+                    return Err(ActionError::Refused(
+                        super::actions::ParseError::PresetRemoved(field).to_string(),
+                    ));
+                }
+            }
+            // The same rule the URL scheme applies (`resolve_style_params`):
+            // `RewriteMode::from_str` rejects an unknown `mode`, and a second
+            // parser here would eventually disagree with it.
+            let style = super::actions::resolve_style_params(
+                body.style.filter(|s| !s.is_empty()),
+                body.mode.filter(|m| !m.is_empty()),
+            )
+            .map_err(|e| ActionError::Refused(e.to_string()))?;
             let request = RewriteRequest {
                 text: body.text.filter(|t| !t.is_empty()),
-                mode,
-                preset_id: body.preset_id.filter(|p| !p.is_empty()),
+                style,
                 instruction: body.instruction.filter(|i| !i.is_empty()),
                 insert: body.insert,
             };
@@ -1526,13 +1534,17 @@ mod tests {
 
     #[test]
     fn a_rewrite_body_maps_onto_the_same_request_the_url_parses() {
-        let json = br#"{"mode":"professional","preset_id":"p1","insert":true}"#;
+        let json = br#"{"style":"professional","insert":true}"#;
         let action = action_for(RouteKind::Rewrite, json).unwrap();
         let super::KeaAction::Rewrite(req) = action else {
             panic!("expected a rewrite")
         };
-        assert_eq!(req.mode, Some(kea_core::rewrite::RewriteMode::Professional));
-        assert_eq!(req.preset_id.as_deref(), Some("p1"));
+        assert_eq!(
+            req.style,
+            Some(kea_core::rewrite::StyleRef::Builtin(
+                kea_core::rewrite::RewriteMode::Professional
+            ))
+        );
         assert!(req.insert);
     }
 
@@ -1550,10 +1562,56 @@ mod tests {
     }
 
     #[test]
+    fn a_custom_style_id_passes_through_for_the_runner_to_check() {
+        let action = action_for(RouteKind::Rewrite, br#"{"style":"style-1699"}"#).unwrap();
+        let super::KeaAction::Rewrite(req) = action else {
+            panic!("expected a rewrite")
+        };
+        assert_eq!(
+            req.style,
+            Some(kea_core::rewrite::StyleRef::Custom("style-1699".into()))
+        );
+    }
+
+    #[test]
+    fn the_mode_alias_still_works_and_cannot_be_combined_with_style() {
+        let action = action_for(RouteKind::Rewrite, br#"{"mode":"concise"}"#).unwrap();
+        let super::KeaAction::Rewrite(req) = action else {
+            panic!("expected a rewrite")
+        };
+        assert_eq!(
+            req.style,
+            Some(kea_core::rewrite::StyleRef::Builtin(
+                kea_core::rewrite::RewriteMode::Concise
+            ))
+        );
+        let err = action_for(
+            RouteKind::Rewrite,
+            br#"{"style":"concise","mode":"friendly"}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn a_removed_preset_field_is_a_400_naming_style() {
+        // Both spellings the old API accepted or suggested.
+        for body in [
+            br#"{"preset_id":"p1"}"# as &[u8],
+            br#"{"preset":"p1"}"#,
+            br#"{"mode":"concise","preset_id":"p1","insert":true}"#,
+        ] {
+            let err = action_for(RouteKind::Rewrite, body).unwrap_err();
+            assert_eq!(err.status(), 400);
+            let message = err.to_string();
+            assert!(message.contains("`style`"), "{message}");
+            assert!(message.contains("preset"), "{message}");
+        }
+    }
+
+    #[test]
     fn an_unknown_field_is_refused_rather_than_ignored() {
-        // A caller that spelled `preset` instead of `preset_id` should hear
-        // about it, not get the default preset silently.
-        let err = action_for(RouteKind::Rewrite, br#"{"preset":"p1"}"#).unwrap_err();
+        let err = action_for(RouteKind::Rewrite, br#"{"tone":"formal"}"#).unwrap_err();
         assert_eq!(err.status(), 400);
     }
 

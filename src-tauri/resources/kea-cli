@@ -35,14 +35,14 @@ usage() {
 usage: kea [--api-url URL] <command> [options]
 
 Fire-and-forget (no local API needed):
-  kea rewrite [--mode MODE] [--preset ID] [--instruction TEXT]
+  kea rewrite [--style STYLE] [--instruction TEXT]
   kea dictation start|stop|toggle
   kea read-aloud
   kea open PAGE                  (general, rewrite, dictation, models, …)
 
 Request/response (needs the local API, enabled on KEA's General page):
-  kea rewrite --text TEXT [--mode MODE]     prints the rewritten text
-  kea rewrite --insert [--mode MODE]        rewrites the selection in place
+  kea rewrite --text TEXT [--style STYLE]   prints the rewritten text
+  kea rewrite --insert [--style STYLE]      rewrites the selection in place
   kea dictate-stop                          prints the transcript
   kea transcribe PATH                       transcribes an audio/video file
   kea status                                prints version and lifecycle state
@@ -59,8 +59,9 @@ Models (the local API's OpenAI-compatible routes):
                                             appended to PROMPT
   kea models [--json]                       lists the models the API accepts
 
-MODE is one of: improve, fix_grammar, professional, concise, friendly,
-audio_refinement, ask_kea, translate.
+STYLE is a built-in style (improve, fix_grammar, professional, concise,
+friendly, ask_kea, translate) or the id of one of your own styles. --mode is
+still accepted as another spelling of --style for the built-in ones.
 
 --speakers labels each segment "Person 1", "Person 2", … (needs the speaker
 models). --speed is 0.25 to 4.0.
@@ -444,11 +445,10 @@ esac
 
 case "$command" in
   rewrite)
-    mode=""; preset=""; instruction=""; text=""; insert=0
+    style=""; instruction=""; text=""; insert=0
     while [ $# -gt 0 ]; do
       case "$1" in
-        --mode) mode="$2"; shift 2 ;;
-        --preset) preset="$2"; shift 2 ;;
+        --style|--mode) style="$2"; shift 2 ;;
         --instruction) instruction="$2"; shift 2 ;;
         --text) text="$2"; shift 2 ;;
         --insert) insert=1; shift ;;
@@ -459,16 +459,14 @@ case "$command" in
     if [ -n "$text" ] || [ "$insert" -eq 1 ]; then
       body="{"
       [ -n "$text" ] && body="${body}\"text\":$(json_string "$text"),"
-      [ -n "$mode" ] && body="${body}\"mode\":$(json_string "$mode"),"
-      [ -n "$preset" ] && body="${body}\"preset_id\":$(json_string "$preset"),"
+      [ -n "$style" ] && body="${body}\"style\":$(json_string "$style"),"
       [ -n "$instruction" ] && body="${body}\"instruction\":$(json_string "$instruction"),"
       body="${body}\"insert\":$( [ "$insert" -eq 1 ] && echo true || echo false )}"
       api_json POST /v1/rewrite "$body"
       echo
     else
       url="kea://rewrite"; sep="?"
-      [ -n "$mode" ] && { url="${url}${sep}mode=$(urlencode "$mode")"; sep="&"; }
-      [ -n "$preset" ] && { url="${url}${sep}preset=$(urlencode "$preset")"; sep="&"; }
+      [ -n "$style" ] && { url="${url}${sep}style=$(urlencode "$style")"; sep="&"; }
       [ -n "$instruction" ] && { url="${url}${sep}instruction=$(urlencode "$instruction")"; sep="&"; }
       open_url "$url"
     fi

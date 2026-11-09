@@ -5,20 +5,22 @@ import {
   getSetting,
   listAppProfiles,
   listLlmEngines,
-  listPresets,
+  listCustomStyles,
   listProviders,
   setSetting,
   upsertAppProfile,
   CAPTURE_URL_SETTING,
   CAPTURE_WINDOW_TITLE_SETTING,
   INSERTION_MODES,
-  REWRITE_MODES,
+  isBuiltinStyle,
+  styleLabel,
   type AppProfile,
   type Provider,
-  type RewritePreset,
+  type CustomStyle,
 } from "../api";
 import LoadingBlock from "../components/LoadingBlock";
 import { Row, RowGroup } from "../components/SettingsRow";
+import StyleOptions from "../components/StyleOptions";
 import Toggle from "../components/Toggle";
 import { useOptimisticSetting } from "../hooks/useOptimisticSetting";
 import { enginesFor } from "../lib/engines";
@@ -26,7 +28,7 @@ import { toMessage } from "../lib/format";
 
 /**
  * The `<select>` value standing for "inherit the global setting", which is
- * stored as null. The empty string, because no mode, preset id or engine id
+ * stored as null. The empty string, because no style or engine id
  * can be empty.
  */
 const INHERIT = "";
@@ -79,13 +81,9 @@ function matchSummary(p: AppProfile): string {
 }
 
 /** What this rule changes, or what to say when it changes nothing. */
-function effectSummary(p: AppProfile, presets: RewritePreset[]): string {
+function effectSummary(p: AppProfile, styles: CustomStyle[]): string {
   const parts: string[] = [];
-  const preset = presets.find((r) => r.id === p.preset_id);
-  if (preset) parts.push(preset.name);
-  else if (p.rewrite_mode) {
-    parts.push(REWRITE_MODES.find((m) => m.value === p.rewrite_mode)?.label ?? p.rewrite_mode);
-  }
+  if (p.rewrite_style) parts.push(styleLabel(p.rewrite_style, styles));
   if (p.post_process !== null) parts.push(p.post_process ? "AI clean-up" : "no AI clean-up");
   if (p.insertion_mode) {
     parts.push(
@@ -109,8 +107,7 @@ function newProfile(existing: AppProfile[]): AppProfile {
     priority: existing.reduce((max, p) => Math.max(max, p.priority), 0) + 1,
     match_bundle_id: null,
     match_url_glob: null,
-    rewrite_mode: null,
-    preset_id: null,
+    rewrite_style: null,
     llm_engine_id: null,
     llm_model: null,
     llm_provider_ref: null,
@@ -129,7 +126,7 @@ type CaptureSettings = { windowTitle: boolean; url: boolean };
 
 export default function ProfilesPage() {
   const [profiles, setProfiles] = useState<AppProfile[] | null>(null);
-  const [presets, setPresets] = useState<RewritePreset[]>([]);
+  const [styles, setStyles] = useState<CustomStyle[]>([]);
   const [llmEngines, setLlmEngines] = useState<string[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -160,9 +157,9 @@ export default function ProfilesPage() {
       });
     // The editor's dropdowns degrade to "inherit only" rather than taking the
     // page down with them.
-    listPresets()
-      .then(setPresets)
-      .catch(() => setPresets([]));
+    listCustomStyles()
+      .then(setStyles)
+      .catch(() => setStyles([]));
     listLlmEngines()
       .then((infos) => {
         const known = new Set<string>(enginesFor("llm").map((e) => e.id));
@@ -372,7 +369,7 @@ export default function ProfilesPage() {
                       </td>
                       <td>{profile.name}</td>
                       <td>{matchSummary(profile)}</td>
-                      <td>{effectSummary(profile, presets)}</td>
+                      <td>{effectSummary(profile, styles)}</td>
                       <td>
                         <Toggle
                           label={`Use ${profile.name}`}
@@ -494,36 +491,19 @@ export default function ProfilesPage() {
                 <select
                   className="kea-select"
                   aria-label="Rewrite style"
-                  value={draft.rewrite_mode ?? INHERIT}
-                  onChange={(e) => editField({ rewrite_mode: orNull(e.target.value) })}
+                  value={draft.rewrite_style ?? INHERIT}
+                  onChange={(e) => editField({ rewrite_style: orNull(e.target.value) })}
                 >
                   <option value={INHERIT}>Inherit — whatever Rewrite is set to</option>
-                  {REWRITE_MODES.map((m) => (
-                    <option key={m.value} value={m.value}>
-                      {m.label}
-                    </option>
-                  ))}
-                  {/* A mode saved by a newer build still has to show as the
-                      selection, or this dropdown would silently re-target it. */}
-                  {draft.rewrite_mode &&
-                    !REWRITE_MODES.some((m) => m.value === draft.rewrite_mode) && (
-                      <option value={draft.rewrite_mode}>{draft.rewrite_mode}</option>
+                  <StyleOptions styles={styles} />
+                  {/* A style this build cannot find — saved by a newer build, or
+                      since deleted — still has to show as the selection, or this
+                      dropdown would silently re-target it. */}
+                  {draft.rewrite_style &&
+                    !isBuiltinStyle(draft.rewrite_style) &&
+                    !styles.some((s) => s.id === draft.rewrite_style) && (
+                      <option value={draft.rewrite_style}>{draft.rewrite_style}</option>
                     )}
-                </select>
-              </Row>
-              <Row label="Preset" hint="A saved instruction, used instead of the style.">
-                <select
-                  className="kea-select"
-                  aria-label="Rewrite preset"
-                  value={draft.preset_id ?? INHERIT}
-                  onChange={(e) => editField({ preset_id: orNull(e.target.value) })}
-                >
-                  <option value={INHERIT}>Inherit — whatever Rewrite is set to</option>
-                  {presets.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}
-                    </option>
-                  ))}
                 </select>
               </Row>
               <Row

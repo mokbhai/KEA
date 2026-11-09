@@ -19,9 +19,9 @@ import { toMessage } from "../lib/format";
 const PREVIEW_DEBOUNCE_MS = 200;
 
 /**
- * Ids follow the preset convention (`preset-${Date.now()}`), with the index
- * mixed in because a bulk import mints a whole block inside one millisecond
- * and identical ids would upsert over each other.
+ * Ids are `vocab-<time>-<index>`, with the index mixed in because a bulk import
+ * mints a whole block inside one millisecond and identical ids would upsert
+ * over each other.
  */
 function newEntry(term: string, soundsLike: string | null, index: number): VocabularyEntry {
   return {

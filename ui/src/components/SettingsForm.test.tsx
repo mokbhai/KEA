@@ -1,7 +1,7 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
-import type { RewritePreset } from "../api";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { CustomStyle } from "../api";
 import type { RewriteSettingsController } from "../hooks/useRewriteSettings";
 import SettingsForm from "./SettingsForm";
 
@@ -10,28 +10,26 @@ vi.mock("@tauri-apps/api/event", async () => (await import("../test-utils/tauri"
 
 /**
  * The form is presentational, so it is tested against a hand-built controller
- * rather than the hook — what matters here is which rows appear for which mode
- * and which handler a change reaches.
+ * rather than the hook — what matters here is which rows appear for which
+ * style and which handler a change reaches.
  */
 function controller(
   overrides: Partial<RewriteSettingsController> = {},
 ): RewriteSettingsController {
   return {
     settings: {
-      mode: "improve",
-      preset_id: null,
+      style: "improve",
       custom_instruction: "",
       translate_target: "fr",
     },
     parameter: null,
-    presets: [],
+    styles: [],
     translateTargets: [],
     promptOverride: "",
     loading: false,
     busy: false,
     status: null,
-    chooseMode: vi.fn(),
-    choosePreset: vi.fn(),
+    chooseStyle: vi.fn(),
     chooseTranslateTarget: vi.fn(),
     addTranslateTarget: vi.fn(async () => {}),
     removeTranslateTarget: vi.fn(async () => {}),
@@ -39,9 +37,9 @@ function controller(
     commitCustomInstruction: vi.fn(),
     editPromptOverride: vi.fn(),
     savePromptOverride: vi.fn(async () => {}),
-    addPreset: vi.fn(async () => true),
-    savePreset: vi.fn(async () => {}),
-    removePreset: vi.fn(async () => {}),
+    addStyle: vi.fn(async () => true),
+    saveStyle: vi.fn(async () => true),
+    removeStyle: vi.fn(async () => {}),
     ...overrides,
   };
 }
@@ -49,12 +47,25 @@ function controller(
 const translating = (target = "fr") =>
   controller({
     settings: {
-      mode: "translate",
-      preset_id: null,
+      style: "translate",
       custom_instruction: "",
       translate_target: target,
     },
   });
+
+const style = (over: Partial<CustomStyle> = {}): CustomStyle => ({
+  id: "style-1",
+  name: "Standup",
+  instruction: "Rewrite as three bullets",
+  ...over,
+});
+
+const optionLabels = (select: HTMLElement) =>
+  within(select)
+    .getAllByRole("option")
+    .map((o) => o.textContent);
+
+afterEach(() => vi.restoreAllMocks());
 
 describe("SettingsForm", () => {
   it("offers the target language only while translating", () => {
@@ -95,55 +106,212 @@ describe("SettingsForm", () => {
     expect(screen.queryByLabelText("Custom instruction")).toBeNull();
   });
 
-  const preset = (over: Partial<RewritePreset> = {}): RewritePreset => ({
-    id: "p1",
-    name: "Grammar",
-    instruction: "Fix the grammar",
-    llm_engine_id: null,
-    llm_model: null,
-    llm_provider_ref: null,
-    ...over,
-  });
+  describe("the Style menu", () => {
+    it("lists the built-ins, then the user's styles, then the add entry", () => {
+      render(
+        <SettingsForm
+          rewrite={controller({ styles: [style(), style({ id: "style-2", name: "Pirate" })] })}
+        />,
+      );
 
-  it("shows a preset with no AI of its own as inheriting the Rewrite AI", async () => {
-    const rewrite = controller({ presets: [preset()] });
-    render(<SettingsForm rewrite={rewrite} />);
-
-    const select = await screen.findByLabelText<HTMLSelectElement>("AI engine for Grammar");
-    expect(select.value).toBe("");
-    // The model and provider mean nothing without an engine, so they are not
-    // offered until one is chosen.
-    expect(screen.getByLabelText<HTMLInputElement>("Model for Grammar").disabled).toBe(true);
-  });
-
-  it("writes the whole preset back when its engine changes", async () => {
-    const rewrite = controller({
-      presets: [preset({ llm_engine_id: "openai", llm_model: "gpt-4o" })],
+      expect(optionLabels(screen.getByLabelText("Rewrite style"))).toEqual([
+        "Improve",
+        "Fix grammar",
+        "Professional",
+        "Concise",
+        "Friendly",
+        "Ask KEA",
+        "Translate",
+        "Standup",
+        "Pirate",
+        "+ New style…",
+      ]);
     });
-    render(<SettingsForm rewrite={rewrite} />);
 
-    const model = await screen.findByLabelText<HTMLInputElement>("Model for Grammar");
-    expect(model.disabled).toBe(false);
+    it("never offers dictation's internal audio refinement", () => {
+      render(<SettingsForm rewrite={controller()} />);
 
-    await userEvent.type(model, "-mini");
+      const labels = optionLabels(screen.getByLabelText("Rewrite style"));
+      expect(labels.join("|")).not.toMatch(/audio/i);
+    });
 
-    // The whole row goes back, not just the field that changed: `upsert_preset`
-    // takes the whole preset, and a partial write would drop the instruction.
-    expect(rewrite.savePreset).toHaveBeenCalledWith(
-      expect.objectContaining({
-        id: "p1",
-        name: "Grammar",
-        instruction: "Fix the grammar",
-        llm_engine_id: "openai",
-      }),
-    );
+    it("has no second selector for a saved instruction", () => {
+      render(<SettingsForm rewrite={controller({ styles: [style()] })} />);
+
+      expect(screen.queryByLabelText(/preset/i)).toBeNull();
+    });
+
+    it("selects a custom style through the same menu and the same handler", async () => {
+      const rewrite = controller({ styles: [style()] });
+      render(<SettingsForm rewrite={rewrite} />);
+
+      await userEvent.selectOptions(screen.getByLabelText("Rewrite style"), "style-1");
+
+      expect(rewrite.chooseStyle).toHaveBeenCalledWith("style-1");
+    });
+
+    it("shows the selected custom style as the menu's value", () => {
+      render(
+        <SettingsForm
+          rewrite={controller({
+            styles: [style()],
+            settings: { style: "style-1", custom_instruction: "", translate_target: "fr" },
+          })}
+        />,
+      );
+
+      expect(screen.getByLabelText<HTMLSelectElement>("Rewrite style").value).toBe("style-1");
+      // A custom style carries its whole prompt: no mode parameter rows, and
+      // no built-in template to override.
+      expect(screen.queryByLabelText("Target language")).toBeNull();
+      expect(screen.queryByLabelText("Custom instruction")).toBeNull();
+      expect(screen.queryByText("Save prompt override")).toBeNull();
+    });
+
+    it("'+ New style…' opens the add form instead of changing the style", async () => {
+      const rewrite = controller();
+      render(<SettingsForm rewrite={rewrite} />);
+
+      await userEvent.selectOptions(screen.getByLabelText("Rewrite style"), "+ New style…");
+
+      expect(rewrite.chooseStyle).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(screen.getByLabelText("New style name"));
+    });
   });
 
-  it("says which override wins when an app rule also names an AI", async () => {
-    // The precedence is a decision the user cannot discover by trying it —
-    // the rule only applies in one app — so the editor states it.
-    render(<SettingsForm rewrite={controller({ presets: [preset()] })} />);
+  describe("Your styles", () => {
+    it("is a section of its own, not tucked under Advanced", () => {
+      render(<SettingsForm rewrite={controller({ styles: [style()] })} />);
 
-    expect(await screen.findByText(/app rule that names its own AI wins/i)).toBeTruthy();
+      const heading = screen.getByRole("heading", { name: "Your styles" });
+      expect(heading.closest("details")).toBeNull();
+      expect(screen.getByRole("button", { name: "Edit Standup" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Delete Standup" })).toBeTruthy();
+    });
+
+    it("says so when there are none", () => {
+      render(<SettingsForm rewrite={controller()} />);
+
+      expect(screen.getByText(/not added a style yet/)).toBeTruthy();
+    });
+
+    it("adds a style from a name and a multi-line instruction, then clears the form", async () => {
+      const rewrite = controller();
+      render(<SettingsForm rewrite={rewrite} />);
+
+      await userEvent.type(screen.getByLabelText("New style name"), "  Standup ");
+      await userEvent.type(
+        screen.getByLabelText("New style instruction"),
+        "Three bullets{Enter}Past tense",
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Add style" }));
+
+      expect(rewrite.addStyle).toHaveBeenCalledWith(
+        "  Standup ",
+        "Three bullets\nPast tense",
+      );
+      // Cleared only because the write succeeded.
+      expect(screen.getByLabelText<HTMLInputElement>("New style name").value).toBe("");
+      expect(screen.getByLabelText<HTMLTextAreaElement>("New style instruction").value).toBe("");
+    });
+
+    it("refuses an empty name or an empty instruction", async () => {
+      const rewrite = controller();
+      render(<SettingsForm rewrite={rewrite} />);
+
+      await userEvent.click(screen.getByRole("button", { name: "Add style" }));
+      expect(rewrite.addStyle).not.toHaveBeenCalled();
+
+      await userEvent.type(screen.getByLabelText("New style name"), "Standup");
+      await userEvent.click(screen.getByRole("button", { name: "Add style" }));
+      expect(rewrite.addStyle).not.toHaveBeenCalled();
+      expect((await screen.findByRole("alert")).textContent).toMatch(/instruction/i);
+
+      // Whitespace is not content.
+      await userEvent.type(screen.getByLabelText("New style instruction"), "   ");
+      await userEvent.click(screen.getByRole("button", { name: "Add style" }));
+      expect(rewrite.addStyle).not.toHaveBeenCalled();
+    });
+
+    it("refuses a name that is already taken, ignoring case and spaces", async () => {
+      const rewrite = controller({ styles: [style()] });
+      render(<SettingsForm rewrite={rewrite} />);
+
+      await userEvent.type(screen.getByLabelText("New style name"), " standup ");
+      await userEvent.type(screen.getByLabelText("New style instruction"), "x");
+      await userEvent.click(screen.getByRole("button", { name: "Add style" }));
+
+      expect(rewrite.addStyle).not.toHaveBeenCalled();
+      expect((await screen.findByRole("alert")).textContent).toMatch(/already exists/);
+    });
+
+    it("refuses the name of a built-in style", async () => {
+      const rewrite = controller();
+      render(<SettingsForm rewrite={rewrite} />);
+
+      await userEvent.type(screen.getByLabelText("New style name"), "Improve");
+      await userEvent.type(screen.getByLabelText("New style instruction"), "x");
+      await userEvent.click(screen.getByRole("button", { name: "Add style" }));
+
+      expect(rewrite.addStyle).not.toHaveBeenCalled();
+      expect((await screen.findByRole("alert")).textContent).toMatch(/already exists/);
+    });
+
+    it("edits a style in place and writes the whole style back under its id", async () => {
+      const rewrite = controller({ styles: [style()] });
+      render(<SettingsForm rewrite={rewrite} />);
+
+      await userEvent.click(screen.getByRole("button", { name: "Edit Standup" }));
+      const instruction = screen.getByLabelText<HTMLTextAreaElement>("Edited style instruction");
+      expect(instruction.value).toBe("Rewrite as three bullets");
+      await userEvent.clear(instruction);
+      await userEvent.type(instruction, "Two bullets");
+      await userEvent.click(screen.getByRole("button", { name: "Save style" }));
+
+      expect(rewrite.saveStyle).toHaveBeenCalledWith({
+        id: "style-1",
+        name: "Standup",
+        instruction: "Two bullets",
+      });
+    });
+
+    it("lets a style keep its own name while it is edited", async () => {
+      const rewrite = controller({ styles: [style()] });
+      render(<SettingsForm rewrite={rewrite} />);
+
+      await userEvent.click(screen.getByRole("button", { name: "Edit Standup" }));
+      await userEvent.click(screen.getByRole("button", { name: "Save style" }));
+
+      expect(rewrite.saveStyle).toHaveBeenCalled();
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
+
+    it("deletes a style that is not in use without asking", async () => {
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+      const rewrite = controller({ styles: [style()] });
+      render(<SettingsForm rewrite={rewrite} />);
+
+      await userEvent.click(screen.getByRole("button", { name: "Delete Standup" }));
+
+      expect(confirm).not.toHaveBeenCalled();
+      expect(rewrite.removeStyle).toHaveBeenCalledWith("style-1");
+    });
+
+    it("asks before deleting the active style, and keeps it on 'cancel'", async () => {
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      const rewrite = controller({
+        styles: [style()],
+        settings: { style: "style-1", custom_instruction: "", translate_target: "fr" },
+      });
+      render(<SettingsForm rewrite={rewrite} />);
+
+      await userEvent.click(screen.getByRole("button", { name: "Delete Standup" }));
+      expect(confirm).toHaveBeenCalledTimes(1);
+      expect(rewrite.removeStyle).not.toHaveBeenCalled();
+
+      confirm.mockReturnValue(true);
+      await userEvent.click(screen.getByRole("button", { name: "Delete Standup" }));
+      expect(rewrite.removeStyle).toHaveBeenCalledWith("style-1");
+    });
   });
 });

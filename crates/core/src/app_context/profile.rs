@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::rewrite::RewriteMode;
+use crate::rewrite::StyleRef;
 use crate::store::bindings::Binding;
 
 /// Where a profile says the rewritten/dictated text should be put back.
@@ -63,11 +63,11 @@ pub struct AppProfile {
     /// `*`-only glob over the normalized `host[/path]`. `None` = matches any URL.
     pub match_url_glob: Option<String>,
 
-    /// [`RewriteMode::as_str`]; kept as the raw column so a mode this build
-    /// does not know about round-trips instead of being silently dropped on
-    /// the next save. Read it through [`AppProfile::mode`].
-    pub rewrite_mode: Option<String>,
-    pub preset_id: Option<String>,
+    /// A [`StyleRef`] string: a built-in mode or a custom style id. Kept as the
+    /// raw column so a value this build does not know about round-trips instead
+    /// of being silently dropped on the next save. Read it through
+    /// [`AppProfile::style`].
+    pub rewrite_style: Option<String>,
     pub llm_engine_id: Option<String>,
     pub llm_model: Option<String>,
     pub llm_provider_ref: Option<String>,
@@ -89,8 +89,7 @@ impl AppProfile {
             priority: 0,
             match_bundle_id: None,
             match_url_glob: None,
-            rewrite_mode: None,
-            preset_id: None,
+            rewrite_style: None,
             llm_engine_id: None,
             llm_model: None,
             llm_provider_ref: None,
@@ -100,14 +99,16 @@ impl AppProfile {
         }
     }
 
-    /// The rewrite mode this profile forces, or `None` to inherit.
+    /// The style this profile forces, or `None` to inherit.
     ///
-    /// An unparseable stored value reads as `None` (inherit) rather than as an
-    /// error: a profile written by a newer build naming a mode this one has
-    /// never heard of should fall back to the global setting, not break every
-    /// rewrite into that app.
-    pub fn mode(&self) -> Option<RewriteMode> {
-        RewriteMode::from_str(self.rewrite_mode.as_deref()?)
+    /// A custom id is not checked against the database here: whoever applies
+    /// the style does that (`StyleRepo::exists`), and a style that no longer
+    /// exists is treated as no override, so a profile naming a style from a
+    /// newer build or a deleted one falls back to the global setting instead
+    /// of breaking every rewrite into that app.
+    pub fn style(&self) -> Option<StyleRef> {
+        let value = self.rewrite_style.as_deref()?;
+        (!value.is_empty()).then(|| StyleRef::parse(value))
     }
 
     /// The insertion mode this profile forces, or `None` to inherit.
@@ -186,6 +187,7 @@ impl<'a> ProfileQuery<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rewrite::RewriteMode;
 
     #[test]
     fn insertion_mode_round_trips_through_its_column_value() {
@@ -198,20 +200,23 @@ mod tests {
     }
 
     #[test]
-    fn unknown_stored_mode_inherits_rather_than_erroring() {
+    fn the_style_column_reads_as_a_builtin_or_a_custom_id() {
         let mut p = AppProfile::new("p", "P");
-        p.rewrite_mode = Some("mode_from_the_future".into());
-        p.insertion_mode = Some("carrier_pigeon".into());
-        assert_eq!(p.mode(), None);
-        assert_eq!(p.insertion(), None);
+        assert_eq!(p.style(), None);
+        p.rewrite_style = Some(String::new());
+        assert_eq!(p.style(), None);
+        p.rewrite_style = Some(RewriteMode::Friendly.as_str().into());
+        assert_eq!(p.style(), Some(StyleRef::Builtin(RewriteMode::Friendly)));
+        p.rewrite_style = Some("style-1".into());
+        assert_eq!(p.style(), Some(StyleRef::Custom("style-1".into())));
     }
 
     #[test]
-    fn typed_accessors_read_the_stored_columns() {
+    fn unknown_stored_insertion_inherits_rather_than_erroring() {
         let mut p = AppProfile::new("p", "P");
-        p.rewrite_mode = Some(RewriteMode::Friendly.as_str().into());
+        p.insertion_mode = Some("carrier_pigeon".into());
+        assert_eq!(p.insertion(), None);
         p.insertion_mode = Some(InsertionMode::ClipboardPaste.as_str().into());
-        assert_eq!(p.mode(), Some(RewriteMode::Friendly));
         assert_eq!(p.insertion(), Some(InsertionMode::ClipboardPaste));
     }
 

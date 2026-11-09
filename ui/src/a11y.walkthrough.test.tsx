@@ -50,8 +50,7 @@ const PROFILE = {
   priority: 1,
   match_bundle_id: "com.tinyspeck.slackmacgap",
   match_url_glob: null,
-  rewrite_mode: "friendly",
-  preset_id: null,
+  rewrite_style: "friendly",
   llm_engine_id: null,
   llm_model: null,
   llm_provider_ref: null,
@@ -85,7 +84,7 @@ function mockWholeApp() {
       extra: {
         get_setting: () => null,
         set_setting: () => undefined,
-        list_presets: () => [],
+        list_custom_styles: () => [],
         get_prompt_override: () => null,
         get_dictation_state: () => "idle",
         get_autostart: () => false,

@@ -7,7 +7,7 @@
 //! they can be tested against a fake and where nothing about Tauri leaks in.
 //! Starting a meeting and rewriting a selection cannot: a meeting needs the
 //! capture gate, the meeting repo, the ledger, the poll tasks and the window
-//! that shows it recording, and a rewrite needs the presets, the prompt
+//! that shows it recording, and a rewrite needs the styles, the prompt
 //! overrides, the app-profile table and the selection busy flag. All of that is
 //! [`AppState`], and [`ActionHandler`] being a trait is precisely what lets
 //! these two be assembled here instead of dragging `AppState` into a crate that
@@ -30,7 +30,7 @@ use kea_core::assistant::dispatch::{
     ActionFailure, ActionHandler, ActionOutcome, Disclosure, Dispatcher,
 };
 use kea_core::assistant::ResolvedArgs;
-use kea_core::rewrite::{PresetRepo, PromptOverrideRepo, RewriteMode};
+use kea_core::rewrite::{PromptOverrideRepo, RewriteMode, StyleRepo};
 use kea_core::store::actions::ActionRepo;
 use kea_core::store::bindings::BindingRepo;
 use kea_features::ProfileOverrides;
@@ -175,7 +175,7 @@ fn meeting_failure(message: &str) -> ActionFailure {
 /// cannot get back with a second sentence.
 ///
 /// So the answer comes back as words, and the pipeline that produces it is the
-/// real one: [`kea_features::run_rewrite`], with the same bindings, presets,
+/// real one: [`kea_features::run_rewrite`], with the same bindings, styles,
 /// prompt overrides, app profile and ledger row a rewrite from the shortcut
 /// gets. Writing a second, non-inserting pipeline here — as
 /// `commands::preview_rewrite_inner` is for the settings window's try-it box —
@@ -256,7 +256,7 @@ impl ActionHandler for RewriteFocused {
 
         let bindings = BindingRepo::new(state.config_pool.clone());
         let actions = ActionRepo::new(state.data_pool.clone());
-        let presets = PresetRepo::new(state.config_pool.clone());
+        let styles = StyleRepo::new(state.config_pool.clone());
         let overrides = PromptOverrideRepo::new(state.config_pool.clone());
         let sink = ReadOnlyTextIo::new(textio);
 
@@ -264,7 +264,7 @@ impl ActionHandler for RewriteFocused {
             &state.engines,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             &sink,
             input,
@@ -319,7 +319,7 @@ fn rewrite_disclosure() -> Disclosure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StyleRequest {
     /// Nothing was said about style. The user's own rewrite settings — their
-    /// active mode, their preset, their app profile — stand untouched, which is
+    /// active style, their app profile — stand untouched, which is
     /// exactly what the rewrite shortcut would have done.
     Settings,
     /// A named style the app already has a mode for.
@@ -334,11 +334,11 @@ impl StyleRequest {
         match self {
             StyleRequest::Settings => RewriteOverride::default(),
             StyleRequest::Mode(mode) => RewriteOverride {
-                mode: Some(mode),
+                style: Some(mode.into()),
                 ..Default::default()
             },
             StyleRequest::Instruction(instruction) => RewriteOverride {
-                mode: Some(RewriteMode::AskKea),
+                style: Some(RewriteMode::AskKea.into()),
                 instruction: Some(instruction),
                 ..Default::default()
             },
@@ -609,8 +609,7 @@ mod tests {
     fn saying_nothing_about_style_leaves_the_users_own_settings_alone() {
         assert_eq!(style_request(None), StyleRequest::Settings);
         let over = StyleRequest::Settings.into_override();
-        assert!(over.mode.is_none());
-        assert!(over.preset_id.is_none());
+        assert!(over.style.is_none());
         assert!(over.instruction.is_none());
     }
 
@@ -718,7 +717,7 @@ mod tests {
     #[test]
     fn an_unmatched_style_runs_as_ask_kea_with_that_instruction() {
         let over = StyleRequest::Instruction("like a pirate".into()).into_override();
-        assert_eq!(over.mode, Some(RewriteMode::AskKea));
+        assert_eq!(over.style, Some(RewriteMode::AskKea.into()));
         assert_eq!(over.instruction.as_deref(), Some("like a pirate"));
     }
 
@@ -728,7 +727,7 @@ mod tests {
         // mode that has its own template: `build_llm_request` would have two
         // sources for the same prompt.
         let over = StyleRequest::Mode(RewriteMode::Concise).into_override();
-        assert_eq!(over.mode, Some(RewriteMode::Concise));
+        assert_eq!(over.style, Some(RewriteMode::Concise.into()));
         assert!(over.instruction.is_none());
     }
 

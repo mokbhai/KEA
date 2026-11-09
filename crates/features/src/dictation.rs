@@ -4,7 +4,7 @@ use kea_core::dictation::{
 };
 use kea_core::resolve::SlotResolver;
 use kea_core::rewrite::{build_llm_request, RewriteInput};
-use kea_core::rewrite::{PresetRepo, PromptOverrideRepo, RewriteMode};
+use kea_core::rewrite::{PromptOverrideRepo, RewriteMode, StyleRepo};
 use kea_core::store::actions::{ActionRepo, NewAction};
 use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_core::store::conversations::MessageRole;
@@ -82,7 +82,7 @@ pub async fn run_dictation(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
     actions: &ActionRepo,
-    presets: &PresetRepo,
+    styles: &StyleRepo,
     overrides: &PromptOverrideRepo,
     audio: &mut dyn AudioIo,
     textio: &dyn TextIo,
@@ -94,7 +94,7 @@ pub async fn run_dictation(
         engines,
         bindings,
         actions,
-        presets,
+        styles,
         overrides,
         audio,
         textio,
@@ -111,7 +111,7 @@ pub async fn run_dictation_with_storage(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
     actions: &ActionRepo,
-    presets: &PresetRepo,
+    styles: &StyleRepo,
     overrides: &PromptOverrideRepo,
     audio: &mut dyn AudioIo,
     textio: &dyn TextIo,
@@ -124,7 +124,7 @@ pub async fn run_dictation_with_storage(
         engines,
         bindings,
         actions,
-        presets,
+        styles,
         overrides,
         audio,
         textio,
@@ -168,7 +168,7 @@ pub async fn run_dictation_with_opts(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
     actions: &ActionRepo,
-    presets: &PresetRepo,
+    styles: &StyleRepo,
     overrides: &PromptOverrideRepo,
     audio: &mut dyn AudioIo,
     textio: &dyn TextIo,
@@ -181,7 +181,7 @@ pub async fn run_dictation_with_opts(
         engines,
         bindings,
         actions,
-        presets,
+        styles,
         overrides,
         audio,
         textio,
@@ -226,7 +226,7 @@ pub async fn run_dictation_with_commands(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
     actions: &ActionRepo,
-    presets: &PresetRepo,
+    styles: &StyleRepo,
     overrides: &PromptOverrideRepo,
     audio: &mut dyn AudioIo,
     textio: &dyn TextIo,
@@ -240,7 +240,7 @@ pub async fn run_dictation_with_commands(
         engines,
         bindings,
         actions,
-        presets,
+        styles,
         overrides,
         audio,
         textio,
@@ -259,7 +259,7 @@ pub async fn run_dictation_outcome(
     engines: &EngineRegistry,
     bindings: &BindingRepo,
     actions: &ActionRepo,
-    presets: &PresetRepo,
+    styles: &StyleRepo,
     overrides: &PromptOverrideRepo,
     audio: &mut dyn AudioIo,
     textio: &dyn TextIo,
@@ -294,7 +294,7 @@ pub async fn run_dictation_outcome(
     let result = run_dictation_inner(
         engines,
         &resolver,
-        presets,
+        styles,
         overrides,
         textio,
         settings,
@@ -358,7 +358,7 @@ const ALREADY_ON_CLIPBOARD: &str = "on your clipboard";
 async fn run_dictation_inner(
     engines: &EngineRegistry,
     resolver: &SlotResolver<'_>,
-    presets: &PresetRepo,
+    styles: &StyleRepo,
     overrides: &PromptOverrideRepo,
     textio: &dyn TextIo,
     settings: &DictationSettings,
@@ -559,7 +559,7 @@ async fn run_dictation_inner(
         // routine) — used to `?` out of the whole run and discard a transcript
         // that had already been decoded. Now the decoded words go in as they
         // are, and the user is told cleanup did not happen.
-        match run_cleanup(engines, resolver, presets, overrides, &raw_text).await {
+        match run_cleanup(engines, resolver, styles, overrides, &raw_text).await {
             Ok(done) => {
                 tracing::info!(
                     action_id = %action_id,
@@ -679,7 +679,7 @@ struct Cleaned {
 async fn run_cleanup(
     engines: &EngineRegistry,
     resolver: &SlotResolver<'_>,
-    presets: &PresetRepo,
+    styles: &StyleRepo,
     overrides: &PromptOverrideRepo,
     text: &str,
 ) -> Result<Cleaned, String> {
@@ -695,10 +695,10 @@ async fn run_cleanup(
         &RewriteInput {
             source_text: text.to_string(),
             mode: RewriteMode::AudioRefinement,
-            preset_id: None,
+            custom_style_id: None,
             custom_instruction: None,
         },
-        presets,
+        styles,
         overrides,
     )
     .await
@@ -1036,7 +1036,7 @@ mod tests {
         }
     }
 
-    async fn test_repos() -> (BindingRepo, ActionRepo, PresetRepo, PromptOverrideRepo) {
+    async fn test_repos() -> (BindingRepo, ActionRepo, StyleRepo, PromptOverrideRepo) {
         let config_pool = open_pool("sqlite::memory:").await.unwrap();
         run_config_migrations(&config_pool).await.unwrap();
         let data_pool = open_pool("sqlite::memory:").await.unwrap();
@@ -1045,7 +1045,7 @@ mod tests {
         (
             BindingRepo::new(config_pool.clone()),
             ActionRepo::new(data_pool),
-            PresetRepo::new(config_pool.clone()),
+            StyleRepo::new(config_pool.clone()),
             PromptOverrideRepo::new(config_pool),
         )
     }
@@ -1286,7 +1286,7 @@ mod tests {
             text: "hello world".into(),
         }));
         let textio = Arc::new(FakeTextIo::new());
-        let (bindings, actions, presets, overrides) = test_repos().await;
+        let (bindings, actions, styles, overrides) = test_repos().await;
         // Half the decoder's rate, so the two counts cannot be confused.
         let mut audio = FakeAudioIo::with_pcm(PcmFrame {
             samples: vec![0.0; 800],
@@ -1297,7 +1297,7 @@ mod tests {
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             &mut audio,
             textio.as_ref(),
@@ -1340,14 +1340,14 @@ mod tests {
         let mut reg = EngineRegistry::default();
         reg.register_stt(Arc::new(FailingStt));
         let textio = Arc::new(FakeTextIo::new());
-        let (bindings, actions, presets, overrides) = test_repos().await;
+        let (bindings, actions, styles, overrides) = test_repos().await;
         let mut audio = FakeAudioIo::with_pcm(frame(1600));
 
         let result = run_dictation(
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             &mut audio,
             textio.as_ref(),
@@ -1381,14 +1381,14 @@ mod tests {
             text: "hello world".into(),
         }));
         let textio = Arc::new(FakeTextIo::new());
-        let (bindings, actions, presets, overrides) = test_repos().await;
+        let (bindings, actions, styles, overrides) = test_repos().await;
         let mut audio = FakeAudioIo::with_pcm(frame(1600));
 
         let out = run_dictation_with_opts(
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             &mut audio,
             textio.as_ref(),
@@ -1422,14 +1422,14 @@ mod tests {
             let mut reg = EngineRegistry::default();
             reg.register_stt(Arc::new(FailingStt));
             let textio = Arc::new(FakeTextIo::new());
-            let (bindings, actions, presets, overrides) = test_repos().await;
+            let (bindings, actions, styles, overrides) = test_repos().await;
             let mut audio = FakeAudioIo::with_pcm(frame(1600));
 
             let result = run_dictation_with_opts(
                 &reg,
                 &bindings,
                 &actions,
-                &presets,
+                &styles,
                 &overrides,
                 &mut audio,
                 textio.as_ref(),
@@ -1568,7 +1568,7 @@ mod tests {
             text: "hello".into(),
         }));
         let textio = Arc::new(FakeTextIo::new());
-        let (bindings, actions, presets, overrides) = test_repos().await;
+        let (bindings, actions, styles, overrides) = test_repos().await;
         let settings = DictationSettings {
             post_process: false,
             active_model: None,
@@ -1588,7 +1588,7 @@ mod tests {
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             &mut audio,
             textio.as_ref(),
@@ -1621,7 +1621,7 @@ mod tests {
             text: "ship it".into(),
         }));
         let textio = Arc::new(FakeTextIo::new());
-        let (bindings, actions, presets, overrides) = test_repos().await;
+        let (bindings, actions, styles, overrides) = test_repos().await;
         let settings = DictationSettings {
             post_process: true,
             active_model: None,
@@ -1641,7 +1641,7 @@ mod tests {
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             &mut audio,
             textio.as_ref(),
@@ -1666,7 +1666,7 @@ mod tests {
             text: String::new(),
         }));
         let textio = Arc::new(FakeTextIo::new());
-        let (bindings, actions, presets, overrides) = test_repos().await;
+        let (bindings, actions, styles, overrides) = test_repos().await;
         let settings = DictationSettings {
             post_process: true,
             active_model: None,
@@ -1687,7 +1687,7 @@ mod tests {
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             &mut audio,
             textio.as_ref(),
@@ -1713,7 +1713,7 @@ mod tests {
         // No LLM engine is registered, so if the refinement pass ran at all the
         // run would fail to resolve one rather than quietly skipping it.
         let textio = Arc::new(FakeTextIo::new());
-        let (bindings, actions, presets, overrides) = test_repos().await;
+        let (bindings, actions, styles, overrides) = test_repos().await;
         let settings = DictationSettings {
             post_process: true,
             active_model: None,
@@ -1733,7 +1733,7 @@ mod tests {
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             &mut audio,
             textio.as_ref(),
@@ -1761,7 +1761,7 @@ mod tests {
 
         let textio = Arc::new(FakeTextIo::new());
 
-        let (bindings, actions, presets, overrides) = test_repos().await;
+        let (bindings, actions, styles, overrides) = test_repos().await;
         let settings = DictationSettings {
             post_process: false,
             active_model: None,
@@ -1781,7 +1781,7 @@ mod tests {
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             &mut audio,
             textio.as_ref(),
@@ -1813,7 +1813,7 @@ mod tests {
             text: transcript.into(),
         }));
         let textio = Arc::new(FakeTextIo::new());
-        let (bindings, actions, presets, overrides) = test_repos().await;
+        let (bindings, actions, styles, overrides) = test_repos().await;
         let settings = DictationSettings {
             language: language.map(str::to_string),
             ..test_settings()
@@ -1824,7 +1824,7 @@ mod tests {
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             &mut audio,
             textio.as_ref(),
@@ -1924,7 +1924,7 @@ mod tests {
                 text: "hello world period".into(),
             }));
             let textio = Arc::new(FakeTextIo::new());
-            let (bindings, actions, presets, overrides) = test_repos().await;
+            let (bindings, actions, styles, overrides) = test_repos().await;
             let settings = DictationSettings {
                 active_model: Some(model.to_string()),
                 language: None,
@@ -1937,7 +1937,7 @@ mod tests {
                 &reg,
                 &bindings,
                 &actions,
-                &presets,
+                &styles,
                 &overrides,
                 &mut audio,
                 textio.as_ref(),
@@ -1980,7 +1980,7 @@ mod tests {
         }));
 
         let textio = Arc::new(FakeTextIo::new());
-        let (bindings, actions, presets, overrides) = test_repos().await;
+        let (bindings, actions, styles, overrides) = test_repos().await;
         let settings = DictationSettings {
             post_process: false,
             active_model: None,
@@ -2000,7 +2000,7 @@ mod tests {
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             &mut audio,
             textio.as_ref(),
@@ -2031,7 +2031,7 @@ mod tests {
 
         let textio = Arc::new(FakeTextIo::new());
 
-        let (bindings, actions, presets, overrides) = test_repos().await;
+        let (bindings, actions, styles, overrides) = test_repos().await;
         let settings = DictationSettings {
             post_process: false,
             active_model: None,
@@ -2052,7 +2052,7 @@ mod tests {
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             &mut audio,
             textio.as_ref(),
@@ -2087,7 +2087,7 @@ mod tests {
 
         let textio = Arc::new(FakeTextIo::new());
 
-        let (bindings, actions, presets, overrides) = test_repos().await;
+        let (bindings, actions, styles, overrides) = test_repos().await;
         let settings = DictationSettings {
             post_process: true,
             active_model: None,
@@ -2109,7 +2109,7 @@ mod tests {
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             &mut audio,
             textio.as_ref(),
@@ -2151,7 +2151,7 @@ mod tests {
         let bindings = BindingRepo::new(config_pool.clone());
         let actions = ActionRepo::new(data_pool.clone());
         let conversations = ConversationRepo::new(data_pool.clone());
-        let presets = PresetRepo::new(config_pool.clone());
+        let styles = StyleRepo::new(config_pool.clone());
         let overrides = PromptOverrideRepo::new(config_pool);
 
         let settings = DictationSettings {
@@ -2175,7 +2175,7 @@ mod tests {
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             &mut audio,
             textio.as_ref(),
@@ -2261,7 +2261,7 @@ mod tests {
         let bindings = BindingRepo::new(config_pool.clone());
         let actions = ActionRepo::new(data_pool.clone());
         let conversations = ConversationRepo::new(data_pool);
-        let presets = PresetRepo::new(config_pool.clone());
+        let styles = StyleRepo::new(config_pool.clone());
         let overrides = PromptOverrideRepo::new(config_pool);
 
         let settings = DictationSettings {
@@ -2285,7 +2285,7 @@ mod tests {
             &reg,
             &bindings,
             &actions,
-            &presets,
+            &styles,
             &overrides,
             &mut audio,
             textio.as_ref(),
@@ -2311,7 +2311,7 @@ mod tests {
         bindings: BindingRepo,
         actions: ActionRepo,
         conversations: ConversationRepo,
-        presets: PresetRepo,
+        styles: StyleRepo,
         overrides: PromptOverrideRepo,
     }
 
@@ -2324,7 +2324,7 @@ mod tests {
             bindings: BindingRepo::new(config_pool.clone()),
             actions: ActionRepo::new(data_pool.clone()),
             conversations: ConversationRepo::new(data_pool),
-            presets: PresetRepo::new(config_pool.clone()),
+            styles: StyleRepo::new(config_pool.clone()),
             overrides: PromptOverrideRepo::new(config_pool),
         }
     }
@@ -2403,7 +2403,7 @@ mod tests {
             reg,
             &w.bindings,
             &w.actions,
-            &w.presets,
+            &w.styles,
             &w.overrides,
             audio,
             textio,

@@ -4,7 +4,7 @@
 //!
 //! [`crate::store::conversations::ConversationRepo`] is the wrong home on four
 //! counts, all visible in that file: it lives on the **data** pool while a list
-//! of the user's own saved phrases is configuration, like presets; its rows are
+//! of the user's own saved phrases is configuration, like custom styles; its rows are
 //! keyed to an `action_id` and an `engine_id`, neither of which a dismissed or
 //! cancelled palette run has; it is gated by `history.store_conversations` and
 //! pruned at 90 days, and "stop keeping my text" should not silently mean "lose

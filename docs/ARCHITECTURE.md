@@ -70,7 +70,7 @@ KEA is a Tauri 2.x desktop app with a React/Vite frontend and a Rust workspace b
 
 1. A hotkey or UI command requests a rewrite.
 2. Platform text I/O captures the selected text.
-3. The rewrite feature resolves the configured LLM engine and prompt/preset.
+3. The rewrite feature resolves the configured LLM engine and the active style (a built-in prompt or one of the user's own styles).
 4. The engine returns the rewritten text.
 5. Platform text I/O inserts the result and the action is recorded.
 

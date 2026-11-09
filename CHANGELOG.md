@@ -6,6 +6,14 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+### Changed
+
+- Presets are gone; styles are the one way to choose how KEA rewrites. Write your own under Rewrite → Your styles (a name and an instruction), then pick it from the Style menu like Improve or Concise. Your saved presets became styles, except one whose instruction was just "None". If a preset was selected, its style is now selected. An app rule that used a preset now uses the style.
+- A custom style uses the Rewrite AI. The per-preset AI choice was removed; an app rule can still name its own AI.
+- Deleting the style you have selected switches you back to Improve.
+- The local API and `kea://` links take `style` (a built-in name or a custom style id). `mode` still works for built-in names. `preset` and `preset_id` are refused with an error that names `style`. `kea rewrite` takes `--style` instead of `--preset`.
+- "Audio refinement" is no longer in the style menus; it is only used internally by dictation.
+
 ## [0.5.5] - 2026-11-10
 
 ### Added

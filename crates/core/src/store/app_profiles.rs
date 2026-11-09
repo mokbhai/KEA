@@ -9,7 +9,7 @@ use crate::error::KeaError;
 /// `SELECT *` is avoided deliberately: `FromRow` matches by name, and a future
 /// migration adding a column would otherwise change what each of these reads.
 const COLUMNS: &str = "id, name, enabled, priority, match_bundle_id, match_url_glob, \
-                       rewrite_mode, preset_id, llm_engine_id, llm_model, llm_provider_ref, \
+                       rewrite_style, llm_engine_id, llm_model, llm_provider_ref, \
                        post_process, insertion_mode, created_at";
 
 pub struct AppProfileRepo {
@@ -24,17 +24,16 @@ impl AppProfileRepo {
     pub async fn upsert(&self, p: &AppProfile) -> Result<(), KeaError> {
         sqlx::query(
             "INSERT INTO app_profiles(id, name, enabled, priority, match_bundle_id, \
-                 match_url_glob, rewrite_mode, preset_id, llm_engine_id, llm_model, \
+                 match_url_glob, rewrite_style, llm_engine_id, llm_model, \
                  llm_provider_ref, post_process, insertion_mode, created_at)
-             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), datetime('now')))
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), datetime('now')))
              ON CONFLICT(id) DO UPDATE SET
                  name = excluded.name,
                  enabled = excluded.enabled,
                  priority = excluded.priority,
                  match_bundle_id = excluded.match_bundle_id,
                  match_url_glob = excluded.match_url_glob,
-                 rewrite_mode = excluded.rewrite_mode,
-                 preset_id = excluded.preset_id,
+                 rewrite_style = excluded.rewrite_style,
                  llm_engine_id = excluded.llm_engine_id,
                  llm_model = excluded.llm_model,
                  llm_provider_ref = excluded.llm_provider_ref,
@@ -47,8 +46,7 @@ impl AppProfileRepo {
         .bind(p.priority)
         .bind(&p.match_bundle_id)
         .bind(&p.match_url_glob)
-        .bind(&p.rewrite_mode)
-        .bind(&p.preset_id)
+        .bind(&p.rewrite_style)
         .bind(&p.llm_engine_id)
         .bind(&p.llm_model)
         .bind(&p.llm_provider_ref)
@@ -113,7 +111,7 @@ mod tests {
     use super::*;
     use crate::app_context::{resolve_profile, InsertionMode, ProfileQuery};
     use crate::rewrite::RewriteMode;
-    use crate::rewrite::{PresetRepo, RewritePreset};
+    use crate::rewrite::{CustomStyle, StyleRepo};
     use crate::store::db::{open_pool, run_config_migrations};
 
     async fn repo() -> (AppProfileRepo, SqlitePool) {
@@ -125,7 +123,7 @@ mod tests {
     fn slack() -> AppProfile {
         let mut p = AppProfile::new("slack", "Slack");
         p.match_bundle_id = Some("com.tinyspeck.slackmacgap".into());
-        p.rewrite_mode = Some(RewriteMode::Friendly.as_str().into());
+        p.rewrite_style = Some(RewriteMode::Friendly.as_str().into());
         p.post_process = Some(true);
         p.insertion_mode = Some(InsertionMode::ClipboardPaste.as_str().into());
         p
@@ -143,7 +141,10 @@ mod tests {
         repo.upsert(&p).await.unwrap();
 
         let got = repo.get("slack").await.unwrap().unwrap();
-        assert_eq!(got.mode(), Some(RewriteMode::Friendly));
+        assert_eq!(
+            got.style(),
+            Some(crate::rewrite::StyleRef::Builtin(RewriteMode::Friendly))
+        );
         assert_eq!(got.insertion(), Some(InsertionMode::ClipboardPaste));
         assert_eq!(got.post_process, Some(true));
         assert_eq!(got.llm_binding().unwrap().engine_id, "openai");
@@ -202,23 +203,26 @@ mod tests {
         assert_eq!(enabled[0].id, "slack");
     }
 
-    /// The foreign key is the reason a deleted preset cannot leave a profile
-    /// pointing at an id `build_llm_request` would later fail on.
+    /// Deleting a custom style clears the profiles that forced it, so a profile
+    /// never names an id `build_llm_request` would later fail on.
     #[tokio::test]
-    async fn deleting_a_preset_nulls_the_profile_reference() {
+    async fn deleting_a_style_clears_the_profile_reference() {
         let (repo, pool) = repo().await;
-        let presets = PresetRepo::new(pool.clone());
-        presets
-            .upsert(&RewritePreset::new("p1", "Terse", "Be terse."))
+        let styles = StyleRepo::new(pool.clone());
+        styles
+            .upsert(&CustomStyle::new("s1", "Terse", "Be terse."))
             .await
             .unwrap();
 
         let mut p = slack();
-        p.preset_id = Some("p1".into());
+        p.rewrite_style = Some("s1".into());
         repo.upsert(&p).await.unwrap();
 
-        presets.delete("p1").await.unwrap();
-        assert_eq!(repo.get("slack").await.unwrap().unwrap().preset_id, None);
+        styles.delete("s1").await.unwrap();
+        assert_eq!(
+            repo.get("slack").await.unwrap().unwrap().rewrite_style,
+            None
+        );
     }
 
     /// The repo and the matcher meet here: rows out of SQLite must feed

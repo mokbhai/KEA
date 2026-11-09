@@ -42,7 +42,7 @@ function mockShellWorld() {
         get_setting: (args) =>
           args?.key === "onboarding.completed" ? "true" : null,
         set_setting: () => undefined,
-        list_presets: () => [],
+        list_custom_styles: () => [],
         get_prompt_override: () => null,
         list_app_profiles: () => [],
       },
@@ -192,7 +192,7 @@ describe("AppShell", () => {
         extra: {
           get_setting: (args) => (args?.key === "onboarding.completed" ? "true" : null),
           set_setting: () => undefined,
-          list_presets: () => [],
+          list_custom_styles: () => [],
           get_prompt_override: () => null,
           list_whisper_models: () => [],
           list_installed_whisper_models: () => [],
