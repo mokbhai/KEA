@@ -250,22 +250,21 @@ async fn dictation(
 ) -> Result<ActionOutcome, ActionError> {
     // The same flag the accelerator loop and the hold-to-talk task claim, and
     // for the same reason: two triggers must not each start a run.
-    let Some(_busy) = try_acquire_busy(&state.dictation_busy) else {
+    let Some(busy) = try_acquire_busy(&state.dictation_busy) else {
         return Err(busy_refusal("a dictation trigger is already being handled"));
     };
 
-    let (meeting_active, in_flight, current) = dictation_gate(state).await;
+    let (meeting_active, current) = dictation_gate(state).await;
     tracing::debug!(
         verb = verb.as_str(),
         state = dictation_state_wire(current),
         meeting_active,
-        in_flight,
         "local API: dictation"
     );
     // A read, not a claim: it reports *why* a directed start or stop cannot
     // run without attempting one. The toggle still goes through the shared
     // decision function.
-    let toggle = dictation_hotkey_action(current, meeting_active, in_flight);
+    let toggle = dictation_hotkey_action(current, meeting_active);
 
     use crate::commands::DictationHotkeyAction as Decision;
     match verb {
@@ -274,10 +273,16 @@ async fn dictation(
                 .await
                 .map(|()| ActionOutcome::Done)
                 .map_err(classify),
-            Decision::Stop => stop_dictation_inner(state, app)
-                .await
-                .map(ActionOutcome::Text)
-                .map_err(classify),
+            Decision::Stop => {
+                // These verbs hand the text back, so they wait out the
+                // transcription; the flag is not held across that, or a hotkey
+                // pressed meanwhile would be dropped for as long as it takes.
+                drop(busy);
+                stop_dictation_inner(state, app)
+                    .await
+                    .map(ActionOutcome::Text)
+                    .map_err(classify)
+            }
             // StartLocked and Cancel are hold-chord transitions; a toggle
             // never produces them, and Ignore means the gate said no.
             _ => Err(ActionError::Busy(format!(
@@ -304,6 +309,7 @@ async fn dictation(
                     dictation_state_wire(current)
                 )));
             }
+            drop(busy);
             stop_dictation_inner(state, app)
                 .await
                 .map(ActionOutcome::Text)
@@ -344,7 +350,7 @@ fn open_page(app: &AppHandle, page: &str) -> Result<ActionOutcome, ActionError> 
 async fn status(state: &Arc<crate::AppState>) -> StatusReport {
     // Deliberately the gate's reading of dictation rather than the raw audio
     // state: it is the one that can tell a locked run from a held one.
-    let (_, _, dictation) = dictation_gate(state).await;
+    let (_, dictation) = dictation_gate(state).await;
     let meeting = {
         let recording = state
             .active_meeting

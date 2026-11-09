@@ -423,6 +423,17 @@ impl TextIo for MacTextIo {
             .map_err(|e| TextIoError::Other(e.to_string()))?
     }
 
+    async fn copy_to_clipboard(&self, text: &str) -> Result<(), TextIoError> {
+        let text = text.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut clipboard = arboard::Clipboard::new()
+                .map_err(|e| TextIoError::Other(format!("clipboard unavailable: {e}")))?;
+            set_clipboard_text_verified(&mut clipboard, &text)
+        })
+        .await
+        .map_err(|e| TextIoError::Other(e.to_string()))?
+    }
+
     /// Accessibility only, with **no clipboard fallback** — unlike
     /// `replace_with_mode` above.
     ///

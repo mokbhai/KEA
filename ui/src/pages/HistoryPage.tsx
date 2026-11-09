@@ -273,7 +273,7 @@ export default function HistoryPage() {
             <div className="kea-card">
               <p className="kea-muted" style={{ margin: 0 }}>
                 No conversations stored yet. Enable "Store conversation content"
-                above, then run a rewrite or dictation with audio refinement to see
+                above, then run a rewrite or a dictation to see
                 transcripts and LLM exchanges here.
               </p>
             </div>
