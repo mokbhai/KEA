@@ -1138,6 +1138,7 @@ pub async fn run_selection_rewrite(
     state: &Arc<AppState>,
     over: &RewriteOverride,
 ) -> Result<String, String> {
+    crate::feature_switches::require(&state.config_pool, "rewrite").await?;
     let ctx = capture_app_context_now(state).await;
     // Read with the context, for the same reason: the app that owns the text
     // is the one that is frontmost *now*, and undo may be pressed from
@@ -1301,6 +1302,7 @@ fn clear_undo_offer(state: &AppState) {
 /// unless the text KEA wrote is still there, exactly once — and only then
 /// spend the offer.
 pub async fn undo_last_rewrite(state: &Arc<AppState>) -> Result<String, String> {
+    crate::feature_switches::require(&state.config_pool, "rewrite").await?;
     let (inserted, original, target_pid) = peek_undo_offer(state)?;
 
     let reactivation =
@@ -1584,6 +1586,7 @@ pub fn register_hotkey(
 }
 
 pub async fn trigger_tts_inner(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
+    crate::feature_switches::require(&state.config_pool, "tts").await?;
     emit_tts_state(app, TtsState::Reading);
     // Any early failure between here and the terminal emit must still return
     // the UI to idle, otherwise the global status banner sticks on
@@ -1767,9 +1770,8 @@ pub async fn run_dictation_action(
 /// chord and the middle mouse button. One listener serves both, installed
 /// when either is on.
 ///
-/// Installing is one-way (the platform listener outlives any disable), so this
-/// is safe to call on every settings write and at startup; turning the mode off
-/// only clears the flag the listener consults.
+/// When both triggers are off, stop and join the listener. Re-enabling installs
+/// a fresh tap, so a disabled feature holds no Accessibility event tap.
 ///
 /// A failure to install is surfaced as a dictation error rather than swallowed:
 /// the realistic cause is missing Accessibility permission, and a hold-to-talk
@@ -1777,17 +1779,26 @@ pub async fn run_dictation_action(
 /// remove. `installed` stays false in that case so granting the permission and
 /// toggling the setting again retries.
 pub fn sync_hold_to_talk(state: &Arc<AppState>, app: &AppHandle, keyboard: bool, mouse: bool) {
+    let mut installed = state
+        .hold_to_talk_installed
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     state.hold_to_talk_enabled.store(keyboard, Ordering::SeqCst);
     state.hold_mouse_enabled.store(mouse, Ordering::SeqCst);
     if !keyboard && !mouse {
+        if let Some(control) = state
+            .hold_control
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            control.stop();
+        }
+        *installed = false;
         return;
     }
 
     {
-        let mut installed = match state.hold_to_talk_installed.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
         if *installed {
             return;
         }
@@ -1834,6 +1845,9 @@ fn spawn_hold_to_talk_dispatch(
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(event) = events.recv().await {
+            if !crate::feature_switches::enabled(&state.config_pool, "dictation").await {
+                continue;
+            }
             // Arming opens and closes the microphone without starting a run,
             // so it is handled before the busy flag: a modifier press must not
             // contend with a recording for the flag that serialises runs.
@@ -2598,6 +2612,8 @@ async fn open_meeting_voices(_state: &AppState) -> Result<MeetingVoices, String>
 }
 
 pub async fn start_meeting_inner(state: &Arc<AppState>, app: &AppHandle) -> Result<String, String> {
+    let _update = crate::feature_switches::UPDATE.lock().await;
+    crate::feature_switches::require(&state.config_pool, "meetings").await?;
     // Reject before the audio lock while a prior meeting is still finishing:
     // during synthesis active_meeting is None and audio is Idle, so without
     // this a hotkey press would start a concurrent, UI-unstoppable meeting.
@@ -2890,6 +2906,8 @@ fn report_device_fallback(app: &AppHandle, audio: &mut dyn AudioIo) {
 }
 
 async fn start_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
+    let _update = crate::feature_switches::UPDATE.lock().await;
+    crate::feature_switches::require(&state.config_pool, "dictation").await?;
     // The preview loses to a recording. `start_mic` cancels it too, but this
     // is the half that tells the frontend, so the "Test microphone" toggle
     // does not stay lit over a recording it is not part of.
@@ -3970,6 +3988,7 @@ pub async fn set_hotkey(
     command: String,
     accelerator: String,
 ) -> Result<(), String> {
+    let _update = crate::feature_switches::UPDATE.lock().await;
     validate_accelerator(&accelerator)?;
 
     let binding_repo = HotkeyBindingRepo::new(state.config_pool.clone());
@@ -4007,12 +4026,13 @@ pub async fn set_hotkey(
         OldHotkeyAction::None
     };
 
+    let feature_enabled = crate::feature_switches::enabled(&state.config_pool, &feature).await;
     // Register the new binding first; only when that succeeds do we persist
     // the DB row, so a failed registration never leaves stale data. The lock
     // is scoped: the std Mutex guard must not live across the persist await.
     let registered = {
         let mut hotkeys = state.hotkeys.lock().map_err(|e| e.to_string())?;
-        match hotkey_action(&feature, &command) {
+        match hotkey_action(&feature, &command).filter(|_| feature_enabled) {
             Some(action) => {
                 register_hotkey(&mut hotkeys, &action, &accelerator)?;
                 true
@@ -4104,6 +4124,7 @@ pub async fn clear_hotkey(
     feature: String,
     command: String,
 ) -> Result<(), String> {
+    let _update = crate::feature_switches::UPDATE.lock().await;
     let repo = HotkeyBindingRepo::new(state.config_pool.clone());
     let Some(row) = repo
         .get(&feature, &command)
@@ -4118,6 +4139,9 @@ pub async fn clear_hotkey(
         .await
         .map_err(|e| e.to_string())?;
 
+    if !crate::feature_switches::enabled(&state.config_pool, &feature).await {
+        return Ok(());
+    }
     // The DB is authoritative and already updated: a failure below leaves a
     // stale registration that dies with the process, which is strictly better
     // than a row the user cannot delete.
@@ -4153,6 +4177,7 @@ pub async fn trigger_rewrite(
     preset_id: Option<String>,
     custom_instruction: Option<String>,
 ) -> Result<String, String> {
+    crate::feature_switches::require(&state.config_pool, "rewrite").await?;
     // No profile here on purpose: this is the UI asking for one specific mode
     // against the selection, and the frontmost app at that moment is KEA's own
     // window. A per-app rule has nothing to match and nothing to override.
@@ -4214,6 +4239,7 @@ pub async fn preview_rewrite_inner(
     preset_id: Option<String>,
     custom_instruction: Option<String>,
 ) -> Result<String, String> {
+    crate::feature_switches::require(&state.config_pool, "rewrite").await?;
     if text.trim().is_empty() {
         return Err("type some text to rewrite first".into());
     }
@@ -4346,6 +4372,7 @@ pub async fn set_dictation_settings(
     app: AppHandle,
     settings: DictationSettings,
 ) -> Result<(), String> {
+    let _update = crate::feature_switches::UPDATE.lock().await;
     DictationSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
         .set(&settings)
         .await
@@ -4375,7 +4402,13 @@ pub async fn apply_dictation_settings(
         .lock()
         .await
         .set_input_device(settings.input_device.clone());
-    sync_hold_to_talk(state, app, settings.hold_to_talk, settings.hold_mouse);
+    let enabled = crate::feature_switches::enabled(&state.config_pool, "dictation").await;
+    sync_hold_to_talk(
+        state,
+        app,
+        enabled && settings.hold_to_talk,
+        enabled && settings.hold_mouse,
+    );
 }
 
 #[tauri::command]
@@ -4432,6 +4465,8 @@ pub async fn stop_input_preview(
 }
 
 async fn start_input_preview_inner(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
+    let _update = crate::feature_switches::UPDATE.lock().await;
+    crate::feature_switches::require(&state.config_pool, "dictation").await?;
     {
         let mut audio = state.audio.lock().await;
         audio
@@ -5304,6 +5339,7 @@ pub async fn preview_voice(
     voice: Option<String>,
     provider_ref: Option<String>,
 ) -> Result<(), String> {
+    crate::feature_switches::require(&state.config_pool, "tts").await?;
     const PREVIEW_SENTENCE: &str = "Hi! This is how this voice sounds when reading aloud.";
     let _guard = PreviewGuard::try_acquire(&state.preview_playing)
         .ok_or_else(|| "A voice preview is already playing — wait for it to finish.".to_string())?;
@@ -5699,6 +5735,7 @@ pub async fn transcribe_file_run(
     app: &AppHandle,
     path: &str,
 ) -> Result<String, String> {
+    crate::feature_switches::require(&state.config_pool, "transcribe").await?;
     let state = state.clone();
     // One job at a time, and emphatically *not* the capture gate: this never
     // opens a device, and taking that lock would block dictation for the
@@ -5836,7 +5873,11 @@ async fn run_file_transcription(
     // Another slot beside the two poll cancels rather than new machinery.
     let (cancel_tx, cancel_rx) = watch::channel(false);
     if let Ok(mut slot) = state.file_transcribe_cancel.lock() {
-        *slot = Some(cancel_tx);
+        *slot = Some(cancel_tx.clone());
+    }
+
+    if !crate::feature_switches::enabled(&state.config_pool, "transcribe").await {
+        let _ = cancel_tx.send(true);
     }
 
     let cuts = cut_points(
@@ -6358,6 +6399,9 @@ pub async fn open_palette_session(
     prefilled: Option<String>,
     busy: BusyGuard,
 ) {
+    if !crate::feature_switches::enabled(&state.config_pool, "rewrite").await {
+        return;
+    }
     if palette_state(state) != PaletteState::Closed {
         // The dispatch loop turns a press arriving while the palette is up
         // into a dismissal before it ever gets here; this is the belt and
@@ -6695,6 +6739,7 @@ pub async fn run_palette(
     instruction: String,
     delivery: String,
 ) -> Result<PaletteOutcome, String> {
+    crate::feature_switches::require(&state.config_pool, "rewrite").await?;
     let state = state.inner().clone();
     let delivery = PaletteDelivery::from_str(&delivery)
         .ok_or_else(|| format!("unknown palette delivery: {delivery}"))?;
@@ -7079,6 +7124,7 @@ pub async fn capture_screen_text_inner(
     app: &AppHandle,
     busy: BusyGuard,
 ) -> Result<(), String> {
+    crate::feature_switches::require(&state.config_pool, "rewrite").await?;
     match recognize_screen_region(&state.config_pool).await? {
         Some(text) => {
             open_palette_session(state, app, PaletteOrigin::ScreenCapture, Some(text), busy).await;

@@ -5,6 +5,7 @@ mod assistant;
 mod assistant_handlers;
 mod commands;
 mod events;
+mod feature_switches;
 mod hotkeys;
 mod macfocus;
 mod notion;
@@ -152,10 +153,8 @@ pub struct AppState {
     /// Whether holding the middle mouse button records. Read by the same
     /// listener; either switch being on is enough to install it.
     pub hold_mouse_enabled: Arc<AtomicBool>,
-    /// Whether the hold-to-talk listener has been installed. It cannot be taken
-    /// back down (see `kea_platform::hotkeys::macos_hold`), so this guards
-    /// against installing a second one — while still allowing a retry after the
-    /// first attempt failed for want of Accessibility permission.
+    /// Whether the hold-to-talk listener is installed. Serializes installation
+    /// and teardown and allows retry after a missing Accessibility grant.
     pub hold_to_talk_installed: Mutex<bool>,
     /// A handle on the installed hold machine, so a lock can be ended by
     /// something other than the keyboard tap: Escape, or a run that finished
@@ -380,6 +379,8 @@ fn main() {
             commands::list_features,
             commands::get_setting,
             commands::set_setting,
+            feature_switches::get_feature_enabled,
+            feature_switches::set_feature_enabled,
             commands::get_binding,
             commands::set_binding,
             commands::delete_binding,
@@ -519,6 +520,7 @@ fn main() {
             api::settings::reveal_api_token,
             api::settings::regenerate_api_token,
             api::settings::install_cli_shim,
+            api::settings::get_cli_shim_status,
         ])
         .build(tauri::generate_context!())
         .expect("error while building KEA")

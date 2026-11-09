@@ -1,3 +1,5 @@
+import type { ComponentProps } from "react";
+import FeatureSwitch from "../components/FeatureSwitch";
 import { useEffect, useState } from "react";
 import {
   getTtsSettings,
@@ -92,7 +94,7 @@ type Props = {
   onNavigate?: Navigate;
 };
 
-export default function ReadAloudPage({ onNavigate }: Props) {
+function ReadAloudPageContent({ onNavigate }: Props) {
   const ai = useFeatureAi(SLOTS);
   const tts = useOptimisticSetting<TtsSettings>({
     initial: { active_voice: null, active_model: null, speed: 1 },
@@ -341,4 +343,8 @@ export default function ReadAloudPage({ onNavigate }: Props) {
       </section>
     </div>
   );
+}
+
+export default function ReadAloudPage(props: ComponentProps<typeof ReadAloudPageContent>) {
+  return <FeatureSwitch feature="tts"><ReadAloudPageContent {...props} /></FeatureSwitch>;
 }

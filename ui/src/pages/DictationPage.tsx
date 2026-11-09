@@ -1,3 +1,5 @@
+import type { ComponentProps } from "react";
+import FeatureSwitch from "../components/FeatureSwitch";
 import { useEffect, useState } from "react";
 import {
   DICTATION_LANGUAGES,
@@ -286,7 +288,7 @@ type Props = {
   onNavigate?: Navigate;
 };
 
-export default function DictationPage({ onNavigate }: Props) {
+function DictationPageContent({ onNavigate }: Props) {
   // Saved whole, so every write re-reads first: a stale copy of the other
   // field would quietly revert it.
   const settings = useOptimisticSetting<DictationSettings>({
@@ -1117,4 +1119,8 @@ export default function DictationPage({ onNavigate }: Props) {
       </section>
     </div>
   );
+}
+
+export default function DictationPage(props: ComponentProps<typeof DictationPageContent>) {
+  return <FeatureSwitch feature="dictation"><DictationPageContent {...props} /></FeatureSwitch>;
 }

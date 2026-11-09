@@ -1652,3 +1652,12 @@ export const onPaletteClose = (handler: () => void): Promise<UnlistenFn> =>
 export const setStatusOverlayVisible = (visible: boolean): Promise<void> =>
   invoke<void>("set_status_overlay_visible", { visible }).catch(() => {});
 
+
+/** Master switches disable commands without clearing shared engine bindings. */
+export const getFeatureEnabled = (feature: string) =>
+  invoke<boolean>("get_feature_enabled", { feature });
+export const setFeatureEnabled = (feature: string, enabled: boolean) =>
+  invoke<void>("set_feature_enabled", { feature, enabled });
+export const onFeatureSwitchChanged = (fn: (feature: string) => void) =>
+  listen<string>("feature-switch-changed", event => fn(event.payload));
+export const getCliShimStatus = () => invoke<string>("get_cli_shim_status");

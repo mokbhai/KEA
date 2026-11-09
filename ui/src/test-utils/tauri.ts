@@ -67,6 +67,8 @@ export function onInvoke(handlers: Record<string, (args?: InvokeArgs) => unknown
     ...Object.fromEntries(
       Object.entries(DEFAULT_ENGINES).map(([cmd, list]) => [cmd, () => list]),
     ),
+    get_feature_enabled: () => true,
+    get_cli_shim_status: () => "Not installed",
     ...handlers,
   };
   invokeMock.mockImplementation((cmd, args) => {

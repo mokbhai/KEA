@@ -29,12 +29,27 @@ pub type ActionId = String;
 /// next tick either way.
 #[derive(Clone)]
 pub struct HoldControl {
+    shutdown: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     machine: std::sync::Arc<std::sync::Mutex<hold::HoldToTalk>>,
 }
 
 impl HoldControl {
     pub(crate) fn new(machine: std::sync::Arc<std::sync::Mutex<hold::HoldToTalk>>) -> Self {
-        Self { machine }
+        Self {
+            machine,
+            shutdown: None,
+        }
+    }
+
+    pub fn stop(&self) {
+        if let Some(stop) = &self.shutdown {
+            stop();
+        }
+    }
+
+    pub(crate) fn with_shutdown(mut self, stop: impl Fn() + Send + Sync + 'static) -> Self {
+        self.shutdown = Some(std::sync::Arc::new(stop));
+        self
     }
 
     fn locked(&self) -> std::sync::MutexGuard<'_, hold::HoldToTalk> {

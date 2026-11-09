@@ -177,29 +177,7 @@ fn dispatch_for(table: &[Dispatch], action_id: &str, state: &Arc<AppState>) -> O
 /// Registration outcomes are recorded per feature so the UI can show which
 /// shortcut the OS refused.
 pub fn register_all(state: &Arc<AppState>, config_pool: &SqlitePool) -> mpsc::Receiver<ActionId> {
-    let bindings = tauri::async_runtime::block_on(
-        HotkeyBindingRepo::new(config_pool.clone()).list(),
-    )
-    .unwrap_or_else(|error| {
-        // The fixed table still registers from its compiled defaults; only the
-        // user's own rows are lost, and they come back on the next launch.
-        tracing::warn!(%error, "could not read saved hotkeys; registering the defaults only");
-        Vec::new()
-    });
-
-    // Resolve every accelerator before taking the hotkeys lock: each one
-    // hits the DB, and the lock is a std Mutex.
-    let accelerators: Vec<(HotkeyAction, String)> = hotkey_owners(&bindings)
-        .into_iter()
-        .map(|action| {
-            let accel = tauri::async_runtime::block_on(resolve_accelerator(config_pool, &action));
-            (action, accel)
-        })
-        // A translate row has no compiled default, so an empty accelerator
-        // means its binding vanished between the two reads. Registering "" is
-        // a guaranteed failure booked against a shortcut the user never set.
-        .filter(|(_, accel)| !accel.is_empty())
-        .collect();
+    let accelerators = tauri::async_runtime::block_on(registration_plan(config_pool));
     let mut hk = state.hotkeys.lock().expect("hotkeys lock");
     {
         let mut statuses = state
@@ -216,6 +194,29 @@ pub fn register_all(state: &Arc<AppState>, config_pool: &SqlitePool) -> mpsc::Re
         }
     }
     hk.on_action()
+}
+
+/// Resolve and gate before taking the OS hotkey mutex. Also covers user-defined
+/// translation shortcuts, which do not occur in the compiled command table.
+async fn registration_plan(pool: &SqlitePool) -> Vec<(HotkeyAction, String)> {
+    let bindings = HotkeyBindingRepo::new(pool.clone())
+        .list()
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not read saved hotkeys; registering defaults only");
+            Vec::new()
+        });
+    let mut actions = Vec::new();
+    for action in hotkey_owners(&bindings) {
+        if !crate::feature_switches::enabled(pool, action.feature).await {
+            continue;
+        }
+        let accelerator = resolve_accelerator(pool, &action).await;
+        if !accelerator.is_empty() {
+            actions.push((action, accelerator));
+        }
+    }
+    actions
 }
 
 /// What Escape means in an open session.
@@ -380,6 +381,11 @@ pub fn spawn_dispatch_loop(state: Arc<AppState>, app: AppHandle, mut rx: mpsc::R
             // opened it with. Same shape as the Escape case above, and for the
             // same reason: the rule is about this one action, not about the
             // table.
+            if let Some((feature, _)) = action_id.split_once(':') {
+                if !crate::feature_switches::enabled(&state.config_pool, feature).await {
+                    continue;
+                }
+            }
             if action_id == PALETTE_ACTION_ID && palette_is_open(&state) {
                 let state = state.clone();
                 let app = app.clone();
@@ -629,6 +635,38 @@ fn handle_ocr_capture<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn disabled_features_register_no_defaults_or_custom_translation_keys() {
+        let pool = kea_core::store::db::open_pool("sqlite::memory:")
+            .await
+            .unwrap();
+        kea_core::store::db::run_config_migrations(&pool)
+            .await
+            .unwrap();
+        HotkeyBindingRepo::new(pool.clone())
+            .set("rewrite", "translate.fr", "Control+Shift+F")
+            .await
+            .unwrap();
+        let all = registration_plan(&pool).await;
+        assert!(all.iter().any(|(a, _)| a.command == "translate.fr"));
+        for feature in crate::feature_switches::FEATURES {
+            SettingsRepo::new(pool.clone())
+                .set(&format!("features.{feature}.enabled"), &false)
+                .await
+                .unwrap();
+            let gated = registration_plan(&pool).await;
+            assert!(!gated.iter().any(|(a, _)| a.feature == feature));
+        }
+        assert!(registration_plan(&pool).await.is_empty());
+        SettingsRepo::new(pool.clone())
+            .set("features.dictation.enabled", &true)
+            .await
+            .unwrap();
+        let restored = registration_plan(&pool).await;
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].0.feature, "dictation");
+    }
 
     #[test]
     fn escape_is_not_a_permanent_hotkey() {

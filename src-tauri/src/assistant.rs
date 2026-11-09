@@ -238,6 +238,7 @@ struct TurnDeps<'a> {
 /// failure reaches the user; every internal step that can fail already emitted
 /// the state the surface needs.
 pub async fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
+    crate::feature_switches::require(&state.config_pool, "assistant").await?;
     let surface: Arc<dyn Surface> = Arc::new(WindowSurface { app: app.clone() });
     let mut session = Session::new();
 
@@ -245,6 +246,7 @@ pub async fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), S
     // after the previous session ended must not cancel this one before it
     // starts.
     state.assistant_cancel.store(false, Ordering::Relaxed);
+    crate::feature_switches::require(&state.config_pool, "assistant").await?;
     crate::commands::set_assistant_cancellable(state, true);
     crate::commands::set_assistant_copyable(state, true);
     // Escape and the copy key belong to the rest of the Mac again the moment
