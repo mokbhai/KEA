@@ -94,7 +94,12 @@ export function featureHandlers({
     ],
     start_input_preview: () => undefined,
     stop_input_preview: () => undefined,
-    get_tts_settings: () => ({ active_voice: null, active_model: null }),
+    get_tts_settings: () => ({
+      active_voice: null,
+      active_model: null,
+      speed: 1,
+      stop_with_esc: true,
+    }),
     set_tts_settings: () => undefined,
     ...extra,
   };

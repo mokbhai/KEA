@@ -51,7 +51,7 @@ use kea_features::meeting::{
 };
 use kea_features::rewrite::{complete_rewrite, OCR_COMMAND, PALETTE_COMMAND, UNDO_COMMAND};
 use kea_features::run_rewrite_with_storage;
-use kea_features::tts::run_tts_with_player;
+use kea_features::tts::{escape_stops_read_aloud, run_tts_with_player};
 use kea_features::ProfileOverrides;
 use kea_features::{
     drain_and_stop_meeting, run_meeting_poll_segment, run_meeting_start, ActionGuard,
@@ -1584,18 +1584,26 @@ pub fn register_hotkey(
 }
 
 pub async fn trigger_tts_inner(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
+    // The control is claimed before anything is shown or captured: a second
+    // trigger that gets past its own busy flag (the UI buttons take none) must
+    // not start a second voice over the first. The shortcut never reaches
+    // here while a run is active — it is a toggle and stops the run instead.
+    let Some(run) = state.read_aloud.try_begin() else {
+        return Err("KEA is already reading something — stop it first.".into());
+    };
     emit_tts_state(app, TtsState::Reading);
-    // Any early failure between here and the terminal emit must still return
-    // the UI to idle, otherwise the global status banner sticks on
-    // "Reading selection aloud…".
+    // Any exit between here and the end — success, a stop, or an early
+    // failure — must return the UI to idle, otherwise the global status banner
+    // sticks on "Reading selection aloud…".
     let result = trigger_tts_run(state, app).await;
-    if result.is_err() {
-        emit_tts_state(app, TtsState::Idle);
-    }
+    // Released before the idle emit, so a UI that reacts to it by starting
+    // another read finds the control free.
+    drop(run);
+    emit_tts_state(app, TtsState::Idle);
     result
 }
 
-async fn trigger_tts_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
+async fn trigger_tts_run(state: &Arc<AppState>, _app: &AppHandle) -> Result<(), String> {
     let settings = TtsSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
         .get()
         .await
@@ -1603,30 +1611,149 @@ async fn trigger_tts_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(), S
     let bindings = BindingRepo::new(state.config_pool.clone());
     let actions = ActionRepo::new(state.data_pool.clone());
     let textio = new_text_io();
+    let stop_with_esc = settings.stop_with_esc;
+    let play_state = state.clone();
 
     // The action lifecycle lives in the feature; this only supplies the way
     // the app reaches the speakers. Playback goes to the free function on a
     // blocking thread rather than through `state.audio`, whose mutex guards
     // capture and must not be held for the length of the audio.
+    //
+    // `Stopped` is not an error: the row is already closed as cancelled and
+    // the caller resets the UI, so it needs no handling here.
     run_tts_with_player(
         &state.engines,
         &bindings,
         &actions,
         textio.as_ref(),
         &settings,
-        |pcm| async move {
+        &state.read_aloud,
+        |pcm, stop| async move {
+            // Escape is held for exactly this window and released by the
+            // guard on every way out, including this future being dropped.
+            let _escape = stop_with_esc
+                .then(|| ReadAloudEscape::acquire(&play_state))
+                .flatten();
             tokio::task::spawn_blocking(move || {
-                kea_platform::audio::playback::play_pcm_blocking(&pcm)
+                kea_platform::audio::playback::play_pcm_cancellable(&pcm, &stop)
             })
             .await
             .map_err(|e| format!("playback failed: {e}"))?
             .map_err(|e| e.to_string())
         },
     )
-    .await?;
+    .await
+    .map(|_| ())
+}
 
-    emit_tts_state(app, TtsState::Idle);
-    Ok(())
+/// Stop the read-aloud run in progress, if any. Returns whether there was one.
+///
+/// Works in both phases: while synthesizing it abandons the synthesis, while
+/// playing it silences the output. The run closes its own ledger row and
+/// resets the status overlay on the way out, so this only has to ask.
+#[tauri::command]
+pub fn stop_read_aloud(state: State<'_, Arc<AppState>>) -> bool {
+    state.read_aloud.request_stop()
+}
+
+/// Escape, while — and only while — read-aloud audio is playing.
+///
+/// The fourth instance of the rule [`LOCK_CANCEL_ACTION_ID`] established:
+/// Escape is registered around the playback that can be stopped and released
+/// the moment it ends, never held for longer, because a global binding takes
+/// the key from every other application. Like the others it is not a
+/// [`HOTKEY_ACTIONS`] row and not user-rebindable.
+///
+/// **Why a registered hotkey and not a key-down event tap**, the other option
+/// the hold-to-talk listener uses. A tap needs the Input Monitoring /
+/// Accessibility permission and is installed for the process's lifetime or
+/// torn down and rebuilt per read; it also only *observes* Escape, so the
+/// frontmost app would still act on the same press (closing a dialog, leaving
+/// full screen) while the user is trying to quiet the voice. The Carbon hotkey
+/// needs no permission, is already what the dictation lock and the assistant
+/// use for this exact key, and consumes the press. The cost — Escape belongs
+/// to KEA for the seconds the audio plays — is the cost the tap would have too
+/// in spirit, and the Stop with Esc switch is the way out of it.
+pub const TTS_CANCEL_ACTION_ID: &str = "tts:cancel";
+
+/// Whether another feature currently holds the global Escape binding.
+///
+/// The accelerator is one slot: registering it again replaces the previous
+/// owner's action, and releasing it removes whoever holds it. A read that
+/// started during a locked dictation or an assistant session must therefore
+/// neither take Escape from them nor, when it ends, release theirs.
+pub fn escape_held_elsewhere(dictation_locked: bool, assistant_session_open: bool) -> bool {
+    dictation_locked || assistant_session_open
+}
+
+/// Holds the read-aloud Escape binding for as long as it lives.
+pub struct ReadAloudEscape {
+    state: Arc<AppState>,
+}
+
+impl ReadAloudEscape {
+    /// Registers Escape, or `None` when another feature owns it or the OS
+    /// refuses. Failure is logged, not propagated: without it Escape does not
+    /// stop the read, and the shortcut, the Stop button and the API still do.
+    pub fn acquire(state: &Arc<AppState>) -> Option<Self> {
+        if read_aloud_escape_blocked(state) {
+            return None;
+        }
+        let mut hotkeys = state.hotkeys.lock().unwrap_or_else(|p| p.into_inner());
+        let binding = HotkeyBinding {
+            accelerator: LOCK_CANCEL_ACCELERATOR.to_string(),
+        };
+        match hotkeys.register(binding, TTS_CANCEL_ACTION_ID.into()) {
+            Ok(()) => Some(Self {
+                state: state.clone(),
+            }),
+            Err(error) => {
+                tracing::warn!(%error, "could not register the read-aloud Escape binding");
+                None
+            }
+        }
+    }
+}
+
+impl Drop for ReadAloudEscape {
+    fn drop(&mut self) {
+        // Someone else may have registered Escape over ours in the meantime;
+        // unregistering now would take it from them.
+        if read_aloud_escape_blocked(&self.state) {
+            return;
+        }
+        let mut hotkeys = self.state.hotkeys.lock().unwrap_or_else(|p| p.into_inner());
+        let binding = HotkeyBinding {
+            accelerator: LOCK_CANCEL_ACCELERATOR.to_string(),
+        };
+        if let Err(error) = hotkeys.unregister(&binding) {
+            tracing::warn!(%error, "could not release the read-aloud Escape binding");
+        }
+    }
+}
+
+fn read_aloud_escape_blocked(state: &AppState) -> bool {
+    escape_held_elsewhere(
+        state.dictation_locked.load(Ordering::SeqCst),
+        state.assistant_busy.load(Ordering::SeqCst),
+    )
+}
+
+/// What a press of the read-aloud Escape binding does: stops the read when
+/// the rules in [`escape_stops_read_aloud`] allow it. The setting is read
+/// again here rather than trusted from registration time, so turning the
+/// switch off mid-read takes effect on the next press.
+pub async fn handle_read_aloud_escape(state: &Arc<AppState>) -> bool {
+    let enabled = TtsSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
+        .get()
+        .await
+        .map(|s| s.stop_with_esc)
+        .unwrap_or(true);
+    if escape_stops_read_aloud(state.read_aloud.phase(), enabled) {
+        state.read_aloud.request_stop()
+    } else {
+        false
+    }
 }
 
 /// Reads the three inputs [`dictation_hotkey_action`] and
@@ -7713,6 +7840,24 @@ mod tests {
         assert!(!clear_active_model_for_deleted(&pool, "llm", "gpt-4o")
             .await
             .unwrap());
+    }
+
+    #[test]
+    fn read_aloud_never_takes_escape_from_a_feature_that_already_holds_it() {
+        // The accelerator is one slot: registering over a locked recording or
+        // an assistant session would steal its cancel, and releasing it at the
+        // end of the read would strip it.
+        assert!(!escape_held_elsewhere(false, false));
+        assert!(escape_held_elsewhere(true, false));
+        assert!(escape_held_elsewhere(false, true));
+        assert!(escape_held_elsewhere(true, true));
+    }
+
+    #[test]
+    fn read_aloud_escape_has_its_own_action_id() {
+        assert_ne!(TTS_CANCEL_ACTION_ID, LOCK_CANCEL_ACTION_ID);
+        assert_ne!(TTS_CANCEL_ACTION_ID, ASSISTANT_CANCEL_ACTION_ID);
+        assert_ne!(TTS_CANCEL_ACTION_ID, TTS_ACTION_ID);
     }
 
     #[test]

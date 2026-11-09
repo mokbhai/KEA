@@ -71,6 +71,7 @@ enum RouteKind {
     DictationStart,
     DictationStop,
     Speak,
+    SpeakStop,
     Transcribe,
     Status,
     // The OpenAI-compatible model routes. They do not produce a `KeaAction`:
@@ -126,6 +127,11 @@ fn routes() -> Vec<Route> {
             method: Method::POST,
             path: "/v1/speak",
             kind: RouteKind::Speak,
+        },
+        Route {
+            method: Method::POST,
+            path: "/v1/speak/stop",
+            kind: RouteKind::SpeakStop,
         },
         Route {
             method: Method::POST,
@@ -251,6 +257,7 @@ fn action_for(kind: RouteKind, body: &[u8]) -> Result<KeaAction, ActionError> {
             }
             Ok(KeaAction::ReadAloud)
         }
+        RouteKind::SpeakStop => Ok(KeaAction::StopReadAloud),
         RouteKind::Transcribe => {
             let body: TranscribeBody = serde_json::from_slice(body)
                 .map_err(|e| ActionError::Refused(format!("bad JSON body: {e}")))?;
@@ -1500,6 +1507,18 @@ mod tests {
         assert_eq!(
             action_for(RouteKind::Speak, b"{}").unwrap(),
             KeaAction::ReadAloud
+        );
+    }
+
+    #[test]
+    fn speak_stop_is_its_own_route_and_verb() {
+        assert_eq!(
+            match_route(&Method::POST, "/v1/speak/stop"),
+            Some(RouteKind::SpeakStop)
+        );
+        assert_eq!(
+            action_for(RouteKind::SpeakStop, b"").unwrap(),
+            KeaAction::StopReadAloud
         );
     }
 

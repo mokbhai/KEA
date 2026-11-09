@@ -22,7 +22,10 @@ pub use rewrite::{
     run_rewrite, run_rewrite_with_storage, ContentStorageOpts, RewriteFeature, RewriteOutcome,
 };
 pub use transcribe::{TranscribeFeature, TRANSCRIBE_FEATURE_ID};
-pub use tts::{run_tts, run_tts_synthesize, TtsFeature};
+pub use tts::{
+    escape_stops_read_aloud, read_aloud_press, run_tts, run_tts_synthesize, ReadAloudControl,
+    ReadAloudPhase, ReadAloudPress, TtsFeature, TtsOutcome,
+};
 
 pub fn crate_name() -> &'static str {
     "kea-features"

@@ -6,6 +6,7 @@ use crate::store::settings::SettingsRepo;
 const KEY_ACTIVE_VOICE: &str = "tts.active_voice";
 const KEY_ACTIVE_MODEL: &str = "tts.active_model";
 const KEY_SPEED: &str = "tts.speed";
+const KEY_STOP_WITH_ESC: &str = "tts.stop_with_esc";
 
 /// A rate of 1.0 is the voice's natural pace. Named rather than inlined so
 /// the default is the same number in the reader, the serde default and the
@@ -30,10 +31,22 @@ pub struct TtsSettings {
     /// `DictationSettings`.
     #[serde(default = "default_speed")]
     pub speed: f32,
+    /// Whether Escape stops a read that is playing.
+    ///
+    /// On by default, and a config written before this key existed has no row,
+    /// which reads as on: Escape is the key everyone already reaches for to
+    /// quiet something. Escape is only ever held while audio is playing, so the
+    /// switch is about whether to take it then, not about holding it longer.
+    #[serde(default = "default_stop_with_esc")]
+    pub stop_with_esc: bool,
 }
 
 fn default_speed() -> f32 {
     DEFAULT_SPEED
+}
+
+fn default_stop_with_esc() -> bool {
+    true
 }
 
 impl Default for TtsSettings {
@@ -42,6 +55,7 @@ impl Default for TtsSettings {
             active_voice: None,
             active_model: None,
             speed: DEFAULT_SPEED,
+            stop_with_esc: true,
         }
     }
 }
@@ -60,6 +74,7 @@ impl TtsSettingsRepo {
             active_voice: self.settings.get_optional(KEY_ACTIVE_VOICE).await?,
             active_model: self.settings.get_optional(KEY_ACTIVE_MODEL).await?,
             speed: self.settings.get(KEY_SPEED).await?.unwrap_or(DEFAULT_SPEED),
+            stop_with_esc: self.settings.get(KEY_STOP_WITH_ESC).await?.unwrap_or(true),
         })
     }
 
@@ -71,6 +86,9 @@ impl TtsSettingsRepo {
             .set(KEY_ACTIVE_MODEL, &cfg.active_model)
             .await?;
         self.settings.set(KEY_SPEED, &cfg.speed).await?;
+        self.settings
+            .set(KEY_STOP_WITH_ESC, &cfg.stop_with_esc)
+            .await?;
         Ok(())
     }
 }
@@ -89,6 +107,7 @@ mod tests {
             active_voice: Some("alloy".into()),
             active_model: Some("tts-1".into()),
             speed: 1.25,
+            stop_with_esc: false,
         };
         repo.set(&cfg).await.unwrap();
         assert_eq!(repo.get().await.unwrap(), cfg);
@@ -156,5 +175,48 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(repo.get().await.unwrap().speed, 0.75);
+    }
+}
+
+#[cfg(test)]
+mod stop_with_esc_tests {
+    use super::*;
+    use crate::store::db::{open_pool, run_config_migrations};
+
+    /// A config written before the switch existed has no row, and Escape
+    /// stopping a read is the behaviour people expect: it must read as on.
+    #[tokio::test]
+    async fn stop_with_esc_defaults_on_for_a_config_without_the_row() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let settings = SettingsRepo::new(pool);
+        settings.set("tts.speed", &1.5f32).await.unwrap();
+
+        let got = TtsSettingsRepo::new(settings).get().await.unwrap();
+        assert!(got.stop_with_esc);
+        assert!(TtsSettings::default().stop_with_esc);
+    }
+
+    #[tokio::test]
+    async fn stop_with_esc_off_survives_a_reread() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&pool).await.unwrap();
+        let repo = TtsSettingsRepo::new(SettingsRepo::new(pool));
+        repo.set(&TtsSettings {
+            stop_with_esc: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert!(!repo.get().await.unwrap().stop_with_esc);
+    }
+
+    /// A payload from a UI built before the switch omits the field; it must
+    /// deserialize as on rather than fail or silently turn Escape off.
+    #[test]
+    fn an_older_payload_without_the_field_reads_as_on() {
+        let got: TtsSettings =
+            serde_json::from_str(r#"{"active_voice":null,"speed":1.0}"#).unwrap();
+        assert!(got.stop_with_esc);
     }
 }

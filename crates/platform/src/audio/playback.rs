@@ -79,16 +79,38 @@ pub fn play_pcm_cancellable(
         .map_err(|e| AudioIoError::Other(format!("audio sink unavailable: {e}")))?;
     sink.append(SamplesBuffer::new(1, pcm.sample_rate_hz, samples));
 
-    // 50 ms is the same cadence the mic level poll runs at. Fast enough that a
-    // stop feels immediate, slow enough to cost nothing while an answer plays.
-    while !sink.empty() {
-        if cancel.load(Ordering::Relaxed) {
-            sink.stop();
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    if drain_until_cancelled(|| sink.empty(), cancel, CANCEL_POLL) {
+        sink.stop();
     }
     Ok(())
+}
+
+/// How often a playing sink is checked for a stop request.
+///
+/// 50 ms is the same cadence the mic level poll runs at. It is finer than one
+/// output buffer, so a stop is as immediate as the device allows, and slow
+/// enough to cost nothing while audio plays.
+#[cfg(target_os = "macos")]
+const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Block until `is_done` reports the audio has drained or `cancel` is set,
+/// checking every `poll`. Returns `true` when it ended because of `cancel`.
+///
+/// Split from the rodio sink so that "a stop ends playback" can be asserted
+/// without an output device: tests hand it a sink that never empties.
+pub fn drain_until_cancelled(
+    mut is_done: impl FnMut() -> bool,
+    cancel: &std::sync::atomic::AtomicBool,
+    poll: std::time::Duration,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    while !is_done() {
+        if cancel.load(Ordering::Relaxed) {
+            return true;
+        }
+        std::thread::sleep(poll);
+    }
+    false
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -113,6 +135,44 @@ pub fn play_pcm_blocking(pcm: &PcmFrame) -> Result<(), AudioIoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stop_ends_a_sink_that_would_never_drain() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&cancel);
+        let started = Instant::now();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            setter.store(true, Ordering::Relaxed);
+        });
+        // A sink that never empties: only the stop can end this.
+        let stopped = drain_until_cancelled(|| false, &cancel, Duration::from_millis(5));
+        handle.join().unwrap();
+        assert!(stopped);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn audio_that_drains_on_its_own_is_not_reported_as_stopped() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let cancel = AtomicBool::new(false);
+        let mut polls = 0;
+        let stopped = drain_until_cancelled(
+            || {
+                polls += 1;
+                polls > 3
+            },
+            &cancel,
+            Duration::from_millis(1),
+        );
+        assert!(!stopped);
+    }
 
     #[test]
     fn clamp_pcm_samples_limits_out_of_range_values() {
