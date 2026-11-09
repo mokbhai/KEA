@@ -6,6 +6,26 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-11-10
+
+### Added
+
+- Turn any feature off. Rewrite, Dictation, Meetings, Transcribe, Read aloud and Assistant each have an on/off switch at the top of their page, and all six are listed in General. A feature that is off has no shortcuts, and the local API refuses it. Its settings are kept for when you turn it back on.
+- Stop read-aloud halfway. Press the read-aloud shortcut again, press Esc while it is speaking, or click Stop on the Read aloud page. Esc is only taken while audio is playing, and "Stop with Esc" turns that off.
+- AI pickers list each provider's models. Choose a provider and a model in one click, search long lists, and see the model in use without opening Advanced. Providers you have not set up are grouped under "Not set up".
+- The command-line tool installs from General with the normal macOS password prompt, instead of failing with "Permission denied".
+
+### Fixed
+
+- Dictation no longer loses your words. Pressing the shortcut again while the last dictation was still being transcribed used to record nothing ("Input sample buffer was empty"). It now records normally, and back-to-back dictations type in order.
+- If AI clean-up fails (for example the provider is busy or over its limit), your raw transcript is typed instead of nothing.
+- Every dictation is saved to History before KEA tries to type it, so a paste that fails can be copied from History. A failed paste also leaves the text on the clipboard.
+- Entries left as "started" by a crash or a quit are closed as "interrupted" the next time KEA opens.
+- The assistant's "Listening…" no longer appears next to the dictation popup after an assistant session has ended. The popup now shows one thing at a time.
+- The popup re-checks its position and visibility every time it appears and rebuilds itself if it has gone missing, and it logs its state so a case where it still disappears can be traced.
+- The Logs page shows the log. It was looking for a file name the logger never writes.
+- kea://open/assistant and kea://open/usage open those pages.
+
 ## [0.5.4] - 2026-11-02
 
 0.5.3 was never published (its Linux build failed), so this release also carries everything listed under it.
