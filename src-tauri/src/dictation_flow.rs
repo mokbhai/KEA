@@ -36,6 +36,13 @@ use crate::commands::{hold_dictation_action, try_acquire_busy, DictationHotkeyAc
 /// Everything the trigger loop needs from the running app.
 #[async_trait]
 pub trait DictationOps: Send + Sync {
+    /// Whether the Dictation feature is switched on. Checked per edge, not
+    /// trusted from when the listener was installed: an edge already queued
+    /// when the switch went off must not start a recording.
+    async fn enabled(&self) -> bool {
+        true
+    }
+
     /// `(a meeting is active or finishing, what the microphone is doing)`.
     async fn gate(&self) -> (bool, DictationState);
 
@@ -87,6 +94,16 @@ pub async fn run_action(ops: &dyn DictationOps, action: DictationHotkeyAction) {
 /// Drive the hold-to-talk edges until the sender goes away.
 pub async fn pump_hold_events(ops: &dyn DictationOps, mut events: UnboundedReceiver<HoldAction>) {
     while let Some(event) = events.recv().await {
+        // A switched-off feature runs nothing. The one edge still honoured is
+        // `Disarm`: it only closes a pre-roll stream that was armed before the
+        // switch went off, and skipping it would leave the microphone open.
+        if !ops.enabled().await {
+            if matches!(event, HoldAction::Disarm) {
+                ops.preroll_edge(event).await;
+            }
+            continue;
+        }
+
         // Arming opens and closes the microphone without starting a run, so it
         // is handled before the busy flag: a modifier press must not contend
         // with a recording for the flag that serialises runs.
@@ -114,6 +131,7 @@ pub async fn pump_hold_events(ops: &dyn DictationOps, mut events: UnboundedRecei
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc::unbounded_channel;
@@ -133,6 +151,9 @@ mod tests {
         /// How long each finished recording lasted.
         recordings: Mutex<Vec<Duration>>,
         errors: Mutex<Vec<String>>,
+        /// Whether the Dictation feature is switched on.
+        enabled: AtomicBool,
+        prerolls: Mutex<Vec<HoldAction>>,
     }
 
     impl FakeOps {
@@ -143,6 +164,8 @@ mod tests {
                 mic_open_since: Mutex::new(None),
                 recordings: Mutex::new(Vec::new()),
                 errors: Mutex::new(Vec::new()),
+                enabled: AtomicBool::new(true),
+                prerolls: Mutex::new(Vec::new()),
             }
         }
 
@@ -153,6 +176,10 @@ mod tests {
 
     #[async_trait]
     impl DictationOps for FakeOps {
+        async fn enabled(&self) -> bool {
+            self.enabled.load(Ordering::SeqCst)
+        }
+
         async fn gate(&self) -> (bool, DictationState) {
             let listening = self.mic_open_since.lock().unwrap().is_some();
             (
@@ -195,7 +222,9 @@ mod tests {
             Ok(())
         }
 
-        async fn preroll_edge(&self, _event: HoldAction) {}
+        async fn preroll_edge(&self, event: HoldAction) {
+            self.prerolls.lock().unwrap().push(event);
+        }
 
         fn report_error(&self, message: &str) {
             self.errors.lock().unwrap().push(message.to_string());
@@ -290,6 +319,36 @@ mod tests {
         );
         drop(tx);
         pump.await.unwrap();
+    }
+
+    /// **Feature switch.** With Dictation off the hold loop runs nothing: no
+    /// recording starts, nothing is stopped or cancelled, and an arm edge does
+    /// not open the microphone. The one edge still honoured is `Disarm`, which
+    /// only closes a pre-roll stream armed before the switch went off.
+    #[tokio::test]
+    async fn a_switched_off_feature_ignores_every_edge_but_disarm() {
+        let ops = Arc::new(FakeOps::new(false));
+        ops.enabled.store(false, Ordering::SeqCst);
+        let (tx, rx) = unbounded_channel();
+        let pump = {
+            let ops = ops.clone();
+            tokio::spawn(async move { pump_hold_events(ops.as_ref(), rx).await })
+        };
+        for event in [
+            HoldAction::Arm,
+            HoldAction::Start,
+            HoldAction::Stop,
+            HoldAction::Disarm,
+        ] {
+            tx.send(event).unwrap();
+        }
+        drop(tx);
+        pump.await.unwrap();
+
+        assert!(ops.recordings().is_empty(), "no recording may start");
+        assert!(ops.mic_open_since.lock().unwrap().is_none());
+        assert!(ops.errors.lock().unwrap().is_empty());
+        assert_eq!(*ops.prerolls.lock().unwrap(), vec![HoldAction::Disarm]);
     }
 
     /// A failed start is reported, not swallowed.

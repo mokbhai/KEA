@@ -73,6 +73,10 @@ impl ApiError {
 
     /// `400`: the request is malformed or asks for something this route
     /// does not do. Also the answer for a body the route cannot decode.
+    pub fn feature_disabled(message: impl Into<String>) -> Self {
+        Self::new(403, "permission_error", Some("feature_disabled"), message)
+    }
+
     pub fn invalid_request(message: impl Into<String>) -> Self {
         Self::new(400, "invalid_request_error", None, message)
     }

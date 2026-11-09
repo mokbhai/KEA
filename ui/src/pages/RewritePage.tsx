@@ -1,3 +1,5 @@
+import type { ComponentProps } from "react";
+import FeatureSwitch from "../components/FeatureSwitch";
 import { useState } from "react";
 import {
   TRANSLATION_TARGETS,
@@ -31,7 +33,7 @@ type Props = {
   onNavigate?: Navigate;
 };
 
-export default function RewritePage({ onRunSetup, onNavigate }: Props) {
+function RewritePageContent({ onRunSetup, onNavigate }: Props) {
   const ai = useFeatureAi(SLOTS);
   const rewrite = useRewriteSettings();
   const { settings, translateTargets } = rewrite;
@@ -300,4 +302,8 @@ export default function RewritePage({ onRunSetup, onNavigate }: Props) {
       </section>
     </div>
   );
+}
+
+export default function RewritePage(props: ComponentProps<typeof RewritePageContent>) {
+  return <FeatureSwitch feature="rewrite"><RewritePageContent {...props} /></FeatureSwitch>;
 }

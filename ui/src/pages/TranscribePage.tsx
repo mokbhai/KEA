@@ -1,3 +1,5 @@
+import type { ComponentProps } from "react";
+import FeatureSwitch from "../components/FeatureSwitch";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
@@ -56,7 +58,7 @@ function toPanelSegments(cues: LiveCue[]): TranscriptSegment[] {
   }));
 }
 
-export default function TranscribePage({ onNavigate }: Props) {
+function TranscribePageContent({ onNavigate }: Props) {
   const [loading, setLoading] = useState(true);
   const [transcripts, setTranscripts] = useState<TranscriptRow[]>([]);
   const [selected, setSelected] = useState<TranscriptDetail | null>(null);
@@ -373,4 +375,8 @@ export default function TranscribePage({ onNavigate }: Props) {
       <StatusPill message={notice} variant={notice ? "progress" : null} />
     </div>
   );
+}
+
+export default function TranscribePage(props: ComponentProps<typeof TranscribePageContent>) {
+  return <FeatureSwitch feature="transcribe"><TranscribePageContent {...props} /></FeatureSwitch>;
 }

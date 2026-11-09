@@ -83,6 +83,20 @@ enum RouteKind {
 }
 
 impl RouteKind {
+    fn feature(self) -> Option<&'static str> {
+        match self {
+            Self::Rewrite => Some("rewrite"),
+            Self::DictationStart | Self::DictationStop => Some("dictation"),
+            Self::Speak | Self::ModelSpeech => Some("tts"),
+            Self::Transcribe | Self::ModelTranscriptions => Some("transcribe"),
+            Self::ModelChat => Some("assistant"),
+            // Stopping is never refused: a read that was running when the
+            // feature was switched off must still be stoppable, and a stop
+            // with nothing to stop is harmless.
+            Self::SpeakStop | Self::Status | Self::ModelList => None,
+        }
+    }
+
     /// Whether this route is one of the OpenAI-compatible ones. Those answer
     /// with OpenAI's error shape and a route-sized body limit; every other
     /// route keeps its existing responses.
@@ -627,6 +641,15 @@ async fn handle(rt: Runtime, req: Request<Incoming>) -> Response<Full<Bytes>> {
         return error_response(StatusCode::NOT_FOUND, "no such endpoint");
     };
 
+    if let Some(feature) = kind.feature() {
+        if let Err(error) = crate::feature_switches::require(&rt.state.config_pool, feature).await {
+            return if openai {
+                openai_error(ApiError::feature_disabled(error))
+            } else {
+                error_response(StatusCode::FORBIDDEN, &error)
+            };
+        }
+    }
     let limit = kind.body_limit();
     let body = match collect_body(req.into_body(), limit).await {
         Ok(bytes) => bytes,
@@ -1095,6 +1118,39 @@ mod tests {
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.unwrap();
         String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[tokio::test]
+    async fn every_feature_route_is_gated_including_model_routes() {
+        let pool = kea_core::store::db::open_pool("sqlite::memory:")
+            .await
+            .unwrap();
+        kea_core::store::db::run_config_migrations(&pool)
+            .await
+            .unwrap();
+        for route in routes() {
+            if matches!(
+                route.kind,
+                RouteKind::Status | RouteKind::ModelList | RouteKind::SpeakStop
+            ) {
+                assert_eq!(route.kind.feature(), None);
+                continue;
+            }
+            let feature = route
+                .kind
+                .feature()
+                .expect("feature route must have a gate");
+            kea_core::store::settings::SettingsRepo::new(pool.clone())
+                .set(&format!("features.{feature}.enabled"), &false)
+                .await
+                .unwrap();
+            let message = crate::feature_switches::require(&pool, feature)
+                .await
+                .unwrap_err();
+            assert!(message.contains("feature disabled"));
+            assert_eq!(ActionError::Disabled(message.clone()).status(), 403);
+            assert_eq!(ApiError::feature_disabled(message).status, 403);
+        }
     }
 
     #[test]

@@ -61,13 +61,24 @@ extern "C" {
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
 }
 
+// CFRunLoopSourceSignal is explicitly safe across threads. Keep a retained
+// source in the control so even an unexpectedly terminated tap thread cannot
+// leave its shutdown handle pointing into freed memory.
+struct StopSource(core_foundation::runloop::CFRunLoopSource);
+unsafe impl Send for StopSource {}
+unsafe impl Sync for StopSource {}
+impl StopSource {
+    fn signal(&self) {
+        unsafe {
+            core_foundation::runloop::CFRunLoopSourceSignal(self.0.as_concrete_TypeRef());
+        }
+    }
+}
+
 /// Installs the hold-to-talk listener.
 ///
 /// `enabled` (the ⌥⇧ chord) and `mouse` (the middle button) are read on every
-/// event so each settings toggle takes effect without tearing anything down. The listener is deliberately *not* stoppable: ending
-/// a `CFRunLoop` from another thread needs a source or timer installed purely to
-/// carry the request, and the tap is inert while disabled (it resets the state
-/// machine and returns before reading anything). It goes away when KEA quits.
+/// event. The master switch stops and joins the tap thread before returning.
 pub fn spawn(
     enabled: Arc<AtomicBool>,
     mouse: Arc<AtomicBool>,
@@ -76,11 +87,12 @@ pub fn spawn(
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     // The tap is created on the run-loop thread, so its success or failure has
     // to travel back here before `spawn` can answer.
-    let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+    let (started_tx, started_rx) =
+        std::sync::mpsc::sync_channel::<Result<(CFRunLoop, StopSource), String>>(1);
 
     let machine = Arc::new(Mutex::new(HoldToTalk::new()));
 
-    spawn_tap_thread(
+    let thread = spawn_tap_thread(
         machine.clone(),
         enabled,
         mouse,
@@ -89,18 +101,31 @@ pub fn spawn(
         started_tx,
     );
 
-    match started_rx.recv() {
-        Ok(Ok(())) => {}
+    let (run_loop, shutdown_source) = match started_rx.recv() {
+        Ok(Ok(control)) => control,
         Ok(Err(message)) => return Err(HotkeyError::Other(message)),
         Err(_) => {
             return Err(HotkeyError::Other(
                 "hold-to-talk listener thread died before it reported readiness".into(),
             ))
         }
-    }
+    };
 
     spawn_deadline_thread(machine.clone(), wake_rx, events_tx);
-    Ok((HoldControl::new(machine), events_rx))
+    let thread = Arc::new(Mutex::new(Some(thread)));
+    Ok((
+        HoldControl::new(machine).with_shutdown(move || {
+            if let Some(thread) = thread.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                // A signal before Run starts remains pending until it runs.
+                unsafe {
+                    shutdown_source.signal();
+                    core_foundation::runloop::CFRunLoopWakeUp(run_loop.as_concrete_TypeRef());
+                }
+                let _ = thread.join();
+            }
+        }),
+        events_rx,
+    ))
 }
 
 /// Said in one place because it is said from two: the pre-flight trust check
@@ -116,8 +141,8 @@ fn spawn_tap_thread(
     mouse: Arc<AtomicBool>,
     events: mpsc::UnboundedSender<HoldAction>,
     wake: std::sync::mpsc::Sender<()>,
-    started: std::sync::mpsc::SyncSender<Result<(), String>>,
-) {
+    started: std::sync::mpsc::SyncSender<Result<(CFRunLoop, StopSource), String>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("kea-hold-to-talk".into())
         .spawn(move || {
@@ -178,11 +203,47 @@ fn spawn_tap_thread(
             tap.enable();
             TAP_PORT.with(|slot| slot.set(tap.mach_port().as_concrete_TypeRef()));
 
-            let _ = started.send(Ok(()));
-            // Never returns; `tap` stays alive (and enabled) for the process.
+            extern "C" fn shutdown(_: *const std::ffi::c_void) {
+                CFRunLoop::get_current().stop();
+            }
+            let run_loop = CFRunLoop::get_current();
+            let mut context = core_foundation::runloop::CFRunLoopSourceContext {
+                version: 0,
+                info: std::ptr::null_mut(),
+                retain: None,
+                release: None,
+                copyDescription: None,
+                equal: None,
+                hash: None,
+                schedule: None,
+                cancel: None,
+                perform: shutdown,
+            };
+
+            let shutdown_source = unsafe {
+                let raw = core_foundation::runloop::CFRunLoopSourceCreate(
+                    std::ptr::null(),
+                    0,
+                    &mut context,
+                );
+                if raw.is_null() {
+                    let _ =
+                        started.send(Err("could not create hold listener shutdown source".into()));
+                    return;
+                }
+                core_foundation::runloop::CFRunLoopSource::wrap_under_create_rule(raw)
+            };
+            run_loop.add_source(&shutdown_source, unsafe { kCFRunLoopCommonModes });
+            let _ = started.send(Ok((run_loop.clone(), StopSource(shutdown_source.clone()))));
             CFRunLoop::run_current();
+            run_loop.remove_source(&shutdown_source, unsafe { kCFRunLoopCommonModes });
+            unsafe {
+                CGEventTapEnable(tap.mach_port().as_concrete_TypeRef(), false);
+            }
+            CFRunLoop::get_current().remove_source(&source, unsafe { kCFRunLoopCommonModes });
+            TAP_PORT.with(|slot| slot.set(std::ptr::null_mut()));
         })
-        .expect("spawning the hold-to-talk listener thread");
+        .expect("spawning the hold-to-talk listener thread")
 }
 
 /// Why the system disabled the tap, or `None` for an ordinary event.

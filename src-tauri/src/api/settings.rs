@@ -341,7 +341,13 @@ const SHIM_INSTALL_DIR: &str = "/usr/local/bin";
 
 /// Symlink the bundled shim onto the PATH.
 #[tauri::command]
-pub fn install_cli_shim(app: AppHandle) -> Result<String, String> {
+pub async fn install_cli_shim(app: AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || install_cli_shim_blocking(app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn install_cli_shim_blocking(app: AppHandle) -> Result<String, String> {
     let source = app
         .path()
         .resolve(SHIM_RESOURCE, tauri::path::BaseDirectory::Resource)
@@ -352,7 +358,47 @@ pub fn install_cli_shim(app: AppHandle) -> Result<String, String> {
             source.display()
         ));
     }
-    install_shim_at(&source, std::path::Path::new(SHIM_INSTALL_DIR))
+    let dir = std::path::Path::new(SHIM_INSTALL_DIR);
+    match install_shim_at(&source, dir) {
+        Ok(path) => Ok(path),
+        Err(_error) => {
+            #[cfg(target_os = "macos")]
+            {
+                // `make install` remains password-free. This explicit user action
+                // can request authorization through the system-owned prompt.
+                let target = dir.join("kea");
+                refuse_regular_file(&target)?;
+                let script = admin_link_script(&source, dir)?;
+                let output = std::process::Command::new("osascript")
+                    .arg("-e")
+                    .arg(script)
+                    .output()
+                    .map_err(|e| format!("could not request administrator authorization: {e}"))?;
+                if output.status.success() {
+                    return Ok(target.to_string_lossy().into_owned());
+                }
+                let reason = String::from_utf8_lossy(&output.stderr);
+                if !reason.contains("(-128)") {
+                    return Err(format!("could not install CLI tool: {reason}"));
+                }
+                let local = app
+                    .path()
+                    .home_dir()
+                    .map_err(|e| e.to_string())?
+                    .join(".local/bin");
+                std::fs::create_dir_all(&local).map_err(|e| e.to_string())?;
+                let linked = install_shim_at(&source, &local)?;
+                Ok(format!(
+                    "{linked}. Add {} to PATH in your shell configuration.",
+                    local.display()
+                ))
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(_error)
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -376,6 +422,10 @@ fn install_shim_at(source: &std::path::Path, dir: &std::path::Path) -> Result<St
             );
         }
     }
+    if std::fs::read_link(&target).is_ok_and(|path| path == source) {
+        return Ok(target.to_string_lossy().into_owned());
+    }
+    refuse_regular_file(&target)?;
     // Replace rather than fail: the app moves on every update, so a symlink
     // from a previous install points at a bundle that may be gone.
     match std::fs::remove_file(&target) {
@@ -386,6 +436,66 @@ fn install_shim_at(source: &std::path::Path, dir: &std::path::Path) -> Result<St
     std::os::unix::fs::symlink(source, &target)
         .map_err(|e| manual_instructions(source, &target, &e.to_string()))?;
     Ok(target.to_string_lossy().into_owned())
+}
+
+fn refuse_regular_file(target: &std::path::Path) -> Result<(), String> {
+    if std::fs::symlink_metadata(target).is_ok_and(|m| !m.file_type().is_symlink()) {
+        return Err(format!(
+            "{} already exists and is not a symlink; move it before installing KEA",
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
+fn shell_quote(path: &std::path::Path) -> Result<String, String> {
+    let path = path.to_str().ok_or("CLI path is not valid UTF-8")?;
+    Ok(format!("'{}'", path.replace('\'', "'\\''")))
+}
+
+fn admin_link_script(source: &std::path::Path, dir: &std::path::Path) -> Result<String, String> {
+    let command = format!(
+        "mkdir -p {} && ln -sfn {} {}",
+        shell_quote(dir)?,
+        shell_quote(source)?,
+        shell_quote(&dir.join("kea"))?
+    );
+    Ok(format!(
+        "do shell script \"{}\" with administrator privileges",
+        command.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
+#[tauri::command]
+pub fn get_cli_shim_status(app: AppHandle) -> Result<String, String> {
+    let source = app
+        .path()
+        .resolve(SHIM_RESOURCE, tauri::path::BaseDirectory::Resource)
+        .map_err(|e| e.to_string())?;
+    let mut targets = vec![std::path::Path::new(SHIM_INSTALL_DIR).join("kea")];
+    if let Ok(home) = app.path().home_dir() {
+        targets.push(home.join(".local/bin/kea"));
+    }
+    Ok(targets
+        .iter()
+        .map(|target| shim_status(&source, target))
+        .collect::<Vec<_>>()
+        .join(". "))
+}
+
+fn shim_status(source: &std::path::Path, target: &std::path::Path) -> String {
+    match std::fs::read_link(target) {
+        Ok(path) if path == source && source.exists() => {
+            format!("Already linked at {}", target.display())
+        }
+        Ok(path) => format!(
+            "Stale link at {} → {}; install to update it",
+            target.display(),
+            path.display()
+        ),
+        Err(_) if target.exists() => format!("{} exists and is not a KEA link", target.display()),
+        Err(_) => format!("Not installed at {}", target.display()),
+    }
 }
 
 #[cfg(not(unix))]
@@ -410,6 +520,46 @@ fn manual_instructions(source: &std::path::Path, target: &std::path::Path, why: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_command_quotes_shell_and_applescript_independently() {
+        let source = std::path::Path::new("/Apps/KEA's \"test\" $(touch bad)`bad`\\app/kea");
+        let script = admin_link_script(source, std::path::Path::new("/usr/local/bin")).unwrap();
+        assert!(script.starts_with("do shell script \"mkdir -p '/usr/local/bin' && ln -sfn '"));
+        assert!(script.contains("KEA'\\\\''s"), "{script}");
+        assert!(script.ends_with("with administrator privileges"));
+        // A real shell parses the quoted path literally, without substitutions.
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {}", shell_quote(source).unwrap()))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            source.to_str().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_status_distinguishes_current_stale_and_missing_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("kea-cli");
+        let target = dir.path().join("kea");
+        std::fs::write(&source, "#!/bin/sh\n").unwrap();
+        assert!(shim_status(&source, &target).starts_with("Not installed"));
+        std::os::unix::fs::symlink(dir.path().join("old"), &target).unwrap();
+        assert!(shim_status(&source, &target).starts_with("Stale link"));
+        install_shim_at(&source, dir.path()).unwrap();
+        assert!(shim_status(&source, &target).starts_with("Already linked"));
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&target, "user tool").unwrap();
+        assert!(install_shim_at(&source, dir.path())
+            .unwrap_err()
+            .contains("not a symlink"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "user tool");
+    }
 
     /// Until someone writes them, the port is off and listens on 8765, and a
     /// stored `0` (which the setter refuses) falls back rather than binding a

@@ -56,6 +56,7 @@ pub struct StatusReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionError {
     /// Something is already using the machinery this action needs.
+    Disabled(String),
     Busy(String),
     /// The request cannot mean anything, or asked for something refused by
     /// policy (a path outside the home, KEA being frontmost).
@@ -67,6 +68,7 @@ pub enum ActionError {
 impl ActionError {
     pub fn status(&self) -> u16 {
         match self {
+            ActionError::Disabled(_) => 403,
             ActionError::Busy(_) => 409,
             ActionError::Refused(_) => 400,
             ActionError::Failed(_) => 500,
@@ -77,7 +79,10 @@ impl ActionError {
 impl std::fmt::Display for ActionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ActionError::Busy(m) | ActionError::Refused(m) | ActionError::Failed(m) => {
+            ActionError::Disabled(m)
+            | ActionError::Busy(m)
+            | ActionError::Refused(m)
+            | ActionError::Failed(m) => {
                 write!(f, "{m}")
             }
         }
@@ -128,6 +133,18 @@ pub async fn execute(
     app: &AppHandle,
     action: KeaAction,
 ) -> Result<ActionOutcome, ActionError> {
+    let feature = match &action {
+        KeaAction::Rewrite(_) => Some("rewrite"),
+        KeaAction::Dictation(_) => Some("dictation"),
+        KeaAction::ReadAloud => Some("tts"),
+        KeaAction::Transcribe { .. } => Some("transcribe"),
+        _ => None,
+    };
+    if let Some(feature) = feature {
+        crate::feature_switches::require(&state.config_pool, feature)
+            .await
+            .map_err(ActionError::Disabled)?;
+    }
     if action.needs_the_users_app() && kea_is_frontmost(state, app).await {
         return Err(ActionError::Refused(FOCUS_REFUSAL.into()));
     }

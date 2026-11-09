@@ -1,3 +1,5 @@
+import type { ComponentProps } from "react";
+import FeatureSwitch from "../components/FeatureSwitch";
 import { parseStoredTime } from "../lib/meetingTime";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
@@ -131,7 +133,7 @@ function newestMeetingId(list: Meeting[]): string | null {
   return best?.id ?? null;
 }
 
-export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMeeting }: Props) {
+function MeetingsPageContent({ onNavigate, selectedMeetingId, onSelectMeeting }: Props) {
   const ai = useFeatureAi(SLOTS);
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [listLoaded, setListLoaded] = useState(false);
@@ -987,4 +989,8 @@ export default function MeetingsPage({ onNavigate, selectedMeetingId, onSelectMe
       )}
     </div>
   );
+}
+
+export default function MeetingsPage(props: ComponentProps<typeof MeetingsPageContent>) {
+  return <FeatureSwitch feature="meetings"><MeetingsPageContent {...props} /></FeatureSwitch>;
 }

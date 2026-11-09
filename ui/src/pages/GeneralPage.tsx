@@ -1,3 +1,4 @@
+import { FeatureSwitchOverview } from "../components/FeatureSwitch";
 import { useEffect, useState } from "react";
 import {
   checkUpdate,
@@ -5,6 +6,7 @@ import {
   getAutostart,
   getSetting,
   installCliShim,
+  getCliShimStatus,
   regenerateApiToken,
   revealApiToken,
   setApiEnabled,
@@ -71,6 +73,14 @@ const TCP_WARNING =
 
 export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) {
   const { preference, setPreference } = useTheme();
+  useEffect(() => {
+    let active = true;
+    void getCliShimStatus().then(value => {
+      if (active) setCliStatus(value);
+    }).catch(() => {});
+    return () => { active = false; };
+  }, []);
+
   const [savedKey, flash] = useSavedFlash();
 
   const [autostart, setAutostartEnabled] = useState(false);
@@ -350,6 +360,7 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
   return (
     <div>
       <h1 style={{ marginTop: 0 }}>General</h1>
+      <FeatureSwitchOverview />
       <p className="kea-muted" style={{ marginBottom: 24 }}>
         Appearance, startup, updates, sounds, notifications and permissions.
       </p>

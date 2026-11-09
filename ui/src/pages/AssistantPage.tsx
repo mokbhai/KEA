@@ -1,3 +1,5 @@
+import type { ComponentProps } from "react";
+import FeatureSwitch from "../components/FeatureSwitch";
 import { useEffect, useRef } from "react";
 import { getAssistantSettings, setAssistantSettings, type AssistantSettings } from "../api";
 import FeatureBanner from "../components/FeatureBanner";
@@ -47,7 +49,7 @@ type Props = {
   onNavigate?: Navigate;
 };
 
-export default function AssistantPage({ onNavigate }: Props) {
+function AssistantPageContent({ onNavigate }: Props) {
   const ai = useFeatureAi(SLOTS);
 
   const outputs = useOptimisticSetting<AssistantSettings>({
@@ -178,4 +180,8 @@ export default function AssistantPage({ onNavigate }: Props) {
       </section>
     </div>
   );
+}
+
+export default function AssistantPage(props: ComponentProps<typeof AssistantPageContent>) {
+  return <FeatureSwitch feature="assistant"><AssistantPageContent {...props} /></FeatureSwitch>;
 }
