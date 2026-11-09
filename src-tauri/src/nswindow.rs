@@ -12,6 +12,8 @@
 //! Nothing here is palette- or HUD-specific; what differs between the two
 //! windows (focusable, transparent, position) stays in their own modules.
 
+#[cfg(target_os = "macos")]
+use tauri::Manager;
 use tauri::WebviewWindow;
 
 /// `NSWindowCollectionBehavior` bits, from AppKit's `NSWindow.h`.
@@ -157,8 +159,10 @@ unsafe fn convert_to_panel(ns_window: *mut objc2::runtime::AnyObject, nonactivat
 ///
 /// Must run on the main thread — AppKit is not thread-safe — which is why both
 /// callers call it from `create` during setup and never from a Tokio worker.
-/// Neither `show()` nor `set_position()` resets the level or the behaviour, so
-/// applying it once at build time holds.
+/// Applied once at build time, and again on every show by
+/// [`order_front_without_activating`] — which also logs whether the level or
+/// the collection behaviour had drifted in between, so the claim that nothing
+/// resets them is checked rather than assumed.
 ///
 /// Every failure here is swallowed: a window at the wrong level is a cosmetic
 /// problem, and neither dictation nor the palette may stop working over it.
@@ -238,13 +242,35 @@ pub fn order_front_without_activating(window: &WebviewWindow) {
         use objc2::msg_send;
         use objc2::runtime::AnyObject;
 
+        let label = window.label().to_string();
         let ns_window = match window.ns_window() {
             Ok(ptr) if !ptr.is_null() => ptr as *mut AnyObject,
-            _ => return,
+            other => {
+                // The window object exists but its NSWindow does not: nothing
+                // we can order front. Only the overlay is rebuilt — the
+                // palette has its own lifecycle.
+                tracing::error!(window = %label, result = ?other.map(|_| ()), "ns_window unavailable");
+                if label == crate::overlay::LABEL {
+                    crate::overlay::recreate(window.app_handle());
+                }
+                return;
+            }
         };
 
-        let is_overlay = window.label() == crate::overlay::LABEL;
+        let is_overlay = label == crate::overlay::LABEL;
         unsafe {
+            // What the panel looks like *before* we touch it. Anything other
+            // than the values we set at build time means something else
+            // changed the window since, which is the evidence a "stopped
+            // appearing" report needs.
+            let before = if is_overlay { Some(panel_snapshot(ns_window)) } else { None };
+            if let Some(before) = &before {
+                let drift = before.problems();
+                if !drift.is_empty() {
+                    tracing::warn!(window = %label, ?drift, snapshot = ?before, "panel drifted since the last show; re-asserting");
+                }
+            }
+
             convert_to_panel(ns_window, is_overlay);
             if is_overlay {
                 reposition_ns_window_on_active_screen(
@@ -255,6 +281,30 @@ pub fn order_front_without_activating(window: &WebviewWindow) {
                 );
             }
             let _: () = msg_send![ns_window, orderFrontRegardless];
+
+            if !is_overlay {
+                return;
+            }
+            let mut after = panel_snapshot(ns_window);
+            if !after.visible {
+                // `orderFrontRegardless` did not take. Fall back to the
+                // ordinary show (the panel is non-focusable, so it cannot take
+                // key), re-assert, and look again.
+                tracing::warn!(snapshot = ?after, "overlay not visible after orderFrontRegardless; retrying with show()");
+                let _ = window.show();
+                convert_to_panel(ns_window, true);
+                let _: () = msg_send![ns_window, orderFrontRegardless];
+                after = panel_snapshot(ns_window);
+            }
+            let problems = after.problems();
+            if after.visible && problems.is_empty() {
+                tracing::info!(snapshot = ?after, "overlay shown");
+            } else if after.visible {
+                tracing::warn!(?problems, snapshot = ?after, "overlay shown with unexpected properties");
+            } else {
+                tracing::error!(?problems, snapshot = ?after, "overlay still not visible; rebuilding the window");
+                crate::overlay::recreate(window.app_handle());
+            }
         }
     });
 }
@@ -274,7 +324,7 @@ pub fn float_over_fullscreen(_window: &WebviewWindow) {}
 pub unsafe fn reposition_ns_window_on_active_screen(
     ns_window: *mut objc2::runtime::AnyObject,
     width: f64,
-    _height: f64,
+    height: f64,
     bottom_margin: f64,
 ) {
     use objc2::msg_send;
@@ -316,11 +366,123 @@ pub unsafe fn reposition_ns_window_on_active_screen(
     }
 
     let visible: CGRect = msg_send![matched_screen, visibleFrame];
-    let x = visible.origin.x + (visible.size.width - width) / 2.0;
-    let y = visible.origin.y + bottom_margin;
-    let origin = CGPoint { x, y };
+    // The whole frame, not just the origin: size is re-asserted too, so a
+    // window that was resized or collapsed since build time comes back at its
+    // designed dimensions on the next show.
+    let frame = panel_frame(visible, width, height, bottom_margin);
+    let _: () = msg_send![ns_window, setFrame: frame, display: true];
+}
 
-    let _: () = msg_send![ns_window, setFrameOrigin: origin];
+/// Where a `width x height` panel goes on a screen whose usable area is
+/// `visible`: horizontally centred, `bottom_margin` above its bottom edge.
+///
+/// AppKit's origin is bottom-left, so `y` counts up from the area's bottom.
+/// Clamped so a panel larger than the area stays inside it rather than being
+/// placed past the area's origin.
+#[cfg(target_os = "macos")]
+pub fn panel_frame(visible: CGRect, width: f64, height: f64, bottom_margin: f64) -> CGRect {
+    let x = visible.origin.x + ((visible.size.width - width) / 2.0).max(0.0);
+    let room = (visible.size.height - height).max(0.0);
+    let y = visible.origin.y + bottom_margin.min(room).max(0.0);
+    CGRect {
+        origin: CGPoint { x, y },
+        size: CGSize { width, height },
+    }
+}
+
+/// A read-back of the AppKit state that decides whether the overlay can be
+/// seen: logged on every show, and checked against what we set at build time.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelSnapshot {
+    pub level: isize,
+    pub visible: bool,
+    pub on_active_space: bool,
+    pub collection_behavior: usize,
+    pub style_mask: usize,
+    pub alpha: f64,
+    pub frame: CGRect,
+    /// The frame of the screen the panel is on, `None` when AppKit says it is
+    /// on no screen at all — which is what an off-screen panel looks like.
+    pub screen_frame: Option<CGRect>,
+    /// `NSWindowOcclusionStateVisible` (1 << 1) set means some part is on screen.
+    pub occlusion_visible: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl PanelSnapshot {
+    /// What differs from the overlay's designed configuration. Empty when the
+    /// panel is as built. `on_active_space` is deliberately not a problem: it
+    /// is false for a moment during a Space switch and means nothing then.
+    pub fn problems(&self) -> Vec<&'static str> {
+        let mut found = Vec::new();
+        if self.level != STATUS_WINDOW_LEVEL {
+            found.push("level changed");
+        }
+        if self.collection_behavior != floating_collection_behavior() {
+            found.push("collection behaviour changed");
+        }
+        if self.style_mask & style_mask::NONACTIVATING_PANEL == 0 {
+            found.push("not a non-activating panel");
+        }
+        if !self.visible {
+            found.push("not visible");
+        }
+        if self.alpha < 1.0 {
+            found.push("alpha below 1");
+        }
+        match self.screen_frame {
+            None => found.push("on no screen"),
+            Some(screen) if !rects_intersect(self.frame, screen) => {
+                found.push("frame outside its screen")
+            }
+            Some(_) => {}
+        }
+        found
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rects_intersect(a: CGRect, b: CGRect) -> bool {
+    a.origin.x < b.origin.x + b.size.width
+        && b.origin.x < a.origin.x + a.size.width
+        && a.origin.y < b.origin.y + b.size.height
+        && b.origin.y < a.origin.y + a.size.height
+}
+
+/// Reads the panel back.
+///
+/// # Safety
+/// Main thread, valid `ns_window`.
+#[cfg(target_os = "macos")]
+pub unsafe fn panel_snapshot(ns_window: *mut objc2::runtime::AnyObject) -> PanelSnapshot {
+    use objc2::msg_send;
+
+    let level: isize = msg_send![ns_window, level];
+    let visible: bool = msg_send![ns_window, isVisible];
+    let on_active_space: bool = msg_send![ns_window, isOnActiveSpace];
+    let collection_behavior: usize = msg_send![ns_window, collectionBehavior];
+    let style_mask: usize = msg_send![ns_window, styleMask];
+    let alpha: f64 = msg_send![ns_window, alphaValue];
+    let frame: CGRect = msg_send![ns_window, frame];
+    let occlusion: usize = msg_send![ns_window, occlusionState];
+    let screen: *mut objc2::runtime::AnyObject = msg_send![ns_window, screen];
+    let screen_frame = if screen.is_null() {
+        None
+    } else {
+        Some(msg_send![screen, frame])
+    };
+    PanelSnapshot {
+        level,
+        visible,
+        on_active_space,
+        collection_behavior,
+        style_mask,
+        alpha,
+        frame,
+        screen_frame,
+        occlusion_visible: occlusion & (1 << 1) != 0,
+    }
 }
 
 /// Positions `window` bottom-centred on the screen containing the mouse cursor
@@ -468,5 +630,110 @@ mod tests {
         // field below the bottom edge.
         let (_, y) = top_centre_position(0, 0, 1000, 800, 600, 120, 900);
         assert_eq!(y, 680);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
+        CGRect {
+            origin: CGPoint { x, y },
+            size: CGSize { width: w, height: h },
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn healthy() -> PanelSnapshot {
+        PanelSnapshot {
+            level: STATUS_WINDOW_LEVEL,
+            visible: true,
+            on_active_space: true,
+            collection_behavior: floating_collection_behavior(),
+            style_mask: style_mask::NONACTIVATING_PANEL | style_mask::UTILITY_WINDOW,
+            alpha: 1.0,
+            frame: rect(100.0, 48.0, 560.0, 96.0),
+            screen_frame: Some(rect(0.0, 0.0, 1440.0, 900.0)),
+            occlusion_visible: true,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_panel_as_built_has_no_problems() {
+        assert!(healthy().problems().is_empty());
+    }
+
+    /// Each of these is a way the overlay can silently stop being seen. The
+    /// snapshot has to name every one, because the log line it feeds is the
+    /// only evidence a "stopped appearing until restart" report will have.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drift_in_any_visibility_property_is_named() {
+        type Break = Box<dyn Fn(&mut PanelSnapshot)>;
+        let cases: Vec<(&str, Break)> = vec![
+            ("level changed", Box::new(|s| s.level = 3)),
+            (
+                "collection behaviour changed",
+                // tao's own `visible_on_all_workspaces` mask: the one the
+                // build-time comment says gets overwritten.
+                Box::new(|s| s.collection_behavior = 1 << 0),
+            ),
+            ("not a non-activating panel", Box::new(|s| s.style_mask = 0)),
+            ("not visible", Box::new(|s| s.visible = false)),
+            ("alpha below 1", Box::new(|s| s.alpha = 0.0)),
+            ("on no screen", Box::new(|s| s.screen_frame = None)),
+            (
+                "frame outside its screen",
+                Box::new(|s| s.frame = rect(5000.0, 5000.0, 560.0, 96.0)),
+            ),
+        ];
+        for (expected, break_it) in cases {
+            let mut snapshot = healthy();
+            break_it(&mut snapshot);
+            assert!(
+                snapshot.problems().contains(&expected),
+                "expected {expected:?} in {:?}",
+                snapshot.problems()
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn being_off_the_active_space_is_not_reported_as_drift() {
+        let mut snapshot = healthy();
+        snapshot.on_active_space = false;
+        assert!(snapshot.problems().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn panel_frame_is_centred_above_the_bottom_edge_at_full_size() {
+        let f = panel_frame(rect(0.0, 0.0, 1440.0, 900.0), 560.0, 96.0, 48.0);
+        assert_eq!(f, rect(440.0, 48.0, 560.0, 96.0));
+    }
+
+    /// A display change must put the panel on the *new* screen's coordinates,
+    /// including a screen left of or below the primary (negative origin).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn panel_frame_follows_a_screen_with_a_negative_origin() {
+        let f = panel_frame(rect(-1920.0, -200.0, 1920.0, 1080.0), 560.0, 96.0, 48.0);
+        assert_eq!(f.origin, CGPoint { x: -1920.0 + 680.0, y: -200.0 + 48.0 });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn panel_frame_keeps_an_oversized_panel_inside_the_area() {
+        let f = panel_frame(rect(0.0, 0.0, 400.0, 80.0), 560.0, 96.0, 48.0);
+        assert_eq!(f.origin, CGPoint { x: 0.0, y: 0.0 });
+        assert_eq!(f.size, CGSize { width: 560.0, height: 96.0 });
+    }
+
+    /// Size is part of the frame: a panel that came back collapsed would be
+    /// "visible" and invisible at once.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn panel_frame_always_restores_the_designed_size() {
+        let f = panel_frame(rect(0.0, 0.0, 1440.0, 900.0), 560.0, 96.0, 48.0);
+        assert_eq!(f.size, CGSize { width: 560.0, height: 96.0 });
     }
 }

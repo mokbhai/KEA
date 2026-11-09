@@ -517,6 +517,10 @@ fn handle_tts<'a>(
     })
 }
 
+/// How long an assistant failure raised after its session ended stays up.
+/// Matches the status pill's error dwell (`StatusHud`).
+const ASSISTANT_FAILURE_DWELL: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn handle_assistant<'a>(
     state: &'a Arc<AppState>,
     app: &'a AppHandle,
@@ -532,6 +536,11 @@ fn handle_assistant<'a>(
                 app,
                 &kea_core::assistant::SessionState::Failed { message: error },
             );
+            // `run_session` has already released the overlay on its way out,
+            // so the line above claimed it again with no session left to let
+            // go. Release it once the error has been on screen long enough to
+            // read, or the assistant owns the overlay until the next session.
+            crate::overlay::release_assistant_after(app, ASSISTANT_FAILURE_DWELL);
         }
     })
 }

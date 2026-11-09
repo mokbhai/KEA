@@ -81,7 +81,25 @@ const BOTH_ON: AssistantSettings = { speak_answers: true, show_answers: true };
  * and this keeps the pill out of the layout when the HUD is showing dictation
  * instead.
  */
-export default function AssistantHud() {
+export default function AssistantHud({
+  visible = true,
+  sessionOpen = true,
+}: {
+  /** False while another feature owns the overlay; see `OverlayApp`. */
+  visible?: boolean;
+  /**
+   * Whether the assistant still holds a claim on the overlay. When it lets go
+   * — the session ended, was cancelled, timed out or failed and was dismissed —
+   * everything this component remembers is dropped.
+   *
+   * Session end has no event of its own on the wire, so without this the last
+   * state ("listening" after an Escape, "presenting" after an answer) stayed in
+   * state forever and was drawn again beside whatever the overlay showed next.
+   * Distinct from `visible`: being covered by a newer owner keeps the session
+   * and its answer, so they are there when the overlay falls back to it.
+   */
+  sessionOpen?: boolean;
+} = {}) {
   const [status, setStatus] = useState<{
     state: AssistantState;
     message?: string;
@@ -140,7 +158,14 @@ export default function AssistantHud() {
     };
   }, []);
 
-  if (!status) return null;
+  useEffect(() => {
+    if (sessionOpen) return;
+    setStatus(null);
+    setAnswer(null);
+    setPartial(null);
+  }, [sessionOpen]);
+
+  if (!visible || !status) return null;
 
   const label =
     status.state === "failed"

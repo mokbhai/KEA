@@ -6657,6 +6657,13 @@ pub async fn list_palette_history(state: State<'_, Arc<AppState>>) -> Result<Vec
         .map_err(|e| e.to_string())
 }
 
+/// The overlay webview reporting it has loaded; answers with who owns the
+/// overlay right now. See `overlay::webview_ready`.
+#[tauri::command]
+pub fn overlay_ready() -> crate::overlay::OverlayOwnerPayload {
+    crate::overlay::webview_ready()
+}
+
 #[tauri::command]
 pub fn set_status_overlay_visible(app: AppHandle, visible: bool) {
     crate::overlay::sync_status_visibility(&app, visible);
