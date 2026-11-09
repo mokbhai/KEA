@@ -2,12 +2,12 @@
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
-    echo "Usage: scripts/set_version.sh <major.minor.patch>" >&2
+    echo "Usage: scripts/set_version.sh <major.minor.patch>[-beta.N]" >&2
     exit 1
 fi
 
 VERSION="$1"
-if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[1-9][0-9]*)?$ ]]; then
     echo "Invalid semantic version: $VERSION" >&2
     exit 1
 fi

@@ -1,6 +1,6 @@
 # KEA - Tauri app commands
 
-.PHONY: all build clean install dev test lint fmt-check hygiene pre-commit-check install-hooks reset-perms release-check release-package set-version help tauri-build tauri-dev tauri-install tauri-test tauri-lint check-tauri smoke
+.PHONY: all build clean install bump-beta release dev test lint fmt-check hygiene pre-commit-check install-hooks reset-perms release-check release-package set-version help tauri-build tauri-dev tauri-install tauri-test tauri-lint check-tauri smoke
 
 APP_NAME = KEA
 BUNDLE_ID = ai.kea.desktop
@@ -72,7 +72,19 @@ dev: tauri-dev
 tauri-dev: check-tauri
 	$(TAURI_CLI) dev $(HOST_FEATURE_FLAGS)
 
-install: tauri-install
+# Every install carries a new version, so the sidebar shows which build is
+# running: 0.5.5 -> 0.5.6-beta.1 -> 0.5.6-beta.2 ... (shown as 0.5.6b1).
+# `make release VERSION=0.5.6` ends the betas with the plain number.
+install: bump-beta
+	@$(MAKE) --no-print-directory tauri-install
+
+bump-beta:
+	@./scripts/bump_beta.sh
+
+release:
+	@if [ -z "$(VERSION)" ]; then echo "Usage: make release VERSION=x.y.z"; exit 1; fi
+	@case "$(VERSION)" in *-*) echo "A release is a plain x.y.z; betas come from make install"; exit 1;; esac
+	@./scripts/set_version.sh $(VERSION)
 
 # Deliberately does NOT reset the TCC prompts. It used to, and that made every
 # install silently break hold-to-talk: `tccutil reset Accessibility` revokes the
@@ -163,6 +175,8 @@ help:
 	@echo "  release-package - Build release artifacts into dist/"
 	@echo "  smoke          - Launch built binary and verify it does not panic/exist early (CI guardrail)"
 	@echo "  set-version    - Set Tauri/Cargo app version (make set-version VERSION=x.y.z)"
+	@echo "  install        - Bump the beta version (0.5.6b1, b2, ...), build, install"
+	@echo "  release        - Set a release version (make release VERSION=x.y.z)"
 	@echo ""
 	@echo "Prerequisite:"
 	@echo "  cargo install tauri-cli --version '^2' --locked"

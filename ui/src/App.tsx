@@ -25,6 +25,7 @@ import ReadAloudPage from "./pages/ReadAloudPage";
 import RewritePage from "./pages/RewritePage";
 import VocabularyPage from "./pages/VocabularyPage";
 import { isPage, type Page } from "./lib/nav";
+import { displayVersion } from "./lib/version";
 import { ThemeProvider, useTheme } from "./theme";
 
 const MOBILE_BREAKPOINT = 768;
@@ -419,7 +420,7 @@ function AppShell() {
             >
               {theme === "dark" ? "☀️" : "🌙"}
             </button>
-            <span className="kea-muted">{version ? `v${version}` : ""}</span>
+            <span className="kea-muted">{version ? `v${displayVersion(version)}` : ""}</span>
           </section>
         </div>
 
