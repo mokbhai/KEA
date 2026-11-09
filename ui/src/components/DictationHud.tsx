@@ -170,7 +170,16 @@ function TranscribingIndicator({ reducedMotion }: { reducedMotion: boolean }) {
  * which the Rust side shows and hides with the dictation state — so `idle`
  * renders nothing rather than an "Idle" chip nobody asked for.
  */
-export default function DictationHud() {
+export default function DictationHud({
+  visible = true,
+}: {
+  /**
+   * False while another feature owns the overlay (`OverlayApp`). The HUD stays
+   * mounted either way — it is what listens for dictation events — it just
+   * draws nothing.
+   */
+  visible?: boolean;
+} = {}) {
   const [state, setState] = useState<DictationState>("idle");
   const [history, setHistory] = useState<number[]>(() => emptyLevelHistory());
   // `null` is the initial state *and* the whole absence path: a build with no
@@ -242,7 +251,7 @@ export default function DictationHud() {
     return () => clearInterval(timer);
   }, [state]);
 
-  if (state === "idle") return null;
+  if (!visible || state === "idle") return null;
 
   return (
     <div

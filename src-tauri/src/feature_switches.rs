@@ -132,6 +132,17 @@ pub async fn set_feature_enabled(
         state
             .assistant_cancel
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        // A running session releases the overlay itself as it winds down
+        // (`OverlayGuard`). One that is not running may still hold a claim —
+        // a failure waiting out its dwell — and a switched-off feature must
+        // not keep the overlay until a timer says otherwise. The dwell's own
+        // release is a no-op afterwards: it only lets go of the claim it saw.
+        if !state
+            .assistant_busy
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            crate::overlay::sync_assistant_visibility(&app, false);
+        }
     }
     if feature == "dictation" {
         let settings = kea_core::dictation::DictationSettingsRepo::new(SettingsRepo::new(

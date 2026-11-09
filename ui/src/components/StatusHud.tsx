@@ -23,7 +23,12 @@ type StatusState = {
  * windows and spaces (including full-screen apps) when global hotkeys or
  * system actions are triggered outside KEA.
  */
-export default function StatusHud() {
+export default function StatusHud({
+  visible = true,
+}: {
+  /** False while another feature owns the overlay; see `OverlayApp`. */
+  visible?: boolean;
+} = {}) {
   const [status, setStatus] = useState<StatusState | null>(null);
 
   useEffect(() => {
@@ -78,7 +83,7 @@ export default function StatusHud() {
     };
   }, []);
 
-  if (!status) return null;
+  if (!visible || !status) return null;
 
   const isDone =
     status.message.toLowerCase() === "done" ||

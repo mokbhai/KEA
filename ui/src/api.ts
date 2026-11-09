@@ -1651,6 +1651,29 @@ export const onPaletteOpen = (
 export const onPaletteClose = (handler: () => void): Promise<UnlistenFn> =>
   listen<null>("palette:close", () => handler());
 
+/** Which feature the floating overlay is currently showing, and who has a claim on it. */
+export type OverlayOwnership = {
+  /** The most recently active claimant, or `null` when the overlay is hidden. */
+  owner: "dictation" | "assistant" | "status" | null;
+  dictation: boolean;
+  assistant: boolean;
+  status: boolean;
+};
+
+export const onOverlayOwner = (
+  handler: (ownership: OverlayOwnership) => void,
+): Promise<UnlistenFn> =>
+  listen<OverlayOwnership>("overlay:owner", (event) => handler(event.payload));
+
+/**
+ * The overlay webview announcing it has loaded. Resolves with the current
+ * ownership so a window that (re)loaded after the last `overlay:owner` event
+ * still knows what to draw; the backend also logs each call, which is how a
+ * reloaded overlay webview shows up in the log.
+ */
+export const overlayReady = (): Promise<OverlayOwnership | null> =>
+  invoke<OverlayOwnership | null>("overlay_ready");
+
 /**
  * Signals to the backend whether a status pill is currently visible in the overlay window.
  */

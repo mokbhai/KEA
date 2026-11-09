@@ -519,6 +519,7 @@ fn main() {
             commands::cancel_palette,
             commands::list_palette_history,
             commands::clear_palette_history,
+            commands::overlay_ready,
             commands::set_status_overlay_visible,
             commands::capture_screen_text,
             commands::get_ocr_languages,
