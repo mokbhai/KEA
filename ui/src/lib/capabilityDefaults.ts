@@ -107,6 +107,7 @@ export async function buildCapabilityOptions(
     // Text engines are picked per provider, not per catalog: one row for each
     // provider the user has connected.
     providers.forEach((p) => {
+      if (["deepgram", "elevenlabs"].includes(p.provider_ref)) return;
       const engine = cloudEngineFor("llm", p.provider_ref);
       if (!available.has(engine)) return;
       const keyless = !needsKey(p);
@@ -184,6 +185,28 @@ export async function buildCapabilityOptions(
       ...(cloud.cloudVoices ? { cloudVoices: true } : {}),
     });
   });
+  // Custom OpenAI-compatible servers can also expose speech endpoints.
+  const compatible = specs.find((spec) => spec.acceptsAnyProvider);
+  if (compatible) {
+    providers
+      .filter(
+        (p) =>
+          !["anthropic", "deepgram", "elevenlabs"].includes(p.provider_ref) &&
+          !opts.some((o) => o.providerRef === p.provider_ref),
+      )
+      .forEach((p) => {
+        opts.push({
+          id: `${capability}:${p.provider_ref}`,
+          label: p.name,
+          detail: "custom server",
+          status: needsKey(p) ? cloudStatus(p.provider_ref) : "No key needed",
+          ready: !needsKey(p) || (keyByRef.get(p.provider_ref) ?? false),
+          engine: compatible.id,
+          model: null,
+          providerRef: p.provider_ref,
+        });
+      });
+  }
   return opts;
 }
 

@@ -1652,3 +1652,7 @@ export const onPaletteClose = (handler: () => void): Promise<UnlistenFn> =>
 export const setStatusOverlayVisible = (visible: boolean): Promise<void> =>
   invoke<void>("set_status_overlay_visible", { visible }).catch(() => {});
 
+
+/** Live catalog, cached briefly by the backend; credentials stay in Rust. */
+export const listProviderModels = (providerRef: string, capability: "llm" | "stt" | "tts") =>
+  invoke<string[]>("list_provider_models", { providerRef, capability });

@@ -11,6 +11,7 @@ mod notion;
 mod nswindow;
 mod overlay;
 mod palette;
+mod provider_models;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -389,6 +390,7 @@ fn main() {
             commands::delete_credential,
             commands::has_credential,
             commands::test_provider,
+            provider_models::list_provider_models,
             commands::list_providers,
             commands::discover_local_llms,
             commands::add_custom_provider,
