@@ -4,6 +4,7 @@ mod api;
 mod assistant;
 mod assistant_handlers;
 mod commands;
+mod dictation_flow;
 mod events;
 mod hotkeys;
 mod macfocus;
@@ -112,6 +113,15 @@ pub struct AppState {
     /// The counter guards against stale emits: a newer run's id is larger.
     pub dictation_run_counter: AtomicU64,
     pub dictation_current_run: Mutex<Option<u64>>,
+    /// Whether a dictation recording is open, readable without the audio lock.
+    ///
+    /// A mirror of `audio.state() == Listening`, kept for the one reader that
+    /// cannot await: the guard that publishes `idle` when a background
+    /// transcription ends, which must not do so over a newer recording.
+    pub dictation_recording: AtomicBool,
+    /// The tail of the chain that orders overlapping runs: each stop leaves its
+    /// own completion channel here and waits on its predecessor's.
+    pub dictation_tail: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     /// The app that was frontmost when the current dictation run started.
     ///
     /// Captured at the start rather than read at the end: by the time a
@@ -606,6 +616,17 @@ fn open_databases(app: &tauri::App<Wry>, dir: &Path) -> (SqlitePool, SqlitePool)
             app,
             &format!("data DB migration failed for {}", data_path.display()),
         );
+        // Here, before anything can record a new action: a row still `started`
+        // belongs to a process that died under it, and would otherwise read as
+        // "running" in History forever.
+        match kea_core::store::actions::ActionRepo::new(data.clone())
+            .close_interrupted()
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(closed = n, "closed actions left open by an earlier run"),
+            Err(e) => tracing::warn!(error = %e, "could not close interrupted actions"),
+        }
         (config, data)
     })
 }
@@ -824,6 +845,8 @@ fn build_state(
         active_downloads: Mutex::new(HashMap::new()),
         dictation_run_counter: AtomicU64::new(0),
         dictation_current_run: Mutex::new(None),
+        dictation_recording: AtomicBool::new(false),
+        dictation_tail: Mutex::new(None),
         dictation_app_context: Mutex::new(None),
         preview_playing: AtomicBool::new(false),
         meeting_processing: AtomicBool::new(false),

@@ -44,7 +44,7 @@ use kea_core::tts::{TtsSettings, TtsSettingsRepo};
 use kea_engines::traits::SttOpts;
 use kea_engines::{EngineRegistry, TtsOpts};
 use kea_features::demo::{run_ping, DemoFeature};
-use kea_features::dictation::{run_dictation_with_commands, spawn_partials, DictationRunOpts};
+use kea_features::dictation::{run_dictation_outcome, spawn_partials, DictationRunOpts};
 use kea_features::meeting::{
     finish_interrupted_meeting, run_interim_notes_pass, run_meeting_stop_with, InterimSchedule,
     MeetingStopOptions, MeetingVoices,
@@ -411,7 +411,7 @@ pub struct HotkeyRegStatus {
     pub error: Option<String>,
 }
 
-/// Drop-guard that clears a per-feature busy flag. Each spawned handler holds
+/// Drop-    let current = state.audio.lock().await.state(); that clears a per-feature busy flag. Each spawned handler holds
 /// one until it completes (Drop), even if the handler task panics.
 pub struct BusyGuard {
     flag: Arc<AtomicBool>,
@@ -1129,7 +1129,7 @@ impl RewriteOverride {
 /// Capture the frontmost app's selection, rewrite it, and write it back.
 ///
 /// The body of the rewrite shortcut, shared with `kea://rewrite` and
-/// `POST /v1/rewrite`. The caller owns the busy guard (`selection_busy`) and
+/// `POST /v1/rewrite`. The caller owns the busy     let current = state.audio.lock().await.state(); (`selection_busy`) and
 /// whatever progress it reports; this owns the *order*, which is the part that
 /// matters — the app context is probed FIRST, before anything that could
 /// change which app is frontmost, because by the time the rewrite returns the
@@ -1629,7 +1629,7 @@ async fn trigger_tts_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(), S
     Ok(())
 }
 
-/// Reads the three inputs [`dictation_hotkey_action`] and
+/// Reads the two inputs [`dictation_hotkey_action`] and
 /// [`hold_dictation_action`] gate on, in the order that keeps the answer
 /// right: the meeting flags come first because during meeting synthesis the
 /// audio lock is free but starting dictation would still be wrong, and reading
@@ -1638,18 +1638,13 @@ async fn trigger_tts_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(), S
 /// This is only the hotkey gate. `start_dictation_run` and
 /// `get_dictation_state` answer different questions with deliberately
 /// different precedence and do not share it.
-pub async fn dictation_gate(state: &Arc<AppState>) -> (bool, bool, DictationState) {
+pub async fn dictation_gate(state: &Arc<AppState>) -> (bool, DictationState) {
     let meeting_active = state
         .active_meeting
         .lock()
         .map(|guard| guard.is_some())
         .unwrap_or(false)
         || state.meeting_processing.load(Ordering::SeqCst);
-    let in_flight = state
-        .dictation_current_run
-        .lock()
-        .map(|guard| guard.is_some())
-        .unwrap_or(false);
     let current = state.audio.lock().await.state();
     // The capture device cannot tell a locked run from a held one — both are
     // an open microphone — so the lock is read from the app's own flag here,
@@ -1658,7 +1653,7 @@ pub async fn dictation_gate(state: &Arc<AppState>) -> (bool, bool, DictationStat
         (DictationState::Listening, true) => DictationState::Locked,
         (current, _) => current,
     };
-    (meeting_active, in_flight, current)
+    (meeting_active, current)
 }
 
 /// Toggle push-to-talk: global-hotkey currently delivers press events only.
@@ -1677,7 +1672,6 @@ pub enum DictationHotkeyAction {
 pub fn dictation_hotkey_action(
     current: DictationState,
     meeting_active: bool,
-    in_flight: bool,
 ) -> DictationHotkeyAction {
     if meeting_active {
         return DictationHotkeyAction::Ignore;
@@ -1689,7 +1683,11 @@ pub fn dictation_hotkey_action(
         // inert would make the lock the one state with no way out but the
         // chord.
         DictationState::Locked => DictationHotkeyAction::Stop,
-        DictationState::Idle if in_flight => DictationHotkeyAction::Ignore,
+        // A transcription still running is not a reason to refuse: the
+        // microphone is free, and a press ignored here used to be the user's
+        // next sentence, lost without a sound. The run in flight finishes in
+        // the background and its insertion is ordered ahead of this one (see
+        // `begin_stop`).
         DictationState::Idle => DictationHotkeyAction::Start,
         DictationState::Processing => DictationHotkeyAction::Ignore,
     }
@@ -1710,9 +1708,8 @@ pub fn hold_dictation_action(
     event: HoldAction,
     current: DictationState,
     meeting_active: bool,
-    in_flight: bool,
 ) -> DictationHotkeyAction {
-    let toggle = dictation_hotkey_action(current, meeting_active, in_flight);
+    let toggle = dictation_hotkey_action(current, meeting_active);
     let narrow = |wanted, then| {
         if toggle == wanted {
             then
@@ -1740,6 +1737,47 @@ pub fn hold_dictation_action(
     }
 }
 
+/// The running app, as the trigger loop in [`crate::dictation_flow`] sees it.
+pub struct AppDictationOps<'a> {
+    pub state: &'a Arc<AppState>,
+    pub app: &'a AppHandle,
+}
+
+#[async_trait::async_trait]
+impl crate::dictation_flow::DictationOps for AppDictationOps<'_> {
+    async fn gate(&self) -> (bool, DictationState) {
+        dictation_gate(self.state).await
+    }
+
+    async fn start(&self) -> Result<(), String> {
+        start_dictation_inner(self.state, self.app).await
+    }
+
+    async fn start_locked(&self) -> Result<(), String> {
+        start_locked_dictation_inner(self.state, self.app).await
+    }
+
+    async fn stop(&self) -> Result<(), String> {
+        stop_dictation_detached(self.state, self.app).await
+    }
+
+    async fn cancel(&self) -> Result<(), String> {
+        cancel_dictation_inner(self.state, self.app).await
+    }
+
+    async fn preroll_edge(&self, event: HoldAction) {
+        apply_preroll_edge(self.state, event).await;
+    }
+
+    fn report_error(&self, message: &str) {
+        emit_dictation_error(self.app, message);
+    }
+
+    fn busy_flag(&self) -> &Arc<AtomicBool> {
+        &self.state.dictation_busy
+    }
+}
+
 /// Carry out a decision from either hotkey path.
 ///
 /// Shared so the accelerator and the hold chord cannot drift: they answer
@@ -1751,16 +1789,7 @@ pub async fn run_dictation_action(
     state: &Arc<AppState>,
     app: &AppHandle,
 ) {
-    let outcome = match action {
-        DictationHotkeyAction::Start => start_dictation_inner(state, app).await,
-        DictationHotkeyAction::StartLocked => start_locked_dictation_inner(state, app).await,
-        DictationHotkeyAction::Stop => stop_dictation_inner(state, app).await.map(|_| ()),
-        DictationHotkeyAction::Cancel => cancel_dictation_inner(state, app).await,
-        DictationHotkeyAction::Ignore => Ok(()),
-    };
-    if let Err(error) = outcome {
-        emit_dictation_error(app, &error);
-    }
+    crate::dictation_flow::run_action(&AppDictationOps { state, app }, action).await;
 }
 
 /// Brings the hold-to-talk listener in line with its two switches: the ⌥⇧
@@ -1828,31 +1857,19 @@ pub fn sync_hold_to_talk(state: &Arc<AppState>, app: &AppHandle, keyboard: bool,
 fn spawn_hold_to_talk_dispatch(
     state: &Arc<AppState>,
     app: &AppHandle,
-    mut events: tokio::sync::mpsc::UnboundedReceiver<HoldAction>,
+    events: tokio::sync::mpsc::UnboundedReceiver<HoldAction>,
 ) {
     let state = state.clone();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        while let Some(event) = events.recv().await {
-            // Arming opens and closes the microphone without starting a run,
-            // so it is handled before the busy flag: a modifier press must not
-            // contend with a recording for the flag that serialises runs.
-            if matches!(event, HoldAction::Arm | HoldAction::Disarm) {
-                apply_preroll_edge(&state, event).await;
-                continue;
-            }
-
-            // Same busy flag as the accelerator path, so a chord and a
-            // Cmd+Shift+D landing together cannot both start a run.
-            let Some(_busy) = try_acquire_busy(&state.dictation_busy) else {
-                tracing::debug!(?event, "hold-to-talk ignored: dictation handler in flight");
-                continue;
-            };
-
-            let (meeting_active, in_flight, current) = dictation_gate(&state).await;
-            let action = hold_dictation_action(event, current, meeting_active, in_flight);
-            run_dictation_action(action, &state, &app).await;
-        }
+        crate::dictation_flow::pump_hold_events(
+            &AppDictationOps {
+                state: &state,
+                app: &app,
+            },
+            events,
+        )
+        .await;
     });
 }
 
@@ -2908,16 +2925,10 @@ async fn start_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(
         return Err("a meeting is finishing; wait for it to complete".into());
     }
 
-    {
-        let in_flight = state
-            .dictation_current_run
-            .lock()
-            .map_err(|e| e.to_string())?
-            .is_some();
-        if in_flight {
-            return Err("dictation is processing a previous run; wait for it to finish".into());
-        }
-    }
+    // A run still being transcribed is deliberately not a reason to refuse. The
+    // microphone is free the moment `stop_mic` returns, and refusing here is
+    // what used to turn the user's next sentence into either silence or, via
+    // the queued edges, an empty recording. See `crate::dictation_flow`.
 
     let frame_rx;
     {
@@ -2934,10 +2945,13 @@ async fn start_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<(
         frame_rx = match audio.start_mic().await {
             Ok(rx) => rx,
             Err(e) => {
-                emit_dictation_state(app, DictationState::Idle);
+                emit_dictation_state(app, settled_state(state));
                 return Err(e.to_string());
             }
         };
+        // Set under the audio lock, so it never disagrees with
+        // `audio.state()` for anyone who reads both.
+        state.dictation_recording.store(true, Ordering::SeqCst);
         report_device_fallback(app, audio.as_mut());
     }
 
@@ -3012,7 +3026,7 @@ async fn open_partials(
     };
 
     let (session, mut partials) = spawn_partials(stream, frames);
-    // Shared with the final emit in `stop_dictation_run`, so `seq` stays
+    // Shared with the final emit in `finish_run`, so `seq` stays
     // monotonic across the whole run and the HUD's "highest seq wins" rule
     // cannot discard the final.
     let throttle = Arc::new(Mutex::new(PartialThrottle::new()));
@@ -3075,6 +3089,21 @@ async fn take_partials(
     }
 }
 
+/// What the HUD should show when nothing is being recorded: `Processing` while
+/// a transcription is still running in the background, `Idle` otherwise.
+fn settled_state(state: &Arc<AppState>) -> DictationState {
+    let in_flight = state
+        .dictation_current_run
+        .lock()
+        .map(|run| run.is_some())
+        .unwrap_or(false);
+    if in_flight {
+        DictationState::Processing
+    } else {
+        DictationState::Idle
+    }
+}
+
 /// Stop a run and throw its audio away. Reached only from Escape during a
 /// locked recording — every other route through the dictation state machine
 /// transcribes what it captured.
@@ -3091,29 +3120,63 @@ pub async fn cancel_dictation_inner(state: &Arc<AppState>, app: &AppHandle) -> R
         let stale = audio.state() == DictationState::Idle;
         drop(audio);
         if stale {
-            emit_dictation_state(app, DictationState::Idle);
+            emit_dictation_state(app, settled_state(state));
         }
         return Err("dictation is not listening".into());
     }
     let discarded = audio.stop_mic().await.map_err(|e| e.to_string());
+    state.dictation_recording.store(false, Ordering::SeqCst);
     drop(audio);
 
     // The streaming pass goes with the audio it was reading. Its draft is
     // discarded along with the recording — a cancelled run inserts nothing.
     let _ = take_partials(state).await;
 
-    emit_dictation_state(app, DictationState::Idle);
+    emit_dictation_state(app, settled_state(state));
     spawn_dictation_cue(state, Cue::Cancel);
     discarded.map(|_| ())
 }
 
+/// Stop recording and wait for the text to be inserted. The Tauri command's
+/// shape, where the caller wants the transcript back.
 pub async fn stop_dictation_inner(
     state: &Arc<AppState>,
     app: &AppHandle,
 ) -> Result<String, String> {
-    let result = stop_dictation_run(state, app).await;
+    let result = match begin_stop(state, app).await {
+        Ok(ticket) => finish_run(state, app, ticket).await,
+        Err(e) => Err(e),
+    };
     spawn_dictation_cue(state, cue_for_dictation_outcome(&result));
     result
+}
+
+/// Stop recording and let the transcription run on its own.
+///
+/// What the hotkeys use, and the reason is the whole of the "lost words" fix:
+/// this returns as soon as the microphone is free, so the trigger loop is
+/// available for the user's next press while the previous run is still being
+/// decoded. See [`crate::dictation_flow`] for what happened when it was not.
+pub async fn stop_dictation_detached(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
+    let ticket = match begin_stop(state, app).await {
+        Ok(ticket) => ticket,
+        Err(e) => {
+            spawn_dictation_cue(state, Cue::Error);
+            return Err(e);
+        }
+    };
+    let state = state.clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = finish_run(&state, &app, ticket).await;
+        spawn_dictation_cue(&state, cue_for_dictation_outcome(&result));
+        // Nobody is awaiting this task, so the failure has to be shown here —
+        // the handler that used to receive it returned long ago.
+        if let Err(error) = result {
+            emit_dictation_error(&app, &error);
+        }
+    });
+    Ok(())
 }
 
 /// Which cue a finished dictation run earns.
@@ -3129,7 +3192,60 @@ pub fn cue_for_dictation_outcome(result: &Result<String, String>) -> Cue {
     }
 }
 
-async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<String, String> {
+/// Marks one run as in flight, and clears that on every exit.
+///
+/// RAII so the flag is cleared on a normal return, an early error, or a panic
+/// inside the processing pipeline — without it a panic would wedge dictation as
+/// "processing" forever. Only clears if this run is still the newest one to
+/// have stopped, and only publishes `idle` if nothing is being recorded, so a
+/// newer run's state is never clobbered. Mirrors the meeting path's
+/// `ProcessingGuard`.
+struct RunSlot {
+    state: Arc<AppState>,
+    app: AppHandle,
+    run_id: u64,
+}
+
+impl Drop for RunSlot {
+    fn drop(&mut self) {
+        let cleared = {
+            let mut current = self
+                .state
+                .dictation_current_run
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if *current == Some(self.run_id) {
+                *current = None;
+                true
+            } else {
+                false
+            }
+        };
+        // A recording opened while this run was processing owns the HUD.
+        if cleared && !self.state.dictation_recording.load(Ordering::SeqCst) {
+            emit_dictation_state(&self.app, DictationState::Idle);
+        }
+    }
+}
+
+/// Everything a stopped recording carries into processing.
+struct StopTicket {
+    pcm: PcmFrame,
+    streaming_draft: Option<String>,
+    partial_throttle: Option<Arc<Mutex<PartialThrottle>>>,
+    /// The app that was frontmost when *this* recording started, taken at stop
+    /// time: the slot is shared, and the next recording overwrites it.
+    app_context: Option<kea_platform::AppContext>,
+    /// Resolves when the run before this one has finished inserting.
+    after: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Dropped when this run ends, which is what releases the next one.
+    _done: tokio::sync::oneshot::Sender<()>,
+    _slot: RunSlot,
+}
+
+/// Phase one of a stop, the only part that needs the microphone: release it,
+/// take the audio, and take this run's place in line.
+async fn begin_stop(state: &Arc<AppState>, app: &AppHandle) -> Result<StopTicket, String> {
     stop_level_poll(state);
     // Whatever ended the run — the chord, the accelerator, the hard cap — the
     // lock goes with it, and the hold machine is told so the next chord is
@@ -3142,21 +3258,19 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
         if audio.state() != DictationState::Listening {
             // Re-sync listeners to idle only when nothing is in-flight.
             if audio.state() == DictationState::Idle {
-                let in_flight = state
-                    .dictation_current_run
-                    .lock()
-                    .map_err(|e| e.to_string())?
-                    .is_some();
-                if !in_flight {
+                state.dictation_recording.store(false, Ordering::SeqCst);
+                if settled_state(state) == DictationState::Idle {
                     emit_dictation_state(app, DictationState::Idle);
                 }
             }
             return Err("dictation is not listening".into());
         }
-        match audio.stop_mic().await {
+        let stopped = audio.stop_mic().await;
+        state.dictation_recording.store(false, Ordering::SeqCst);
+        match stopped {
             Ok(pcm) => pcm,
             Err(e) => {
-                emit_dictation_state(app, DictationState::Idle);
+                emit_dictation_state(app, settled_state(state));
                 return Err(e.to_string());
             }
         }
@@ -3167,6 +3281,12 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
     // produces the inserted text wants the cores.
     let (streaming_draft, partial_throttle) = take_partials(state).await;
 
+    let app_context = state
+        .dictation_app_context
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+
     // Allocate a run id and mark in-flight before emitting "processing".
     let run_id = state.dictation_run_counter.fetch_add(1, Ordering::SeqCst);
     {
@@ -3176,41 +3296,65 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
             .map_err(|e| e.to_string())?;
         *guard = Some(run_id);
     }
-
-    // RAII: clear the in-flight flag and emit idle on every exit — normal
-    // return, early error, or a panic inside the processing pipeline — but
-    // only if this run is still the current one, so a newer run's "listening"
-    // state is never clobbered. Mirrors the meeting path's ProcessingGuard;
-    // without it a panic here would wedge dictation as "processing" forever.
-    struct RunGuard<'a> {
-        flag: &'a std::sync::Mutex<Option<u64>>,
-        run_id: u64,
-        app: &'a AppHandle,
-    }
-    impl Drop for RunGuard<'_> {
-        fn drop(&mut self) {
-            let mut g = self.flag.lock().unwrap_or_else(|p| p.into_inner());
-            if *g == Some(self.run_id) {
-                *g = None;
-                emit_dictation_state(self.app, DictationState::Idle);
-            }
-        }
-    }
-    let _run_guard = RunGuard {
-        flag: &state.dictation_current_run,
+    let slot = RunSlot {
+        state: state.clone(),
+        app: app.clone(),
         run_id,
-        app,
     };
+
+    // Runs insert in the order they were stopped. Two can now overlap — the
+    // user may start talking while the previous run is still decoding — and a
+    // short second utterance would otherwise overtake a long first one and
+    // land in the document ahead of it. A chain of one-shot channels rather
+    // than a lock because the position in line has to be fixed *here*, in
+    // order, not wherever the spawned task happens to be polled first.
+    let (done, next) = tokio::sync::oneshot::channel();
+    let after = state
+        .dictation_tail
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .replace(next);
 
     emit_dictation_state(app, DictationState::Processing);
 
-    let settings = match DictationSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
+    Ok(StopTicket {
+        pcm,
+        streaming_draft,
+        partial_throttle,
+        app_context,
+        after,
+        _done: done,
+        _slot: slot,
+    })
+}
+
+/// Phase two: decode, clean up, insert. Runs with no microphone and no busy
+/// flag held.
+async fn finish_run(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    ticket: StopTicket,
+) -> Result<String, String> {
+    let StopTicket {
+        pcm,
+        streaming_draft,
+        partial_throttle,
+        app_context,
+        after,
+        _done,
+        _slot,
+    } = ticket;
+
+    // Both a finished predecessor (`Ok`) and a predecessor that panicked and
+    // dropped its sender (`Err`) mean it is this run's turn.
+    if let Some(previous) = after {
+        let _ = previous.await;
+    }
+
+    let settings = DictationSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
         .get()
         .await
-    {
-        Ok(s) => s,
-        Err(e) => return Err(e.to_string()),
-    };
+        .map_err(|e| e.to_string())?;
 
     let bindings = BindingRepo::new(state.config_pool.clone());
     let actions = ActionRepo::new(state.data_pool.clone());
@@ -3230,11 +3374,6 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
     .with_usage(&usage);
 
     let vocabulary = load_vocabulary(&state.config_pool).await;
-    let app_context = state
-        .dictation_app_context
-        .lock()
-        .ok()
-        .and_then(|mut slot| slot.take());
     let profile = profile_for(&state.config_pool, app_context.as_ref()).await;
     let profile = ProfileOverrides::from_profile(profile.as_ref());
 
@@ -3246,7 +3385,7 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
         .await
         .unwrap_or_default();
 
-    let result = run_dictation_with_commands(
+    let result = run_dictation_outcome(
         &state.engines,
         &bindings,
         &actions,
@@ -3271,25 +3410,36 @@ async fn stop_dictation_run(state: &Arc<AppState>, app: &AppHandle) -> Result<St
     )
     .await;
 
-    // The last frame in which the HUD shows the text that was actually typed.
-    // Without it, the HUD's final state is a claim the app never honoured: the
-    // streaming hypothesis and the offline transcript come from two different
-    // decoders. Emitted before `_run_guard` drops and publishes "idle", which
-    // is what clears it.
-    if let (Ok(text), Some(throttle)) = (&result, partial_throttle) {
-        let payload = throttle.lock().unwrap_or_else(|p| p.into_inner()).offer(
-            text,
-            true,
-            std::time::Instant::now(),
-        );
-        if let Some(payload) = payload {
-            emit_dictation_partial(app, &payload);
+    // Cleanup failed but the words went in: say so, on the same channel
+    // errors use, since that is the one the HUD already shows.
+    if let Ok(outcome) = &result {
+        if let Some(notice) = &outcome.notice {
+            emit_dictation_error(app, notice);
         }
     }
 
-    // Flag clearing + the terminal "idle" emit are handled by _run_guard's
-    // Drop (which also covers panics and the "newer run" case).
-    result
+    // The last frame in which the HUD shows the text that was actually typed.
+    // Without it, the HUD's final state is a claim the app never honoured: the
+    // streaming hypothesis and the offline transcript come from two different
+    // decoders. Emitted before `_slot` drops and publishes "idle", which is
+    // what clears it. Skipped when a newer recording owns the HUD: this text
+    // would land in the middle of its live partials.
+    if let (Ok(outcome), Some(throttle)) = (&result, partial_throttle) {
+        if !state.dictation_recording.load(Ordering::SeqCst) {
+            let payload = throttle.lock().unwrap_or_else(|p| p.into_inner()).offer(
+                &outcome.text,
+                true,
+                std::time::Instant::now(),
+            );
+            if let Some(payload) = payload {
+                emit_dictation_partial(app, &payload);
+            }
+        }
+    }
+
+    // Flag clearing + the terminal "idle" emit are handled by `_slot`'s Drop
+    // (which also covers panics and the "newer run" case).
+    result.map(|outcome| outcome.text)
 }
 
 #[tauri::command]
@@ -8405,15 +8555,15 @@ mod tests {
     #[test]
     fn dictation_hotkey_action_toggles_listen_state() {
         assert_eq!(
-            dictation_hotkey_action(DictationState::Idle, false, false),
+            dictation_hotkey_action(DictationState::Idle, false),
             DictationHotkeyAction::Start
         );
         assert_eq!(
-            dictation_hotkey_action(DictationState::Listening, false, false),
+            dictation_hotkey_action(DictationState::Listening, false),
             DictationHotkeyAction::Stop
         );
         assert_eq!(
-            dictation_hotkey_action(DictationState::Processing, false, false),
+            dictation_hotkey_action(DictationState::Processing, false),
             DictationHotkeyAction::Ignore
         );
     }
@@ -8421,29 +8571,31 @@ mod tests {
     #[test]
     fn dictation_hotkey_action_ignores_during_meeting() {
         assert_eq!(
-            dictation_hotkey_action(DictationState::Idle, true, false),
+            dictation_hotkey_action(DictationState::Idle, true),
             DictationHotkeyAction::Ignore
         );
         assert_eq!(
-            dictation_hotkey_action(DictationState::Listening, true, false),
+            dictation_hotkey_action(DictationState::Listening, true),
             DictationHotkeyAction::Ignore
         );
         assert_eq!(
-            dictation_hotkey_action(DictationState::Processing, true, false),
+            dictation_hotkey_action(DictationState::Processing, true),
             DictationHotkeyAction::Ignore
         );
     }
 
     #[test]
-    fn dictation_hotkey_action_ignores_when_in_flight() {
-        // Audio is Idle but a dictation run is still processing → Ignore
+    fn dictation_hotkey_action_starts_while_a_previous_run_is_still_processing() {
+        // Audio is idle because the microphone is free; a transcription still
+        // running in the background is no reason to drop the next press. It used
+        // to be ignored, which cost the user the sentence they were saying.
         assert_eq!(
-            dictation_hotkey_action(DictationState::Idle, false, true),
-            DictationHotkeyAction::Ignore
+            dictation_hotkey_action(DictationState::Idle, false),
+            DictationHotkeyAction::Start
         );
-        // Meeting active + in-flight → still Ignore
+        // A meeting still wins.
         assert_eq!(
-            dictation_hotkey_action(DictationState::Idle, true, true),
+            dictation_hotkey_action(DictationState::Idle, true),
             DictationHotkeyAction::Ignore
         );
     }
@@ -8451,11 +8603,11 @@ mod tests {
     #[test]
     fn a_hold_starts_only_from_idle_and_a_release_stops_only_while_listening() {
         assert_eq!(
-            hold_dictation_action(HoldAction::Start, DictationState::Idle, false, false),
+            hold_dictation_action(HoldAction::Start, DictationState::Idle, false),
             DictationHotkeyAction::Start
         );
         assert_eq!(
-            hold_dictation_action(HoldAction::Stop, DictationState::Listening, false, false),
+            hold_dictation_action(HoldAction::Stop, DictationState::Listening, false),
             DictationHotkeyAction::Stop
         );
     }
@@ -8467,29 +8619,30 @@ mod tests {
         // is a toggle; this is not, and routing it through the same rules would
         // otherwise invert on a missed edge.
         assert_eq!(
-            hold_dictation_action(HoldAction::Start, DictationState::Listening, false, false),
+            hold_dictation_action(HoldAction::Start, DictationState::Listening, false),
             DictationHotkeyAction::Ignore
         );
         assert_eq!(
-            hold_dictation_action(HoldAction::Stop, DictationState::Idle, false, false),
+            hold_dictation_action(HoldAction::Stop, DictationState::Idle, false),
             DictationHotkeyAction::Ignore
         );
     }
 
     #[test]
-    fn a_hold_defers_to_meetings_and_to_a_run_still_finishing() {
+    fn a_hold_defers_to_meetings_but_not_to_a_run_still_finishing() {
         assert_eq!(
-            hold_dictation_action(HoldAction::Start, DictationState::Idle, true, false),
+            hold_dictation_action(HoldAction::Start, DictationState::Idle, true),
             DictationHotkeyAction::Ignore,
             "a meeting owns the microphone"
         );
         assert_eq!(
-            hold_dictation_action(HoldAction::Start, DictationState::Idle, false, true),
-            DictationHotkeyAction::Ignore,
-            "the previous transcript is still being inserted"
+            hold_dictation_action(HoldAction::Start, DictationState::Idle, false),
+            DictationHotkeyAction::Start,
+            "the previous transcript is still being inserted in the background, \
+             and the microphone is free"
         );
         assert_eq!(
-            hold_dictation_action(HoldAction::Stop, DictationState::Processing, false, false),
+            hold_dictation_action(HoldAction::Stop, DictationState::Processing, false),
             DictationHotkeyAction::Ignore
         );
     }
@@ -8507,7 +8660,7 @@ mod tests {
                 DictationState::Processing,
             ] {
                 assert_eq!(
-                    hold_dictation_action(event, current, false, false),
+                    hold_dictation_action(event, current, false),
                     DictationHotkeyAction::Ignore,
                     "{event:?} in {current:?} must not touch the run"
                 );
@@ -8518,7 +8671,7 @@ mod tests {
     #[test]
     fn a_double_tap_starts_a_locked_run() {
         assert_eq!(
-            hold_dictation_action(HoldAction::StartLocked, DictationState::Idle, false, false),
+            hold_dictation_action(HoldAction::StartLocked, DictationState::Idle, false),
             DictationHotkeyAction::StartLocked
         );
     }
@@ -8526,22 +8679,17 @@ mod tests {
     #[test]
     fn locking_inherits_the_rules_about_when_dictation_may_run() {
         assert_eq!(
-            hold_dictation_action(HoldAction::StartLocked, DictationState::Idle, true, false),
+            hold_dictation_action(HoldAction::StartLocked, DictationState::Idle, true),
             DictationHotkeyAction::Ignore,
             "a meeting owns the microphone; a double tap cannot take it"
         );
         assert_eq!(
-            hold_dictation_action(HoldAction::StartLocked, DictationState::Idle, false, true),
-            DictationHotkeyAction::Ignore,
-            "the previous transcript is still being inserted"
+            hold_dictation_action(HoldAction::StartLocked, DictationState::Idle, false),
+            DictationHotkeyAction::StartLocked,
+            "a lock may begin while the previous transcript is still being inserted"
         );
         assert_eq!(
-            hold_dictation_action(
-                HoldAction::StartLocked,
-                DictationState::Listening,
-                false,
-                false
-            ),
+            hold_dictation_action(HoldAction::StartLocked, DictationState::Listening, false),
             DictationHotkeyAction::Ignore,
             "a hold is already recording; locking on top of it would start a second run"
         );
@@ -8550,17 +8698,12 @@ mod tests {
     #[test]
     fn a_locked_run_stops_and_cancels_only_while_it_is_running() {
         assert_eq!(
-            hold_dictation_action(HoldAction::StopLocked, DictationState::Locked, false, false),
+            hold_dictation_action(HoldAction::StopLocked, DictationState::Locked, false),
             DictationHotkeyAction::Stop,
             "the tap that ends a lock transcribes what it captured"
         );
         assert_eq!(
-            hold_dictation_action(
-                HoldAction::CancelLocked,
-                DictationState::Locked,
-                false,
-                false
-            ),
+            hold_dictation_action(HoldAction::CancelLocked, DictationState::Locked, false),
             DictationHotkeyAction::Cancel,
             "Escape throws the audio away"
         );
@@ -8568,7 +8711,7 @@ mod tests {
         // other way; neither may reach into the next one.
         for event in [HoldAction::StopLocked, HoldAction::CancelLocked] {
             assert_eq!(
-                hold_dictation_action(event, DictationState::Idle, false, false),
+                hold_dictation_action(event, DictationState::Idle, false),
                 DictationHotkeyAction::Ignore,
                 "{event:?} with nothing running"
             );
@@ -8580,11 +8723,11 @@ mod tests {
         // Otherwise the lock would be the one state with no way out but the
         // chord that started it.
         assert_eq!(
-            dictation_hotkey_action(DictationState::Locked, false, false),
+            dictation_hotkey_action(DictationState::Locked, false),
             DictationHotkeyAction::Stop
         );
         assert_eq!(
-            dictation_hotkey_action(DictationState::Locked, true, false),
+            dictation_hotkey_action(DictationState::Locked, true),
             DictationHotkeyAction::Ignore,
             "a meeting still silences the dictation hotkey"
         );

@@ -365,8 +365,8 @@ pub fn spawn_dispatch_loop(state: Arc<AppState>, app: AppHandle, mut rx: mpsc::R
                     // Asked of the hold machine rather than assumed: the press
                     // can still arrive after the lock ended some other way.
                     let event = lock_cancel_action(&state);
-                    let (meeting_active, in_flight, current) = dictation_gate(&state).await;
-                    let action = hold_dictation_action(event, current, meeting_active, in_flight);
+                    let (meeting_active, current) = dictation_gate(&state).await;
+                    let action = hold_dictation_action(event, current, meeting_active);
                     run_dictation_action(action, &state, &app).await;
                 });
                 continue;
@@ -497,8 +497,8 @@ fn handle_dictation<'a>(
 ) -> HandlerFuture<'a> {
     Box::pin(async move {
         let _busy = busy;
-        let (meeting_active, in_flight, current) = dictation_gate(state).await;
-        let action = dictation_hotkey_action(current, meeting_active, in_flight);
+        let (meeting_active, current) = dictation_gate(state).await;
+        let action = dictation_hotkey_action(current, meeting_active);
         run_dictation_action(action, state, app).await;
     })
 }

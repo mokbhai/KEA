@@ -99,6 +99,49 @@ pub(crate) async fn record_llm_call(
     if !storage.store_content {
         return Ok(());
     }
+    // The prompt count belongs to what was sent and the completion count to
+    // what came back, which is what the two message rows already are.
+    record_conversation(
+        storage,
+        action_id,
+        feature_id,
+        engine_id,
+        model,
+        provider_ref,
+        &[
+            (
+                MessageRole::User,
+                user_content,
+                usage.map(|u| i64::from(u.prompt)),
+            ),
+            (
+                MessageRole::Assistant,
+                assistant_content,
+                usage.map(|u| i64::from(u.completion)),
+            ),
+        ],
+    )
+    .await
+}
+
+/// Writes one History conversation, if this run is allowed to keep content.
+///
+/// Split out of [`record_llm_call`] because dictation has a conversation to
+/// leave even when no LLM call happened: with cleanup off, or failed, the
+/// transcript alone is the whole record. Gated by `store_content` here as well
+/// so no caller can forget the setting.
+pub(crate) async fn record_conversation(
+    storage: ContentStorageOpts<'_>,
+    action_id: i64,
+    feature_id: &str,
+    engine_id: &str,
+    model: Option<String>,
+    provider_ref: Option<String>,
+    messages: &[(MessageRole, &str, Option<i64>)],
+) -> Result<(), String> {
+    if !storage.store_content {
+        return Ok(());
+    }
     let Some(repo) = storage.conversations else {
         return Ok(());
     };
@@ -114,25 +157,16 @@ pub(crate) async fn record_llm_call(
         .await
         .map_err(|e| e.to_string())?;
 
-    // The prompt count belongs to what was sent and the completion count to
-    // what came back, which is what the two message rows already are.
-    repo.append_message(&NewMessage {
-        conversation_id: conv_id,
-        role: MessageRole::User,
-        content: user_content.into(),
-        token_count: usage.map(|u| i64::from(u.prompt)),
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-
-    repo.append_message(&NewMessage {
-        conversation_id: conv_id,
-        role: MessageRole::Assistant,
-        content: assistant_content.into(),
-        token_count: usage.map(|u| i64::from(u.completion)),
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+    for (role, content, token_count) in messages {
+        repo.append_message(&NewMessage {
+            conversation_id: conv_id,
+            role: *role,
+            content: (*content).into(),
+            token_count: *token_count,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
 
     Ok(())
 }

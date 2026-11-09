@@ -50,6 +50,9 @@ impl TryFrom<String> for ActionStatus {
     }
 }
 
+/// What History shows for a run that never reported an outcome.
+pub const INTERRUPTED_MESSAGE: &str = "interrupted: KEA closed before this finished";
+
 pub struct ActionRepo {
     pool: SqlitePool,
 }
@@ -133,6 +136,44 @@ impl ActionRepo {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Closes `id` from a context that cannot await — a `Drop` running while a
+    /// task unwinds from a panic. Returns whether the write was scheduled.
+    ///
+    /// Best effort by construction: with no tokio runtime to hand the write to
+    /// (shutdown), or a runtime that stops before it runs, the row stays open
+    /// and [`ActionRepo::close_interrupted`] reaps it at the next launch.
+    pub fn finish_detached(&self, id: i64, status: ActionStatus, error: String) -> bool {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
+        let repo = ActionRepo::new(self.pool.clone());
+        runtime.spawn(async move {
+            if let Err(e) = repo.finish(id, status, Some(&error)).await {
+                tracing::warn!(error = %e, action_id = id, "could not close an abandoned action");
+            }
+        });
+        true
+    }
+
+    /// Marks every row still `started` as an error, for the start of a launch.
+    ///
+    /// At that moment no run can be in flight — this process has not started
+    /// one — so a row still `started` belongs to a process that died under it
+    /// (a quit mid-dictation, a crash, a killed dev build) and will otherwise
+    /// read as "running" in History forever. Must run before anything can
+    /// record a new action, or it would close a live row.
+    pub async fn close_interrupted(&self) -> Result<u64, KeaError> {
+        let result = sqlx::query(
+            "UPDATE actions
+             SET status = 'error', error = ?, finished_at = datetime('now')
+             WHERE status = 'started'",
+        )
+        .bind(INTERRUPTED_MESSAGE)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<ActionRow>, KeaError> {
@@ -240,6 +281,68 @@ mod tests {
         repo.finish(id, ActionStatus::Ok, None).await.unwrap();
         let rows = repo.recent(1).await.unwrap();
         assert_eq!(rows[0].status, ActionStatus::Ok);
+    }
+
+    fn new_action(feature: &str) -> NewAction {
+        NewAction {
+            feature_id: feature.into(),
+            command: "run".into(),
+            engine_id: "noop".into(),
+            model: None,
+            provider_ref: None,
+        }
+    }
+
+    /// Rows 6, 65, 67 and 438 of a real data.db sat at `started` for weeks
+    /// because the process that opened them quit mid-run.
+    #[tokio::test]
+    async fn close_interrupted_reaps_open_rows_and_leaves_finished_ones() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&pool).await.unwrap();
+        let repo = ActionRepo::new(pool);
+        let open = repo.record(new_action("dictation")).await.unwrap();
+        let done = repo.record(new_action("dictation")).await.unwrap();
+        repo.finish(done, ActionStatus::Ok, None).await.unwrap();
+        let failed = repo.record(new_action("rewrite")).await.unwrap();
+        repo.finish(failed, ActionStatus::Error, Some("boom"))
+            .await
+            .unwrap();
+
+        assert_eq!(repo.close_interrupted().await.unwrap(), 1);
+
+        let row = repo.get(open).await.unwrap().unwrap();
+        assert_eq!(row.status, ActionStatus::Error);
+        assert_eq!(row.error.as_deref(), Some(INTERRUPTED_MESSAGE));
+        assert!(row.finished_at.is_some());
+        assert_eq!(
+            repo.get(done).await.unwrap().unwrap().status,
+            ActionStatus::Ok
+        );
+        assert_eq!(
+            repo.get(failed).await.unwrap().unwrap().error.as_deref(),
+            Some("boom")
+        );
+        assert_eq!(repo.close_interrupted().await.unwrap(), 0, "idempotent");
+    }
+
+    #[tokio::test]
+    async fn finish_detached_closes_the_row_from_a_sync_context() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&pool).await.unwrap();
+        let repo = ActionRepo::new(pool);
+        let id = repo.record(new_action("dictation")).await.unwrap();
+
+        assert!(repo.finish_detached(id, ActionStatus::Error, "abandoned".into()));
+
+        for _ in 0..50 {
+            if repo.get(id).await.unwrap().unwrap().status != ActionStatus::Started {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let row = repo.get(id).await.unwrap().unwrap();
+        assert_eq!(row.status, ActionStatus::Error);
+        assert_eq!(row.error.as_deref(), Some("abandoned"));
     }
 
     #[tokio::test]

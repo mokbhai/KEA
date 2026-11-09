@@ -7,15 +7,16 @@ use kea_core::rewrite::{build_llm_request, RewriteInput};
 use kea_core::rewrite::{PresetRepo, PromptOverrideRepo, RewriteMode};
 use kea_core::store::actions::{ActionRepo, NewAction};
 use kea_core::store::bindings::{Binding, BindingRepo};
+use kea_core::store::conversations::MessageRole;
 use kea_core::store::vocabulary::VocabularyEntry;
-use kea_engines::traits::{AudioPcm, Partial, SttOpts, SttStream, Transcript};
+use kea_engines::traits::{AudioPcm, Partial, SttOpts, SttStream, TokenUsage, Transcript};
 use kea_engines::EngineRegistry;
 use kea_platform::audio::util::resample_linear;
 use kea_platform::TextIo;
 use kea_platform::{AudioIo, PcmFrame};
 
 use crate::feature::{ActionGuard, CapKind, CapSlot, Command, Feature, ProfileOverrides};
-use crate::rewrite::{record_llm_call, ContentStorageOpts};
+use crate::rewrite::{record_conversation, record_llm_call, ContentStorageOpts};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -206,6 +207,20 @@ pub async fn run_dictation_with_opts(
 /// run actually bound, and that is not known until the slot has resolved, in
 /// here. Leaving the gate to the caller would give every caller a chance to
 /// get it wrong.
+/// What a finished run hands back: the text that was inserted, and a note for
+/// the user when the run succeeded by a lesser route than they configured.
+///
+/// A struct rather than a second `Result` because "cleanup was skipped" is not
+/// a failure: the words were delivered. Callers that only want the text use
+/// [`run_dictation_with_commands`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DictationOutcome {
+    pub text: String,
+    /// Something the user should be told even though the run succeeded.
+    pub notice: Option<String>,
+}
+
+/// [`run_dictation_outcome`], for the callers that only want the text.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_dictation_with_commands(
     engines: &EngineRegistry,
@@ -221,6 +236,39 @@ pub async fn run_dictation_with_commands(
     opts: DictationRunOpts<'_>,
     voice_commands: &VoiceCommandSettings,
 ) -> Result<String, String> {
+    run_dictation_outcome(
+        engines,
+        bindings,
+        actions,
+        presets,
+        overrides,
+        audio,
+        textio,
+        settings,
+        vocabulary,
+        profile,
+        opts,
+        voice_commands,
+    )
+    .await
+    .map(|outcome| outcome.text)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_dictation_outcome(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    actions: &ActionRepo,
+    presets: &PresetRepo,
+    overrides: &PromptOverrideRepo,
+    audio: &mut dyn AudioIo,
+    textio: &dyn TextIo,
+    settings: &DictationSettings,
+    vocabulary: &[VocabularyEntry],
+    profile: &ProfileOverrides,
+    opts: DictationRunOpts<'_>,
+    voice_commands: &VoiceCommandSettings,
+) -> Result<DictationOutcome, String> {
     let _frame_rx = audio.start_mic().await.map_err(|e| e.to_string())?;
     let pcm = audio.stop_mic().await.map_err(|e| e.to_string())?;
 
@@ -260,13 +308,51 @@ pub async fn run_dictation_with_commands(
     )
     .await;
     match result {
-        Ok(text) => {
-            guard.succeed().await;
-            Ok(text)
+        Ok(run) => {
+            match &run.cleanup_skipped {
+                // The words were delivered, so the row is `ok`; the reason
+                // rides in the free-text column rather than turning it red.
+                Some(reason) => {
+                    guard
+                        .succeed_with_note(format!("cleanup skipped: {reason}"))
+                        .await
+                }
+                None => guard.succeed().await,
+            }
+            Ok(DictationOutcome {
+                notice: run
+                    .cleanup_skipped
+                    .map(|reason| cleanup_skipped_notice(&reason)),
+                text: run.text,
+            })
         }
         Err(e) => Err(guard.fail(e).await),
     }
 }
+
+/// What the body of a run produced, before the ledger row is closed.
+struct InnerRun {
+    text: String,
+    /// Why the cleanup pass did not apply, when it was wanted and failed.
+    cleanup_skipped: Option<String>,
+}
+
+/// What the user sees when cleanup failed but their words went in anyway.
+fn cleanup_skipped_notice(reason: &str) -> String {
+    format!("AI cleanup was skipped ({reason}) — your raw transcript was inserted instead.")
+}
+
+/// Message for a capture that contained no samples at all.
+///
+/// Written for the person holding the key rather than for the decoder: the
+/// engine's own wording ("Input sample buffer was empty") was the only thing
+/// the user ever saw for this, and it names nothing they can act on.
+const NO_AUDIO_MESSAGE: &str = "No audio was captured — the microphone delivered nothing. \
+Hold the key while you speak, and check the input device if it keeps happening.";
+
+/// The substring a failed insertion's message carries once the text is
+/// already on the clipboard (`paste_failed_but_copied` in the platform crate).
+const ALREADY_ON_CLIPBOARD: &str = "on your clipboard";
 
 #[allow(clippy::too_many_arguments)]
 async fn run_dictation_inner(
@@ -283,7 +369,7 @@ async fn run_dictation_inner(
     binding: &Binding,
     action_id: i64,
     pcm: PcmFrame,
-) -> Result<String, String> {
+) -> Result<InnerRun, String> {
     let DictationRunOpts {
         storage,
         streaming_draft,
@@ -330,6 +416,18 @@ async fn run_dictation_inner(
     // means "what the decoder was handed" — a 48kHz capture device would
     // otherwise report three times the work for the same speech.
     let decoded_samples = audio.samples.len();
+    if decoded_samples == 0 {
+        // Not a Whisper failure, so Whisper is not asked: it answers an empty
+        // buffer with a cryptic error after loading the model, which is
+        // seconds of work to say nothing. See `hold_to_talk` dispatch for the
+        // way this used to be produced by a queued press/release pair.
+        tracing::warn!(
+            action_id = %action_id,
+            engine = %engine_id,
+            "dictation: the capture held no samples; not calling the decoder"
+        );
+        return Err(NO_AUDIO_MESSAGE.to_string());
+    }
     let decode_started = std::time::Instant::now();
     let decoded = engine.transcribe(audio, stt_opts).await;
     // One line covering both outcomes, unlike the two-edged insertion log
@@ -447,60 +545,86 @@ async fn run_dictation_inner(
             "dictation: skipped the cleanup pass, transcript below the minimum length"
         );
     }
+    // What the user said, as far as this pass can tell: voice commands and
+    // vocabulary applied, no model's opinion. It is what History keeps as the
+    // "user" side of the exchange, and what is inserted when cleanup is off or
+    // fails.
+    let raw_text = final_text.clone();
+    let mut cleaned: Option<Cleaned> = None;
+    let mut cleanup_skipped: Option<String> = None;
+
     if profile.post_process_or(settings.post_process) && long_enough {
-        let transcript_text = final_text.clone();
-        // Dictation borrows rewrite's slot, so its failures name what the
-        // binding was wanted for.
-        let llm_binding = resolver
-            .require_llm("rewrite")
+        // An enhancement, never a gate. Every way this can fail — no LLM bound,
+        // a request that cannot be built, a provider outage (a 429 or 503 is
+        // routine) — used to `?` out of the whole run and discard a transcript
+        // that had already been decoded. Now the decoded words go in as they
+        // are, and the user is told cleanup did not happen.
+        match run_cleanup(engines, resolver, presets, overrides, &raw_text).await {
+            Ok(done) => {
+                tracing::info!(
+                    action_id = %action_id,
+                    engine = %done.engine_id,
+                    chars = done.text.chars().count(),
+                    "dictation: post-processed"
+                );
+                final_text = done.text.clone();
+                cleaned = Some(done);
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    action_id = %action_id,
+                    error = %reason,
+                    "dictation: the cleanup pass failed; inserting the raw transcript instead"
+                );
+                cleanup_skipped = Some(reason);
+            }
+        }
+    }
+
+    // Written down *before* the paste is attempted. The paste is the one step
+    // the OS may refuse (secure input, Accessibility revoked), and a transcript
+    // that exists only in memory at that moment is gone when it does. A failure
+    // to write is logged and otherwise ignored for the same reason: History is
+    // a record of the words, and must never be the thing that keeps them from
+    // arriving.
+    let kept = match &cleaned {
+        Some(done) => {
+            record_llm_call(
+                storage,
+                action_id,
+                "dictation",
+                &done.engine_id,
+                done.model.clone(),
+                done.provider_ref.clone(),
+                &raw_text,
+                &done.text,
+                done.usage,
+            )
             .await
-            .map_err(|e| e.with_purpose("audio refinement"))?;
-        let llm_engine_id = llm_binding.engine_id.clone();
-
-        let mut llm_req = build_llm_request(
-            &RewriteInput {
-                source_text: final_text.clone(),
-                mode: RewriteMode::AudioRefinement,
-                preset_id: None,
-                custom_instruction: None,
-            },
-            presets,
-            overrides,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-        llm_req.model = llm_binding.model.clone();
-        // Same reason as run_rewrite: the provider lives on the binding, not on
-        // the shared engine instance.
-        llm_req.provider_ref = llm_binding.provider_ref.clone();
-
-        let llm = engines
-            .llm(&llm_engine_id)
-            .ok_or_else(|| format!("no llm engine '{llm_engine_id}'"))?;
-
-        let resp = llm.complete(llm_req).await.map_err(|e| e.to_string())?;
-
-        record_llm_call(
-            storage,
-            action_id,
-            "dictation",
-            &llm_engine_id,
-            llm_binding.model.clone(),
-            llm_binding.provider_ref.clone(),
-            &transcript_text,
-            &resp.text,
-            resp.usage,
-        )
-        .await?;
-
-        tracing::info!(
+        }
+        // No model answered, so there is no exchange — only the transcript,
+        // as a single message from the user. Nothing is written for a
+        // transcript with no words in it.
+        None if !raw_text.trim().is_empty() => {
+            record_conversation(
+                storage,
+                action_id,
+                "dictation",
+                &binding.engine_id,
+                binding.model.clone(),
+                binding.provider_ref.clone(),
+                &[(MessageRole::User, raw_text.as_str(), None)],
+            )
+            .await
+        }
+        None => Ok(()),
+    };
+    if let Err(e) = kept {
+        tracing::warn!(
             action_id = %action_id,
-            engine = %llm_engine_id,
-            chars = resp.text.chars().count(),
-            "dictation: post-processed"
+            error = %e,
+            "dictation: could not record the transcript in History; inserting it anyway"
         );
-        final_text = resp.text;
     }
 
     // The paste is the one step whose outcome the OS will not report (see
@@ -526,7 +650,7 @@ async fn run_dictation_inner(
             elapsed_ms = insert_started.elapsed().as_millis() as u64,
             "dictation: insertion failed"
         );
-        return Err(e.to_string());
+        return Err(leave_on_clipboard(textio, &final_text, e.to_string(), action_id).await);
     }
 
     tracing::info!(
@@ -535,7 +659,99 @@ async fn run_dictation_inner(
         "dictation: inserted"
     );
 
-    Ok(final_text)
+    Ok(InnerRun {
+        text: final_text,
+        cleanup_skipped,
+    })
+}
+
+/// A cleanup pass that answered.
+struct Cleaned {
+    text: String,
+    engine_id: String,
+    model: Option<String>,
+    provider_ref: Option<String>,
+    usage: Option<TokenUsage>,
+}
+
+/// The audio-refinement call. Every failure is reported as the reason string;
+/// the caller decides that none of them is fatal.
+async fn run_cleanup(
+    engines: &EngineRegistry,
+    resolver: &SlotResolver<'_>,
+    presets: &PresetRepo,
+    overrides: &PromptOverrideRepo,
+    text: &str,
+) -> Result<Cleaned, String> {
+    // Dictation borrows rewrite's slot, so its failures name what the
+    // binding was wanted for.
+    let llm_binding = resolver
+        .require_llm("rewrite")
+        .await
+        .map_err(|e| e.with_purpose("audio refinement"))?;
+    let llm_engine_id = llm_binding.engine_id.clone();
+
+    let mut llm_req = build_llm_request(
+        &RewriteInput {
+            source_text: text.to_string(),
+            mode: RewriteMode::AudioRefinement,
+            preset_id: None,
+            custom_instruction: None,
+        },
+        presets,
+        overrides,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    llm_req.model = llm_binding.model.clone();
+    // Same reason as run_rewrite: the provider lives on the binding, not on
+    // the shared engine instance.
+    llm_req.provider_ref = llm_binding.provider_ref.clone();
+
+    let llm = engines
+        .llm(&llm_engine_id)
+        .ok_or_else(|| format!("no llm engine '{llm_engine_id}'"))?;
+
+    let resp = llm.complete(llm_req).await.map_err(|e| e.to_string())?;
+
+    Ok(Cleaned {
+        text: resp.text,
+        engine_id: llm_engine_id,
+        model: llm_binding.model,
+        provider_ref: llm_binding.provider_ref,
+        usage: resp.usage,
+    })
+}
+
+/// Makes sure the words of a failed insertion are somewhere the user can still
+/// reach, and says where in the message handed back.
+///
+/// The macOS paste path already leaves the text on the clipboard once it has
+/// written it, and says so. What it cannot cover is a refusal that comes before
+/// the write — Accessibility not granted, the pasteboard unavailable — and
+/// those are the failures that used to leave the words in no app, on no
+/// clipboard and in no History row.
+async fn leave_on_clipboard(
+    textio: &dyn TextIo,
+    text: &str,
+    reason: String,
+    action_id: i64,
+) -> String {
+    if reason.contains(ALREADY_ON_CLIPBOARD) || text.trim().is_empty() {
+        return reason;
+    }
+    match textio.copy_to_clipboard(text).await {
+        Ok(()) => format!("{reason} The text is on your clipboard — press ⌘V to paste it."),
+        Err(copy_error) => {
+            tracing::warn!(
+                action_id = %action_id,
+                error = %copy_error,
+                "dictation: could not leave the text on the clipboard after a failed insertion"
+            );
+            reason
+        }
+    }
 }
 
 /// A running streaming pass: the task feeding capture frames to a recognizer
@@ -768,6 +984,10 @@ mod tests {
         /// a profile's choice reached the platform rather than only that some
         /// text arrived.
         mode: Mutex<Option<ReplaceMode>>,
+        /// When set, every insertion is refused with this message.
+        fail_with: Mutex<Option<String>>,
+        /// What the run left on the clipboard through `copy_to_clipboard`.
+        copied: Mutex<Option<String>>,
     }
 
     impl FakeTextIo {
@@ -775,7 +995,15 @@ mod tests {
             Self {
                 inserted: Mutex::new(None),
                 mode: Mutex::new(None),
+                fail_with: Mutex::new(None),
+                copied: Mutex::new(None),
             }
+        }
+
+        fn refusing(message: &str) -> Self {
+            let io = Self::new();
+            *io.fail_with.lock().unwrap() = Some(message.to_string());
+            io
         }
     }
 
@@ -794,8 +1022,16 @@ mod tests {
             text: &str,
             mode: ReplaceMode,
         ) -> Result<(), TextIoError> {
+            if let Some(message) = self.fail_with.lock().unwrap().clone() {
+                return Err(TextIoError::Other(message));
+            }
             *self.inserted.lock().unwrap() = Some(text.to_string());
             *self.mode.lock().unwrap() = Some(mode);
+            Ok(())
+        }
+
+        async fn copy_to_clipboard(&self, text: &str) -> Result<(), TextIoError> {
+            *self.copied.lock().unwrap() = Some(text.to_string());
             Ok(())
         }
     }
@@ -2062,5 +2298,501 @@ mod tests {
         .unwrap();
 
         assert!(conversations.list_recent(1).await.unwrap().is_empty());
+    }
+
+    // ---- never lose the user's words -------------------------------------
+    //
+    // Measured on a real data.db: 14 of 577 dictations errored, and a dictation
+    // only ever reached History if the cleanup pass ran *and* succeeded. These
+    // tests pin the opposite contract: once the audio has been transcribed, the
+    // words survive every later failure.
+
+    struct World {
+        bindings: BindingRepo,
+        actions: ActionRepo,
+        conversations: ConversationRepo,
+        presets: PresetRepo,
+        overrides: PromptOverrideRepo,
+    }
+
+    async fn world() -> World {
+        let config_pool = open_pool("sqlite::memory:").await.unwrap();
+        run_config_migrations(&config_pool).await.unwrap();
+        let data_pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&data_pool).await.unwrap();
+        World {
+            bindings: BindingRepo::new(config_pool.clone()),
+            actions: ActionRepo::new(data_pool.clone()),
+            conversations: ConversationRepo::new(data_pool),
+            presets: PresetRepo::new(config_pool.clone()),
+            overrides: PromptOverrideRepo::new(config_pool),
+        }
+    }
+
+    fn cleanup_on() -> DictationSettings {
+        DictationSettings {
+            post_process: true,
+            post_process_min_chars: 0,
+            ..test_settings()
+        }
+    }
+
+    /// An LLM that is down, which is what a 429 or 503 from the provider looks
+    /// like from here.
+    struct DownLlm;
+
+    #[async_trait]
+    impl kea_engines::traits::LlmEngine for DownLlm {
+        fn id(&self) -> &str {
+            "down-llm"
+        }
+
+        fn capabilities(&self) -> EngineCaps {
+            EngineCaps {
+                models: vec!["m".into()],
+            }
+        }
+
+        async fn complete(
+            &self,
+            _req: kea_engines::traits::LlmRequest,
+        ) -> Result<kea_engines::traits::LlmResponse, EngineError> {
+            Err(EngineError::Other(
+                "HTTP 503: Service temporarily unavailable".into(),
+            ))
+        }
+    }
+
+    /// Counts how often it is asked to decode.
+    struct CountingStt {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SttEngine for CountingStt {
+        fn id(&self) -> &str {
+            "counting-stt"
+        }
+
+        fn capabilities(&self) -> EngineCaps {
+            EngineCaps {
+                models: vec!["fake".into()],
+            }
+        }
+
+        async fn transcribe(
+            &self,
+            _audio: AudioPcm,
+            _opts: SttOpts,
+        ) -> Result<Transcript, EngineError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Transcript::text_only("never reached"))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn outcome_of(
+        reg: &EngineRegistry,
+        w: &World,
+        audio: &mut FakeAudioIo,
+        textio: &FakeTextIo,
+        settings: &DictationSettings,
+        storage: ContentStorageOpts<'_>,
+    ) -> Result<DictationOutcome, String> {
+        run_dictation_outcome(
+            reg,
+            &w.bindings,
+            &w.actions,
+            &w.presets,
+            &w.overrides,
+            audio,
+            textio,
+            settings,
+            &[],
+            &ProfileOverrides::default(),
+            DictationRunOpts {
+                storage,
+                ..Default::default()
+            },
+            &VoiceCommandSettings::default(),
+        )
+        .await
+    }
+
+    /// Cleanup is an enhancement. A provider outage used to throw the whole
+    /// transcript away (`llm.complete(..)?`); the user then re-dictated what
+    /// they had already said.
+    #[tokio::test]
+    async fn a_failed_cleanup_inserts_the_raw_transcript_and_says_so() {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: "um hello there".into(),
+        }));
+        reg.register_llm(Arc::new(DownLlm));
+        let w = world().await;
+        let textio = FakeTextIo::new();
+        let mut audio = FakeAudioIo::with_pcm(frame(1600));
+
+        let out = outcome_of(
+            &reg,
+            &w,
+            &mut audio,
+            &textio,
+            &cleanup_on(),
+            ContentStorageOpts::enabled(&w.conversations),
+        )
+        .await
+        .expect("a cleanup failure must not fail the dictation");
+
+        assert_eq!(out.text, "um hello there");
+        assert_eq!(
+            textio.inserted.lock().unwrap().as_deref(),
+            Some("um hello there")
+        );
+        let notice = out.notice.expect("the user is told cleanup was skipped");
+        assert!(notice.contains("cleanup"), "{notice}");
+        assert!(notice.contains("503"), "the reason is kept: {notice}");
+
+        // The ledger convention: the user got their text, so the row is `ok`,
+        // and the reason lives in the one free-text column History displays.
+        let row = w.actions.recent(1).await.unwrap().remove(0);
+        assert_eq!(row.status, ActionStatus::Ok);
+        let detail = w.actions.get(row.id).await.unwrap().unwrap();
+        assert!(detail.error.unwrap().contains("503"));
+
+        // And the transcript is in History even though no LLM answered.
+        let convs = w.conversations.list_recent(10).await.unwrap();
+        assert_eq!(convs.len(), 1);
+        let msgs = w.conversations.list_messages(convs[0].id).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, MessageRole::User);
+        assert_eq!(msgs[0].content, "um hello there");
+    }
+
+    /// The other two early returns in the cleanup block: no LLM bound at all.
+    #[tokio::test]
+    async fn a_missing_llm_binding_also_falls_back_to_the_raw_transcript() {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: "um hello there".into(),
+        }));
+        // No LLM engine registered: `require_llm` fails.
+        let w = world().await;
+        let textio = FakeTextIo::new();
+        let mut audio = FakeAudioIo::with_pcm(frame(1600));
+
+        let out = outcome_of(
+            &reg,
+            &w,
+            &mut audio,
+            &textio,
+            &cleanup_on(),
+            ContentStorageOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.text, "um hello there");
+        assert!(out.notice.is_some());
+        assert_eq!(
+            textio.inserted.lock().unwrap().as_deref(),
+            Some("um hello there")
+        );
+    }
+
+    /// With cleanup off there used to be no conversation row at all
+    /// (`record_llm_call` was the only writer), so most dictations never
+    /// reached History.
+    #[tokio::test]
+    async fn the_transcript_reaches_history_when_cleanup_is_off() {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: "hello world".into(),
+        }));
+        let w = world().await;
+        let textio = FakeTextIo::new();
+        let mut audio = FakeAudioIo::with_pcm(frame(1600));
+
+        let out = outcome_of(
+            &reg,
+            &w,
+            &mut audio,
+            &textio,
+            &test_settings(),
+            ContentStorageOpts::enabled(&w.conversations),
+        )
+        .await
+        .unwrap();
+        assert!(out.notice.is_none(), "nothing went wrong");
+
+        let convs = w.conversations.list_recent(10).await.unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].feature_id, "dictation");
+        assert_eq!(convs[0].engine_id, "fake-stt");
+        assert!(
+            convs[0].action_id.is_some(),
+            "History links it to the action"
+        );
+        let msgs = w.conversations.list_messages(convs[0].id).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, MessageRole::User);
+        assert_eq!(msgs[0].content, "hello world");
+    }
+
+    /// The setting is the user's, and it still wins.
+    #[tokio::test]
+    async fn the_transcript_is_not_kept_when_content_storage_is_off() {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: "hello world".into(),
+        }));
+        let w = world().await;
+        let textio = FakeTextIo::new();
+        let mut audio = FakeAudioIo::with_pcm(frame(1600));
+
+        outcome_of(
+            &reg,
+            &w,
+            &mut audio,
+            &textio,
+            &test_settings(),
+            ContentStorageOpts::disabled(),
+        )
+        .await
+        .unwrap();
+
+        assert!(w.conversations.list_recent(10).await.unwrap().is_empty());
+    }
+
+    /// A successful cleanup keeps its two-message shape (raw in, cleaned out)
+    /// and is stored exactly once, not once for the transcript and again for
+    /// the exchange.
+    #[tokio::test]
+    async fn a_cleaned_dictation_stores_one_conversation_with_both_texts() {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: "um hello".into(),
+        }));
+        reg.register_llm(Arc::new(NoopLlmEngine));
+        let w = world().await;
+        let textio = FakeTextIo::new();
+        let mut audio = FakeAudioIo::with_pcm(frame(1600));
+
+        let out = outcome_of(
+            &reg,
+            &w,
+            &mut audio,
+            &textio,
+            &cleanup_on(),
+            ContentStorageOpts::enabled(&w.conversations),
+        )
+        .await
+        .unwrap();
+        assert!(out.notice.is_none());
+
+        let convs = w.conversations.list_recent(10).await.unwrap();
+        assert_eq!(convs.len(), 1);
+        let msgs = w.conversations.list_messages(convs[0].id).await.unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "um hello");
+        assert_eq!(msgs[1].content, out.text);
+    }
+
+    /// The paste is the step the OS can refuse (secure input, Accessibility
+    /// revoked). The words must already be in History by then, and on the
+    /// clipboard afterwards. Rows 16/17/66/77/162/440/598 of the real data.db
+    /// are exactly this and left nothing behind.
+    #[tokio::test]
+    async fn a_failed_insertion_leaves_the_words_in_history_and_on_the_clipboard() {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: "hello world".into(),
+        }));
+        let w = world().await;
+        let textio = FakeTextIo::refusing("KEA needs Accessibility permission.");
+        let mut audio = FakeAudioIo::with_pcm(frame(1600));
+
+        let err = outcome_of(
+            &reg,
+            &w,
+            &mut audio,
+            &textio,
+            &test_settings(),
+            ContentStorageOpts::enabled(&w.conversations),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("Accessibility"), "the cause is kept: {err}");
+        assert!(
+            err.contains("clipboard"),
+            "and the user is told where the text went: {err}"
+        );
+        assert_eq!(
+            textio.copied.lock().unwrap().as_deref(),
+            Some("hello world")
+        );
+        let convs = w.conversations.list_recent(10).await.unwrap();
+        assert_eq!(convs.len(), 1, "stored before the paste was attempted");
+        let msgs = w.conversations.list_messages(convs[0].id).await.unwrap();
+        assert_eq!(msgs[0].content, "hello world");
+        assert_eq!(
+            w.actions.recent(1).await.unwrap()[0].status,
+            ActionStatus::Error
+        );
+    }
+
+    /// Cleaned text is what the user would have received, so it is what gets
+    /// rescued — and the raw transcript is still in the conversation.
+    #[tokio::test]
+    async fn a_failed_insertion_rescues_the_cleaned_text() {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: "um hello".into(),
+        }));
+        reg.register_llm(Arc::new(NoopLlmEngine));
+        let w = world().await;
+        let textio = FakeTextIo::refusing("macOS is blocking synthetic keystrokes.");
+        let mut audio = FakeAudioIo::with_pcm(frame(1600));
+
+        outcome_of(
+            &reg,
+            &w,
+            &mut audio,
+            &textio,
+            &cleanup_on(),
+            ContentStorageOpts::enabled(&w.conversations),
+        )
+        .await
+        .unwrap_err();
+
+        let copied = textio.copied.lock().unwrap().clone().unwrap();
+        assert!(copied.starts_with("echo:"), "{copied}");
+        let convs = w.conversations.list_recent(10).await.unwrap();
+        let msgs = w.conversations.list_messages(convs[0].id).await.unwrap();
+        assert_eq!(msgs[0].content, "um hello");
+    }
+
+    /// A refusal that already says the text is on the clipboard (the macOS
+    /// paste path) is not contradicted or repeated.
+    #[tokio::test]
+    async fn an_error_that_already_names_the_clipboard_is_not_repeated() {
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(FakeStt {
+            text: "hello".into(),
+        }));
+        let w = world().await;
+        let msg = "secure input. The text is on your clipboard — press ⌘V to paste it.";
+        let textio = FakeTextIo::refusing(msg);
+        let mut audio = FakeAudioIo::with_pcm(frame(1600));
+
+        let err = outcome_of(
+            &reg,
+            &w,
+            &mut audio,
+            &textio,
+            &test_settings(),
+            ContentStorageOpts::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err, msg);
+    }
+
+    /// Every insertion failure of the 14 recorded ones that came from an empty
+    /// buffer: a capture with no samples is reported as what it is, and the
+    /// decoder is never asked to chew on nothing.
+    #[tokio::test]
+    async fn an_empty_capture_is_reported_as_no_audio_without_calling_the_engine() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(CountingStt {
+            calls: calls.clone(),
+        }));
+        let w = world().await;
+        let textio = FakeTextIo::new();
+        let mut audio = FakeAudioIo::with_pcm(frame(0));
+
+        let err = outcome_of(
+            &reg,
+            &w,
+            &mut audio,
+            &textio,
+            &test_settings(),
+            ContentStorageOpts::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_lowercase().contains("no audio"), "{err}");
+        assert!(
+            !err.to_lowercase().contains("whisper"),
+            "not the cryptic engine error: {err}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no decode was attempted");
+        assert!(textio.inserted.lock().unwrap().is_none());
+        let row = w.actions.recent(1).await.unwrap().remove(0);
+        assert_eq!(row.status, ActionStatus::Error, "and the row is closed");
+    }
+
+    /// A panic anywhere between recording the row and reporting its outcome
+    /// must not leave the row `started` forever.
+    #[tokio::test]
+    async fn a_panicking_engine_does_not_leave_the_action_open() {
+        struct PanickingStt;
+
+        #[async_trait]
+        impl SttEngine for PanickingStt {
+            fn id(&self) -> &str {
+                "panicking-stt"
+            }
+
+            fn capabilities(&self) -> EngineCaps {
+                EngineCaps {
+                    models: vec!["fake".into()],
+                }
+            }
+
+            async fn transcribe(
+                &self,
+                _audio: AudioPcm,
+                _opts: SttOpts,
+            ) -> Result<Transcript, EngineError> {
+                panic!("the decoder blew up");
+            }
+        }
+
+        let mut reg = EngineRegistry::default();
+        reg.register_stt(Arc::new(PanickingStt));
+        let w = Arc::new(world().await);
+        let reg = Arc::new(reg);
+
+        let (w2, reg2) = (w.clone(), reg.clone());
+        let joined = tokio::spawn(async move {
+            let textio = FakeTextIo::new();
+            let mut audio = FakeAudioIo::with_pcm(frame(1600));
+            outcome_of(
+                &reg2,
+                &w2,
+                &mut audio,
+                &textio,
+                &test_settings(),
+                ContentStorageOpts::default(),
+            )
+            .await
+        })
+        .await;
+        assert!(joined.is_err(), "the task panicked");
+
+        let mut status = ActionStatus::Started;
+        for _ in 0..100 {
+            status = w.actions.recent(1).await.unwrap()[0].status;
+            if status != ActionStatus::Started {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(status, ActionStatus::Error);
     }
 }

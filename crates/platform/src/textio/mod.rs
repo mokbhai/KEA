@@ -61,6 +61,25 @@ pub trait TextIo: Send + Sync {
             .await
     }
 
+    /// Leave `text` on the system clipboard, replacing whatever is there.
+    ///
+    /// The last resort when an insertion fails: words that could not be typed
+    /// into the focused app must still be reachable with a manual paste. The
+    /// clipboard paths already keep the text there once they have written it
+    /// (see `should_restore_clipboard`), but a refusal that comes *before* the
+    /// write — Accessibility not granted, the clipboard momentarily
+    /// unavailable — leaves the user's words nowhere, so the caller asks for
+    /// the copy explicitly.
+    ///
+    /// Defaults to refusing, which is the honest answer on a platform with no
+    /// clipboard backend.
+    async fn copy_to_clipboard(&self, text: &str) -> Result<(), TextIoError> {
+        let _ = text;
+        Err(TextIoError::Other(
+            "the clipboard is not available on this platform".into(),
+        ))
+    }
+
     /// Put `from` back where `to` is now, in whatever has keyboard focus.
     ///
     /// This is what undoing a rewrite needs and none of the three methods

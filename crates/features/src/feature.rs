@@ -168,6 +168,18 @@ impl<'a> ActionGuard<'a> {
         self.finish(ActionStatus::Ok, None).await;
     }
 
+    /// Closes the row as `ok` while keeping a note about what did not go to
+    /// plan.
+    ///
+    /// For a run that delivered what the user asked for by a lesser route —
+    /// dictation that inserted the raw transcript because the cleanup model
+    /// was down. `error` is the only free-text column, and History shows it
+    /// whenever it is set, so the note is visible without the row turning red.
+    pub async fn succeed_with_note(mut self, note: impl Display) {
+        let note = note.to_string();
+        self.finish(ActionStatus::Ok, Some(&note)).await;
+    }
+
     /// Closes the row as something the user called off rather than a failure.
     ///
     /// Takes a reason because "cancelled" alone does not say what was dropped;
@@ -204,10 +216,20 @@ impl Drop for ActionGuard<'_> {
     fn drop(&mut self) {
         if self.outcome.is_none() && !self.released {
             // A run that returns without closing its row leaves it pending
-            // forever in History; there is no async drop to do it for us.
+            // forever in History, and there is no async drop to do it for us.
+            // The way to get here is a panic (or a cancelled task) between
+            // `new` and the outcome, so the close is handed to the runtime
+            // rather than awaited. If there is no runtime left the row stays
+            // open and the next launch reaps it (`ActionRepo::close_interrupted`).
+            let scheduled = self.actions.finish_detached(
+                self.id,
+                ActionStatus::Error,
+                "interrupted: the run ended without reporting an outcome".to_string(),
+            );
             tracing::warn!(
                 action_id = %self.id,
                 feature = %self.feature,
+                closed = scheduled,
                 "action row dropped without an outcome"
             );
         }
