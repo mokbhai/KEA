@@ -72,14 +72,16 @@ dev: tauri-dev
 tauri-dev: check-tauri
 	$(TAURI_CLI) dev $(HOST_FEATURE_FLAGS)
 
-# Every install carries a new version, so the sidebar shows which build is
-# running: 0.5.5 -> 0.5.6-beta.1 -> 0.5.6-beta.2 ... (shown as 0.5.6b1).
-# `make release VERSION=0.5.6` ends the betas with the plain number.
+# Every install carries a version, so the sidebar shows which build is running.
+#   make install                 next beta: 0.5.5 -> 0.5.6-beta.1 -> 0.5.6-beta.2
+#                                (shown as 0.5.6b1, 0.5.6b2)
+#   make install VERSION=0.5.6   exactly that version, no bump; a beta can be
+#                                written 0.5.7b3 or 0.5.7-beta.3
 install: bump-beta
 	@$(MAKE) --no-print-directory tauri-install
 
 bump-beta:
-	@./scripts/bump_beta.sh
+	@./scripts/bump_beta.sh $(VERSION)
 
 release:
 	@if [ -z "$(VERSION)" ]; then echo "Usage: make release VERSION=x.y.z"; exit 1; fi
@@ -175,7 +177,8 @@ help:
 	@echo "  release-package - Build release artifacts into dist/"
 	@echo "  smoke          - Launch built binary and verify it does not panic/exist early (CI guardrail)"
 	@echo "  set-version    - Set Tauri/Cargo app version (make set-version VERSION=x.y.z)"
-	@echo "  install        - Bump the beta version (0.5.6b1, b2, ...), build, install"
+	@echo "  install        - Build and install with the next beta version (0.5.6b1, b2, ...);"
+	@echo "                   make install VERSION=x.y.z installs exactly that version"
 	@echo "  release        - Set a release version (make release VERSION=x.y.z)"
 	@echo ""
 	@echo "Prerequisite:"
