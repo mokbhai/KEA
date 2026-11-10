@@ -265,7 +265,7 @@ pub fn order_front_without_activating(window: &WebviewWindow) {
             // appearing" report needs.
             let before = if is_overlay { Some(panel_snapshot(ns_window)) } else { None };
             if let Some(before) = &before {
-                let drift = before.problems();
+                let drift = before.drift_before_show();
                 if !drift.is_empty() {
                     tracing::warn!(window = %label, ?drift, snapshot = ?before, "panel drifted since the last show; re-asserting");
                 }
@@ -411,6 +411,17 @@ pub struct PanelSnapshot {
 
 #[cfg(target_os = "macos")]
 impl PanelSnapshot {
+    /// What differs from the design *before* a show. The panel is hidden
+    /// between runs on purpose, so "not visible" here is the normal state,
+    /// not drift: flagging it made every first show after a hide log a
+    /// warning and buried the real evidence for a "stopped appearing" report.
+    pub fn drift_before_show(&self) -> Vec<&'static str> {
+        self.problems()
+            .into_iter()
+            .filter(|p| *p != "not visible")
+            .collect()
+    }
+
     /// What differs from the overlay's designed configuration. Empty when the
     /// panel is as built. `on_active_space` is deliberately not a problem: it
     /// is false for a moment during a Space switch and means nothing then.
@@ -697,6 +708,16 @@ mod tests {
                 snapshot.problems()
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_panel_hidden_between_runs_is_not_drift_before_a_show() {
+        let mut snapshot = healthy();
+        snapshot.visible = false;
+        assert!(snapshot.drift_before_show().is_empty());
+        snapshot.level = 3;
+        assert_eq!(snapshot.drift_before_show(), vec!["level changed"]);
     }
 
     #[cfg(target_os = "macos")]
