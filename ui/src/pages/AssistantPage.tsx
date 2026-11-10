@@ -1,9 +1,10 @@
 import type { ComponentProps } from "react";
-import FeatureSwitch from "../components/FeatureSwitch";
+import FeatureSwitch, { FeaturePageHeader } from "../components/FeatureSwitch";
 import { useEffect, useRef } from "react";
 import { getAssistantSettings, setAssistantSettings, type AssistantSettings } from "../api";
 import FeatureBanner from "../components/FeatureBanner";
-import HotkeyRow from "../components/HotkeyRow";
+import HotkeyRow, { KeyChips } from "../components/HotkeyRow";
+import Section from "../components/Section";
 import { Row, RowGroup } from "../components/SettingsRow";
 import FeatureAiCard from "../components/FeatureAiCard";
 import Toggle from "../components/Toggle";
@@ -81,18 +82,11 @@ function AssistantPageContent({ onNavigate }: Props) {
 
   return (
     <div>
-      <header>
-        <h1 style={{ marginTop: 0 }}>Assistant</h1>
-        <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
-          Press the shortcut, ask a question, and hear a short answer. Stop
-          talking and it answers — there is no key to release.
-        </p>
-      </header>
+      <FeaturePageHeader />
 
       <FeatureBanner ai={ai} onNavigate={onNavigate} />
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Behavior</h2>
+      <Section title="Behavior">
         <RowGroup aria-label="Assistant behavior">
           <HotkeyRow
             feature={ASSISTANT_FEATURE}
@@ -105,19 +99,15 @@ function AssistantPageContent({ onNavigate }: Props) {
             label="Cancel"
             hint="Registered only while a session is open, so it stays available to every other app the rest of the time."
           >
-            <kbd className="kea-kbd">Esc</kbd>
+            <KeyChips accelerator="Esc" />
           </Row>
         </RowGroup>
-      </section>
+      </Section>
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 4px" }}>Answers</h2>
-        <p className="kea-muted" style={{ marginTop: 0, marginBottom: 12 }}>
-          Two independent switches, because the useful settings are at both
-          ends: spoken and not shown for an answer you asked for without
-          looking, shown and not spoken for one you asked for in a room full of
-          people.
-        </p>
+      <Section
+        title="Answers"
+        note="Two independent switches, because the useful settings are at both ends: spoken and not shown for an answer you asked for without looking, shown and not spoken for one you asked for in a room full of people."
+      >
         <RowGroup aria-label="Assistant answers">
           <Row
             label="Speak answers"
@@ -162,17 +152,14 @@ function AssistantPageContent({ onNavigate }: Props) {
             {outputs.error}
           </p>
         )}
-      </section>
+      </Section>
 
       <FeatureAiCard ai={ai} featureLabel="Assistant" />
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 4px" }}>What it can do</h2>
-        <p className="kea-muted" style={{ marginTop: 0, marginBottom: 12 }}>
-          Anything else is answered as a question. Nothing the assistant can do
-          changes or deletes your work, so a misheard request costs you an
-          irrelevant answer and nothing more.
-        </p>
+      <Section
+        title="What it can do"
+        note="Anything else is answered as a question. Nothing the assistant can do changes or deletes your work, so a misheard request costs you an irrelevant answer and nothing more."
+      >
         <RowGroup aria-label="Assistant actions">
           {ACTIONS.map((action) => (
             <Row key={action.title} label={action.title} hint={action.when}>
@@ -180,7 +167,7 @@ function AssistantPageContent({ onNavigate }: Props) {
             </Row>
           ))}
         </RowGroup>
-      </section>
+      </Section>
     </div>
   );
 }

@@ -1,4 +1,6 @@
+import Section from "../components/Section";
 import { FeatureSwitchOverview } from "../components/FeatureSwitch";
+import PageHeader from "../components/PageHeader";
 import { useEffect, useState } from "react";
 import {
   checkUpdate,
@@ -359,16 +361,15 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
 
   return (
     <div>
-      <h1 style={{ marginTop: 0 }}>General</h1>
+      <PageHeader
+        title="General"
+        summary="Features, appearance, startup, updates, sounds, notifications and permissions."
+      />
       <FeatureSwitchOverview />
-      <p className="kea-muted" style={{ marginBottom: 24 }}>
-        Appearance, startup, updates, sounds, notifications and permissions.
-      </p>
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Appearance</h2>
+      <Section title="Appearance">
         <RowGroup aria-label="Appearance">
-          <Row label="Appearance" hint="Follow this Mac or pick a theme">
+          <Row label="Theme" hint="Follow this Mac or pick a theme">
             {savedKey === "appearance" && <span className="kea-saved">Saved ✓</span>}
             <select
               className="kea-select"
@@ -382,10 +383,9 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
             </select>
           </Row>
         </RowGroup>
-      </section>
+      </Section>
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Startup & updates</h2>
+      <Section title="Startup & updates">
         <RowGroup aria-label="Startup and updates">
           <Row
             label="Launch at login"
@@ -408,7 +408,7 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
               disabled={autoCheckBusy}
             />
           </Row>
-          <Row label="Updates" hint={updateResult ?? undefined}>
+          <Row label="Updates" hint={updateResult ?? "Check whether a KEA update is available"}>
             <button
               type="button"
               className="kea-btn"
@@ -419,10 +419,9 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
             </button>
           </Row>
         </RowGroup>
-      </section>
+      </Section>
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Sounds & notifications</h2>
+      <Section title="Sounds & notifications">
         <RowGroup aria-label="Sounds and notifications">
           <Row
             label="Dictation sounds"
@@ -447,10 +446,9 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
             </button>
           </Row>
         </RowGroup>
-      </section>
+      </Section>
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Local API &amp; scripting</h2>
+      <Section title="Local API &amp; scripting">
         <p className="kea-muted" style={{ margin: "0 0 12px" }}>
           {API_THREAT_MODEL}
         </p>
@@ -593,12 +591,11 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
           portOn={api.value.tcp_enabled}
           socketPath={api.value.unix_socket_supported ? api.value.socket_path : null}
         />
-      </section>
+      </Section>
 
       <PermissionPanel />
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Setup assistant</h2>
+      <Section title="Setup assistant">
         <RowGroup aria-label="Setup assistant">
           <Row
             label="First-run setup"
@@ -614,7 +611,7 @@ export default function GeneralPage({ onRunSetup }: { onRunSetup: () => void }) 
             </button>
           </Row>
         </RowGroup>
-      </section>
+      </Section>
     </div>
   );
 }

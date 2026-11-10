@@ -1,5 +1,5 @@
 import type { ComponentProps } from "react";
-import FeatureSwitch from "../components/FeatureSwitch";
+import FeatureSwitch, { FeaturePageHeader } from "../components/FeatureSwitch";
 import { useState } from "react";
 import {
   TRANSLATION_TARGETS,
@@ -13,8 +13,9 @@ import FeatureAiCard from "../components/FeatureAiCard";
 import FeatureBanner from "../components/FeatureBanner";
 import HotkeyRow from "../components/HotkeyRow";
 import PaletteSettings from "../components/PaletteSettings";
+import Section, { SectionFooter } from "../components/Section";
 import SettingsForm from "../components/SettingsForm";
-import { RowGroup } from "../components/SettingsRow";
+import { Row, RowGroup } from "../components/SettingsRow";
 import Spinner from "../components/Spinner";
 import { useFeatureAi } from "../hooks/useFeatureAi";
 import { useRewriteSettings } from "../hooks/useRewriteSettings";
@@ -99,13 +100,7 @@ function RewritePageContent({ onRunSetup, onNavigate }: Props) {
 
   return (
     <div>
-      <header>
-        <h1 style={{ marginTop: 0 }}>Rewrite</h1>
-        <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
-          Select text anywhere on your Mac and press the shortcut to rewrite it in
-          place.
-        </p>
-      </header>
+      <FeaturePageHeader />
 
       <FeatureBanner ai={ai} onNavigate={onNavigate} />
 
@@ -117,8 +112,7 @@ function RewritePageContent({ onRunSetup, onNavigate }: Props) {
         </div>
       )}
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Behavior</h2>
+      <Section title="Behavior">
         <SettingsForm
           rewrite={rewrite}
           leadingRows={
@@ -140,33 +134,24 @@ function RewritePageContent({ onRunSetup, onNavigate }: Props) {
             </>
           }
         />
-      </section>
+      </Section>
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Languages and shortcuts</h2>
-        <div className="kea-card">
-          <p className="kea-muted" style={{ margin: "0 0 12px" }}>
-            Each language here gets a shortcut of its own that translates the
-            selection straight into it, whatever style is chosen above. Nothing is
-            bound until you record a combo.
-          </p>
-          {translateTargets.length > 0 && (
-            <RowGroup aria-label="Translate shortcuts">
-              {translateTargets.map((tag) => (
-                <HotkeyRow
-                  key={tag}
-                  feature="rewrite"
-                  command={translateCommand(tag)}
-                  label={translationTargetLabel(tag)}
-                  hint={`Translates the selection into ${translationTargetLabel(tag)}.`}
-                  checkRegistration
-                />
-              ))}
-            </RowGroup>
-          )}
-          <div
-            style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}
-          >
+      <Section
+        title="Languages and shortcuts"
+        note="Each language here gets a shortcut of its own that translates the selection straight into it, whatever style is chosen above. Nothing is bound until you record a combo."
+      >
+        <RowGroup aria-label="Translate shortcuts">
+          {translateTargets.map((tag) => (
+            <HotkeyRow
+              key={tag}
+              feature="rewrite"
+              command={translateCommand(tag)}
+              label={translationTargetLabel(tag)}
+              hint={`Translates the selection into ${translationTargetLabel(tag)}.`}
+              checkRegistration
+            />
+          ))}
+          <Row label="Add a language">
             <select
               className="kea-select"
               aria-label="Language to add"
@@ -193,33 +178,32 @@ function RewritePageContent({ onRunSetup, onNavigate }: Props) {
             >
               Add
             </button>
-          </div>
-          {translateTargets.length > 0 && (
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
-              {translateTargets.map((tag) => (
-                <button
-                  key={tag}
-                  type="button"
-                  className="kea-btn"
-                  disabled={rewrite.busy}
-                  onClick={() => void rewrite.removeTranslateTarget(tag)}
-                >
-                  Remove {translationTargetLabel(tag)}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-      </section>
+          </Row>
+        </RowGroup>
+        {translateTargets.length > 0 && (
+          <SectionFooter>
+            {translateTargets.map((tag) => (
+              <button
+                key={tag}
+                type="button"
+                className="kea-btn"
+                disabled={rewrite.busy}
+                onClick={() => void rewrite.removeTranslateTarget(tag)}
+              >
+                Remove {translationTargetLabel(tag)}
+              </button>
+            ))}
+          </SectionFooter>
+        )}
+      </Section>
 
       <PaletteSettings />
 
       <FeatureAiCard ai={ai} featureLabel="Rewrite" />
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Try it</h2>
-        <div className="kea-card">
-          <label style={{ display: "block", marginBottom: 12 }}>
+      <Section title="Try it">
+        <div className="kea-card" style={{ display: "grid", gap: 12 }}>
+          <label style={{ display: "block" }}>
             <span className="kea-label">Sample text</span>
             <textarea
               className="kea-input"
@@ -262,13 +246,13 @@ function RewritePageContent({ onRunSetup, onNavigate }: Props) {
               Put my words back
             </button>
           </div>
-          <p className="kea-muted" style={{ margin: "8px 0 0", fontSize: "0.8125rem" }}>
+          <p className="kea-muted" style={{ margin: 0, fontSize: "0.8125rem" }}>
             "Rewrite this" shows the result here and pastes nothing anywhere.
             "Rewrite my selection" runs the real shortcut and replaces the text
             you have selected in another app.
           </p>
           {result !== null && (
-            <div style={{ marginTop: 12 }}>
+            <div>
               <span className="kea-label">Result</span>
               <p
                 style={{
@@ -285,12 +269,12 @@ function RewritePageContent({ onRunSetup, onNavigate }: Props) {
             </div>
           )}
           {runStatus && (
-            <p className="kea-muted" style={{ marginTop: 12, marginBottom: 0 }}>
+            <p className="kea-muted" style={{ margin: 0 }}>
               {runStatus}
             </p>
           )}
         </div>
-      </section>
+      </Section>
     </div>
   );
 }

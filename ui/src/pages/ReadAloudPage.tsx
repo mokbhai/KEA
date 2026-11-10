@@ -1,5 +1,5 @@
 import type { ComponentProps } from "react";
-import FeatureSwitch from "../components/FeatureSwitch";
+import FeatureSwitch, { FeaturePageHeader } from "../components/FeatureSwitch";
 import { useEffect, useState } from "react";
 import {
   getTtsSettings,
@@ -17,6 +17,7 @@ import FeatureAiCard from "../components/FeatureAiCard";
 import FeatureBanner from "../components/FeatureBanner";
 import HotkeyRow from "../components/HotkeyRow";
 import LoadingBlock from "../components/LoadingBlock";
+import Section from "../components/Section";
 import { Row, RowGroup } from "../components/SettingsRow";
 import ReadAloudStop from "../components/ReadAloudStop";
 import Spinner from "../components/Spinner";
@@ -198,20 +199,13 @@ function ReadAloudPageContent({ onNavigate }: Props) {
 
   return (
     <div>
-      <header>
-        <h1 style={{ marginTop: 0 }}>Read aloud</h1>
-        <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
-          Select text anywhere on your Mac and press the shortcut to hear it read
-          out loud.
-        </p>
-      </header>
+      <FeaturePageHeader />
 
       <ReadAloudStop />
 
       <FeatureBanner ai={ai} onNavigate={onNavigate} />
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Behavior</h2>
+      <Section title="Behavior">
         {settingsLoading ? (
           <LoadingBlock label="Loading settings…" minHeight={44} />
         ) : (
@@ -316,14 +310,13 @@ function ReadAloudPageContent({ onNavigate }: Props) {
             )}
           </>
         )}
-      </section>
+      </Section>
 
       <FeatureAiCard ai={ai} featureLabel="Read aloud" />
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Try it</h2>
-        <div className="kea-card">
-          <p style={{ marginTop: 0 }}>Hear a sample sentence in the chosen voice.</p>
+      <Section title="Try it">
+        <div className="kea-card" style={{ display: "grid", gap: 12 }}>
+          <p style={{ margin: 0 }}>Hear a sample sentence in the chosen voice.</p>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <button
               type="button"
@@ -351,12 +344,12 @@ function ReadAloudPageContent({ onNavigate }: Props) {
             </button>
           </div>
           {runStatus && (
-            <p className="kea-muted" style={{ marginTop: 12, marginBottom: 0 }}>
+            <p className="kea-muted" style={{ margin: 0 }}>
               {runStatus}
             </p>
           )}
         </div>
-      </section>
+      </Section>
     </div>
   );
 }

@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invokeMock, onInvoke, resetTauriMocks } from "./test-utils/tauri";
 import { featureHandlers, openAiBinding } from "./test-utils/featureWorld";
+import { switchSitsUnderTitle } from "./test-utils/pageHeader";
 import Onboarding from "./components/Onboarding";
 import AiProvidersPage from "./pages/AiProvidersPage";
 import DictationPage from "./pages/DictationPage";
@@ -33,14 +34,15 @@ const ACTION = {
   status: "ok",
 };
 
-const CONVERSATION = {
+const HISTORY_ENTRY = {
   id: 3,
   action_id: 7,
   feature_id: "rewrite",
   engine_id: "openai",
   model: "gpt-4o-mini",
-  provider_ref: "openai",
-  created_at: "2026-07-17T10:00:00Z",
+  created_at: "2026-07-17 10:00:00",
+  input: "can u send the invoice",
+  output: "Could you send the invoice?",
 };
 
 const PROFILE = {
@@ -118,8 +120,7 @@ function mockWholeApp() {
         test_provider: () => "ok",
         delete_model: () => undefined,
         list_actions: () => [ACTION],
-        list_conversations: () => [CONVERSATION],
-        list_messages: () => [],
+        list_history: () => [HISTORY_ENTRY],
         get_action: () => ({
           ...ACTION,
           model: "gpt-4o-mini",
@@ -227,7 +228,8 @@ const PAGES: [string, () => JSX.Element, RegExp[]][] = [
   ["Models", () => <ModelsPage />, []],
   ["General", () => <GeneralPage onRunSetup={() => {}} />, []],
   ["App profiles", () => <ProfilesPage />, [/^Edit Slack$/]],
-  ["History", () => <HistoryPage />, [/^Show action 7$/]],
+  // The saved text: a row's copy button, and the open entry's own controls.
+  ["History", () => <HistoryPage />, [/^Copy rewrite from /,/^Copy original$/, /^Delete$/]],
   ["Logs", () => <LogsPage />, []],
 ];
 
@@ -255,13 +257,25 @@ describe("keyboard-only walkthrough", () => {
     },
   );
 
-  it("reaches every control on History's conversations tab", async () => {
+  // Assistant and Transcribe make the same check in their own tests.
+  it.each([
+    ["Rewrite", () => <RewritePage />],
+    ["Dictation", () => <DictationPage />],
+    ["Meetings", () => <MeetingsPage />],
+    ["Read aloud", () => <ReadAloudPage />],
+  ] as [string, () => JSX.Element][])(
+    "opens %s with its title, then the switch that turns it on",
+    async (title, page) => {
+      render(<ThemeProvider>{page()}</ThemeProvider>);
+      await screen.findByRole("heading", { level: 1, name: title });
+      expect(switchSitsUnderTitle(title)).toBe(true);
+    },
+  );
+
+  it("reaches every control on History's activity log", async () => {
     render(<HistoryPage />);
-    await userEvent.click(await screen.findByRole("button", { name: "Conversations" }));
-    expect(
-      await screen.findByRole("button", { name: "Show conversation 3" }),
-    ).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Delete conversation 3" })).toBeTruthy();
+    await userEvent.click(await screen.findByRole("button", { name: "Activity log" }));
+    expect(await screen.findByRole("button", { name: "Show action 7" })).toBeTruthy();
 
     expect(hiddenFromKeyboard().map(describeControl)).toEqual([]);
     expect((await tabSweep()).map(describeControl)).toEqual([]);

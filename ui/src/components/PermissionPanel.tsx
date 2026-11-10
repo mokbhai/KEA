@@ -1,3 +1,5 @@
+import Section from "./Section";
+import { Row, RowGroup } from "./SettingsRow";
 import { useCallback, useEffect, useState } from "react";
 import {
   getAllPermissionStatuses,
@@ -8,17 +10,6 @@ import {
   type PermissionStatusItem,
 } from "../api";
 import { toMessage } from "../lib/format";
-
-function statusColor(status: PermStatus): string {
-  switch (status) {
-    case "Granted":
-      return "#16a34a";
-    case "Denied":
-      return "var(--danger)";
-    default:
-      return "#737373";
-  }
-}
 
 function permissionLabel(kind: string): string {
   switch (kind) {
@@ -34,6 +25,18 @@ function permissionLabel(kind: string): string {
       return "Speech Recognition";
     default:
       return kind;
+  }
+}
+
+/** The row's second line: the state in plain words, and what to do about it. */
+function statusHint(status: PermStatus): string {
+  switch (status) {
+    case "Granted":
+      return "Allowed";
+    case "Denied":
+      return "Not allowed. Turn it on in System Settings, under Privacy & Security.";
+    default:
+      return "Not asked yet";
   }
 }
 
@@ -80,89 +83,54 @@ export default function PermissionPanel() {
   };
 
   return (
-    <section className="kea-card" style={{ marginBottom: 16 }}>
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          marginBottom: 12,
-        }}
-      >
-        <h2 style={{ margin: 0 }}>Permissions</h2>
-        <button
-          type="button"
-          className="kea-btn"
-          onClick={refreshPerms}
-          disabled={permsBusy}
-        >
-          Refresh
-        </button>
-      </div>
-      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
+    <Section title="Permissions" actions={
+      <button type="button" className="kea-btn" onClick={refreshPerms} disabled={permsBusy}>Refresh</button>
+    }>
+      <RowGroup aria-label="Permissions">
         {perms.map((p) => (
-          <span
+          <Row
             key={p.kind}
-            style={{
-              fontSize: 12,
-              fontWeight: 600,
-              padding: "4px 10px",
-              borderRadius: 999,
-              background: "var(--surface-2)",
-              color: statusColor(p.status),
-              border: "1px solid var(--border)",
-            }}
+            label={permissionLabel(p.kind)}
+            hint={
+              p.kind === "accessibility" && p.status !== "Granted"
+                ? `${statusHint(p.status)} After granting, click Refresh.`
+                : statusHint(p.status)
+            }
+            tone={p.status === "Denied" ? "danger" : "muted"}
           >
-            {permissionLabel(p.kind)}: {p.status}
-          </span>
+            {/* Nothing to ask for once it is allowed: a granted row is just its state. */}
+            {p.status !== "Granted" &&
+              (p.kind === "microphone" ||
+                p.kind === "screen_recording" ||
+                p.kind === "accessibility") && (
+                <button
+                  type="button"
+                  className="kea-btn"
+                  aria-label={`Request ${permissionLabel(p.kind)}`}
+                  onClick={() => onRequestPermission(p.kind as PermissionKind)}
+                  disabled={permsBusy}
+                >
+                  Request
+                </button>
+              )}
+            {p.kind === "accessibility" && p.status !== "Granted" && (
+              <button
+                type="button"
+                className="kea-btn"
+                onClick={() => openAccessibilitySettings()}
+                disabled={permsBusy}
+              >
+                Open System Settings
+              </button>
+            )}
+          </Row>
         ))}
-      </div>
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-        <button
-          type="button"
-          className="kea-btn"
-          onClick={() => onRequestPermission("microphone")}
-          disabled={permsBusy}
-        >
-          Request Microphone
-        </button>
-        <button
-          type="button"
-          className="kea-btn"
-          onClick={() => onRequestPermission("screen_recording")}
-          disabled={permsBusy}
-        >
-          Request Screen Recording
-        </button>
-        {perms.some((p) => p.kind === "accessibility" && p.status !== "Granted") && (
-          <>
-            <button
-              type="button"
-              className="kea-btn"
-              onClick={() => onRequestPermission("accessibility")}
-              disabled={permsBusy}
-            >
-              Request Accessibility
-            </button>
-            <button
-              type="button"
-              className="kea-btn"
-              onClick={() => openAccessibilitySettings()}
-              disabled={permsBusy}
-            >
-              Open System Settings
-            </button>
-            <span className="kea-muted" style={{ fontSize: 13, alignSelf: "center" }}>
-              After granting, click Refresh.
-            </span>
-          </>
-        )}
-      </div>
+      </RowGroup>
       {permsStatus && (
         <p className="kea-muted" style={{ margin: "12px 0 0" }}>
           {permsStatus}
         </p>
       )}
-    </section>
+    </Section>
   );
 }

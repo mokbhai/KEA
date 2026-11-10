@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import PageHeader from "../components/PageHeader";
 import { openLogFolder, tailLogs } from "../api";
 import Banner from "../components/Banner";
 import LogsViewer from "../components/LogsViewer";
@@ -65,14 +66,15 @@ export default function LogsPage() {
 
   return (
     <div>
-      <header>
-        <h1 style={{ marginTop: 0 }}>Logs</h1>
-        <p className="kea-muted" style={{ marginTop: 0, marginBottom: 16 }}>
+      <PageHeader
+        title="Logs"
+        tight
+        summary={<>
           Tail of the rolling KEA application log (last{" "}
           {Math.round(DEFAULT_MAX_BYTES / 1024)} KB). Turn on Live and dictate to
           watch a run as it happens.
-        </p>
-      </header>
+        </>}
+      />
 
       {status && <Banner variant="error">{status}</Banner>}
 

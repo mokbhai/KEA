@@ -394,7 +394,7 @@ function AppShell() {
             {navItem("dictation", "Dictation", "🎙")}
             {navItem("meetings", "Meetings", "👥")}
             {navItem("transcribe", "Transcribe", "🎞")}
-            {navItem("read-aloud", "Read-aloud", "🔊")}
+            {navItem("read-aloud", "Read aloud", "🔊")}
 
             <div className="kea-drawer__group-label">Activity</div>
             {navItem("history", "History", "🕘")}

@@ -1,5 +1,5 @@
 import type { ComponentProps } from "react";
-import FeatureSwitch from "../components/FeatureSwitch";
+import FeatureSwitch, { FeaturePageHeader } from "../components/FeatureSwitch";
 import { useEffect, useState } from "react";
 import {
   DICTATION_LANGUAGES,
@@ -33,6 +33,7 @@ import HotkeyRow, {
 } from "../components/HotkeyRow";
 import LevelMeter from "../components/LevelMeter";
 import LoadingBlock from "../components/LoadingBlock";
+import Section, { SectionFooter } from "../components/Section";
 import { Row, RowGroup } from "../components/SettingsRow";
 import Toggle from "../components/Toggle";
 import { useFeatureAi } from "../hooks/useFeatureAi";
@@ -587,18 +588,11 @@ function DictationPageContent({ onNavigate }: Props) {
 
   return (
     <div>
-      <header>
-        <h1 style={{ marginTop: 0 }}>Dictation</h1>
-        <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
-          Hold the shortcut anywhere on your Mac, talk, and KEA types what you
-          said.
-        </p>
-      </header>
+      <FeaturePageHeader />
 
       <FeatureBanner ai={ai} onNavigate={onNavigate} />
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Microphone</h2>
+      <Section title="Microphone">
         <RowGroup aria-label="Microphone">
           <Row
             label="Input device"
@@ -655,10 +649,9 @@ function DictationPageContent({ onNavigate }: Props) {
             {fallbackNotice}
           </p>
         )}
-      </section>
+      </Section>
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Behavior</h2>
+      <Section title="Behavior">
         {settingsLoading ? (
           <LoadingBlock label="Loading settings…" minHeight={44} />
         ) : (
@@ -794,10 +787,9 @@ function DictationPageContent({ onNavigate }: Props) {
             )}
           </>
         )}
-      </section>
+      </Section>
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Voice commands</h2>
+      <Section title="Voice commands">
         {voiceLoading ? (
           <LoadingBlock label="Loading settings…" minHeight={44} />
         ) : (
@@ -834,8 +826,10 @@ function DictationPageContent({ onNavigate }: Props) {
               </p>
             )}
             {voiceOn && (
-              <div className="kea-card" style={{ marginTop: 12 }}>
-                <div className="kea-table-wrap">
+              <>
+                {/* The table is its own bordered surface, so it sits directly
+                    under the group rather than in a second card. */}
+                <div className="kea-table-wrap" style={{ marginTop: 12 }}>
                   <table className="kea-table" aria-label="Spoken commands">
                     <thead>
                       <tr>
@@ -874,30 +868,21 @@ function DictationPageContent({ onNavigate }: Props) {
                 {/* Directly beneath the table on purpose: it is the only
                     recourse when the rules get it wrong, and a recourse nobody
                     can find is not one. */}
-                <p
-                  style={{
-                    marginTop: 12,
-                    marginBottom: 0,
-                    fontSize: "0.8125rem",
-                  }}
-                >
-                  To type one of these words instead of running it, say{" "}
-                  <strong>literally</strong> or <strong>the words</strong> first
-                  — &ldquo;literally period&rdquo; types <em>period</em>.
-                </p>
-                <p
-                  className="kea-muted"
-                  style={{
-                    marginTop: 8,
-                    marginBottom: 0,
-                    fontSize: "0.8125rem",
-                  }}
-                >
-                  A word straight after <em>a</em>, <em>the</em>, <em>for</em>,{" "}
-                  <em>say</em>, <em>type</em>, <em>write</em>, <em>insert</em>{" "}
-                  or <em>word</em> is always typed, not run.
-                </p>
-              </div>
+                <SectionFooter>
+                  <div>
+                    <p style={{ margin: 0, color: "var(--text)" }}>
+                      To type one of these words instead of running it, say{" "}
+                      <strong>literally</strong> or <strong>the words</strong> first
+                      — &ldquo;literally period&rdquo; types <em>period</em>.
+                    </p>
+                    <p style={{ margin: "6px 0 0" }}>
+                      A word straight after <em>a</em>, <em>the</em>, <em>for</em>,{" "}
+                      <em>say</em>, <em>type</em>, <em>write</em>, <em>insert</em>{" "}
+                      or <em>word</em> is always typed, not run.
+                    </p>
+                  </div>
+                </SectionFooter>
+              </>
             )}
             {voice.error && (
               <p
@@ -912,10 +897,9 @@ function DictationPageContent({ onNavigate }: Props) {
             )}
           </>
         )}
-      </section>
+      </Section>
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Live transcript</h2>
+      <Section title="Live transcript">
         {liveLoading ? (
           <LoadingBlock label="Loading settings…" minHeight={44} />
         ) : (
@@ -925,15 +909,10 @@ function DictationPageContent({ onNavigate }: Props) {
                 label="Live preview model"
                 hint="A small, fast model that shows words in the dictation window while you talk. It is a preview only — when you stop, your speech model transcribes the whole recording again and that second pass is what gets typed, so the preview can be visibly wrong and then correct itself."
               >
-                {streamingCatalogError ? (
-                  <span className="kea-muted">
-                    Couldn&apos;t check which previews are downloaded.
-                  </span>
-                ) : noStreamingChoice ? (
-                  <span className="kea-muted">
-                    No preview model is downloaded yet.
-                  </span>
-                ) : (
+                {/* Without a model to pick there is no control here: the row
+                    keeps its label and hint, and what went wrong (and the way
+                    to fix it) goes under the group. */}
+                {!streamingCatalogError && !noStreamingChoice && (
                   <>
                     {live.savedKey === "model" && (
                       <span className="kea-saved">Saved ✓</span>
@@ -966,20 +945,6 @@ function DictationPageContent({ onNavigate }: Props) {
                         )}
                     </select>
                   </>
-                )}
-                {/* Only offered when there is somewhere to send the user, the
-                    same rule the blocked-slot banner uses. The label is
-                    spelled out because that banner's own "Open Models" can be
-                    on screen at the same time, for a different reason. */}
-                {(streamingCatalogError || noStreamingChoice) && onNavigate && (
-                  <button
-                    type="button"
-                    className="kea-btn"
-                    aria-label="Open Models to download a live preview"
-                    onClick={() => onNavigate("models")}
-                  >
-                    Open Models
-                  </button>
                 )}
               </Row>
               {streamingOn && (
@@ -1019,6 +984,29 @@ function DictationPageContent({ onNavigate }: Props) {
                 </>
               )}
             </RowGroup>
+            {(streamingCatalogError || noStreamingChoice) && (
+              <SectionFooter>
+                <span>
+                  {streamingCatalogError
+                    ? "Couldn\u2019t check which previews are downloaded."
+                    : "No preview model is downloaded yet."}
+                </span>
+                {/* Only offered when there is somewhere to send the user, the
+                    same rule the blocked-slot banner uses. The label is
+                    spelled out because that banner's own "Open Models" can be
+                    on screen at the same time, for a different reason. */}
+                {onNavigate && (
+                  <button
+                    type="button"
+                    className="kea-btn"
+                    aria-label="Open Models to download a live preview"
+                    onClick={() => onNavigate("models")}
+                  >
+                    Open Models
+                  </button>
+                )}
+              </SectionFooter>
+            )}
             {(streamingCatalogError || live.error) && (
               <p
                 style={{
@@ -1032,14 +1020,14 @@ function DictationPageContent({ onNavigate }: Props) {
             )}
           </>
         )}
-      </section>
+      </Section>
 
       <FeatureAiCard ai={ai} featureLabel="Dictation" />
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Try it</h2>
-        <div className="kea-card">
-          <p style={{ marginTop: 0 }}>
+      <Section
+        title="Try it"
+        note={
+          <>
             {accelerator ? (
               <>
                 Hold <strong>{formatAccelerator(accelerator)}</strong> and say
@@ -1048,24 +1036,27 @@ function DictationPageContent({ onNavigate }: Props) {
             ) : (
               "Start listening, say something, then stop."
             )}
-          </p>
-          {holdToTalk && (
-            <p
-              className="kea-muted"
-              style={{ marginTop: 0, fontSize: "0.8125rem" }}
-            >
-              Tap <KeyChips accelerator="Option+Shift" /> twice to keep
-              recording hands-free. Tap again to finish, or press Esc to throw
-              it away.
-            </p>
-          )}
+            {holdToTalk && (
+              <>
+                {" "}
+                Tap <KeyChips accelerator="Option+Shift" /> twice to keep
+                recording hands-free. Tap again to finish, or press Esc to throw
+                it away.
+              </>
+            )}
+          </>
+        }
+      >
+        <div
+          className="kea-card"
+          style={{ display: "flex", flexDirection: "column", gap: 12 }}
+        >
           <div
             style={{
               display: "flex",
               alignItems: "center",
               gap: 12,
               flexWrap: "wrap",
-              marginBottom: 12,
             }}
           >
             <span className="kea-muted" style={{ fontSize: 13 }}>
@@ -1095,12 +1086,12 @@ function DictationPageContent({ onNavigate }: Props) {
             </button>
           </div>
           {dictationStatus && (
-            <p className="kea-muted" style={{ marginTop: 12, marginBottom: 0 }}>
+            <p className="kea-muted" style={{ margin: 0 }}>
               {dictationStatus}
             </p>
           )}
           {transcript && (
-            <div style={{ marginTop: 12 }}>
+            <div>
               <span className="kea-label">Last transcript</span>
               <p
                 style={{
@@ -1117,7 +1108,7 @@ function DictationPageContent({ onNavigate }: Props) {
             </div>
           )}
         </div>
-      </section>
+      </Section>
     </div>
   );
 }

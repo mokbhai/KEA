@@ -1,5 +1,5 @@
 import type { ComponentProps } from "react";
-import FeatureSwitch from "../components/FeatureSwitch";
+import FeatureSwitch, { FeaturePageHeader } from "../components/FeatureSwitch";
 import { parseStoredTime } from "../lib/meetingTime";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
@@ -45,6 +45,7 @@ import Banner from "../components/Banner";
 import FeatureBanner from "../components/FeatureBanner";
 import LevelMeter from "../components/LevelMeter";
 import LoadingBlock from "../components/LoadingBlock";
+import Section, { SectionFooter } from "../components/Section";
 import MeetingSettingsPanel from "../components/meetings/MeetingSettingsPanel";
 import MeetingList from "../components/meetings/MeetingList";
 import MeetingPane, { type MeetingPaneHandle } from "../components/meetings/MeetingPane";
@@ -796,8 +797,7 @@ function MeetingsPageContent({ onNavigate, selectedMeetingId, onSelectMeeting }:
   // The test capture lives with the other settings: it checks the setup, and
   // it is not something to press during a meeting by accident.
   const checkSection: ReactNode = (
-    <section style={{ marginBottom: 16 }}>
-      <h3 style={{ margin: "0 0 8px", fontSize: 15 }}>Check your setup</h3>
+    <Section title="Check your setup">
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
         <button
           type="button"
@@ -808,26 +808,16 @@ function MeetingsPageContent({ onNavigate, selectedMeetingId, onSelectMeeting }:
           Run a 10-second test
         </button>
       </div>
-      <p className="kea-muted" style={{ margin: "8px 0 0", fontSize: "0.8125rem" }}>
+      <SectionFooter>
         The test is a real capture — it is saved to your meetings like any other.
-      </p>
-    </section>
+      </SectionFooter>
+    </Section>
   );
 
   return (
     <div>
-      <header style={{ display: "flex", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
-        {/* A basis, not min-width 0: when the controls grow (the level meter
-            while recording) they wrap below instead of squeezing the title
-            to a sliver and painting over it. */}
-        <div style={{ flex: "1 1 280px", minWidth: 0 }}>
-          <h1 style={{ marginTop: 0 }}>Meetings</h1>
-          <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
-            Record a meeting, watch the transcript appear live, and get notes when you
-            stop.
-          </p>
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+      <FeaturePageHeader
+        actions={<>
           <span className="kea-muted" style={{ fontSize: 13 }}>
             State:{" "}
             <strong style={{ color: "var(--text)" }}>
@@ -863,8 +853,8 @@ function MeetingsPageContent({ onNavigate, selectedMeetingId, onSelectMeeting }:
           >
             ⚙
           </button>
-        </div>
-      </header>
+        </>}
+      />
 
       {meetingStatus && (
         <p className="kea-muted" style={{ margin: "0 0 16px" }}>
@@ -916,7 +906,7 @@ function MeetingsPageContent({ onNavigate, selectedMeetingId, onSelectMeeting }:
         </Banner>
       )}
 
-      <div className={`kea-meetings-grid${narrow ? " kea-meetings-grid--narrow" : ""}`}>
+      <div className={`kea-meetings-grid${narrow ? " kea-meetings-grid--narrow" : " kea-meet-grid"}`}>
         {showListPane && (
           <MeetingList
             meetings={listRows}
@@ -957,7 +947,7 @@ function MeetingsPageContent({ onNavigate, selectedMeetingId, onSelectMeeting }:
               />
             ) : !hasAnyMeeting ? (
               <div>
-                <h2 style={{ marginTop: 0, fontSize: 18 }}>No meetings yet</h2>
+                <h2 style={{ marginTop: 0 }}>No meetings yet</h2>
                 <p className="kea-muted" style={{ margin: "0 0 16px" }}>
                   Record one and its transcript appears here as it happens, with notes
                   when you stop.

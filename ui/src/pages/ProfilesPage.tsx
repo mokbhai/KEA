@@ -1,4 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
+import PageHeader from "../components/PageHeader";
 import {
   captureAppContext,
   deleteAppProfile,
@@ -19,6 +20,7 @@ import {
   type CustomStyle,
 } from "../api";
 import LoadingBlock from "../components/LoadingBlock";
+import Section from "../components/Section";
 import { Row, RowGroup } from "../components/SettingsRow";
 import StyleOptions from "../components/StyleOptions";
 import Toggle from "../components/Toggle";
@@ -292,21 +294,30 @@ export default function ProfilesPage() {
 
   return (
     <div>
-      <header>
-        <h1 style={{ marginTop: 0 }}>App profiles</h1>
-        <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
-          Rules that change what KEA does depending on the app you are typing into —
-          Friendly in Slack, raw text with no AI clean-up in Terminal.
-        </p>
-      </header>
+      <PageHeader
+        title="App profiles"
+        summary="Rules that change what KEA does depending on the app you are typing into — Friendly in Slack, raw text with no AI clean-up in Terminal."
+      />
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 4px" }}>Your rules</h2>
-        <p className="kea-muted" style={{ margin: "0 0 12px", fontSize: "0.8125rem" }}>
-          KEA uses the first rule here that matches. A rule naming both an app and a
-          web address always beats a broader one, whatever the order; the arrows
-          decide between rules that match equally specifically.
-        </p>
+      <Section
+        title="Your rules"
+        note="KEA uses the first rule here that matches. A rule naming both an app and a web address always beats a broader one, whatever the order; the arrows decide between rules that match equally specifically."
+        actions={
+          !draft && (
+            <button
+              type="button"
+              className="kea-btn kea-btn--primary"
+              disabled={busy || profiles === null}
+              onClick={() => {
+                setCaptureNote(null);
+                setDraft(newProfile(profiles ?? []));
+              }}
+            >
+              New rule
+            </button>
+          )
+        }
+      >
 
         {profiles === null ? (
           <LoadingBlock label="Loading profiles…" minHeight={44} />
@@ -319,17 +330,16 @@ export default function ProfilesPage() {
           </div>
         ) : (
           <div className="kea-table-wrap">
-            <table className="kea-table">
+            <table className="kea-table kea-table--rules">
               <caption className="kea-visually-hidden">
                 App profiles, in the order KEA checks them
               </caption>
               <thead>
                 <tr>
-                  <th scope="col">Order</th>
-                  <th scope="col">Rule</th>
+                  <th scope="col" className="kea-rules__order">Order</th>
+                  <th scope="col" className="kea-rules__name">Rule</th>
                   <th scope="col">Matches</th>
-                  <th scope="col">Changes</th>
-                  <th scope="col">On</th>
+                  <th scope="col" className="kea-rules__on">On</th>
                   <th scope="col" className="kea-table__actions">
                     <span className="kea-visually-hidden">Actions</span>
                   </th>
@@ -368,8 +378,13 @@ export default function ProfilesPage() {
                         </div>
                       </td>
                       <td>{profile.name}</td>
-                      <td>{matchSummary(profile)}</td>
-                      <td>{effectSummary(profile, styles)}</td>
+                      {/* What it matches, with what it changes underneath: one
+                          column for both is what lets Edit and Delete stay
+                          on screen at the default window width. */}
+                      <td className="kea-rules__match">
+                        <span>{matchSummary(profile)}</span>
+                        <span className="kea-table__sub">{effectSummary(profile, styles)}</span>
+                      </td>
                       <td>
                         <Toggle
                           label={`Use ${profile.name}`}
@@ -417,29 +432,17 @@ export default function ProfilesPage() {
             {error}
           </p>
         )}
-
-        {!draft && (
-          <button
-            type="button"
-            className="kea-btn kea-btn--primary"
-            style={{ marginTop: 16 }}
-            disabled={busy || profiles === null}
-            onClick={() => {
-              setCaptureNote(null);
-              setDraft(newProfile(profiles ?? []));
-            }}
-          >
-            New rule
-          </button>
-        )}
-      </section>
+      </Section>
 
       {draft && (
-        <section style={{ marginBottom: 24 }}>
-          <h2 style={{ margin: "0 0 12px" }}>
-            {profiles?.some((p) => p.id === draft.id) ? "Edit rule" : "New rule"}
-          </h2>
-          <form className="kea-card" onSubmit={(e) => void onSave(e)}>
+        <Section
+          title={profiles?.some((p) => p.id === draft.id) ? "Edit rule" : "New rule"}
+        >
+          <form
+            className="kea-card"
+            style={{ display: "flex", flexDirection: "column", gap: 12 }}
+            onSubmit={(e) => void onSave(e)}
+          >
             <RowGroup aria-label="Rule">
               <Row label="Name" hint="Just for you — “Slack”, “Terminal”, “Work email”.">
                 <input
@@ -545,73 +548,72 @@ export default function ProfilesPage() {
               </Row>
             </RowGroup>
 
-            <details className="kea-advanced">
+            <details className="kea-advanced" style={{ marginTop: 0 }}>
               <summary>Advanced</summary>
-              <div className="kea-advanced__body">
+              <div className="kea-advanced__body" style={{ maxWidth: "none" }}>
                 <p className="kea-muted" style={{ margin: 0, fontSize: "0.8125rem" }}>
                   A different AI for this app only. Leave the engine on Inherit and the
                   rest is ignored — a model with no engine names nothing KEA can resolve.
                 </p>
-                <label>
-                  <span className="kea-label">AI engine</span>
-                  <select
-                    className="kea-select"
-                    aria-label="AI engine"
-                    value={draft.llm_engine_id ?? INHERIT}
-                    onChange={(e) => editField({ llm_engine_id: orNull(e.target.value) })}
-                  >
-                    <option value={INHERIT}>Inherit — the Rewrite AI</option>
-                    {llmEngines.map((id) => (
-                      <option key={id} value={id}>
-                        {id}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  <span className="kea-label">Model</span>
-                  <input
-                    className="kea-input"
-                    aria-label="Model"
-                    value={draft.llm_model ?? ""}
-                    onChange={(e) => editField({ llm_model: orNull(e.target.value) })}
-                    placeholder="gpt-4o-mini"
-                  />
-                </label>
-                <label>
-                  <span className="kea-label">Provider</span>
-                  <select
-                    className="kea-select"
-                    aria-label="Provider"
-                    value={draft.llm_provider_ref ?? INHERIT}
-                    onChange={(e) =>
-                      editField({ llm_provider_ref: orNull(e.target.value) })
-                    }
-                  >
-                    <option value={INHERIT}>Inherit — the engine's own</option>
-                    {providers.map((p) => (
-                      <option key={p.provider_ref} value={p.provider_ref}>
-                        {p.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                <RowGroup aria-label="Advanced AI">
+                  <Row label="AI engine">
+                    <select
+                      className="kea-select"
+                      aria-label="AI engine"
+                      value={draft.llm_engine_id ?? INHERIT}
+                      onChange={(e) => editField({ llm_engine_id: orNull(e.target.value) })}
+                    >
+                      <option value={INHERIT}>Inherit — the Rewrite AI</option>
+                      {llmEngines.map((id) => (
+                        <option key={id} value={id}>
+                          {id}
+                        </option>
+                      ))}
+                    </select>
+                  </Row>
+                  <Row label="Model">
+                    <input
+                      className="kea-input"
+                      aria-label="Model"
+                      value={draft.llm_model ?? ""}
+                      onChange={(e) => editField({ llm_model: orNull(e.target.value) })}
+                      placeholder="gpt-4o-mini"
+                    />
+                  </Row>
+                  <Row label="Provider">
+                    <select
+                      className="kea-select"
+                      aria-label="Provider"
+                      value={draft.llm_provider_ref ?? INHERIT}
+                      onChange={(e) =>
+                        editField({ llm_provider_ref: orNull(e.target.value) })
+                      }
+                    >
+                      <option value={INHERIT}>Inherit — the engine's own</option>
+                      {providers.map((p) => (
+                        <option key={p.provider_ref} value={p.provider_ref}>
+                          {p.name}
+                        </option>
+                      ))}
+                    </select>
+                  </Row>
+                </RowGroup>
               </div>
             </details>
 
             {captureNote && (
-              <p role="status" className="kea-muted" style={{ margin: "12px 0 0" }}>
+              <p role="status" className="kea-muted" style={{ margin: 0 }}>
                 {captureNote}
               </p>
             )}
             {capturing && (
-              <p role="status" className="kea-muted" style={{ margin: "12px 0 0" }}>
+              <p role="status" className="kea-muted" style={{ margin: 0 }}>
                 Switch to the app you want now — KEA reads whatever is in front in a
                 moment.
               </p>
             )}
 
-            <div style={{ display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap" }}>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
               <button
                 type="submit"
                 className="kea-btn kea-btn--primary"
@@ -632,11 +634,10 @@ export default function ProfilesPage() {
               </button>
             </div>
           </form>
-        </section>
+        </Section>
       )}
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>What KEA may look at</h2>
+      <Section title="What KEA may look at">
         <RowGroup aria-label="What KEA may look at">
           <Row
             label="Read the window title"
@@ -675,7 +676,7 @@ export default function ProfilesPage() {
             {capture.error}
           </p>
         )}
-      </section>
+      </Section>
     </div>
   );
 }

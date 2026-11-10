@@ -7,6 +7,7 @@ import {
   onInvoke,
   resetTauriMocks,
 } from "../test-utils/tauri";
+import { switchSitsUnderTitle } from "../test-utils/pageHeader";
 import TranscribePage from "./TranscribePage";
 
 vi.mock("@tauri-apps/api/core", async () => (await import("../test-utils/tauri")).coreModule);
@@ -84,6 +85,12 @@ describe("TranscribePage", () => {
     resetTauriMocks();
     dropHandler = null;
     onInvoke(handlers);
+  });
+
+  it("opens with its title, then the switch that turns it on", async () => {
+    render(<TranscribePage />);
+    await screen.findByText("standup.m4a");
+    expect(switchSitsUnderTitle("Transcribe")).toBe(true);
   });
 
   it("lists previously transcribed files", async () => {

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import PageHeader from "../components/PageHeader";
 import {
   addCustomProvider,
   discoverLocalLlms,
@@ -18,6 +19,7 @@ import DefaultsPicker, {
 } from "../components/DefaultsPicker";
 import LoadingBlock from "../components/LoadingBlock";
 import ProviderRow from "../components/ProviderRow";
+import Section from "../components/Section";
 import { Row, RowGroup } from "../components/SettingsRow";
 import { usePendingActivation } from "../hooks/usePendingActivation";
 import { describeBinding } from "../lib/featureSlot";
@@ -157,15 +159,14 @@ export default function AiProvidersPage() {
 
   return (
     <div>
-      <h1 style={{ marginTop: 0 }}>AI Providers</h1>
-      <p className="kea-muted" style={{ marginBottom: 24 }}>
-        Connect AI services once — every feature reuses them.
-      </p>
+      <PageHeader
+        title="AI Providers"
+        summary="Connect AI services once — every feature reuses them."
+      />
 
       {error && <Banner variant="error">{error}</Banner>}
 
-      <section style={{ marginBottom: 32 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Providers</h2>
+      <Section title="Providers">
         {providers === null ? (
           <LoadingBlock label="Loading providers…" minHeight={60} />
         ) : (
@@ -257,10 +258,9 @@ export default function AiProvidersPage() {
             </div>
           )}
         </div>
-      </section>
+      </Section>
 
-      <section>
-        <h2 style={{ margin: "0 0 12px" }}>Defaults</h2>
+      <Section title="Defaults">
         {missing.length > 0 && (
           <Banner variant="warn">
             Not set: {missing.map(({ capability }) => CAPABILITY_LABELS[capability]).join(", ")}.
@@ -307,7 +307,7 @@ export default function AiProvidersPage() {
             download finishes.
           </p>
         )}
-      </section>
+      </Section>
     </div>
   );
 }

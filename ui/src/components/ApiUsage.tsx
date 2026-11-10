@@ -23,8 +23,8 @@ export default function ApiUsage({ port, portOn, socketPath }: Props) {
   const baseUrl = `http://127.0.0.1:${port}/v1`;
 
   return (
-    <div style={{ marginTop: 24 }}>
-      <h3 style={{ margin: "0 0 8px" }}>Using the API</h3>
+    <div style={{ minWidth: 0, maxWidth: "100%" }}>
+      <p className="kea-muted" style={{ fontWeight: 600 }}>Using the API</p>
 
       {portOn ? (
         <p className="kea-muted" style={{ margin: "0 0 8px" }}>
@@ -36,7 +36,7 @@ export default function ApiUsage({ port, portOn, socketPath }: Props) {
             The unix socket is the default transport. Most SDKs can only reach a URL, so turn on
             the localhost port above to use them. From the shell, use curl:
           </p>
-          <pre style={{ overflowX: "auto" }}>
+          <pre style={{ overflowX: "auto", maxWidth: "100%", background: "var(--surface-2)", borderRadius: 8, padding: 12, fontSize: 12, whiteSpace: "pre" }}>
             <code>{`curl --unix-socket ${socketPath} \\
   -H "Authorization: Bearer ${TOKEN_PLACEHOLDER}" \\
   http://localhost/v1/models`}</code>
@@ -52,14 +52,17 @@ export default function ApiUsage({ port, portOn, socketPath }: Props) {
         With the OpenAI Python SDK, point <code>base_url</code> at the port and use the access
         token as the key:
       </p>
-      <pre style={{ overflowX: "auto" }}>
+      <pre style={{ overflowX: "auto", maxWidth: "100%", background: "var(--surface-2)", borderRadius: 8, padding: 12, fontSize: 12, whiteSpace: "pre" }}>
         <code>{`from openai import OpenAI
 
 client = OpenAI(
     base_url="${baseUrl}",
     api_key="${TOKEN_PLACEHOLDER}",
 )
-audio = client.audio.transcriptions.create(model="whisper-1", file=open("note.m4a", "rb"))`}</code>
+audio = client.audio.transcriptions.create(
+    model="whisper-1",
+    file=open("note.m4a", "rb"),
+)`}</code>
       </pre>
 
       <ul className="kea-muted" style={{ margin: "0 0 8px", paddingLeft: 20 }}>

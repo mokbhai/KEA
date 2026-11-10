@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invokeCalls, onInvoke, resetTauriMocks } from "../test-utils/tauri";
 import { featureHandlers, openAiBinding } from "../test-utils/featureWorld";
 import type { AssistantSettings } from "../api";
+import { switchSitsUnderTitle } from "../test-utils/pageHeader";
 import AssistantPage from "./AssistantPage";
 
 vi.mock("@tauri-apps/api/core", async () => (await import("../test-utils/tauri")).coreModule);
@@ -45,6 +46,12 @@ const switchNamed = (name: string) => screen.findByRole("switch", { name });
 
 describe("AssistantPage", () => {
   beforeEach(() => resetTauriMocks());
+
+  it("opens with its title, then the switch that turns it on", async () => {
+    renderPage();
+    await screen.findByText("Shortcut");
+    expect(switchSitsUnderTitle("Assistant")).toBe(true);
+  });
 
   it("shows the shortcut row", async () => {
     renderPage();

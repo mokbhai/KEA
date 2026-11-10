@@ -394,6 +394,10 @@ const MeetingPane = forwardRef<MeetingPaneHandle, MeetingPaneProps>(function Mee
         aria-labelledby={`meeting-tab-${tab}`}
         className="kea-meeting-body"
         onScroll={onBodyScroll}
+        // Summary and Ask AI grow with their content, so the last control is
+        // never cut by a scroll edge. Only the transcript, which follows the
+        // live line, scrolls inside the pane.
+        style={tab === "transcript" ? undefined : { maxHeight: "none", overflowY: "visible" }}
       >
         {renderTab()}
         {askTab}

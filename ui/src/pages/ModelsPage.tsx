@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import PageHeader from "../components/PageHeader";
 import {
   cancelModelDownload,
   deleteModel,
@@ -15,6 +16,7 @@ import {
 import Banner from "../components/Banner";
 import FeatureAiCard from "../components/FeatureAiCard";
 import LoadingBlock from "../components/LoadingBlock";
+import Section from "../components/Section";
 import { Row, RowGroup } from "../components/SettingsRow";
 import { useFeatureAi } from "../hooks/useFeatureAi";
 import { useModelDownloads } from "../hooks/useModelDownloads";
@@ -99,14 +101,14 @@ const API_SLOTS: SlotSpec[] = [
   { feature: "api", slot: "llm", capability: "llm", label: "Language model" },
 ];
 
-type Section = {
+type CatalogSection = {
   spec: CatalogSpec;
   models: (WhisperModel | OnnxModel)[];
   installed: Set<string>;
 };
 
 export default function ModelsPage() {
-  const [sections, setSections] = useState<Section[] | null>(null);
+  const [sections, setSections] = useState<CatalogSection[] | null>(null);
   const [bindings, setBindings] = useState<Map<Capability, Binding | null>>(new Map());
   const [error, setError] = useState<string | null>(null);
   const apiAi = useFeatureAi(API_SLOTS);
@@ -174,7 +176,7 @@ export default function ModelsPage() {
     }
   };
 
-  const remove = async (section: Section, model: WhisperModel | OnnxModel) => {
+  const remove = async (section: CatalogSection, model: WhisperModel | OnnxModel) => {
     const capability = section.spec.capability;
     // A catalog nothing binds to has no default to warn about — and asking
     // "this is your speech-to-text default" about a streaming model would be a
@@ -212,20 +214,21 @@ export default function ModelsPage() {
 
   return (
     <div>
-      <h1 style={{ marginTop: 0 }}>Models</h1>
-      <p className="kea-muted" style={{ marginBottom: 24 }}>
-        Download models to run speech features privately on this Mac.
-      </p>
+      <PageHeader
+        title="Models"
+        summary="Download models to run speech features privately on this Mac."
+      />
 
       {error && <Banner variant="error">{error}</Banner>}
 
       {sections.map((section) => (
-        <section key={section.spec.id} style={{ marginBottom: 28 }}>
-          <h2 style={{ margin: "0 0 12px" }}>{section.spec.catalog.title}</h2>
+        <Section key={section.spec.id} title={section.spec.catalog.title}>
           {section.models.length === 0 ? (
-            <p className="kea-muted" style={{ margin: 0 }}>
-              No models available.
-            </p>
+            <RowGroup aria-label={section.spec.catalog.title}>
+              <p className="kea-muted" style={{ margin: 0, padding: "10px 14px" }}>
+                No models available.
+              </p>
+            </RowGroup>
           ) : (
             <RowGroup aria-label={section.spec.catalog.title}>
               {section.models.map((model) => {
@@ -294,7 +297,7 @@ export default function ModelsPage() {
               })}
             </RowGroup>
           )}
-        </section>
+        </Section>
       ))}
 
       <FeatureAiCard ai={apiAi} title="API" featureLabel="API" />

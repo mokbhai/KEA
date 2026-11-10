@@ -2,6 +2,7 @@ import { useState } from "react";
 import { deleteBinding } from "../api";
 import DefaultsPicker from "./DefaultsPicker";
 import LoadingBlock from "./LoadingBlock";
+import Section from "./Section";
 import { Row, RowGroup } from "./SettingsRow";
 import { useSavedFlash } from "../hooks/useSavedFlash";
 import { usePendingActivation } from "../hooks/usePendingActivation";
@@ -54,8 +55,7 @@ export default function FeatureAiCard({ ai, title = "AI", featureLabel }: Props)
   };
 
   return (
-    <section style={{ marginBottom: 24 }}>
-      <h2 style={{ margin: "0 0 12px" }}>{title}</h2>
+    <Section title={title}>
       {ai.statuses === null ? (
         <LoadingBlock label="Loading…" minHeight={44} />
       ) : (
@@ -136,6 +136,6 @@ export default function FeatureAiCard({ ai, title = "AI", featureLabel }: Props)
           finishes.
         </p>
       )}
-    </section>
+    </Section>
   );
 }

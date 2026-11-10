@@ -1,6 +1,7 @@
 import { forwardRef, useEffect, useRef, useState } from "react";
 import { REWRITE_MODES, type CustomStyle } from "../api";
 import type { RewriteSettingsController } from "../hooks/useRewriteSettings";
+import Section from "./Section";
 import { Row, RowGroup } from "./SettingsRow";
 
 type Props = {
@@ -161,15 +162,10 @@ export default function CustomStyles({ rewrite, newStyleRequest }: Props) {
   };
 
   return (
-    <section aria-labelledby="custom-styles-heading" style={{ marginTop: 24 }}>
-      <h3 id="custom-styles-heading" style={{ margin: "0 0 4px" }}>
-        Your styles
-      </h3>
-      <p className="kea-muted" style={{ margin: "0 0 12px" }}>
-        Write your own instruction, then choose it from the Style menu like any other
-        style.
-      </p>
-
+    <Section
+      title="Your styles"
+      note="Write your own instruction, then choose it from the Style menu like any other style."
+    >
       {styles.length === 0 ? (
         <p className="kea-muted" style={{ margin: "0 0 12px" }}>
           You have not added a style yet.
@@ -227,7 +223,9 @@ export default function CustomStyles({ rewrite, newStyleRequest }: Props) {
         </ul>
       )}
 
-      <h4 style={{ margin: "0 0 8px" }}>Add a style</h4>
+      <p className="kea-muted" style={{ margin: "0 0 8px" }}>
+        Add a style
+      </p>
       <StyleForm
         ref={nameInput}
         initial={null}
@@ -236,6 +234,6 @@ export default function CustomStyles({ rewrite, newStyleRequest }: Props) {
         submitLabel="Add style"
         onSubmit={(name, instruction) => rewrite.addStyle(name, instruction)}
       />
-    </section>
+    </Section>
   );
 }

@@ -1,5 +1,5 @@
 import type { ComponentProps } from "react";
-import FeatureSwitch from "../components/FeatureSwitch";
+import FeatureSwitch, { FeaturePageHeader } from "../components/FeatureSwitch";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
@@ -22,6 +22,8 @@ import {
 } from "../api";
 import Banner from "../components/Banner";
 import LoadingBlock from "../components/LoadingBlock";
+import Section, { SectionFooter } from "../components/Section";
+import { RowGroup } from "../components/SettingsRow";
 import StatusPill from "../components/StatusPill";
 import TranscriptPanel, { type TranscriptSegment } from "../components/TranscriptPanel";
 import { toMessage } from "../lib/format";
@@ -237,13 +239,7 @@ function TranscribePageContent({ onNavigate }: Props) {
 
   return (
     <div>
-      <header style={{ marginBottom: 16 }}>
-        <h2 style={{ margin: "0 0 4px" }}>Transcribe a file</h2>
-        <p className="kea-muted" style={{ margin: 0 }}>
-          Drop an audio or video recording here to get a timed transcript you can export as
-          subtitles.
-        </p>
-      </header>
+      <FeaturePageHeader />
 
       {error && (
         <Banner
@@ -258,48 +254,48 @@ function TranscribePageContent({ onNavigate }: Props) {
         </Banner>
       )}
 
-      <section
-        className="kea-card"
-        aria-label="Drop zone"
-        style={{
-          marginBottom: 16,
-          borderStyle: "dashed",
-          borderWidth: 2,
-          borderColor: dragging ? "var(--accent)" : "var(--border)",
-          textAlign: "center",
-          padding: 24,
-        }}
-      >
-        <p style={{ margin: "0 0 12px" }}>
-          {dragging ? "Drop it to start" : "Drag a recording here"}
-        </p>
-        <button type="button" className="kea-btn" onClick={choose} disabled={running}>
-          Choose file…
-        </button>
-      </section>
-
-      {running && (
-        <section className="kea-card" style={{ marginBottom: 16 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-            <progress value={percent} max={100} style={{ flex: 1 }} />
-            <span className="kea-muted">
-              {progress
-                ? `${formatOffset(progress.audio_ms_done)} of ${formatOffset(
-                    progress.audio_ms_total,
-                  )} · chunk ${progress.chunk_index + 1}/${progress.chunk_count}`
-                : "Decoding…"}
-            </span>
-            <button type="button" className="kea-btn" onClick={stop} disabled={stopping}>
-              {/* Honest about the latency: a decode already running cannot be
-                  interrupted, so a stop lands at the end of the chunk. */}
-              {stopping ? "Stopping…" : "Stop"}
-            </button>
-          </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 16, marginBottom: 16 }}>
+        <section
+          className="kea-card"
+          aria-label="Drop zone"
+          style={{
+            borderStyle: "dashed",
+            borderWidth: 2,
+            borderColor: dragging ? "var(--accent)" : "var(--border)",
+            textAlign: "center",
+            padding: 24,
+          }}
+        >
+          <p style={{ margin: "0 0 12px" }}>
+            {dragging ? "Drop it to start" : "Drag a recording here"}
+          </p>
+          <button type="button" className="kea-btn" onClick={choose} disabled={running}>
+            Choose file…
+          </button>
         </section>
-      )}
 
-      <section style={{ marginBottom: 16 }}>
-        <h3 style={{ margin: "0 0 8px" }}>Transcript</h3>
+        {running && (
+          <section className="kea-card">
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <progress value={percent} max={100} style={{ flex: 1 }} />
+              <span className="kea-muted">
+                {progress
+                  ? `${formatOffset(progress.audio_ms_done)} of ${formatOffset(
+                      progress.audio_ms_total,
+                    )} · chunk ${progress.chunk_index + 1}/${progress.chunk_count}`
+                  : "Decoding…"}
+              </span>
+              <button type="button" className="kea-btn" onClick={stop} disabled={stopping}>
+                {/* Honest about the latency: a decode already running cannot be
+                    interrupted, so a stop lands at the end of the chunk. */}
+                {stopping ? "Stopping…" : "Stop"}
+              </button>
+            </div>
+          </section>
+        )}
+      </div>
+
+      <Section title="Transcript">
         <TranscriptPanel
           segments={panelSegments}
           live={running}
@@ -318,59 +314,53 @@ function TranscribePageContent({ onNavigate }: Props) {
             </button>
           </div>
         )}
-      </section>
+      </Section>
 
-      <section>
-        <h3 style={{ margin: "0 0 8px" }}>Recent files</h3>
+      <Section title="Recent files">
         {transcripts.length === 0 ? (
           <p className="kea-muted" style={{ margin: 0 }}>
             No files transcribed yet.
           </p>
         ) : (
-          <ul style={{ margin: 0, padding: 0, listStyle: "none" }}>
+          <RowGroup aria-label="Recent files">
             {transcripts.map((row) => (
-              <li
-                key={row.id}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  padding: "6px 0",
-                  borderBottom: "1px solid var(--border)",
-                }}
-              >
-                <button
-                  type="button"
-                  className="kea-btn"
-                  style={{ flex: 1, textAlign: "left" }}
-                  onClick={() => open(row.id)}
-                >
-                  {row.source_filename}
-                </button>
-                <span className="kea-muted">{row.status}</span>
-                <button
-                  type="button"
-                  className="kea-btn"
-                  onClick={() => remove(row.id)}
-                  style={{ color: "var(--danger)", borderColor: "var(--danger)" }}
-                >
-                  Delete
-                </button>
-              </li>
+              <div key={row.id} className="kea-row">
+                <span className="kea-row__label" style={{ flex: 1, minWidth: 0 }}>
+                  <button
+                    type="button"
+                    className="kea-tc-file"
+                    onClick={() => open(row.id)}
+                  >
+                    {row.source_filename}
+                  </button>
+                  <span className="kea-row__hint">{row.status}</span>
+                </span>
+                <span className="kea-row__control">
+                  <button
+                    type="button"
+                    className="kea-tc-delete"
+                    onClick={() => remove(row.id)}
+                  >
+                    Delete
+                  </button>
+                </span>
+              </div>
             ))}
-          </ul>
+          </RowGroup>
         )}
-      </section>
 
-      {onNavigate && (
-        <p className="kea-muted" style={{ marginTop: 16 }}>
-          Uses the speech-to-text engine from{" "}
-          <button type="button" className="kea-link" onClick={() => onNavigate("models")}>
-            Models
-          </button>
-          .
-        </p>
-      )}
+        {onNavigate && (
+          <SectionFooter>
+            <span>
+              Uses the speech-to-text engine from{" "}
+              <button type="button" className="kea-tc-link" onClick={() => onNavigate("models")}>
+                Models
+              </button>
+              .
+            </span>
+          </SectionFooter>
+        )}
+      </Section>
 
       <StatusPill message={notice} variant={notice ? "progress" : null} />
     </div>

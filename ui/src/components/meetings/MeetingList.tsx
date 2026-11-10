@@ -270,7 +270,7 @@ export default function MeetingList({ meetings, recording, selectedId, onSelect 
 
   return (
     <div className="kea-card" style={{ padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
-      <h2 style={{ margin: 0, fontSize: 15 }}>Past meetings</h2>
+      <h3 style={{ margin: 0 }}>Past meetings</h3>
       <input
         type="search"
         className="kea-input"

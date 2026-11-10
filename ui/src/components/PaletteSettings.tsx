@@ -9,6 +9,7 @@ import {
 } from "../api";
 import { toMessage } from "../lib/format";
 import HotkeyRow from "./HotkeyRow";
+import Section, { SectionFooter } from "./Section";
 import { Row, RowGroup } from "./SettingsRow";
 import Toggle from "./Toggle";
 
@@ -138,13 +139,10 @@ export default function PaletteSettings() {
   };
 
   return (
-    <section style={{ marginBottom: 24 }}>
-      <h2 style={{ margin: "0 0 12px" }}>Prompt palette</h2>
-      <p className="kea-muted" style={{ margin: "0 0 12px" }}>
-        A bar that takes one instruction against whatever you have selected, and
-        puts the answer back where it came from. Return replaces the selection,
-        ⌘Return inserts at the cursor, ⇧⌘Return copies.
-      </p>
+    <Section
+      title="Prompt palette"
+      note="A bar that takes one instruction against whatever you have selected, and puts the answer back where it came from. Return replaces the selection, ⌘Return inserts at the cursor, ⇧⌘Return copies."
+    >
       <RowGroup aria-label="Prompt palette">
         <HotkeyRow
           feature="rewrite"
@@ -224,7 +222,7 @@ export default function PaletteSettings() {
           />
         </Row>
       </RowGroup>
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
+      <SectionFooter>
         <button type="button" className="kea-btn" onClick={() => void run(openPalette)}>
           Open the palette
         </button>
@@ -235,12 +233,12 @@ export default function PaletteSettings() {
         >
           Capture screen text
         </button>
-      </div>
-      <p className="kea-muted" style={{ margin: "8px 0 0", fontSize: "0.8125rem" }}>
-        Opened from here the palette has no selection to work on — KEA is the
-        app in front — so it opens as a plain question. The shortcut is the real
-        entry point.
-      </p>
+        <p style={{ flex: "1 1 100%", margin: 0 }}>
+          Opened from here the palette has no selection to work on — KEA is the
+          app in front — so it opens as a plain question. The shortcut is the real
+          entry point.
+        </p>
+      </SectionFooter>
 
       {status && (
         <p className="kea-muted" style={{ margin: "8px 0 0" }}>
@@ -252,6 +250,6 @@ export default function PaletteSettings() {
           {error}
         </p>
       )}
-    </section>
+    </Section>
   );
 }

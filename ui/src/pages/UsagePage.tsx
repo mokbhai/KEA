@@ -1,4 +1,6 @@
+import Section from "../components/Section";
 import { useCallback, useEffect, useState } from "react";
+import PageHeader from "../components/PageHeader";
 
 import {
   clearUsage,
@@ -162,18 +164,21 @@ export default function UsagePage() {
   );
 
   return (
-    <div>
-      <header>
-        <h1 style={{ marginTop: 0 }}>Usage</h1>
-        <p className="kea-muted" style={{ marginTop: 0, marginBottom: 16 }}>
-          Tokens KEA's providers reported, per feature and per model. Every number
-          here came from a provider — KEA never estimates one.
-        </p>
-      </header>
+    <div className="kea-usage-page">
+      <PageHeader
+        title="Usage"
+        tight
+        summary="Tokens KEA's providers reported, per feature and per model. Every number here came from a provider — KEA never estimates one."
+      />
 
       {error && <Banner variant="error">{error}</Banner>}
 
-      <div className="kea-toolbar" role="group" aria-label="Time range">
+      <div
+        className="kea-toolbar"
+        role="group"
+        aria-label="Time range"
+        style={{ marginBottom: 20 }}
+      >
         {WINDOWS.map((w) => (
           <button
             key={w.days}
@@ -190,7 +195,7 @@ export default function UsagePage() {
       {!report ? (
         <LoadingBlock label="Loading usage…" minHeight={120} />
       ) : totals.length === 0 ? (
-        <div className="kea-card" style={{ marginTop: 16 }}>
+        <div className="kea-card">
           <p className="kea-muted" style={{ margin: 0 }}>
             No AI calls in the last {report.days} days. Rewrites, dictation clean-up
             and meeting notes all land here once they run.
@@ -198,9 +203,9 @@ export default function UsagePage() {
         </div>
       ) : (
         <>
-          <section style={{ marginBottom: 24, marginTop: 16 }}>
+          <Section title="Totals">
             <div className="kea-card">
-              <dl className="kea-detail-list">
+              <dl className="kea-usage-stats">
                 <dt>Calls</dt>
                 <dd>{nf.format(callTotal)}</dd>
                 <dt>Tokens</dt>
@@ -226,18 +231,17 @@ export default function UsagePage() {
                 </p>
               )}
             </div>
-          </section>
+          </Section>
 
-          <section style={{ marginBottom: 24 }}>
-            <h2 style={{ margin: "0 0 12px" }}>Per day</h2>
+          <Section title="Per day">
             <div className="kea-table-wrap">
               <table className="kea-table">
                 <caption className="kea-visually-hidden">Tokens per day</caption>
                 <thead>
                   <tr>
-                    <th scope="col">Day</th>
-                    <th scope="col">Calls</th>
-                    <th scope="col">Tokens</th>
+                    <th scope="col" style={{ width: "24%" }}>Day</th>
+                    <th scope="col" className="kea-num" style={{ width: "14%" }}>Calls</th>
+                    <th scope="col" className="kea-num" style={{ width: "20%" }}>Tokens</th>
                     <th scope="col">
                       <span className="kea-visually-hidden">Relative size</span>
                     </th>
@@ -249,9 +253,9 @@ export default function UsagePage() {
                     return (
                       <tr key={d.day}>
                         <td>{d.day}</td>
-                        <td>{nf.format(d.calls)}</td>
-                        <td>{nf.format(tokens)}</td>
-                        <td style={{ width: "40%" }}>
+                        <td className="kea-num">{nf.format(d.calls)}</td>
+                        <td className="kea-num">{nf.format(tokens)}</td>
+                        <td>
                           {/* Decoration over the number beside it, so it is
                               hidden rather than read out twice. */}
                           <span
@@ -272,10 +276,9 @@ export default function UsagePage() {
                 </tbody>
               </table>
             </div>
-          </section>
+          </Section>
 
-          <section style={{ marginBottom: 24 }}>
-            <h2 style={{ margin: "0 0 12px" }}>Per feature and model</h2>
+          <Section title="Per feature and model">
             <div className="kea-table-wrap">
               <table className="kea-table">
                 <caption className="kea-visually-hidden">
@@ -283,37 +286,37 @@ export default function UsagePage() {
                 </caption>
                 <thead>
                   <tr>
-                    <th scope="col">Feature</th>
-                    <th scope="col">Provider</th>
-                    <th scope="col">Model</th>
-                    <th scope="col">Calls</th>
-                    <th scope="col">In</th>
-                    <th scope="col">Out</th>
-                    <th scope="col">Cost</th>
+                    <th scope="col" style={{ width: "17%" }}>Feature</th>
+                    <th scope="col" style={{ width: "23%" }}>Model</th>
+                    <th scope="col" className="kea-num" style={{ width: "10%" }}>Calls</th>
+                    <th scope="col" className="kea-num" style={{ width: "13%" }}>In</th>
+                    <th scope="col" className="kea-num" style={{ width: "13%" }}>Out</th>
+                    <th scope="col" className="kea-num">Cost</th>
                   </tr>
                 </thead>
                 <tbody>
                   {totals.map((row) => (
                     <tr key={`${row.feature_id}|${row.provider_key}|${row.model ?? ""}`}>
-                      <td>{row.feature_id}</td>
-                      <td>{row.provider_key}</td>
-                      <td>{row.model ?? "—"}</td>
-                      <td>{nf.format(row.calls)}</td>
-                      <td>{nf.format(row.prompt_tokens)}</td>
-                      <td>{nf.format(row.completion_tokens)}</td>
-                      <td>
+                      <td title={row.feature_id}>{row.feature_id}</td>
+                      {/* The provider sits under its model: one fewer column is what
+                          lets the table fit the default window unclipped. */}
+                      <td title={`${row.model ?? "—"} · ${row.provider_key}`}>
+                        {row.model ?? "—"}
+                        <span className="kea-table__sub">{row.provider_key}</span>
+                      </td>
+                      <td className="kea-num">{nf.format(row.calls)}</td>
+                      <td className="kea-num">{nf.format(row.prompt_tokens)}</td>
+                      <td className="kea-num">{nf.format(row.completion_tokens)}</td>
+                      <td className="kea-num kea-usage-cost">
                         {row.cost !== null && row.currency ? (
                           <>
                             {formatCost(row.cost, row.currency)}
-                            <span
-                              className="kea-muted"
-                              style={{ display: "block", fontSize: "0.75rem" }}
-                            >
+                            <span className="kea-table__sub">
                               rate of {row.rate_updated_at?.slice(0, 10)}
                             </span>
                           </>
                         ) : (
-                          <span className="kea-muted" style={{ fontSize: "0.8125rem" }}>
+                          <span className="kea-table__sub">
                             {costNote(row, report.any_rates)}
                           </span>
                         )}
@@ -336,18 +339,15 @@ export default function UsagePage() {
                 </tbody>
               </table>
             </div>
-          </section>
+          </Section>
         </>
       )}
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Rates</h2>
-        <div className="kea-card">
-          <p className="kea-muted" style={{ margin: "0 0 12px" }}>
-            Per million tokens, as your provider publishes them. KEA never changes
-            these on its own, so the date beside each one is how you know whether it
-            is still true.
-          </p>
+      <Section
+        title="Rates"
+        note="Per million tokens, as your provider publishes them. KEA never changes these on its own, so the date beside each one is how you know whether it is still true."
+      >
+        <div>
 
           {rates.length > 0 && (
             <div className="kea-table-wrap" style={{ marginBottom: 12 }}>
@@ -355,11 +355,10 @@ export default function UsagePage() {
                 <caption className="kea-visually-hidden">Saved rates</caption>
                 <thead>
                   <tr>
-                    <th scope="col">Provider</th>
                     <th scope="col">Model</th>
-                    <th scope="col">In</th>
-                    <th scope="col">Out</th>
-                    <th scope="col">Entered</th>
+                    <th scope="col" className="kea-num" style={{ width: "15%" }}>In</th>
+                    <th scope="col" className="kea-num" style={{ width: "15%" }}>Out</th>
+                    <th scope="col" style={{ width: "19%" }}>Entered</th>
                     <th scope="col" className="kea-table__actions">
                       <span className="kea-visually-hidden">Actions</span>
                     </th>
@@ -368,12 +367,14 @@ export default function UsagePage() {
                 <tbody>
                   {rates.map((rate) => (
                     <tr key={`${rate.provider_key}|${rate.model}`}>
-                      <td>{rate.provider_key}</td>
-                      <td>{rate.model}</td>
-                      <td>
+                      <td title={`${rate.model} · ${rate.provider_key}`}>
+                        {rate.model}
+                        <span className="kea-table__sub">{rate.provider_key}</span>
+                      </td>
+                      <td className="kea-num">
                         {rate.input_per_mtok} {rate.currency}
                       </td>
-                      <td>
+                      <td className="kea-num">
                         {rate.output_per_mtok} {rate.currency}
                       </td>
                       <td>{rate.updated_at.slice(0, 10)}</td>
@@ -498,10 +499,9 @@ export default function UsagePage() {
             </button>
           )}
         </div>
-      </section>
+      </Section>
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Recorded counts</h2>
+      <Section title="Recorded counts">
         <RowGroup aria-label="Recorded counts">
           <Row
             label="Delete every recorded count"
@@ -512,7 +512,7 @@ export default function UsagePage() {
             </button>
           </Row>
         </RowGroup>
-      </section>
+      </Section>
     </div>
   );
 }

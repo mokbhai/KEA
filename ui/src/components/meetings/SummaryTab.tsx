@@ -195,7 +195,7 @@ function ActionItems({
           return (
             <li
               key={item.id}
-              style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 4 }}
+              style={{ display: "flex", alignItems: "flex-start", gap: 8, marginBottom: 8 }}
             >
               <input
                 type="checkbox"
@@ -205,25 +205,28 @@ function ActionItems({
                 onChange={(e) =>
                   void onSetStatus?.(item.id, e.target.checked ? "done" : "open")
                 }
+                style={{ marginTop: 4, flexShrink: 0 }}
               />
-              <span
-                style={{
-                  color: done || dropped ? "var(--text-muted)" : "var(--text)",
-                  textDecoration: done || dropped ? "line-through" : undefined,
-                }}
-              >
-                {item.text}
-              </span>
-              {item.owner && (
-                <span className="kea-muted" style={{ fontSize: 12 }}>
-                  — {item.owner}
+              {/* The text takes the free width; owner and due date sit under it
+                  as quiet secondary text instead of squeezing it into columns. */}
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <span
+                  style={{
+                    color: done || dropped ? "var(--text-muted)" : "var(--text)",
+                    textDecoration: done || dropped ? "line-through" : undefined,
+                    overflowWrap: "anywhere",
+                  }}
+                >
+                  {item.text}
                 </span>
-              )}
-              {item.due_hint && (
-                <span className="kea-muted" style={{ fontSize: 12 }}>
-                  ({item.due_hint})
-                </span>
-              )}
+                {(item.owner || item.due_hint) && (
+                  <div className="kea-muted" style={{ fontSize: 12, marginTop: 2 }}>
+                    {item.owner && <span>— {item.owner}</span>}
+                    {item.owner && item.due_hint && " "}
+                    {item.due_hint && <span>({item.due_hint})</span>}
+                  </div>
+                )}
+              </div>
             </li>
           );
         })}
@@ -252,7 +255,7 @@ function AddItemRow({
   };
 
   return (
-    <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+    <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
       <input
         className="kea-input"
         aria-label="New action item"
@@ -263,7 +266,9 @@ function AddItemRow({
         onKeyDown={(e) => {
           if (e.key === "Enter") submit();
         }}
-        style={{ flex: 1, minWidth: 0 }}
+        // Wide enough for the whole placeholder; the button wraps under it
+        // before the field is squeezed below that.
+        style={{ flex: "1 1 240px", minWidth: 0 }}
       />
       <button
         type="button"
@@ -313,77 +318,85 @@ function SpeakerLegend({
           padding: 0,
           listStyle: "none",
           display: "flex",
-          gap: 12,
-          flexWrap: "wrap",
+          flexDirection: "column",
+          gap: 8,
         }}
       >
         {speakers.map((speaker) => {
           const side = SIDE_LABELS[speaker.speaker_key] ?? speaker.speaker_key;
           return (
+            // One grid for every row: labels share a column, inputs the next.
             <li
               key={speaker.speaker_key}
-              style={{ display: "flex", alignItems: "center", gap: 6 }}
+              style={{
+                display: "grid",
+                gridTemplateColumns: "7rem minmax(0, 1fr)",
+                alignItems: "center",
+                columnGap: 12,
+              }}
             >
               <span className="kea-muted" style={{ fontSize: 12 }}>
                 {side}
               </span>
-              {speaker.source === "inferred" && (
-                <>
-                  <span
-                    className="kea-muted"
-                    title="Proposed from something said in the meeting. Confirm it or rename it."
-                    style={{
-                      padding: "2px 8px",
-                      borderRadius: 999,
-                      border: "1px solid var(--border)",
-                      background: "var(--surface-2)",
-                      fontSize: 11,
-                      whiteSpace: "nowrap",
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                {onRename ? (
+                  <input
+                    className="kea-input"
+                    aria-label={`Name for ${side}`}
+                    value={drafts[speaker.speaker_key] ?? speaker.display_name}
+                    disabled={busy}
+                    onChange={(e) =>
+                      setDrafts((prev) => ({
+                        ...prev,
+                        [speaker.speaker_key]: e.target.value,
+                      }))
+                    }
+                    onBlur={() => commit(speaker)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") e.currentTarget.blur();
                     }}
-                  >
-                    inferred
-                  </span>
-                  {onRename && (
-                    // Confirming saves the name as typed: the same write as a
-                    // rename, which is what makes it a user name the transcript
-                    // will never overwrite.
-                    <button
-                      type="button"
-                      className="kea-btn"
-                      disabled={busy}
-                      onClick={() => void onRename(speaker.speaker_key, speaker.display_name)}
+                    style={{ width: 180, maxWidth: "100%" }}
+                  />
+                ) : (
+                  <strong style={{ fontSize: 13 }}>{speaker.display_name}</strong>
+                )}
+                {speaker.source === "inferred" && (
+                  <>
+                    <span
+                      className="kea-muted"
+                      title="Proposed from something said in the meeting. Confirm it or rename it."
+                      style={{
+                        padding: "2px 8px",
+                        borderRadius: 999,
+                        border: "1px solid var(--border)",
+                        background: "var(--surface-2)",
+                        fontSize: 11,
+                        whiteSpace: "nowrap",
+                      }}
                     >
-                      Confirm
-                    </button>
-                  )}
-                </>
-              )}
-              {onRename ? (
-                <input
-                  className="kea-input"
-                  aria-label={`Name for ${side}`}
-                  value={drafts[speaker.speaker_key] ?? speaker.display_name}
-                  disabled={busy}
-                  onChange={(e) =>
-                    setDrafts((prev) => ({
-                      ...prev,
-                      [speaker.speaker_key]: e.target.value,
-                    }))
-                  }
-                  onBlur={() => commit(speaker)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") e.currentTarget.blur();
-                  }}
-                  style={{ width: 140 }}
-                />
-              ) : (
-                <strong style={{ fontSize: 13 }}>{speaker.display_name}</strong>
-              )}
+                      inferred
+                    </span>
+                    {onRename && (
+                      // Confirming saves the name as typed: the same write as a
+                      // rename, which is what makes it a user name the transcript
+                      // will never overwrite.
+                      <button
+                        type="button"
+                        className="kea-btn"
+                        disabled={busy}
+                        onClick={() => void onRename(speaker.speaker_key, speaker.display_name)}
+                      >
+                        Confirm
+                      </button>
+                    )}
+                  </>
+                )}
+              </div>
             </li>
           );
         })}
       </ul>
-      <p className="kea-muted" style={{ margin: "6px 0 0", fontSize: "0.75rem" }}>
+      <p className="kea-muted" style={{ margin: "8px 0 0", fontSize: "0.75rem" }}>
         Speakers are told apart by which device the audio arrived on, which is
         reliable on headphones. On speakers the mic also hears the call, and
         those stretches are left unlabelled rather than guessed.
@@ -406,8 +419,10 @@ function LiveNotes({ notes, interimNotes }: { notes: MeetingNotes | null; interi
     );
   }
   return (
-    <section className="kea-card" style={{ marginBottom: 16 }}>
-      <h2 style={{ margin: "0 0 8px", fontSize: 15 }}>Notes so far</h2>
+    <section style={{ marginBottom: 16 }}>
+      <h3 style={{ margin: "0 0 8px", paddingBottom: 8, borderBottom: "1px solid var(--border)" }}>
+        Notes so far
+      </h3>
       {/*
         Said plainly, because a stale summary read as a final one is the
         way this feature misleads: the fold can compress out a point
@@ -423,7 +438,7 @@ function LiveNotes({ notes, interimNotes }: { notes: MeetingNotes | null; interi
       )}
       {notes.action_items.trim() && (
         <>
-          <h3 style={{ margin: "0 0 4px", fontSize: 14 }}>Action items</h3>
+          <h4 style={{ margin: "0 0 4px", fontSize: 14 }}>Action items</h4>
           <p style={{ margin: 0, whiteSpace: "pre-wrap" }}>{notes.action_items}</p>
         </>
       )}
@@ -561,8 +576,18 @@ export default function SummaryTab({
       )}
 
       {hasNotes ? (
-        <section className="kea-card" style={{ marginBottom: 16 }}>
-          <h3 style={{ margin: "0 0 12px", display: "flex", alignItems: "center", gap: 8 }}>
+        <section style={{ marginBottom: 16 }}>
+          {/* A heading and a rule, not a card: the tab already sits in one. */}
+          <h3
+            style={{
+              margin: "0 0 12px",
+              paddingBottom: 8,
+              borderBottom: "1px solid var(--border)",
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+            }}
+          >
             Notes
             {notes?.edited && (
               <span

@@ -164,15 +164,17 @@ h1 {
   font-weight: 700;
 }
 
+/* A section heading labels the group under it. At 20px it competed with the
+   24px page title; 17px leaves the title as the only loud thing on a page. */
 h2 {
-  font-size: 1.25rem;
+  font-size: 1.0625rem;
   font-weight: 600;
 }
 
 /* Without this, the UA default (1.17em bold) renders h3 heavier than the h2
    above it. */
 h3 {
-  font-size: 1rem;
+  font-size: 0.9375rem;
   font-weight: 600;
 }
 
@@ -270,10 +272,14 @@ a:hover {
   margin-bottom: 4px;
 }
 
+/* A source-list row, as in a Mac sidebar: the selection is a rounded fill inset
+   from the sidebar's edges, and rows are short enough that all fourteen pages
+   and the footer fit a 640px-tall window without scrolling. */
 .kea-nav-item {
-  display: block;
+  display: flex;
+  align-items: center;
   width: 100%;
-  padding: 10px 16px;
+  padding: 6px 8px;
   font-size: 0.875rem;
   font-family: inherit;
   font-weight: 400;
@@ -281,9 +287,9 @@ a:hover {
   color: var(--text);
   background: transparent;
   border: none;
-  border-left: 3px solid transparent;
+  border-radius: 6px;
   cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease;
+  transition: background 0.15s ease;
 }
 
 .kea-nav-item:hover {
@@ -294,13 +300,13 @@ a:hover {
   font-weight: 600;
   color: var(--accent);
   background: var(--surface-2);
-  border-left-color: var(--accent);
 }
 
 .kea-nav-item__icon {
-  display: inline-block;
+  flex: none;
   width: 22px;
   margin-right: 6px;
+  text-align: center;
 }
 
 .kea-sidebar__footer {
@@ -309,7 +315,7 @@ a:hover {
   justify-content: space-between;
   gap: 8px;
   margin-top: auto;
-  padding: 12px 16px 4px;
+  padding: 8px 8px 0;
   border-top: 1px solid var(--border);
 }
 
@@ -421,7 +427,7 @@ a:hover {
   background: var(--surface);
   border-right: 1px solid var(--border);
   overflow-y: auto;
-  padding: 12px 0;
+  padding: 10px 8px;
 }
 
 .kea-drawer__nav {
@@ -430,12 +436,16 @@ a:hover {
 }
 
 .kea-drawer__group-label {
-  padding: 8px 16px 4px;
+  padding: 12px 8px 4px;
   font-size: 0.6875rem;
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--text-muted);
+}
+
+.kea-drawer__group-label:first-child {
+  padding-top: 4px;
 }
 
 .kea-main {
@@ -524,6 +534,57 @@ a:hover {
   }
 }
 
+/* ── Page header ───────────────────────────────────────────────────── */
+/* Every page opens the same way: its title, then what belongs to the title (a
+   line on what the page is for, or the switch that turns a feature on), then
+   the content. The title line also carries the page's main controls. */
+.kea-page-header {
+  margin-bottom: 24px;
+}
+
+/* A toolbar that follows is part of the header, so it sits closer. */
+.kea-page-header--tight {
+  margin-bottom: 16px;
+}
+
+.kea-page-header__title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.kea-page-header__summary {
+  margin: 4px 0 0;
+  max-width: 68ch;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}
+
+.kea-page-header > .kea-rows {
+  margin-top: 12px;
+}
+
+/* A basis, not min-width 0: when the controls grow (a level meter while
+   recording) they wrap below instead of squeezing the title to a sliver. */
+.kea-page-header__title h1 {
+  flex: 1 1 160px;
+  margin: 0;
+}
+
+.kea-page-header__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.kea-page-header__error {
+  margin: 8px 0 0;
+  color: var(--danger);
+  font-size: 0.8125rem;
+}
+
 /* ── Settings rows ─────────────────────────────────────────────────── */
 .kea-rows {
   background: var(--surface);
@@ -566,6 +627,79 @@ a:hover {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+}
+
+/* ── Page sections ─────────────────────────────────────────────────── */
+/* One rhythm for every page: 28px above a section, 8px from its heading to
+   its content. The heading is a clear step below the page title — on a Mac a
+   section header is a label for the group under it, not a second title. */
+.kea-section {
+  margin-bottom: 28px;
+}
+
+.kea-section:last-child {
+  margin-bottom: 0;
+}
+
+.kea-section__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-bottom: 8px;
+}
+
+.kea-section__head h2,
+.kea-section__head h3 {
+  margin: 0;
+}
+
+.kea-section__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Pulled up toward the heading it explains, then the normal gap to content. */
+.kea-section__note {
+  margin: -4px 0 10px;
+  max-width: 68ch;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
+.kea-section__footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
+/* Two groups in one section read as one settings list with a break in it. */
+.kea-section > .kea-rows + .kea-rows,
+.kea-section > .kea-rows + .kea-card,
+.kea-section > .kea-card + .kea-rows {
+  margin-top: 12px;
+}
+
+/* A disclosure under a group belongs to that group. */
+.kea-section > details {
+  margin-top: 10px;
+}
+
+/* A section inside a section is a sub-group of it: closer to what is above
+   than a new section would be, and headed a step quieter than its parent. */
+.kea-section .kea-section {
+  margin: 20px 0 0;
+}
+
+.kea-section .kea-section .kea-section__head h2 {
+  font-size: 0.9375rem;
 }
 
 /* ── Toggle switch ─────────────────────────────────────────────────── */
@@ -1389,6 +1523,154 @@ a:hover {
   padding-right: 2px;
 }
 
+/* History: the list beside whatever is selected in it, as in Meetings, so
+   reading an entry never means scrolling past the list to reach it. */
+.kea-history-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+/* The run log is a table, so it takes all the width its detail can spare. */
+.kea-history-grid--log {
+  grid-template-columns: minmax(0, 1fr) 260px;
+}
+
+/* Each pane scrolls on its own: a long list must not push the selected entry
+   off screen, and a long entry must not push the list away. */
+.kea-history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 2px 0 0;
+  max-height: max(240px, calc(100vh - 250px));
+  overflow-y: auto;
+}
+
+.kea-history-group {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 8px 2px 4px;
+}
+
+.kea-history-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 4px;
+  border: 1px solid var(--control-border);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.kea-history-row:hover {
+  background: var(--btn-hover-bg);
+}
+
+.kea-history-row[data-selected="true"] {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+  background: var(--surface-2);
+}
+
+.kea-history-row__main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  text-align: left;
+  font: inherit;
+  color: var(--text);
+  background: none;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+/* Two lines of the words themselves: enough to recognise an entry without
+   opening it, short enough that a screenful is still a list. */
+.kea-history-row__text {
+  font-size: 13px;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.kea-history-row__meta {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.kea-history-row__copy {
+  flex: none;
+  margin-right: 6px;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+}
+
+.kea-history-detail {
+  min-width: 0;
+  position: sticky;
+  top: 0;
+}
+
+.kea-history-detail__body {
+  max-height: max(200px, calc(100vh - 254px));
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.kea-history-text {
+  margin: 0;
+  font-size: 0.9375rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* The pane is narrow, so the labels give their width to the values. */
+.kea-history-detail .kea-detail-list {
+  grid-template-columns: 76px 1fr;
+}
+
+/* Sharing the row with that pane, the table closes up so the status column
+   stays in view at the default window width. */
+.kea-history-grid--log .kea-table th,
+.kea-history-grid--log .kea-table td {
+  padding-left: 10px;
+  padding-right: 10px;
+}
+
+/* After the rules above, which it overrides: stacked in a narrow window, the
+   list must leave room for the entry it opens. */
+@media (max-width: 768px) {
+  .kea-history-grid,
+  .kea-history-grid--log {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .kea-history-list {
+    max-height: 40vh;
+  }
+
+  .kea-history-detail {
+    position: static;
+  }
+
+  .kea-history-detail__body {
+    max-height: none;
+  }
+}
+
 /* A segment jumped to from a citation: a highlight that fades out. */
 .kea-transcript-line--flash {
   animation: kea-transcript-flash 2s ease-out;
@@ -1434,4 +1716,249 @@ a:hover {
 }
 .kea-picker__model-list .kea-picker__option {
   width: 100%;
+}
+
+/* ── Meetings ── */
+/* Meetings: the 240px drawer is always open above 768px, so at the default
+   900px window the content area is ~610px wide. The list column gives up some
+   width so the open meeting keeps room for its action items and speaker rows.
+   (At <=720px the page already shows one pane at a time.) */
+@media (min-width: 721px) and (max-width: 1100px) {
+  .kea-meetings-grid.kea-meet-grid {
+    grid-template-columns: minmax(160px, 200px) minmax(0, 1fr);
+  }
+}
+
+/* ── Usage ── */
+/* Every table here fits the default 900px window (~610px of content) with
+   nothing to scroll sideways: columns have fixed shares, numbers sit right
+   under their heading, and a provider rides under its model instead of taking
+   a column of its own. */
+.kea-usage-page .kea-table {
+  table-layout: fixed;
+}
+
+.kea-usage-page .kea-table th,
+.kea-usage-page .kea-table td {
+  padding: 9px 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: top;
+}
+
+.kea-usage-page .kea-table th:first-child,
+.kea-usage-page .kea-table td:first-child {
+  padding-left: 14px;
+}
+
+.kea-usage-page .kea-table th:last-child,
+.kea-usage-page .kea-table td:last-child {
+  padding-right: 14px;
+}
+
+/* These rows report; nothing happens when one is clicked. */
+.kea-usage-page .kea-table tbody tr {
+  cursor: default;
+}
+
+.kea-usage-page .kea-table tbody tr:hover {
+  background: none;
+}
+
+.kea-usage-page .kea-table .kea-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The second line of a cell: the provider under a model, the date under a cost. */
+.kea-table__sub {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.kea-usage-cost .kea-table__sub {
+  white-space: normal;
+}
+
+.kea-usage-cost .kea-btn {
+  margin-top: 4px;
+}
+
+/* Wide enough for both buttons, and never clipped: an ellipsis where Delete
+   should be is a control the user cannot see. */
+.kea-usage-page .kea-table .kea-table__actions {
+  width: 176px;
+  padding-top: 5px;
+  padding-bottom: 5px;
+  overflow: visible;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.kea-usage-page .kea-table__actions .kea-btn + .kea-btn {
+  margin-left: 6px;
+}
+
+.kea-usage-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  margin: 0;
+}
+
+.kea-usage-stats dt {
+  grid-row: 1;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.kea-usage-stats dd {
+  grid-row: 2;
+  margin: 4px 0 0;
+  font-size: 1.5rem;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 600px) {
+  .kea-usage-stats {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  .kea-usage-stats dt,
+  .kea-usage-stats dd {
+    grid-row: auto;
+  }
+}
+
+/* ── App profiles ── */
+/* The rules table has to fit the default window: fixed columns, so a long
+   bundle id shortens with an ellipsis instead of pushing Edit and Delete
+   off the right edge. */
+.kea-table--rules {
+  table-layout: fixed;
+}
+
+.kea-table--rules th,
+.kea-table--rules td {
+  padding: 9px 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+
+.kea-table--rules th:first-child,
+.kea-table--rules td:first-child {
+  padding-left: 14px;
+}
+
+.kea-table--rules th:last-child,
+.kea-table--rules td:last-child {
+  padding-right: 14px;
+}
+
+.kea-table--rules tbody tr {
+  cursor: default;
+}
+
+.kea-table--rules .kea-rules__order {
+  width: 92px;
+}
+
+.kea-table--rules .kea-rules__name {
+  width: 15%;
+}
+
+.kea-table--rules .kea-rules__on {
+  width: 60px;
+}
+
+.kea-table--rules td:first-child .kea-btn {
+  min-width: 0;
+  padding: 2px 7px;
+}
+
+/* A bundle id or web address is the whole point of the row, so it wraps
+   onto a second line rather than being cut short. */
+.kea-rules__match > span {
+  display: block;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.kea-table--rules .kea-table__actions {
+  width: 156px;
+  overflow: visible;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.kea-table--rules .kea-table__actions .kea-btn + .kea-btn {
+  margin-left: 6px;
+}
+
+/* ── Transcribe ── */
+/* A recent file reads as a quiet link, not a big button; Delete stays
+   available without its danger colour shouting from every row. */
+.kea-tc-file {
+  padding: 0;
+  font: inherit;
+  text-align: left;
+  color: var(--text);
+  background: none;
+  border: 0;
+  cursor: pointer;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.kea-tc-file:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.kea-tc-file:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+.kea-tc-delete {
+  padding: 2px 0;
+  font: inherit;
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+.kea-tc-delete:hover {
+  color: var(--danger);
+}
+
+.kea-tc-delete:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* The inline navigation button in a section footer. */
+.kea-tc-link {
+  padding: 0;
+  font: inherit;
+  color: var(--accent);
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.kea-tc-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
 }

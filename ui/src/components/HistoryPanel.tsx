@@ -37,8 +37,11 @@ export default function HistoryPanel({ actions, selectedId, onSelect }: Props) {
             <th scope="col">ID</th>
             <th scope="col">Feature</th>
             <th scope="col">Command</th>
-            <th scope="col">Engine</th>
+            {/* Status before engine: beside a detail pane the last column is the
+                one that scrolls out of view, and whether a run worked is the
+                reason this table exists. */}
             <th scope="col">Status</th>
+            <th scope="col">Engine</th>
           </tr>
         </thead>
         <tbody>
@@ -67,8 +70,8 @@ export default function HistoryPanel({ actions, selectedId, onSelect }: Props) {
                 </td>
                 <td>{action.feature_id}</td>
                 <td>{action.command}</td>
-                <td>{action.engine_id}</td>
                 <td className={statusClass(action.status)}>{action.status}</td>
+                <td>{action.engine_id}</td>
               </tr>
             );
           })}

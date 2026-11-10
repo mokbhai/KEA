@@ -1,4 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
+import PageHeader from "../components/PageHeader";
 import {
   deleteVocabularyEntry,
   listVocabulary,
@@ -7,6 +8,7 @@ import {
   type VocabularyEntry,
 } from "../api";
 import LoadingBlock from "../components/LoadingBlock";
+import Section, { SectionFooter } from "../components/Section";
 import Toggle from "../components/Toggle";
 import { toMessage } from "../lib/format";
 
@@ -194,16 +196,12 @@ export default function VocabularyPage() {
 
   return (
     <div>
-      <header>
-        <h1 style={{ marginTop: 0 }}>Vocabulary</h1>
-        <p className="kea-muted" style={{ marginTop: 0, marginBottom: 24 }}>
-          Names, acronyms and product terms KEA keeps getting wrong — it hints the
-          speech model with them and fixes near-misses in every transcript.
-        </p>
-      </header>
+      <PageHeader
+        title="Vocabulary"
+        summary="Names, acronyms and product terms KEA keeps getting wrong — it hints the speech model with them and fixes near-misses in every transcript."
+      />
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Your terms</h2>
+      <Section title="Your terms">
         {loading ? (
           <LoadingBlock label="Loading vocabulary…" minHeight={44} />
         ) : entries.length === 0 ? (
@@ -264,38 +262,46 @@ export default function VocabularyPage() {
           </p>
         )}
 
-        <form className="kea-toolbar" style={{ marginTop: 16 }} onSubmit={(e) => void onAdd(e)}>
-          <label>
-            <span className="kea-label">Term</span>
-            <input
-              className="kea-input"
-              aria-label="Term"
-              value={term}
-              onChange={(e) => setTerm(e.target.value)}
-              placeholder="KittyClaw"
-            />
-          </label>
-          <label className="kea-toolbar__grow">
-            <span className="kea-label">Sounds like (optional)</span>
-            <input
-              className="kea-input"
-              style={{ width: "100%" }}
-              aria-label="Sounds like"
-              value={soundsLike}
-              onChange={(e) => setSoundsLike(e.target.value)}
-              placeholder="kitty claw, kitty paw"
-            />
-          </label>
-          <button type="submit" className="kea-btn kea-btn--primary" disabled={busy || !term.trim()}>
-            Add term
-          </button>
-        </form>
-      </section>
+        <SectionFooter>
+          <form
+            className="kea-toolbar"
+            style={{ marginBottom: 0, width: "100%", alignItems: "flex-end" }}
+            onSubmit={(e) => void onAdd(e)}
+          >
+            <label>
+              <span className="kea-label">Term</span>
+              <input
+                className="kea-input"
+                aria-label="Term"
+                value={term}
+                onChange={(e) => setTerm(e.target.value)}
+                placeholder="KittyClaw"
+              />
+            </label>
+            <label className="kea-toolbar__grow">
+              <span className="kea-label">Sounds like (optional)</span>
+              <input
+                className="kea-input"
+                style={{ width: "100%" }}
+                aria-label="Sounds like"
+                value={soundsLike}
+                onChange={(e) => setSoundsLike(e.target.value)}
+                placeholder="kitty claw, kitty paw"
+              />
+            </label>
+            <button type="submit" className="kea-btn kea-btn--primary" disabled={busy || !term.trim()}>
+              Add term
+            </button>
+          </form>
+        </SectionFooter>
+      </Section>
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Import a list</h2>
-        <div className="kea-card">
-          <label style={{ display: "block", marginBottom: 12 }}>
+      <Section title="Import a list">
+        <div
+          className="kea-card"
+          style={{ display: "flex", flexDirection: "column", gap: 12 }}
+        >
+          <label>
             <span className="kea-label">Terms to import — one per line</span>
             <textarea
               className="kea-input"
@@ -307,26 +313,30 @@ export default function VocabularyPage() {
               placeholder={"KittyClaw\nKEA\nParakeet"}
             />
           </label>
-          <button
-            type="button"
-            className="kea-btn"
-            disabled={busy || !importText.trim()}
-            onClick={() => void onImport()}
-          >
-            Import terms
-          </button>
+          <div>
+            <button
+              type="button"
+              className="kea-btn"
+              disabled={busy || !importText.trim()}
+              onClick={() => void onImport()}
+            >
+              Import terms
+            </button>
+          </div>
           {importStatus && (
-            <p className="kea-muted" role="status" style={{ marginTop: 12, marginBottom: 0 }}>
+            <p className="kea-muted" role="status" style={{ margin: 0 }}>
               {importStatus}
             </p>
           )}
         </div>
-      </section>
+      </Section>
 
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ margin: "0 0 12px" }}>Test it</h2>
-        <div className="kea-card">
-          <label style={{ display: "block", marginBottom: 12 }}>
+      <Section title="Test it">
+        <div
+          className="kea-card"
+          style={{ display: "flex", flexDirection: "column", gap: 12 }}
+        >
+          <label>
             <span className="kea-label">Test sentence</span>
             <textarea
               className="kea-input"
@@ -372,7 +382,7 @@ export default function VocabularyPage() {
             )}
           </div>
         </div>
-      </section>
+      </Section>
     </div>
   );
 }
