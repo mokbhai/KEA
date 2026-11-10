@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and the project follows Semantic Versioning.
 
-## [Unreleased]
+## [0.5.6] - 2026-11-10
 
 ### Changed
 
@@ -13,6 +13,10 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 - Deleting the style you have selected switches you back to Improve.
 - The local API and `kea://` links take `style` (a built-in name or a custom style id). `mode` still works for built-in names. `preset` and `preset_id` are refused with an error that names `style`. `kea rewrite` takes `--style` instead of `--preset`.
 - "Audio refinement" is no longer in the style menus; it is only used internally by dictation.
+
+### Fixed
+
+- The popup no longer logs a "drifted" warning each time it appears after being hidden. Being hidden between uses is normal, and the false warnings would have buried a real one.
 
 ## [0.5.5] - 2026-11-10
 
