@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and the project follows Semantic Versioning.
 
+## [0.5.7] - 2026-11-10
+
+0.5.5 and 0.5.6 were never published, so this release also carries everything listed under them.
+
+### Changed
+
+- History is redesigned. It shows your saved text in one list, with tabs for All, Dictation and Rewrite, and an Activity log tab that lists every run of every feature.
+- The Enable switch on each feature page sits directly under the page title, with a one-line description of the feature beside it, instead of above the title.
+- Every page uses the same headings, spacing and grouped rows, so settings look and line up the same way throughout the app.
+- App profiles shows what a rule changes underneath what it matches, and "New rule" is beside the heading.
+- Transcribe lists recent files as plain rows, with a quieter Delete.
+- Permissions in General says "Allowed" for a permission you have granted, and only offers Request for one you have not.
+
+### Fixed
+
+- The Usage and App profiles tables fit the window at its default size. Their Edit and Delete buttons used to be pushed off the right edge.
+- The Python example under "Using the API" no longer runs off the edge of the page.
+
 ## [0.5.6] - 2026-11-10
 
 ### Changed
