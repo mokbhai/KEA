@@ -1249,6 +1249,28 @@ export const getAction = (id: number) =>
 export const listConversations = (limit?: number) =>
   invoke<ConversationSummary[]>("list_conversations", { limit: limit ?? null });
 
+/** Mirrors `kea_core::store::conversations::HistoryEntry`. */
+export type HistoryEntry = {
+  id: number;
+  action_id: number | null;
+  feature_id: string;
+  engine_id: string;
+  model: string | null;
+  created_at: string;
+  /** What went in: the transcript as heard, or the text a rewrite began with. */
+  input: string | null;
+  /** What a model returned; null when none ran. */
+  output: string | null;
+};
+
+/** History rows with their words, newest first. */
+export const listHistory = (opts: { feature?: string; query?: string; limit?: number } = {}) =>
+  invoke<HistoryEntry[]>("list_history", {
+    feature: opts.feature ?? null,
+    query: opts.query ?? null,
+    limit: opts.limit ?? null,
+  });
+
 export const listMessages = (conversationId: number) =>
   invoke<Message[]>("list_messages", { conversationId });
 

@@ -25,7 +25,9 @@ use kea_core::secrets::NOTION_TOKEN_REF;
 use kea_core::store::actions::{ActionDetail, ActionRepo, ActionRow, NewAction};
 use kea_core::store::app_profiles::AppProfileRepo;
 use kea_core::store::bindings::{Binding, BindingRepo};
-use kea_core::store::conversations::{ConversationRepo, ConversationSummary, Message};
+use kea_core::store::conversations::{
+    ConversationRepo, ConversationSummary, HistoryEntry, Message,
+};
 use kea_core::store::hotkeys::{HotkeyBindingRepo, HotkeyBindingRow};
 use kea_core::store::meetings::{
     ActionItemStatus, Meeting, MeetingChatMessage, MeetingDetail, MeetingRepo, MeetingStatus,
@@ -5477,6 +5479,25 @@ pub async fn list_conversations(
 ) -> Result<Vec<ConversationSummary>, String> {
     ConversationRepo::new(state.data_pool.clone())
         .list_recent(limit.unwrap_or(50))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// History as the page shows it: each row with its words, optionally narrowed
+/// to one feature and to rows whose text contains `query`.
+#[tauri::command]
+pub async fn list_history(
+    state: State<'_, Arc<AppState>>,
+    feature: Option<String>,
+    query: Option<String>,
+    limit: Option<i64>,
+) -> Result<Vec<HistoryEntry>, String> {
+    ConversationRepo::new(state.data_pool.clone())
+        .list_history(
+            feature.as_deref().filter(|f| !f.is_empty()),
+            query.as_deref(),
+            limit.unwrap_or(50).clamp(1, 1000),
+        )
         .await
         .map_err(|e| e.to_string())
 }

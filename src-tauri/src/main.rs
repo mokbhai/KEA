@@ -480,6 +480,7 @@ fn main() {
             commands::list_actions,
             commands::get_action,
             commands::list_conversations,
+            commands::list_history,
             commands::list_messages,
             commands::delete_conversation,
             commands::tail_logs,

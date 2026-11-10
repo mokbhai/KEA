@@ -63,6 +63,42 @@ pub struct Message {
     pub created_at: String,
 }
 
+/// One History row with its words attached: what the user dictated or
+/// selected, and what a model made of it.
+///
+/// The text travels with the row on purpose. History is read by scanning for
+/// a sentence, and a list of ids that each need a second query to show their
+/// words cannot be scanned at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct HistoryEntry {
+    pub id: i64,
+    pub action_id: Option<i64>,
+    pub feature_id: String,
+    pub engine_id: String,
+    pub model: Option<String>,
+    pub created_at: String,
+    /// What went in: the transcript as heard, or the text a rewrite began with.
+    pub input: Option<String>,
+    /// What a model returned. `None` when none ran — a dictation with cleanup
+    /// off is its transcript and nothing else.
+    pub output: Option<String>,
+}
+
+/// Escapes a user's search text for `LIKE ... ESCAPE '\'`, so a `%` or `_`
+/// typed into the box is looked for rather than treated as a wildcard.
+fn like_pattern(query: &str) -> String {
+    let mut pattern = String::with_capacity(query.len() + 2);
+    pattern.push('%');
+    for ch in query.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewConversation {
     pub action_id: Option<i64>,
@@ -127,6 +163,47 @@ impl ConversationRepo {
              FROM conversations WHERE meeting_id IS NULL
              ORDER BY created_at DESC LIMIT ?",
         )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// History with the words in each row, newest first.
+    ///
+    /// `feature` narrows to one feature id; `query` matches text on either
+    /// side of the exchange, so a search finds a dictation by what was said
+    /// as well as by what cleanup turned it into. Meeting chats stay out, as
+    /// in [`Self::list_recent`], and so does a conversation with no messages:
+    /// a row with nothing to read or copy is not history.
+    pub async fn list_history(
+        &self,
+        feature: Option<&str>,
+        query: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<HistoryEntry>, KeaError> {
+        let pattern = query
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(like_pattern);
+        let rows = sqlx::query_as::<_, HistoryEntry>(
+            "SELECT c.id, c.action_id, c.feature_id, c.engine_id, c.model, c.created_at,
+                    (SELECT m.content FROM messages m
+                      WHERE m.conversation_id = c.id AND m.role = 'user'
+                      ORDER BY m.id LIMIT 1) AS input,
+                    (SELECT m.content FROM messages m
+                      WHERE m.conversation_id = c.id AND m.role = 'assistant'
+                      ORDER BY m.id DESC LIMIT 1) AS output
+             FROM conversations c
+             WHERE c.meeting_id IS NULL
+               AND (?1 IS NULL OR c.feature_id = ?1)
+               AND EXISTS (SELECT 1 FROM messages m
+                            WHERE m.conversation_id = c.id
+                              AND (?2 IS NULL OR m.content LIKE ?2 ESCAPE '\\'))
+             ORDER BY c.created_at DESC, c.id DESC LIMIT ?3",
+        )
+        .bind(feature)
+        .bind(pattern)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -307,6 +384,129 @@ mod tests {
         let recent = repo.list_recent(10).await.unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].feature_id, "rewrite");
+    }
+
+    async fn seed(repo: &ConversationRepo, feature: &str, messages: &[(MessageRole, &str)]) -> i64 {
+        let id = repo
+            .start(&NewConversation {
+                action_id: None,
+                feature_id: feature.into(),
+                engine_id: "whisper".into(),
+                model: None,
+                provider_ref: None,
+            })
+            .await
+            .unwrap();
+        for (role, content) in messages {
+            repo.append_message(&NewMessage {
+                conversation_id: id,
+                role: *role,
+                content: (*content).into(),
+                token_count: None,
+            })
+            .await
+            .unwrap();
+        }
+        id
+    }
+
+    #[tokio::test]
+    async fn history_rows_carry_their_words_newest_first() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&pool).await.unwrap();
+        let repo = ConversationRepo::new(pool);
+        let plain = seed(&repo, "dictation", &[(MessageRole::User, "just the words")]).await;
+        let cleaned = seed(
+            &repo,
+            "dictation",
+            &[
+                (MessageRole::User, "um so the plan"),
+                (MessageRole::Assistant, "So, the plan."),
+            ],
+        )
+        .await;
+
+        let rows = repo.list_history(None, None, 10).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![cleaned, plain]
+        );
+        assert_eq!(rows[0].input.as_deref(), Some("um so the plan"));
+        assert_eq!(rows[0].output.as_deref(), Some("So, the plan."));
+        // No model ran, so there is a transcript and no output.
+        assert_eq!(rows[1].input.as_deref(), Some("just the words"));
+        assert_eq!(rows[1].output, None);
+    }
+
+    #[tokio::test]
+    async fn history_filters_by_feature_and_by_text_on_either_side() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&pool).await.unwrap();
+        let repo = ConversationRepo::new(pool);
+        let dictation = seed(
+            &repo,
+            "dictation",
+            &[(MessageRole::User, "book the flight")],
+        )
+        .await;
+        let rewrite = seed(
+            &repo,
+            "rewrite",
+            &[
+                (MessageRole::User, "pls fix"),
+                (MessageRole::Assistant, "Please fix the 100% CPU bug."),
+            ],
+        )
+        .await;
+
+        let only = |rows: Vec<HistoryEntry>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(
+            only(
+                repo.list_history(Some("dictation"), None, 10)
+                    .await
+                    .unwrap()
+            ),
+            vec![dictation]
+        );
+        // Matched on the model's side of the exchange, case-insensitively.
+        assert_eq!(
+            only(repo.list_history(None, Some("cpu BUG"), 10).await.unwrap()),
+            vec![rewrite]
+        );
+        // A typed `%` is a character to find, not a wildcard that matches all.
+        assert_eq!(
+            only(repo.list_history(None, Some("100%"), 10).await.unwrap()),
+            vec![rewrite]
+        );
+        assert!(repo
+            .list_history(None, Some("50%"), 10)
+            .await
+            .unwrap()
+            .is_empty());
+        // A blank query is no query.
+        assert_eq!(
+            repo.list_history(None, Some("  "), 10).await.unwrap().len(),
+            2
+        );
+    }
+
+    /// Nothing to read, nothing to copy: an empty conversation and a meeting's
+    /// chat are both left out of History.
+    #[tokio::test]
+    async fn history_leaves_out_empty_conversations_and_meeting_chats() {
+        let pool = open_pool("sqlite::memory:").await.unwrap();
+        run_data_migrations(&pool).await.unwrap();
+        sqlx::query("INSERT INTO meetings (id,title,capture_mode,status,started_at) VALUES ('m1','t','mic_only','completed',datetime('now'))")
+            .execute(&pool).await.unwrap();
+        let chat: i64 = sqlx::query_scalar("INSERT INTO conversations (feature_id, engine_id, meeting_id) VALUES ('meetings','openai','m1') RETURNING id")
+            .fetch_one(&pool).await.unwrap();
+        sqlx::query("INSERT INTO messages (conversation_id, role, content) VALUES (?, 'user', 'what was decided?')")
+            .bind(chat)
+            .execute(&pool).await.unwrap();
+        let repo = ConversationRepo::new(pool);
+        seed(&repo, "dictation", &[]).await;
+
+        assert!(repo.list_history(None, None, 10).await.unwrap().is_empty());
     }
 
     /// Rewrite-history retention must not reach into a meeting's chat.

@@ -12,7 +12,8 @@ pub mod transcript;
 pub mod tts;
 
 pub use store::conversations::{
-    ConversationRepo, ConversationSummary, Message, MessageRole, NewConversation, NewMessage,
+    ConversationRepo, ConversationSummary, HistoryEntry, Message, MessageRole, NewConversation,
+    NewMessage,
 };
 pub use store::meetings::{
     CaptureMode, Meeting, MeetingChatMessage, MeetingDetail, MeetingNotes, MeetingRepo,
