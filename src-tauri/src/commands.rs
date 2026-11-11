@@ -5149,6 +5149,66 @@ pub async fn set_meeting_title(
         .map_err(|e| e.to_string())
 }
 
+/// Writes a finished meeting's notes again from its stored transcript: the
+/// retry for a meeting whose AI step failed, and "regenerate" for one that
+/// completed. Returns the meeting as it now stands.
+///
+/// One retry per meeting at a time; a second is refused rather than queued.
+#[tauri::command]
+pub async fn reprocess_meeting(
+    state: State<'_, Arc<AppState>>,
+    meeting_id: String,
+) -> Result<MeetingDetail, String> {
+    reprocess_meeting_inner(&state, &meeting_id).await
+}
+
+async fn reprocess_meeting_inner(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<MeetingDetail, String> {
+    struct InFlight<'a>(
+        &'a std::sync::Mutex<std::collections::BTreeSet<String>>,
+        String,
+    );
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.1);
+        }
+    }
+    {
+        let mut set = state
+            .meeting_reprocessing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !set.insert(meeting_id.to_string()) {
+            return Err("this meeting's notes are already being written".into());
+        }
+    }
+    let _in_flight = InFlight(&state.meeting_reprocessing, meeting_id.to_string());
+
+    let bindings = BindingRepo::new(state.config_pool.clone());
+    // A settings read that fails falls back to the defaults, as at the stop.
+    let settings = MeetingSettingsRepo::new(SettingsRepo::new(state.config_pool.clone()))
+        .get()
+        .await
+        .unwrap_or_default();
+    kea_features::meeting::reprocess_meeting(
+        &state.engines,
+        &bindings,
+        &state.meeting_repo,
+        meeting_id,
+        MeetingStopOptions {
+            calendar: state.calendar.clone(),
+            calendar_titles: settings.calendar_titles,
+            usage: Some(UsageRepo::new(state.data_pool.clone())),
+        },
+    )
+    .await
+}
+
 /// Meeting search for the list, over titles and notes.
 ///
 /// `limit` defaults to the same 50 the plain list uses, so a blank search

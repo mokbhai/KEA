@@ -56,6 +56,11 @@ export type SummaryTabProps = {
    * Edit and Undo on a finished meeting.
    */
   onNotesChanged?: (detail: MeetingDetailData) => void;
+  /**
+   * Write the notes again from the stored transcript: Retry on a meeting whose
+   * notes failed, Regenerate on a finished one. Omitted while it records.
+   */
+  onReprocess?: () => void | Promise<void>;
 };
 
 /** What a prose section needs to offer and run an edit. */
@@ -469,6 +474,7 @@ export default function SummaryTab({
   onExportNotion,
   onDelete,
   onNotesChanged,
+  onReprocess,
 }: SummaryTabProps) {
   const [editing, setEditing] = useState<NotesSectionKey | null>(null);
   const [draft, setDraft] = useState("");
@@ -504,6 +510,22 @@ export default function SummaryTab({
   // that can only fail is worse than none.
   const canEdit = Boolean(onNotesChanged) && Boolean(notes) && !generating;
   const editBusyNow = busy || editBusy;
+  // The notes are written from the stored lines, so a meeting with none has
+  // nothing to retry from.
+  const canReprocess = Boolean(onReprocess) && detail.segments.length > 0 && !generating;
+  const failed = meeting.status === "error";
+
+  const reprocess = () => {
+    if (
+      notes?.edited &&
+      !window.confirm(
+        "Regenerating replaces the notes you edited. You can bring them back with Undo.",
+      )
+    ) {
+      return;
+    }
+    void onReprocess?.();
+  };
 
   const startEdit = (section: NotesSectionKey) => {
     setDraft(notes?.[section] ?? "");
@@ -573,6 +595,34 @@ export default function SummaryTab({
         <p role="status" className="kea-muted" style={{ margin: "0 0 12px" }}>
           Generating notes…
         </p>
+      )}
+
+      {failed && canReprocess && (
+        <div
+          role="alert"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            flexWrap: "wrap",
+            margin: "0 0 16px",
+            padding: "10px 12px",
+            borderRadius: 8,
+            border: "1px solid var(--danger)",
+          }}
+        >
+          <p style={{ margin: 0, flex: 1, minWidth: 200, fontSize: 13 }}>
+            The transcript was saved, but the notes could not be written.
+          </p>
+          <button
+            type="button"
+            className="kea-btn kea-btn--primary"
+            onClick={reprocess}
+            disabled={busy}
+          >
+            Retry notes
+          </button>
+        </div>
       )}
 
       {hasNotes ? (
@@ -692,6 +742,17 @@ export default function SummaryTab({
               </button>
             )}
           </div>
+        )}
+        {canReprocess && !failed && (
+          <button
+            type="button"
+            className="kea-btn"
+            title="Write the notes and title again from the transcript."
+            onClick={reprocess}
+            disabled={busy}
+          >
+            Regenerate notes
+          </button>
         )}
         <div style={{ flex: 1 }} />
         {onDelete && (

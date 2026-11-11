@@ -1085,6 +1085,15 @@ export const addMeetingActionItem = (meetingId: string, text: string) =>
 export const setMeetingTitle = (meetingId: string, title: string) =>
   invoke<void>("set_meeting_title", { meetingId, title });
 
+/**
+ * Write a finished meeting's notes again from its stored transcript: the retry
+ * for a meeting whose AI step failed, and "regenerate" for a completed one.
+ * Resolves with the meeting as it now stands; the notes it replaced can be
+ * restored with Undo.
+ */
+export const reprocessMeeting = (meetingId: string) =>
+  invoke<MeetingDetail>("reprocess_meeting", { meetingId });
+
 /** Meetings whose title or notes match `query`. A blank query is the plain list. */
 export const searchMeetings = (query: string, limit?: number) =>
   invoke<Meeting[]>("search_meetings", { query, limit });

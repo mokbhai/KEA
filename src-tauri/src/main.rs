@@ -64,6 +64,10 @@ pub struct AppState {
     /// Which meetings have an Ask AI turn in flight. One per meeting, shared by
     /// every window, so a second Send for the same meeting is refused here.
     pub meeting_chat_turns: kea_features::meeting::MeetingChatTurns,
+    /// Which meetings are having their notes written again. One retry per
+    /// meeting at a time, so a double press cannot run two LLM passes that race
+    /// to write the same notes.
+    pub meeting_reprocessing: std::sync::Mutex<std::collections::BTreeSet<String>>,
     pub credentials: Arc<dyn kea_core::secrets::CredentialStore>,
     pub permissions: Box<dyn kea_platform::Permissions>,
     pub hotkeys: Mutex<Box<dyn kea_platform::Hotkeys>>,
@@ -464,6 +468,7 @@ fn main() {
             commands::set_meeting_action_item_status,
             commands::add_meeting_action_item,
             commands::set_meeting_title,
+            commands::reprocess_meeting,
             commands::search_meetings,
             commands::get_meeting_chat,
             commands::send_meeting_chat,
@@ -836,6 +841,7 @@ fn build_state(
         data_pool,
         meeting_repo,
         meeting_chat_turns: Default::default(),
+        meeting_reprocessing: Default::default(),
         credentials,
         permissions: new_permissions(),
         hotkeys: Mutex::new(new_hotkeys()),

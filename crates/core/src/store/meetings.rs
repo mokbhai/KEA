@@ -626,12 +626,37 @@ async fn write_user_notes(
         .await?
         .ok_or_else(|| KeaError::NotFound(format!("notes for meeting {meeting_id}")))?;
 
+    push_notes_version(tx, &current).await?;
+
+    sqlx::query(
+        "UPDATE meeting_notes SET summary = ?, decisions = ?, action_items = ?,
+                follow_ups = ?, open_questions = ?, edited = 1
+         WHERE meeting_id = ?",
+    )
+    .bind(&text.summary)
+    .bind(&text.decisions)
+    .bind(&text.action_items)
+    .bind(&text.follow_ups)
+    .bind(&text.open_questions)
+    .bind(meeting_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Puts `current` on top of its meeting's undo stack, then trims the stack to
+/// [`NOTES_UNDO_LIMIT`]. The bottom of the stack is never trimmed.
+async fn push_notes_version(
+    tx: &mut Transaction<'_, Sqlite>,
+    current: &MeetingNotes,
+) -> Result<(), KeaError> {
+    let meeting_id = current.meeting_id.as_str();
     sqlx::query(
         "INSERT INTO meeting_notes_versions (meeting_id, notes_json, edited)
          VALUES (?, ?, ?)",
     )
     .bind(meeting_id)
-    .bind(serde_json::to_string(&current)?)
+    .bind(serde_json::to_string(current)?)
     .bind(i64::from(current.edited))
     .execute(&mut **tx)
     .await?;
@@ -649,20 +674,6 @@ async fn write_user_notes(
     .bind(meeting_id)
     .bind(meeting_id)
     .bind(NOTES_UNDO_LIMIT - 1)
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        "UPDATE meeting_notes SET summary = ?, decisions = ?, action_items = ?,
-                follow_ups = ?, open_questions = ?, edited = 1
-         WHERE meeting_id = ?",
-    )
-    .bind(&text.summary)
-    .bind(&text.decisions)
-    .bind(&text.action_items)
-    .bind(&text.follow_ups)
-    .bind(&text.open_questions)
-    .bind(meeting_id)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1640,6 +1651,43 @@ impl MeetingRepo {
         if result.rows_affected() == 0 {
             return Err(KeaError::NotFound(format!("meeting {id}")));
         }
+        Ok(())
+    }
+
+    /// Sets a finished meeting's status and error, leaving `ended_at` alone.
+    ///
+    /// Used when the notes are written again after the meeting ended: the
+    /// meeting still ended when it did, whenever its notes were rewritten.
+    pub async fn set_status(
+        &self,
+        id: &str,
+        status: MeetingStatus,
+        error: Option<&str>,
+    ) -> Result<(), KeaError> {
+        let result = sqlx::query("UPDATE meetings SET status = ?, error = ? WHERE id = ?")
+            .bind(status.as_str())
+            .bind(error)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(KeaError::NotFound(format!("meeting {id}")));
+        }
+        Ok(())
+    }
+
+    /// Puts the current notes on the undo stack, so notes about to be written
+    /// again can be got back with Undo. Does nothing when there are no notes.
+    pub async fn snapshot_notes_for_undo(&self, meeting_id: &str) -> Result<(), KeaError> {
+        let mut tx = self.pool.begin().await?;
+        let current = sqlx::query_as::<_, MeetingNotes>(NOTES_SELECT)
+            .bind(meeting_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if let Some(current) = current {
+            push_notes_version(&mut tx, &current).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 

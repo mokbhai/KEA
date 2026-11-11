@@ -431,4 +431,50 @@ describe("SummaryTab", () => {
     await userEvent.type(screen.getByLabelText("Summary text"), " more");
     expect((screen.getByRole("button", { name: "Edit decisions" }) as HTMLButtonElement).disabled).toBe(true);
   });
+
+  describe("retrying the notes", () => {
+    const failed = (over: Record<string, unknown> = {}) =>
+      meetingDetail({
+        meeting: { ...meetingDetail().meeting, status: "error", error: "provider is down" },
+        ...over,
+      });
+
+    it("offers Retry on a meeting whose notes failed, and only Retry", async () => {
+      const onReprocess = vi.fn();
+      renderSummary({ detail: failed(), onReprocess });
+      expect(screen.queryByRole("button", { name: "Regenerate notes" })).toBeNull();
+      await userEvent.click(screen.getByRole("button", { name: "Retry notes" }));
+      expect(onReprocess).toHaveBeenCalledTimes(1);
+    });
+
+    it("offers Regenerate on a completed meeting", async () => {
+      const onReprocess = vi.fn();
+      renderSummary({ detail: meetingDetail({ notes: meetingNotes }), onReprocess });
+      expect(screen.queryByRole("button", { name: "Retry notes" })).toBeNull();
+      await userEvent.click(screen.getByRole("button", { name: "Regenerate notes" }));
+      expect(onReprocess).toHaveBeenCalledTimes(1);
+    });
+
+    // Nothing was transcribed, so there is nothing to write notes from.
+    it("offers neither with no transcript, nor while notes are being written", () => {
+      const { unmount } = renderSummary({ detail: failed({ segments: [] }), onReprocess: vi.fn() });
+      expect(screen.queryByRole("button", { name: "Retry notes" })).toBeNull();
+      unmount();
+      renderSummary({ detail: meetingDetail(), generating: true, onReprocess: vi.fn() });
+      expect(screen.queryByRole("button", { name: "Regenerate notes" })).toBeNull();
+    });
+
+    it("asks before replacing notes the user edited", async () => {
+      const onReprocess = vi.fn();
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      renderSummary({
+        detail: meetingDetail({ notes: { ...meetingNotes, edited: true } }),
+        onReprocess,
+      });
+      await userEvent.click(screen.getByRole("button", { name: "Regenerate notes" }));
+      expect(confirm).toHaveBeenCalledTimes(1);
+      expect(onReprocess).not.toHaveBeenCalled();
+      confirm.mockRestore();
+    });
+  });
 });

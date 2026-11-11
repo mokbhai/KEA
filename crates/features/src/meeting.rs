@@ -1291,6 +1291,10 @@ pub async fn synthesize_meeting_title(
     Ok(sanitize_meeting_title(&resp.text))
 }
 
+/// The title a meeting starts with, and the one the notes prompt sees in
+/// place of any title the user did not type.
+const UNTITLED_MEETING: &str = "Untitled Meeting";
+
 pub struct MeetingRunContext<'a> {
     pub engines: &'a EngineRegistry,
     pub bindings: &'a BindingRepo,
@@ -1458,7 +1462,7 @@ pub async fn run_meeting_start(
         .meetings
         .create(&NewMeeting {
             id: meeting_id.clone(),
-            title: "Untitled Meeting".into(),
+            title: UNTITLED_MEETING.into(),
             capture_mode,
             stt_engine_id: Some(stt_binding.engine_id.clone()),
             llm_engine_id: Some(llm_binding.engine_id),
@@ -1824,6 +1828,83 @@ async fn finalize_meeting(
         partial = reload_meeting(meetings, meeting_id).await?;
     }
 
+    write_notes_and_title(
+        engines, bindings, meetings, meeting_id, partial, opts, false,
+    )
+    .await
+}
+
+/// Writes the notes for a finished meeting again, from its stored transcript.
+///
+/// The retry for both a meeting whose AI step failed (status `error`, lines
+/// stored) and one the user wants rewritten (status `completed`). Only the AI
+/// half of the stop runs — speaker names, notes, title — since the audio is
+/// gone and the lines are already stored.
+///
+/// On success the meeting is `completed` with no error, and the notes it had
+/// before are on the undo stack. On failure a meeting that was `error` keeps
+/// that status with the new reason; a `completed` one stays `completed` with
+/// its notes untouched, and the error is only returned. A meeting still
+/// recording, or with no lines, is refused before anything runs.
+pub async fn reprocess_meeting(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    meetings: &MeetingRepo,
+    meeting_id: &str,
+    opts: MeetingStopOptions,
+) -> Result<MeetingDetail, String> {
+    let existing = reload_meeting(meetings, meeting_id).await?;
+    if existing.meeting.status == MeetingStatus::Recording {
+        return Err("this meeting is still recording".into());
+    }
+    if existing.segments.is_empty() {
+        return Err(
+            "nothing in this meeting was transcribed, so there is nothing to process".into(),
+        );
+    }
+
+    let prior = existing.meeting.status;
+    let outcome = write_notes_and_title(
+        engines, bindings, meetings, meeting_id, existing, &opts, true,
+    )
+    .await;
+    match outcome {
+        Ok(()) => {
+            meetings
+                .set_status(meeting_id, MeetingStatus::Completed, None)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Err(e) => {
+            if prior == MeetingStatus::Error {
+                if let Err(inner) = meetings
+                    .set_status(meeting_id, MeetingStatus::Error, Some(&e))
+                    .await
+                {
+                    tracing::warn!(error = %inner, meeting_id, "meeting retry: could not record the error");
+                }
+            }
+            return Err(e);
+        }
+    }
+    reload_meeting(meetings, meeting_id).await
+}
+
+/// The AI half of the stop: speaker names, then the notes, then the title.
+///
+/// Shared by the stop and by [`reprocess_meeting`]. `keep_undo` puts the notes
+/// being replaced on the undo stack first; the stop has nothing worth keeping
+/// there (at most an interim draft), a retry may be replacing notes the user
+/// read or edited.
+async fn write_notes_and_title(
+    engines: &EngineRegistry,
+    bindings: &BindingRepo,
+    meetings: &MeetingRepo,
+    meeting_id: &str,
+    mut partial: MeetingDetail,
+    opts: &MeetingStopOptions,
+    keep_undo: bool,
+) -> Result<(), String> {
     // Names are inferred before the notes so the notes are written against
     // them. Any failure inside is logged and skipped; the notes do not wait.
     if infer_speaker_names(
@@ -1843,15 +1924,32 @@ async fn finalize_meeting(
     // interim passes already wrote this row. The fold is an approximation, and
     // the version the user keeps is the one place a fresh full-context read is
     // worth paying for.
+    //
+    // Only a title the user typed goes into the prompt. A calendar title must
+    // never reach the engine (see the title step below), and a generated one
+    // would only steer a retry toward the old notes; both are sent as the
+    // placeholder a fresh stop sends.
+    let mut prompt_meeting = partial.meeting.clone();
+    if prompt_meeting.title_source != TitleSource::User {
+        prompt_meeting.title = UNTITLED_MEETING.to_string();
+    }
     let (parsed, binding) = synthesize_notes_parsed(
         engines,
         bindings,
-        &partial.meeting,
+        &prompt_meeting,
         &partial.segments,
         &partial.speakers,
         opts.usage.as_ref(),
     )
     .await?;
+
+    // After the call succeeds, so a failed retry leaves no extra version.
+    if keep_undo {
+        meetings
+            .snapshot_notes_for_undo(meeting_id)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     let notes = persist_notes(
         meetings,
@@ -1877,6 +1975,15 @@ async fn finalize_meeting(
     // Applying it here, after synthesis has already run against
     // "Untitled Meeting", prevents that structurally rather than by
     // convention.
+    //
+    // A title the user typed, or one already taken from the calendar, stays:
+    // a retry rewrites the notes, not a name the meeting already has.
+    if matches!(
+        partial.meeting.title_source,
+        TitleSource::User | TitleSource::Calendar
+    ) {
+        return Ok(());
+    }
     if let Some(event_title) = calendar_title(opts, &partial.meeting).await {
         return meetings
             .set_title_with_source(meeting_id, &event_title, TitleSource::Calendar)
@@ -4872,6 +4979,220 @@ mod item_16_17_tests {
         assert!(llm.prompts().is_empty(), "nothing to send");
         let meeting = meetings.get("m1").await.unwrap().unwrap().meeting;
         assert_eq!(meeting.status, MeetingStatus::Error);
+    }
+
+    // --- retrying the AI step ---
+
+    /// A meeting whose lines are stored but whose notes failed: the error state
+    /// a retry is for.
+    async fn failed_meeting(meetings: &MeetingRepo, id: &str, texts: &[&str]) {
+        recording_meeting(meetings, id, texts).await;
+        meetings
+            .complete(id, MeetingStatus::Error, Some("provider is down"))
+            .await
+            .unwrap();
+    }
+
+    fn stored_notes(meeting_id: &str, summary: &str) -> MeetingNotes {
+        MeetingNotes {
+            meeting_id: meeting_id.into(),
+            summary: summary.into(),
+            decisions: String::new(),
+            action_items: String::new(),
+            follow_ups: String::new(),
+            open_questions: String::new(),
+            prompt_version: MEETING_NOTES_PROMPT_VERSION.into(),
+            engine_id: Some("fake-llm".into()),
+            model: None,
+            edited: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_writes_the_notes_a_failed_meeting_is_missing() {
+        let llm = RecordingLlm::new(&[]);
+        let (reg, bindings, _actions, meetings) = world(llm.clone()).await;
+        failed_meeting(&meetings, "m1", &["hello", "world"]).await;
+        let ended_before = meetings.get("m1").await.unwrap().unwrap().meeting.ended_at;
+
+        let detail = reprocess_meeting(
+            &reg,
+            &bindings,
+            &meetings,
+            "m1",
+            MeetingStopOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(detail.meeting.status, MeetingStatus::Completed);
+        assert_eq!(detail.meeting.error, None);
+        assert_eq!(
+            detail.meeting.ended_at, ended_before,
+            "the meeting still ended when it did"
+        );
+        assert_eq!(detail.notes.unwrap().summary, "kickoff summary");
+        assert_eq!(detail.meeting.title, "Sprint Planning");
+        assert_eq!(detail.segments.len(), 2, "the transcript is untouched");
+        assert!(llm.prompts().iter().any(|p| p.contains("hello")));
+    }
+
+    #[tokio::test]
+    async fn a_retry_that_fails_again_keeps_the_meeting_in_error_with_the_new_reason() {
+        let (reg, bindings, _actions, meetings) = world(RecordingLlm::failing()).await;
+        failed_meeting(&meetings, "m1", &["hello"]).await;
+        meetings
+            .set_status("m1", MeetingStatus::Error, Some("old reason"))
+            .await
+            .unwrap();
+
+        let err = reprocess_meeting(
+            &reg,
+            &bindings,
+            &meetings,
+            "m1",
+            MeetingStopOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        let meeting = meetings.get("m1").await.unwrap().unwrap().meeting;
+        assert_eq!(meeting.status, MeetingStatus::Error);
+        assert_eq!(meeting.error.as_deref(), Some(err.as_str()));
+        assert_ne!(meeting.error.as_deref(), Some("old reason"));
+    }
+
+    #[tokio::test]
+    async fn regenerating_a_completed_meeting_replaces_the_notes_and_undo_brings_them_back() {
+        let llm = RecordingLlm::new(&[]);
+        let (reg, bindings, _actions, meetings) = world(llm.clone()).await;
+        recording_meeting(&meetings, "m1", &["hello"]).await;
+        meetings
+            .upsert_notes(&stored_notes("m1", "old summary"))
+            .await
+            .unwrap();
+        meetings
+            .complete("m1", MeetingStatus::Completed, None)
+            .await
+            .unwrap();
+
+        let detail = reprocess_meeting(
+            &reg,
+            &bindings,
+            &meetings,
+            "m1",
+            MeetingStopOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail.meeting.status, MeetingStatus::Completed);
+        assert_eq!(detail.notes.unwrap().summary, "kickoff summary");
+
+        let restored = meetings.undo_notes("m1").await.unwrap().unwrap();
+        assert_eq!(restored.summary, "old summary");
+    }
+
+    #[tokio::test]
+    async fn a_failed_regenerate_leaves_a_completed_meeting_and_its_notes_alone() {
+        let (reg, bindings, _actions, meetings) = world(RecordingLlm::failing()).await;
+        recording_meeting(&meetings, "m1", &["hello"]).await;
+        meetings
+            .upsert_notes(&stored_notes("m1", "old summary"))
+            .await
+            .unwrap();
+        meetings
+            .complete("m1", MeetingStatus::Completed, None)
+            .await
+            .unwrap();
+
+        assert!(reprocess_meeting(
+            &reg,
+            &bindings,
+            &meetings,
+            "m1",
+            MeetingStopOptions::default()
+        )
+        .await
+        .is_err());
+
+        let detail = meetings.get("m1").await.unwrap().unwrap();
+        assert_eq!(detail.meeting.status, MeetingStatus::Completed);
+        assert_eq!(detail.meeting.error, None);
+        assert_eq!(detail.notes.unwrap().summary, "old summary");
+        assert!(
+            meetings.undo_notes("m1").await.unwrap().is_none(),
+            "no version pushed"
+        );
+    }
+
+    /// A typed title is kept; a calendar title is kept and never sent.
+    #[tokio::test]
+    async fn a_retry_keeps_a_typed_or_calendar_title_and_never_sends_the_calendar_one() {
+        let llm = RecordingLlm::new(&[]);
+        let (reg, bindings, _actions, meetings) = world(llm.clone()).await;
+        failed_meeting(&meetings, "typed", &["hello"]).await;
+        meetings
+            .set_title_with_source("typed", "My Title", TitleSource::User)
+            .await
+            .unwrap();
+        failed_meeting(&meetings, "cal", &["hello"]).await;
+        meetings
+            .set_title_with_source("cal", "Q3 Roadmap Review", TitleSource::Calendar)
+            .await
+            .unwrap();
+
+        for id in ["typed", "cal"] {
+            reprocess_meeting(
+                &reg,
+                &bindings,
+                &meetings,
+                id,
+                MeetingStopOptions::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let typed = meetings.get("typed").await.unwrap().unwrap().meeting;
+        assert_eq!(
+            (typed.title.as_str(), typed.title_source),
+            ("My Title", TitleSource::User)
+        );
+        let cal = meetings.get("cal").await.unwrap().unwrap().meeting;
+        assert_eq!(cal.title, "Q3 Roadmap Review");
+        for prompt in llm.prompts() {
+            assert!(!prompt.contains("Q3 Roadmap Review"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_is_refused_while_recording_or_with_no_lines() {
+        let llm = RecordingLlm::new(&[]);
+        let (reg, bindings, _actions, meetings) = world(llm.clone()).await;
+        recording_meeting(&meetings, "live", &["hello"]).await;
+        failed_meeting(&meetings, "empty", &[]).await;
+
+        let live = reprocess_meeting(
+            &reg,
+            &bindings,
+            &meetings,
+            "live",
+            MeetingStopOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(live.contains("still recording"), "{live}");
+        let empty = reprocess_meeting(
+            &reg,
+            &bindings,
+            &meetings,
+            "empty",
+            MeetingStopOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(empty.contains("nothing"), "{empty}");
+        assert!(llm.prompts().is_empty());
     }
 
     // --- 17: calendar titles ---

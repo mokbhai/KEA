@@ -56,6 +56,11 @@ export type MeetingPaneProps = {
   /** Omitted while the meeting records, which cannot be deleted. */
   onDelete?: (id: string) => void;
   onRenameTitle?: (title: string) => void | Promise<void>;
+  /**
+   * Write the notes again from the stored transcript. Omitted while the
+   * meeting records or its notes are being written.
+   */
+  onReprocess?: () => void | Promise<void>;
   onRenameSpeaker?: (speakerKey: string, displayName: string) => void | Promise<void>;
   onSetActionItemStatus?: (id: number, status: ActionItemStatus) => void | Promise<void>;
   onAddActionItem?: (text: string) => void | Promise<void>;
@@ -170,6 +175,7 @@ const MeetingPane = forwardRef<MeetingPaneHandle, MeetingPaneProps>(function Mee
     onBack,
     onDelete,
     onRenameTitle,
+    onReprocess,
     onRenameSpeaker,
     onSetActionItemStatus,
     onAddActionItem,
@@ -280,6 +286,7 @@ const MeetingPane = forwardRef<MeetingPaneHandle, MeetingPaneProps>(function Mee
           generating={generating}
           busy={busy}
           onRenameSpeaker={onRenameSpeaker}
+          onReprocess={live ? undefined : onReprocess}
           onSetActionItemStatus={onSetActionItemStatus}
           onAddActionItem={onAddActionItem}
           onCopyMarkdown={onCopyMarkdown}

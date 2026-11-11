@@ -21,6 +21,7 @@ import {
   onMeetingNotes,
   onMeetingSegment,
   onMeetingState,
+  reprocessMeeting,
   requestPermission,
   revealPath,
   setMeetingActionItemStatus,
@@ -154,6 +155,9 @@ function MeetingsPageContent({ onNavigate, selectedMeetingId, onSelectMeeting }:
   const detailRequest = useRef(0);
   const [listStatus, setListStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // The meeting whose notes are being written again, if any. Kept apart from
+  // `busy` so the pane can say "Generating notes…" for that meeting only.
+  const [reprocessingId, setReprocessingId] = useState<string | null>(null);
   // Narrow windows show one pane at a time; this is which one is showing.
   const narrow = useMediaQuery(MEETINGS_NARROW_QUERY);
   const [showDetailNarrow, setShowDetailNarrow] = useState(false);
@@ -603,6 +607,33 @@ function MeetingsPageContent({ onNavigate, selectedMeetingId, onSelectMeeting }:
   };
 
   /**
+   * Writes the open meeting's notes again: Retry on a meeting whose notes
+   * failed, Regenerate on a finished one. The list is re-read either way, since
+   * the status, error and title it shows may all have changed.
+   */
+  const onReprocess = async () => {
+    const meetingId = selectedId;
+    if (!meetingId || reprocessingId) return;
+    const hadNotes = detail?.meeting.id === meetingId && Boolean(detail.notes);
+    setReprocessingId(meetingId);
+    setListStatus(null);
+    try {
+      applyDetail(await reprocessMeeting(meetingId));
+      setListStatus(
+        hadNotes ? "Notes rewritten. Undo brings back the previous notes." : "Notes written.",
+      );
+    } catch (e) {
+      setListStatus(toMessage(e));
+      // A failed retry stores the new reason on the meeting; show it.
+      await loadDetail(meetingId, true);
+    } finally {
+      setReprocessingId(null);
+      await refreshList();
+    }
+  };
+  const reprocessing = reprocessingId !== null && reprocessingId === selectedId;
+
+  /**
    * Copy in the webview rather than through the Rust clipboard path.
    *
    * `kea_platform`'s clipboard is wired into the save/paste/restore state
@@ -928,12 +959,13 @@ function MeetingsPageContent({ onNavigate, selectedMeetingId, onSelectMeeting }:
                 liveSegments={segments}
                 liveNotes={liveNotes}
                 interimNotes={settings.interim_notes}
-                generating={generating}
+                generating={generating || reprocessing}
                 loading={detailLoading}
-                busy={busy}
+                busy={busy || reprocessing}
                 onBack={narrow ? () => setShowDetailNarrow(false) : undefined}
                 onDelete={live ? undefined : onDelete}
                 onRenameTitle={onRenameTitle}
+                onReprocess={live || generating ? undefined : onReprocess}
                 onRenameSpeaker={onRenameSpeaker}
                 onSetActionItemStatus={onSetActionItemStatus}
                 onAddActionItem={onAddActionItem}
