@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and the project follows Semantic Versioning.
 
+## [0.5.9] - 2026-11-13
+
+0.5.8 was a beta, so this release also carries its changes.
+
+### Added
+
+- Retry a meeting's notes when generation fails, or regenerate them after a meeting ends, from the meeting's Summary tab.
+
+### Changed
+
+- Every AI request now sends its instructions as a system prompt and the conversation as separate user and assistant messages. This covers rewrite, dictation clean-up, meeting notes and chat, the assistant, and the local API's `/v1/chat/completions`. Anthropic requests use its top-level `system` field; OpenAI-compatible requests put the system message first.
+
 ## [0.5.7] - 2026-11-10
 
 0.5.5 and 0.5.6 were never published, so this release also carries everything listed under them.
