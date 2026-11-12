@@ -75,12 +75,8 @@ impl RoutingOutcome {
     }
 }
 
-/// Build the prompt that asks for a routing decision.
-pub fn build_routing_prompt(
-    registry: &ActionRegistry,
-    utterance: &str,
-    history: &[(String, String)],
-) -> String {
+/// Build the system prompt that asks for a routing decision.
+pub fn build_routing_prompt(registry: &ActionRegistry) -> String {
     let mut p = String::new();
 
     p.push_str(
@@ -140,15 +136,35 @@ pub fn build_routing_prompt(
         }
     }
 
-    if !history.is_empty() {
-        p.push_str("\nEarlier in this conversation:\n");
-        for (user, assistant) in history {
-            p.push_str(&format!("  User: {user}\n  You: {assistant}\n"));
-        }
-    }
-
-    p.push_str(&format!("\nUser said: {utterance}\n"));
     p
+}
+
+/// The conversation the routing prompt answers: earlier turns keep their
+/// roles, and the utterance is the final user message.
+fn build_routing_messages(
+    utterance: &str,
+    history: &[(String, String)],
+) -> Vec<kea_engines::LlmMessage> {
+    let mut messages = Vec::with_capacity(history.len() * 2 + 1);
+    for (user, assistant) in history {
+        messages.push(kea_engines::LlmMessage::user(user.clone()));
+        messages.push(kea_engines::LlmMessage::assistant(assistant.clone()));
+    }
+    messages.push(kea_engines::LlmMessage::user(utterance));
+    messages
+}
+
+/// Build the routing request: the instructions in the system prompt, the
+/// conversation in the messages.
+pub fn build_routing_request(
+    registry: &ActionRegistry,
+    utterance: &str,
+    history: &[(String, String)],
+) -> LlmRequest {
+    LlmRequest::new(
+        build_routing_prompt(registry),
+        build_routing_messages(utterance, history),
+    )
 }
 
 /// Strip a fenced code block, if the model wrapped its JSON in one.
@@ -288,14 +304,10 @@ pub async fn route(
     utterance: &str,
     history: &[(String, String)],
 ) -> Result<RoutingOutcome, EngineError> {
-    let prompt = build_routing_prompt(registry, utterance, history);
-    let response = engine
-        .complete(LlmRequest {
-            prompt,
-            model: binding.model.clone(),
-            provider_ref: binding.provider_ref.clone(),
-        })
-        .await?;
+    let mut request = build_routing_request(registry, utterance, history);
+    request.model = binding.model.clone();
+    request.provider_ref = binding.provider_ref.clone();
+    let response = engine.complete(request).await?;
     Ok(parse_routing_response(&response.text, registry))
 }
 
@@ -401,7 +413,7 @@ mod tests {
 
     #[test]
     fn the_prompt_lists_every_action_id_and_its_arguments() {
-        let p = build_routing_prompt(&reg(), "open mail", &[]);
+        let p = build_routing_request(&reg(), "open mail", &[]).prompt();
         for spec in CATALOG {
             assert!(p.contains(spec.id), "{} missing from prompt", spec.id);
             assert!(
@@ -416,7 +428,7 @@ mod tests {
 
     #[test]
     fn the_prompt_states_the_answer_default_and_the_length_limit() {
-        let p = build_routing_prompt(&reg(), "what is rust", &[]);
+        let p = build_routing_request(&reg(), "what is rust", &[]).prompt();
         assert!(p.contains("THIS IS THE DEFAULT"));
         assert!(p.contains(&ANSWER_WORD_LIMIT.to_string()));
         assert!(p.contains("at most"));
@@ -425,7 +437,7 @@ mod tests {
     #[test]
     fn the_prompt_carries_earlier_turns() {
         let history = vec![("what is it".to_string(), "a bird".to_string())];
-        let p = build_routing_prompt(&reg(), "how big", &history);
+        let p = build_routing_request(&reg(), "how big", &history).prompt();
         assert!(p.contains("what is it") && p.contains("a bird"));
     }
 

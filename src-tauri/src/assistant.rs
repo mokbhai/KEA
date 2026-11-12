@@ -1155,7 +1155,8 @@ mod tests {
     use kea_core::store::actions::ActionStatus;
     use kea_core::store::db::{open_pool, run_data_migrations};
     use kea_engines::traits::{
-        AudioPcm, EngineCaps, EngineError, LlmRequest, LlmResponse, Partial, SttStream, Transcript,
+        AudioPcm, EngineCaps, EngineError, LlmRequest, LlmResponse, LlmRole, Partial, SttStream,
+        Transcript,
     };
     use kea_platform::AudioIoError;
     use std::sync::Mutex;
@@ -1307,10 +1308,12 @@ mod tests {
     }
 
     /// The utterance as `build_routing_prompt` writes it into the prompt.
-    fn utterance_of(prompt: &str) -> String {
-        prompt
-            .rsplit_once("User said: ")
-            .map(|(_, rest)| rest.trim().to_string())
+    fn utterance_of(req: &LlmRequest) -> String {
+        req.messages
+            .iter()
+            .rev()
+            .find(|message| message.role == LlmRole::User)
+            .map(|message| message.content.clone())
             .unwrap_or_default()
     }
 
@@ -1323,10 +1326,8 @@ mod tests {
             EngineCaps { models: vec![] }
         }
         async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, EngineError> {
-            self.prompts.lock().unwrap().push(req.prompt.clone());
-            Ok(LlmResponse::untracked((self.reply)(&utterance_of(
-                &req.prompt,
-            ))))
+            self.prompts.lock().unwrap().push(req.prompt());
+            Ok(LlmResponse::untracked((self.reply)(&utterance_of(&req))))
         }
     }
 

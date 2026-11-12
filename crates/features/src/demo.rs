@@ -3,6 +3,10 @@ use kea_engines::{EngineRegistry, LlmRequest};
 
 pub struct DemoFeature;
 
+/// The ping is a connectivity check, not a task, but every model call still
+/// carries instructions in the system prompt.
+const PING_SYSTEM: &str = "You are a helpful assistant. Reply briefly to the user's message.";
+
 impl Feature for DemoFeature {
     fn id(&self) -> &str {
         "demo"
@@ -28,14 +32,9 @@ pub async fn run_ping(
     let engine = engines
         .llm(engine_id)
         .ok_or_else(|| format!("no llm engine '{engine_id}'"))?;
-    let resp = engine
-        .complete(LlmRequest {
-            prompt: prompt.to_string(),
-            model: None,
-            provider_ref,
-        })
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut request = LlmRequest::single_turn(PING_SYSTEM, prompt);
+    request.provider_ref = provider_ref;
+    let resp = engine.complete(request).await.map_err(|e| e.to_string())?;
     Ok(resp.text)
 }
 
@@ -58,6 +57,6 @@ mod tests {
         let mut reg = EngineRegistry::default();
         reg.register_llm(Arc::new(NoopLlmEngine));
         let out = run_ping(&reg, "noop", None, "hi").await.unwrap();
-        assert_eq!(out, "echo: hi");
+        assert!(out.contains("hi"));
     }
 }

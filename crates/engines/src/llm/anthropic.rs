@@ -22,6 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::http::{Auth, HttpClient};
+use crate::llm::conversation_json;
 use crate::llm::stream::{self, LlmStream, StreamingLlmEngine};
 use crate::provider::{self, CredentialSource, Defaults, ProviderConfigSource};
 use crate::traits::{EngineCaps, EngineError, LlmEngine, LlmRequest, LlmResponse, TokenUsage};
@@ -80,14 +81,22 @@ impl AnthropicLlmEngine {
             .model
             .clone()
             .unwrap_or_else(|| provider.default_model.clone());
+        let mut body = serde_json::json!({
+            "model": model,
+            "max_tokens": DEFAULT_MAX_TOKENS,
+            "messages": conversation_json(req),
+        });
+        // Anthropic takes the system prompt as a top-level field, not as a
+        // message in the array.
+        if let Some(system) = &req.system {
+            if !system.is_empty() {
+                body["system"] = serde_json::Value::String(system.clone());
+            }
+        }
         Ok(Prepared {
             url: format!("{}/messages", provider.base_url.trim_end_matches('/')),
             api_key,
-            body: serde_json::json!({
-                "model": model,
-                "max_tokens": DEFAULT_MAX_TOKENS,
-                "messages": [{"role": "user", "content": req.prompt}],
-            }),
+            body,
         })
     }
 }
@@ -209,7 +218,7 @@ mod tests {
     use futures_util::StreamExt;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use wiremock::matchers::{body_string_contains, header, method, path};
+    use wiremock::matchers::{body_json, body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     struct MapCredentials(HashMap<String, String>);
@@ -250,11 +259,7 @@ mod tests {
     }
 
     fn request(prompt: &str) -> LlmRequest {
-        LlmRequest {
-            prompt: prompt.into(),
-            model: None,
-            provider_ref: None,
-        }
+        LlmRequest::user(prompt).with_binding(None, None)
     }
 
     /// The whole reason this engine exists: the path, the auth header, the
@@ -287,6 +292,33 @@ mod tests {
                 completion: 3
             })
         );
+    }
+
+    /// Anthropic takes the system prompt as a top-level field, not as a
+    /// message in the array. Sending it as a `system` message would be a 400.
+    #[tokio::test]
+    async fn sends_the_system_prompt_as_a_top_level_field() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_json(serde_json::json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": DEFAULT_MAX_TOKENS,
+                "messages": [{"role": "user", "content": "hi"}],
+                "system": "Be terse.",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"content":[{"type":"text","text":"hello"}]}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let out = engine(&server.uri(), Some("sk-ant-test"))
+            .complete(LlmRequest::single_turn("Be terse.", "hi"))
+            .await
+            .unwrap();
+        assert_eq!(out.text, "hello");
     }
 
     /// A bearer would not authenticate here, so a missing key has to fail

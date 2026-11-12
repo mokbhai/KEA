@@ -28,9 +28,7 @@ use kea_core::store::usage::{NewUsageEvent, UsageRepo};
 use kea_core::transcript::{
     assign_speakers, plan_chunks, transcribe_chunks, SilentSink, DEFAULT_CHUNK_SECS,
 };
-use kea_engines::traits::{
-    AudioPcm, EngineError, LlmRequest, SttOpts, SttSegment, TokenUsage, TtsOpts,
-};
+use kea_engines::traits::{AudioPcm, EngineError, SttOpts, SttSegment, TokenUsage, TtsOpts};
 use kea_engines::EngineRegistry;
 use kea_features::API_FEATURE_ID;
 use kea_infer::{
@@ -41,7 +39,7 @@ use kea_platform::audio::{cut_points, decode_bytes, DECODE_SAMPLE_RATE_HZ};
 use serde_json::Value;
 
 use super::openai::{
-    chat_completion_body, chat_stream_body, flatten_messages, models_list_body, parse_chat,
+    chat_completion_body, chat_stream_body, chat_to_llm_request, models_list_body, parse_chat,
     parse_speech, redact, render_transcription, resolve_model, scrub_secrets, validate_speech,
     ApiError, Capability, ListedModel, ModelChoice, SpeechFormat, TranscriptSegment,
     TranscriptionForm, TranscriptionFormat, SSE_CONTENT_TYPE,
@@ -678,7 +676,7 @@ static COMPLETION_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// token is taken, so a malformed request does not spend one.
 pub async fn chat(deps: &Deps<'_>, body: &[u8]) -> Result<Reply, ApiError> {
     let req = parse_chat(body)?;
-    let prompt = flatten_messages(&req.messages)?;
+    let mut request = chat_to_llm_request(&req.messages)?;
 
     let binding = choose(deps, Capability::Llm, req.model.as_deref()).await?;
     let engine = deps.engines.llm(&binding.engine_id).ok_or_else(|| {
@@ -690,14 +688,9 @@ pub async fn chat(deps: &Deps<'_>, body: &[u8]) -> Result<Reply, ApiError> {
 
     take_token(deps)?;
 
-    let response = match engine
-        .complete(LlmRequest {
-            prompt,
-            model: binding.model.clone(),
-            provider_ref: binding.provider_ref.clone(),
-        })
-        .await
-    {
+    request.model = binding.model.clone();
+    request.provider_ref = binding.provider_ref.clone();
+    let response = match engine.complete(request).await {
         Ok(response) => response,
         Err(e) => return Err(engine_failure(deps, &binding, e).await),
     };
@@ -770,7 +763,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use kea_core::store::db::{open_pool, run_config_migrations, run_data_migrations};
-    use kea_engines::traits::{LlmEngine, LlmResponse, SttEngine, Transcript, TtsEngine};
+    use kea_engines::traits::{
+        LlmEngine, LlmRequest, LlmResponse, SttEngine, Transcript, TtsEngine,
+    };
     use kea_engines::EngineCaps;
     use kea_infer::SpeakerSpan;
 

@@ -14,7 +14,37 @@ pub use openai::OpenAiLlmEngine;
 pub use stream::{LlmStream, StreamingLlmEngine};
 
 use crate::http::{Auth, HttpClient};
-use crate::traits::{EngineError, LlmResponse, TokenUsage};
+use crate::traits::{EngineError, LlmRequest, LlmResponse, TokenUsage};
+
+/// The conversation turns, without the system prompt.
+pub(crate) fn conversation_json(req: &LlmRequest) -> serde_json::Value {
+    let messages: Vec<serde_json::Value> = req
+        .messages
+        .iter()
+        .map(|message| {
+            serde_json::json!({
+                "role": message.role.as_str(),
+                "content": message.content,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(messages)
+}
+
+/// The conversation as OpenAI-shaped `messages`, with the system prompt
+/// first when there is one.
+pub(crate) fn messages_json(req: &LlmRequest) -> serde_json::Value {
+    let mut messages = Vec::with_capacity(req.messages.len() + 1);
+    if let Some(system) = &req.system {
+        if !system.is_empty() {
+            messages.push(serde_json::json!({"role": "system", "content": system}));
+        }
+    }
+    if let serde_json::Value::Array(turns) = conversation_json(req) {
+        messages.extend(turns);
+    }
+    serde_json::Value::Array(messages)
+}
 
 /// Reads the `usage` block every OpenAI-shaped server *may* send.
 ///
@@ -42,12 +72,12 @@ pub(crate) async fn stream_chat_completion(
     base_url: &str,
     model: &str,
     auth: Auth<'_>,
-    prompt: &str,
+    req: &LlmRequest,
 ) -> Result<stream::LlmStream, crate::traits::EngineError> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages_json(req),
         "stream": true,
     });
     let bytes = http.post_json_stream(&url, auth, &[], body).await?;
@@ -59,12 +89,12 @@ pub(crate) async fn post_chat_completion(
     base_url: &str,
     model: &str,
     auth: Auth<'_>,
-    prompt: &str,
+    req: &LlmRequest,
 ) -> Result<LlmResponse, EngineError> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages_json(req),
     });
     let text = http.post_json(&url, auth, body).await?;
     let parsed: serde_json::Value =

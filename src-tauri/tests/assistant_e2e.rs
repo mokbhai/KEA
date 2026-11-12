@@ -40,7 +40,8 @@ use kea_core::store::bindings::{Binding, BindingRepo};
 use kea_core::store::db::{open_pool, run_config_migrations, run_data_migrations};
 use kea_core::TtsSettings;
 use kea_engines::traits::{
-    AudioPcm, EngineCaps, EngineError, LlmEngine, LlmRequest, LlmResponse, TtsEngine, TtsOpts,
+    AudioPcm, EngineCaps, EngineError, LlmEngine, LlmRequest, LlmResponse, LlmRole, TtsEngine,
+    TtsOpts,
 };
 use kea_engines::EngineRegistry;
 use kea_features::{ActionGuard, ASSISTANT_FEATURE_ID};
@@ -61,14 +62,16 @@ struct ScriptedLlm {
     reply: Box<dyn Fn(&str) -> String + Send + Sync>,
 }
 
-/// The utterance as `build_routing_prompt` writes it into the prompt.
+/// The utterance, which is the last user message.
 ///
 /// Reading it back out is what lets the script above be written in terms of
 /// what the user said rather than in terms of prompt text.
-fn utterance_of(prompt: &str) -> String {
-    prompt
-        .rsplit_once("User said: ")
-        .map(|(_, rest)| rest.trim().to_string())
+fn utterance_of(req: &LlmRequest) -> String {
+    req.messages
+        .iter()
+        .rev()
+        .find(|message| message.role == LlmRole::User)
+        .map(|message| message.content.clone())
         .unwrap_or_default()
 }
 
@@ -81,9 +84,7 @@ impl LlmEngine for ScriptedLlm {
         EngineCaps { models: vec![] }
     }
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, EngineError> {
-        Ok(LlmResponse::untracked((self.reply)(&utterance_of(
-            &req.prompt,
-        ))))
+        Ok(LlmResponse::untracked((self.reply)(&utterance_of(&req))))
     }
 }
 

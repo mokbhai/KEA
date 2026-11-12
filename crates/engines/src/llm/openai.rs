@@ -68,7 +68,7 @@ impl LlmEngine for OpenAiLlmEngine {
             &provider.base_url,
             &model,
             Auth::Bearer(api_key),
-            &req.prompt,
+            &req,
         )
         .await
     }
@@ -88,7 +88,7 @@ impl StreamingLlmEngine for OpenAiLlmEngine {
             &provider.base_url,
             &model,
             Auth::Bearer(api_key),
-            &req.prompt,
+            &req,
         )
         .await
     }
@@ -102,7 +102,7 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_json, body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     struct FakeCredentials {
@@ -175,11 +175,7 @@ mod tests {
             provider_ref: "openai".into(),
         };
         let out = engine
-            .complete(LlmRequest {
-                prompt: "fix this".into(),
-                model: None,
-                provider_ref: None,
-            })
+            .complete(LlmRequest::user("fix this").with_binding(None, None))
             .await
             .unwrap();
         assert_eq!(out.text, "rewritten");
@@ -187,6 +183,46 @@ mod tests {
         // the provider's own numbers rather than a count we made up — this
         // body carries none, so the honest answer is a blank.
         assert_eq!(out.usage, None);
+    }
+
+    /// Instructions travel as a `system` message ahead of the user's input,
+    /// not as one flattened prompt.
+    #[tokio::test]
+    async fn sends_the_system_prompt_as_a_message() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_json(serde_json::json!({
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "system", "content": "Be terse."},
+                    {"role": "user", "content": "hi"},
+                ],
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"choices":[{"message":{"content":"hello"}}]}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let engine = OpenAiLlmEngine {
+            http: Arc::new(ReqwestHttpClient::new()),
+            credentials: FakeCredentials::with_key("openai", "sk-test"),
+            configs: FakeConfigs::with_config(
+                "openai",
+                ProviderConfig {
+                    base_url: format!("{}/v1", server.uri()),
+                    default_model: "gpt-4o-mini".into(),
+                },
+            ),
+            provider_ref: "openai".into(),
+        };
+        let out = engine
+            .complete(LlmRequest::single_turn("Be terse.", "hi"))
+            .await
+            .unwrap();
+        assert_eq!(out.text, "hello");
     }
 
     /// The same request with one field added, decoded through OpenAI's own
@@ -224,11 +260,7 @@ mod tests {
         };
         let mut chunks = StreamingLlmEngine::stream(
             &engine,
-            LlmRequest {
-                prompt: "fix this".into(),
-                model: None,
-                provider_ref: None,
-            },
+            LlmRequest::user("fix this").with_binding(None, None),
         )
         .await
         .unwrap();
@@ -266,11 +298,7 @@ mod tests {
             provider_ref: "openai".into(),
         };
         let out = engine
-            .complete(LlmRequest {
-                prompt: "fix this".into(),
-                model: None,
-                provider_ref: None,
-            })
+            .complete(LlmRequest::user("fix this").with_binding(None, None))
             .await
             .unwrap();
         assert_eq!(
@@ -307,11 +335,7 @@ mod tests {
             provider_ref: "openai".into(),
         };
         let err = engine
-            .complete(LlmRequest {
-                prompt: "fix this".into(),
-                model: None,
-                provider_ref: None,
-            })
+            .complete(LlmRequest::user("fix this").with_binding(None, None))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("401"));
@@ -342,11 +366,7 @@ mod tests {
             provider_ref: "openai".into(),
         };
         let err = engine
-            .complete(LlmRequest {
-                prompt: "test".into(),
-                model: None,
-                provider_ref: None,
-            })
+            .complete(LlmRequest::user("test").with_binding(None, None))
             .await
             .unwrap_err();
         match &err {
@@ -387,11 +407,7 @@ mod tests {
             provider_ref: "openai".into(),
         };
         let out = engine
-            .complete(LlmRequest {
-                prompt: "test".into(),
-                model: Some("gpt-4o".into()),
-                provider_ref: None,
-            })
+            .complete(LlmRequest::user("test").with_binding(Some("gpt-4o".into()), None))
             .await
             .unwrap();
         assert_eq!(out.text, "bound");
@@ -428,11 +444,7 @@ mod tests {
             provider_ref: "openai".into(),
         };
         let out = engine
-            .complete(LlmRequest {
-                prompt: "fix this".into(),
-                model: None,
-                provider_ref: Some("omni".into()),
-            })
+            .complete(LlmRequest::user("fix this").with_binding(None, Some("omni".into())))
             .await
             .unwrap();
         assert_eq!(out.text, "gateway");

@@ -17,7 +17,7 @@ impl LlmEngine for NoopLlmEngine {
         }
     }
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, EngineError> {
-        Ok(LlmResponse::untracked(format!("echo: {}", req.prompt)))
+        Ok(LlmResponse::untracked(format!("echo: {}", req.prompt())))
     }
 }
 

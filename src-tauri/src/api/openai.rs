@@ -14,7 +14,7 @@
 //! a provider echoes one back.
 
 use kea_core::transcript::{SubtitleFormat, SubtitleOpts};
-use kea_engines::traits::{SttSegment, TokenUsage};
+use kea_engines::traits::{LlmMessage, LlmRequest, SttSegment, TokenUsage};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -694,7 +694,7 @@ pub struct ChatMessage {
 
 /// A message's content: a plain string, or an array of typed parts.
 ///
-/// The parts are kept as raw JSON and checked in [`flatten_messages`], so
+/// The parts are kept as raw JSON and checked in [`chat_to_llm_request`], so
 /// that a non-text part is refused with a message about text, not with
 /// serde's "data did not match any variant".
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -707,7 +707,7 @@ pub enum ChatContent {
 /// Parses a chat body and refuses the parts of it this route does not do.
 ///
 /// Refused here: tools, and an empty `messages`. The per-message refusals
-/// (tool calls, role `tool`, non-text parts) are in [`flatten_messages`],
+/// (tool calls, role `tool`, non-text parts) are in [`chat_to_llm_request`],
 /// which is the one place a message's content is read.
 pub fn parse_chat(body: &[u8]) -> Result<ChatRequest, ApiError> {
     let req: ChatRequest = serde_json::from_slice(body).map_err(|e| {
@@ -729,33 +729,31 @@ pub fn parse_chat(body: &[u8]) -> Result<ChatRequest, ApiError> {
     Ok(req)
 }
 
-/// Flattens a conversation into the single prompt `LlmRequest` takes.
-///
-/// Each message becomes a `System:`, `User:` or `Assistant:` paragraph, and
-/// the prompt ends with a bare `Assistant:` so the model continues as the
-/// assistant. This is the same flattening the providers that only expose a
-/// completion endpoint receive, so the two paths produce the same prompt.
+/// Turns a client's OpenAI-shaped conversation into the request the engines
+/// take: system/developer messages become the system prompt, and user and
+/// assistant turns keep their roles.
 ///
 /// Refused: a message with tool calls, role `tool`, any role other than
 /// `system`, `developer`, `user` and `assistant`, and any content part that
 /// is not `{"type":"text","text":…}`.
-pub fn flatten_messages(messages: &[ChatMessage]) -> Result<String, ApiError> {
+pub fn chat_to_llm_request(messages: &[ChatMessage]) -> Result<LlmRequest, ApiError> {
     if messages.is_empty() {
         return Err(ApiError::invalid_request(
             "`messages` must contain at least one message.",
         ));
     }
-    let mut out = String::new();
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut turns: Vec<LlmMessage> = Vec::new();
     for message in messages {
         if message.tool_calls.as_ref().is_some_and(|t| !t.is_null()) {
             return Err(ApiError::invalid_request(
                 "Tool calls are not supported on this endpoint.",
             ));
         }
-        let label = match message.role.as_str() {
-            "system" | "developer" => "System",
-            "user" => "User",
-            "assistant" => "Assistant",
+        match message.role.as_str() {
+            "system" | "developer" => system_parts.push(message_text(message)?),
+            "user" => turns.push(LlmMessage::user(message_text(message)?)),
+            "assistant" => turns.push(LlmMessage::assistant(message_text(message)?)),
             "tool" => {
                 return Err(ApiError::invalid_request(
                     "Messages with role `tool` are not supported on this endpoint.",
@@ -766,14 +764,13 @@ pub fn flatten_messages(messages: &[ChatMessage]) -> Result<String, ApiError> {
                     "The role `{other}` is not supported; use system, user or assistant."
                 )))
             }
-        };
-        out.push_str(label);
-        out.push_str(": ");
-        out.push_str(&message_text(message)?);
-        out.push_str("\n\n");
+        }
     }
-    out.push_str("Assistant:");
-    Ok(out)
+    let mut request = LlmRequest::new(system_parts.join("\n\n"), turns);
+    if request.system.as_deref() == Some("") {
+        request.system = None;
+    }
+    Ok(request)
 }
 
 /// The text of one message, with text parts joined by a newline.
@@ -1292,21 +1289,27 @@ mod tests {
     }
 
     #[test]
-    fn flatten_golden() {
+    fn chat_request_keeps_roles() {
         let messages = vec![
             msg("system", "Be brief."),
             msg("user", "Hi"),
             msg("assistant", "Hello"),
             msg("user", "Name?"),
         ];
+        let request = chat_to_llm_request(&messages).unwrap();
+        assert_eq!(request.system.as_deref(), Some("Be brief."));
         assert_eq!(
-            flatten_messages(&messages).unwrap(),
-            "System: Be brief.\n\nUser: Hi\n\nAssistant: Hello\n\nUser: Name?\n\nAssistant:"
+            request.messages,
+            vec![
+                LlmMessage::user("Hi"),
+                LlmMessage::assistant("Hello"),
+                LlmMessage::user("Name?"),
+            ]
         );
     }
 
     #[test]
-    fn flatten_accepts_developer_and_text_parts() {
+    fn chat_request_accepts_developer_and_text_parts() {
         let parts = ChatMessage {
             role: "user".into(),
             content: Some(ChatContent::Parts(vec![
@@ -1316,20 +1319,19 @@ mod tests {
             tool_calls: None,
         };
         let messages = vec![msg("developer", "Rules."), parts];
-        assert_eq!(
-            flatten_messages(&messages).unwrap(),
-            "System: Rules.\n\nUser: one\ntwo\n\nAssistant:"
-        );
+        let request = chat_to_llm_request(&messages).unwrap();
+        assert_eq!(request.system.as_deref(), Some("Rules."));
+        assert_eq!(request.messages, vec![LlmMessage::user("one\ntwo")]);
     }
 
     #[test]
-    fn flatten_refuses_tool_calls_tool_role_and_non_text_parts() {
+    fn chat_request_refuses_tool_calls_tool_role_and_non_text_parts() {
         let with_calls = ChatMessage {
             role: "assistant".into(),
             content: None,
             tool_calls: Some(json!([{"id": "c1"}])),
         };
-        assert_eq!(flatten_messages(&[with_calls]).unwrap_err().status, 400);
+        assert_eq!(chat_to_llm_request(&[with_calls]).unwrap_err().status, 400);
 
         let null_calls = ChatMessage {
             role: "assistant".into(),
@@ -1337,15 +1339,15 @@ mod tests {
             tool_calls: Some(Value::Null),
         };
         assert!(
-            flatten_messages(&[null_calls]).is_ok(),
+            chat_to_llm_request(&[null_calls]).is_ok(),
             "a null tool_calls is absent"
         );
 
-        let err = flatten_messages(&[msg("tool", "result")]).unwrap_err();
+        let err = chat_to_llm_request(&[msg("tool", "result")]).unwrap_err();
         assert_eq!(err.status, 400);
         assert!(err.message.contains("tool"));
 
-        let err = flatten_messages(&[msg("function", "x")]).unwrap_err();
+        let err = chat_to_llm_request(&[msg("function", "x")]).unwrap_err();
         assert_eq!(err.status, 400);
 
         let image = ChatMessage {
@@ -1356,7 +1358,7 @@ mod tests {
             ])),
             tool_calls: None,
         };
-        let err = flatten_messages(&[image]).unwrap_err();
+        let err = chat_to_llm_request(&[image]).unwrap_err();
         assert_eq!(err.status, 400);
         assert!(err.message.contains("Only text content is supported"));
     }

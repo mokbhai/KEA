@@ -58,9 +58,67 @@ pub struct EngineCaps {
     pub models: Vec<String>,
 }
 
+/// Who wrote one message in a conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmRole {
+    System,
+    User,
+    Assistant,
+}
+
+impl LlmRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LlmRole::System => "system",
+            LlmRole::User => "user",
+            LlmRole::Assistant => "assistant",
+        }
+    }
+}
+
+/// One turn in the conversation sent to a model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmMessage {
+    pub role: LlmRole,
+    pub content: String,
+}
+
+impl LlmMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: LlmRole::System,
+            content: content.into(),
+        }
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: LlmRole::User,
+            content: content.into(),
+        }
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: LlmRole::Assistant,
+            content: content.into(),
+        }
+    }
+}
+
+/// One completion request: a system prompt plus the conversation so far.
+///
+/// Instructions belong in `system`; `messages` carries the user's actual
+/// input and the assistant's earlier turns. Engines translate this to their
+/// own wire shape (`messages` for OpenAI-shaped servers, the top-level
+/// `system` field for Anthropic).
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlmRequest {
-    pub prompt: String,
+    #[serde(default)]
+    pub system: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<LlmMessage>,
     #[serde(default)]
     pub model: Option<String>,
     /// Which provider's key and base URL to use for this one call.
@@ -76,6 +134,61 @@ pub struct LlmRequest {
     /// was the one that did not.
     #[serde(default)]
     pub provider_ref: Option<String>,
+}
+
+impl LlmRequest {
+    /// A request with a system prompt and a conversation.
+    pub fn new(system: impl Into<String>, messages: Vec<LlmMessage>) -> Self {
+        Self {
+            system: Some(system.into()),
+            messages,
+            model: None,
+            provider_ref: None,
+        }
+    }
+
+    /// A request with no system prompt and one user message.
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            system: None,
+            messages: vec![LlmMessage::user(content)],
+            model: None,
+            provider_ref: None,
+        }
+    }
+
+    /// A single-turn request: instructions in the system prompt, the user's
+    /// input in the one user message.
+    pub fn single_turn(system: impl Into<String>, user: impl Into<String>) -> Self {
+        Self::new(system, vec![LlmMessage::user(user)])
+    }
+
+    /// Fills in the resolved binding's model and provider, which the prompt
+    /// builders have no view of.
+    pub fn with_binding(mut self, model: Option<String>, provider_ref: Option<String>) -> Self {
+        self.model = model;
+        self.provider_ref = provider_ref;
+        self
+    }
+
+    /// The request as one prompt, for tests and for engines that only expose
+    /// a completion endpoint. Not what the hosted engines send: they preserve
+    /// the roles.
+    pub fn prompt(&self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        if let Some(system) = &self.system {
+            if !system.is_empty() {
+                parts.push(system);
+            }
+        }
+        parts.extend(
+            self.messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .filter(|content| !content.is_empty()),
+        );
+        parts.join("\n\n")
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -8541,8 +8541,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            req.prompt,
-            "Rewrite as a three-bullet standup update.\n\nSource text:\ndid the thing"
+            req.prompt(),
+            "Rewrite as a three-bullet standup update.\n\ndid the thing"
         );
     }
 

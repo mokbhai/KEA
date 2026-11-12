@@ -66,7 +66,7 @@ impl LlmEngine for OpenAiCompatibleLlmEngine {
             &provider.base_url,
             &model,
             provider.auth(),
-            &req.prompt,
+            &req,
         )
         .await
     }
@@ -85,7 +85,7 @@ impl StreamingLlmEngine for OpenAiCompatibleLlmEngine {
             &provider.base_url,
             &model,
             provider.auth(),
-            &req.prompt,
+            &req,
         )
         .await
     }
@@ -178,11 +178,7 @@ mod tests {
             provider_ref: "local-llm".into(),
         };
         let out = engine
-            .complete(LlmRequest {
-                prompt: "rewrite me".into(),
-                model: None,
-                provider_ref: None,
-            })
+            .complete(LlmRequest::user("rewrite me").with_binding(None, None))
             .await
             .unwrap();
         assert_eq!(out.text, "compatible");
@@ -202,11 +198,7 @@ mod tests {
             provider_ref: "local-llm".into(),
         };
         let err = engine
-            .complete(LlmRequest {
-                prompt: "rewrite me".into(),
-                model: None,
-                provider_ref: None,
-            })
+            .complete(LlmRequest::user("rewrite me").with_binding(None, None))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("missing provider config"));
@@ -251,11 +243,7 @@ mod tests {
             provider_ref: "local-llm".into(),
         };
         let out = engine
-            .complete(LlmRequest {
-                prompt: "rewrite me".into(),
-                model: None,
-                provider_ref: Some("omni".into()),
-            })
+            .complete(LlmRequest::user("rewrite me").with_binding(None, Some("omni".into())))
             .await
             .unwrap();
         assert_eq!(out.text, "omni");
@@ -292,11 +280,7 @@ mod tests {
             provider_ref: "local-llm".into(),
         };
         let out = engine
-            .complete(LlmRequest {
-                prompt: "rewrite me".into(),
-                model: None,
-                provider_ref: None,
-            })
+            .complete(LlmRequest::user("rewrite me").with_binding(None, None))
             .await
             .unwrap();
         assert_eq!(out.text, "local");
@@ -328,11 +312,7 @@ mod tests {
             provider_ref: "local-llm".into(),
         };
         let err = engine
-            .complete(LlmRequest {
-                prompt: "rewrite me".into(),
-                model: None,
-                provider_ref: None,
-            })
+            .complete(LlmRequest::user("rewrite me").with_binding(None, None))
             .await
             .unwrap_err();
         match &err {

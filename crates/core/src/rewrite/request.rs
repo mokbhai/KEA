@@ -68,19 +68,16 @@ pub async fn build_llm_request(
     styles: &StyleRepo,
     overrides: &PromptOverrideRepo,
 ) -> Result<LlmRequest, KeaError> {
-    let prompt = if let Some(ref style_id) = input.custom_style_id {
+    let (system, user) = if let Some(ref style_id) = input.custom_style_id {
         let style = styles
             .get(style_id)
             .await?
             .ok_or_else(|| KeaError::NotFound(format!("style {style_id}")))?;
-        format!(
-            "{}\n\nSource text:\n{}",
-            style.instruction, input.source_text
-        )
+        (style.instruction, input.source_text.clone())
     } else {
         let override_prompt = overrides.get(input.mode).await?;
         let vars = PromptVars::for_mode(input.mode, input.custom_instruction.as_deref());
-        PromptCatalog::rendered(
+        PromptCatalog::rendered_parts(
             input.mode,
             &input.source_text,
             &vars,
@@ -88,12 +85,8 @@ pub async fn build_llm_request(
         )?
     };
     // model and provider_ref are the resolved binding's to fill in — the
-    // prompt builder has no view of which engine or provider will run it.
-    Ok(LlmRequest {
-        prompt,
-        model: None,
-        provider_ref: None,
-    })
+    // request builder has no view of which engine or provider will run it.
+    Ok(LlmRequest::single_turn(system, user))
 }
 
 #[cfg(test)]
@@ -122,8 +115,8 @@ mod tests {
         let req = build_llm_request(&input, &styles, &overrides)
             .await
             .unwrap();
-        assert!(req.prompt.contains("Translate to French"));
-        assert!(req.prompt.contains("hello"));
+        assert!(req.prompt().contains("Translate to French"));
+        assert!(req.prompt().contains("hello"));
     }
 
     #[tokio::test]
@@ -151,8 +144,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            req.prompt,
-            "Rewrite as a three-bullet standup update.\n\nSource text:\ndid the thing"
+            req.prompt(),
+            "Rewrite as a three-bullet standup update.\n\ndid the thing"
         );
     }
 
@@ -190,8 +183,8 @@ mod tests {
         let req = build_llm_request(&input, &styles, &overrides)
             .await
             .unwrap();
-        assert!(req.prompt.contains("writing assistant"));
-        assert!(req.prompt.contains("hello"));
+        assert!(req.prompt().contains("writing assistant"));
+        assert!(req.prompt().contains("hello"));
     }
 
     #[tokio::test]
@@ -210,9 +203,9 @@ mod tests {
         let req = build_llm_request(&input, &styles, &overrides)
             .await
             .unwrap();
-        assert!(req.prompt.contains("German"));
-        assert!(req.prompt.contains("hello"));
-        assert!(!req.prompt.contains("{{target_language}}"));
+        assert!(req.prompt().contains("German"));
+        assert!(req.prompt().contains("hello"));
+        assert!(!req.prompt().contains("{{target_language}}"));
     }
 
     #[tokio::test]
@@ -237,8 +230,8 @@ mod tests {
         let req = build_llm_request(&input, &styles, &overrides)
             .await
             .unwrap();
-        assert!(req.prompt.contains("Rewrite as a pirate"));
-        assert!(!req.prompt.contains("German"));
+        assert!(req.prompt().contains("Rewrite as a pirate"));
+        assert!(!req.prompt().contains("German"));
     }
 
     #[tokio::test]

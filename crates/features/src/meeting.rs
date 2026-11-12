@@ -2268,7 +2268,7 @@ mod tests {
         }
 
         async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, EngineError> {
-            if req.prompt.contains("<summary>") {
+            if req.prompt().contains("<summary>") {
                 return Ok(LlmResponse::untracked("Sprint Planning"));
             }
             Ok(LlmResponse::untracked(
@@ -3212,14 +3212,14 @@ mod tests {
         }
 
         async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, EngineError> {
-            self.prompts.lock().unwrap().push(req.prompt.clone());
-            if req.prompt.contains("<participants>") {
+            self.prompts.lock().unwrap().push(req.prompt());
+            if req.prompt().contains("<participants>") {
                 if self.fail_names {
                     return Err(EngineError::Other("names are down".into()));
                 }
                 return Ok(LlmResponse::untracked(self.names_reply.clone()));
             }
-            if req.prompt.contains("<summary>") {
+            if req.prompt().contains("<summary>") {
                 return Ok(LlmResponse::untracked("Sprint Planning"));
             }
             Ok(LlmResponse::untracked(KIND_NOTES))
@@ -4263,14 +4263,14 @@ mod item_16_17_tests {
         }
 
         async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, EngineError> {
-            self.prompts.lock().unwrap().push(req.prompt.clone());
+            self.prompts.lock().unwrap().push(req.prompt());
             if self.fail {
                 return Err(EngineError::Other("provider is down".into()));
             }
             if let Some(text) = self.replies.lock().unwrap().pop_front() {
                 return Ok(LlmResponse::untracked(text));
             }
-            if req.prompt.contains("<summary>") {
+            if req.prompt().contains("<summary>") {
                 return Ok(LlmResponse::untracked("Sprint Planning"));
             }
             Ok(LlmResponse::untracked(VALID_NOTES))

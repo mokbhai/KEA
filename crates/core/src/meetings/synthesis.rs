@@ -172,11 +172,7 @@ pub fn build_meeting_notes_request(title: &str, started_at: &str, transcript: &s
     let user_prompt = format!(
         "Meeting title: {title}\nStarted: {started_at}\n\n<transcript>\n{transcript}\n</transcript>"
     );
-    LlmRequest {
-        prompt: format!("{}\n\n{user_prompt}", meeting_notes_system_prompt()),
-        model: None,
-        provider_ref: None,
-    }
+    LlmRequest::single_turn(meeting_notes_system_prompt(), user_prompt)
 }
 
 /// One incremental pass: the notes so far, plus only the segments recorded
@@ -204,11 +200,7 @@ pub fn build_interim_notes_request(
     let user_prompt = format!(
         "<notes_so_far>\n{previous_json}\n</notes_so_far>\n\n<new_transcript>\n{transcript}\n</new_transcript>"
     );
-    LlmRequest {
-        prompt: format!("{}\n\n{user_prompt}", meeting_interim_system_prompt()),
-        model: None,
-        provider_ref: None,
-    }
+    LlmRequest::single_turn(meeting_interim_system_prompt(), user_prompt)
 }
 
 /// The one repair round trip, given the reply that would not parse.
@@ -216,14 +208,10 @@ pub fn build_interim_notes_request(
 /// Exactly one. A loop here bills the user once per attempt against a provider
 /// that has already shown it cannot produce the shape.
 pub fn build_notes_repair_request(unparsable_reply: &str) -> LlmRequest {
-    LlmRequest {
-        prompt: format!(
-            "{}\n\n<your_previous_reply>\n{unparsable_reply}\n</your_previous_reply>",
-            meeting_notes_repair_prompt()
-        ),
-        model: None,
-        provider_ref: None,
-    }
+    LlmRequest::single_turn(
+        meeting_notes_repair_prompt(),
+        format!("<your_previous_reply>\n{unparsable_reply}\n</your_previous_reply>"),
+    )
 }
 
 /// The shape a speaker-naming reply must have. Shown as a literal for the same
@@ -259,20 +247,12 @@ pub fn build_speaker_names_request(transcript: &str, labels: &[&str]) -> LlmRequ
     let user_prompt = format!(
         "<participants>\n{label_list}\n</participants>\n\n<transcript>\n{transcript}\n</transcript>"
     );
-    LlmRequest {
-        prompt: format!("{}\n\n{user_prompt}", speaker_names_system_prompt()),
-        model: None,
-        provider_ref: None,
-    }
+    LlmRequest::single_turn(speaker_names_system_prompt(), user_prompt)
 }
 
 pub fn build_meeting_title_request(summary: &str) -> LlmRequest {
     let user_prompt = format!("<summary>\n{summary}\n</summary>");
-    LlmRequest {
-        prompt: format!("{}\n\n{user_prompt}", meeting_title_system_prompt()),
-        model: None,
-        provider_ref: None,
-    }
+    LlmRequest::single_turn(meeting_title_system_prompt(), user_prompt)
 }
 
 /// One action item as the model returned it, before it has a row.
@@ -612,10 +592,10 @@ mod tests {
     fn notes_prompt_wraps_transcript_in_tags() {
         let req =
             build_meeting_notes_request("Weekly Sync", "2026-06-26T10:00:00Z", "Alice: hello");
-        assert!(req.prompt.contains("<transcript>"));
-        assert!(req.prompt.contains("Alice: hello"));
-        assert!(req.prompt.contains("summary"));
-        assert!(req.prompt.contains("Meeting title: Weekly Sync"));
+        assert!(req.prompt().contains("<transcript>"));
+        assert!(req.prompt().contains("Alice: hello"));
+        assert!(req.prompt().contains("summary"));
+        assert!(req.prompt().contains("Meeting title: Weekly Sync"));
     }
 
     #[test]
@@ -636,9 +616,9 @@ mod tests {
     #[test]
     fn title_prompt_wraps_summary_in_tags() {
         let req = build_meeting_title_request("Sprint planning recap");
-        assert!(req.prompt.contains("<summary>"));
-        assert!(req.prompt.contains("Sprint planning recap"));
-        assert!(req.prompt.contains("title"));
+        assert!(req.prompt().contains("<summary>"));
+        assert!(req.prompt().contains("Sprint planning recap"));
+        assert!(req.prompt().contains("title"));
     }
 
     #[test]
@@ -738,12 +718,12 @@ mod tests {
         let new = vec![segment(7, 210_000, 240_000, "and the venue is booked")];
         let req = build_interim_notes_request(&previous, &new, &[]);
 
-        assert!(req.prompt.contains("we agreed to slip the launch"));
-        assert!(req.prompt.contains("and the venue is booked"));
-        assert!(req.prompt.contains("<notes_so_far>"));
-        assert!(req.prompt.contains("<new_transcript>"));
+        assert!(req.prompt().contains("we agreed to slip the launch"));
+        assert!(req.prompt().contains("and the venue is booked"));
+        assert!(req.prompt().contains("<notes_so_far>"));
+        assert!(req.prompt().contains("<new_transcript>"));
         // Nothing from before the last pass.
-        assert!(!req.prompt.contains("shall we start"));
+        assert!(!req.prompt().contains("shall we start"));
     }
 
     /// An interim pass runs while the title may already be a calendar title,
@@ -752,7 +732,7 @@ mod tests {
     #[test]
     fn the_interim_request_has_no_place_to_put_a_meeting_title() {
         let req = build_interim_notes_request(&notes("s"), &[], &[]);
-        assert!(!req.prompt.contains("Meeting title"));
+        assert!(!req.prompt().contains("Meeting title"));
     }
 
     /// Item 15 must survive into the live notes: an interim pass sees who
@@ -763,7 +743,7 @@ mod tests {
         seg.speaker_key = Some("remote".into());
         let speakers = vec![speaker("remote", "Priya", SpeakerSource::User)];
         let req = build_interim_notes_request(&notes("s"), &[seg], &speakers);
-        assert!(req.prompt.contains("Priya: hello"));
+        assert!(req.prompt().contains("Priya: hello"));
     }
 
     // --- 16b: getting JSON out of a provider that promises nothing ---
@@ -771,8 +751,8 @@ mod tests {
     #[test]
     fn the_notes_prompt_shows_the_shape_rather_than_only_describing_it() {
         let req = build_meeting_notes_request("Weekly Sync", "2026-06-26T10:00:00Z", "hi");
-        assert!(req.prompt.contains(NOTES_JSON_EXAMPLE));
-        assert!(req.prompt.contains("action_item_rows"));
+        assert!(req.prompt().contains(NOTES_JSON_EXAMPLE));
+        assert!(req.prompt().contains("action_item_rows"));
     }
 
     #[test]
@@ -863,9 +843,9 @@ mod tests {
     #[test]
     fn the_repair_request_quotes_the_reply_that_failed() {
         let req = build_notes_repair_request("Sorry, I cannot.");
-        assert!(req.prompt.contains("was not valid JSON"));
-        assert!(req.prompt.contains("Sorry, I cannot."));
-        assert!(req.prompt.contains(NOTES_JSON_EXAMPLE));
+        assert!(req.prompt().contains("was not valid JSON"));
+        assert!(req.prompt().contains("Sorry, I cannot."));
+        assert!(req.prompt().contains(NOTES_JSON_EXAMPLE));
     }
 
     #[test]
@@ -884,8 +864,8 @@ mod tests {
     fn the_owner_is_the_labelled_speaker_in_both_notes_prompts() {
         let final_pass = build_meeting_notes_request("T", "2026-06-26T10:00:00Z", "hi");
         let interim_pass = build_interim_notes_request(&notes("s"), &[], &[]);
-        assert!(final_pass.prompt.contains(OWNER_LABEL_SENTENCE));
-        assert!(interim_pass.prompt.contains(OWNER_LABEL_SENTENCE));
+        assert!(final_pass.prompt().contains(OWNER_LABEL_SENTENCE));
+        assert!(interim_pass.prompt().contains(OWNER_LABEL_SENTENCE));
     }
 
     // --- 5.1: naming the participants ---
@@ -1031,10 +1011,10 @@ mod tests {
     #[test]
     fn the_naming_request_carries_labels_and_transcript_and_no_calendar_data() {
         let req = build_speaker_names_request(NAMES_TRANSCRIPT, NAMES_LABELS);
-        assert!(req.prompt.contains("<transcript>"));
-        assert!(req.prompt.contains(NAMES_TRANSCRIPT));
-        assert!(req.prompt.contains("Person 1, Person 2, Person 3"));
-        assert!(req.prompt.contains(SPEAKER_NAMES_JSON_EXAMPLE));
-        assert!(!req.prompt.contains("Meeting title"));
+        assert!(req.prompt().contains("<transcript>"));
+        assert!(req.prompt().contains(NAMES_TRANSCRIPT));
+        assert!(req.prompt().contains("Person 1, Person 2, Person 3"));
+        assert!(req.prompt().contains(SPEAKER_NAMES_JSON_EXAMPLE));
+        assert!(!req.prompt().contains("Meeting title"));
     }
 }
